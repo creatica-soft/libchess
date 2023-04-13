@@ -1,5 +1,12 @@
 import sys, time
 from chess import ffi, lib
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("pgnfile", help="pgn file to import into next_moves db", type=str)
+parser.add_argument("db", help="next_moves sqlie3 db file", type=str)
+parser.add_argument("minElo", help="min Elo", type=int)
+parser.add_argument("maxEloDiff", help="max Elo difference between opponents", type=int)
+args = parser.parse_args()
 
 if __name__ == "__main__":
 #  fenString = ffi.new('char[]', b'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1')
@@ -19,8 +26,10 @@ if __name__ == "__main__":
 #  print(f' san move {ffi.string(move.sanMove)} uci move {ffi.string(move.uciMove)}')
 #    lib.makeMove(move)
 #    print(f' fen after move {ffi.string(m)}: {ffi.string(move.chessBoard.fen.fenString)}')
+
 #  fileName = ffi.new('char[]', b'KingBaseLite2019-E60-E99.pgn')
-  fileName = ffi.new('char[]', b'test.pgn')
+
+#  fileName = ffi.new('char[]', b'test.pgn')
 #  ecoFileName = ffi.new('char[]', b'eco.pgn')
 #  engineName = ffi.new('char[]', b'stockfish')
 #  chessEngine = ffi.new('struct Engine *')
@@ -50,9 +59,12 @@ if __name__ == "__main__":
 #  res = lib.engine(engineName, chessEngine, [eval1, eval2])
 #  print(f' engine returned {res}, best move {ffi.string(eval1.bestmove)}, NAG {eval1.nag}', file=sys.stderr)
   print(f' {time.asctime()}')
-  res = lib.pgnGames(fileName, ffi.NULL)
+#  res = lib.pgnGames(fileName, ffi.NULL, True)
+  res = lib.pgnGames(ffi.from_buffer(bytes(args.pgnfile, "ascii")), ffi.NULL, ffi.from_buffer(bytes(args.db, "ascii")), True, args.minElo, args.maxEloDiff)
   print(f' {time.asctime()}')
   print(f' pgnGames return {res}')
+#  ffi.release(fileName)
+
 #  fileName = ffi.new('char[]', b'test.pgn')
 #  gameStartPositions = ffi.new('unsigned long[256000]')
 #  res = lib.countGames(fileName, gameStartPositions, 256000)

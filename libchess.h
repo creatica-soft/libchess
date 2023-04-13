@@ -1,9 +1,11 @@
 #include <stdbool.h>
+//#include <sqlite3.h>
 //#include <stdio.h>
 //#define bool _Bool
 #define TO_ENGINE_NAMED_PIPE "/tmp/to_chess_engine_pipe"
 #define FROM_ENGINE_NAMED_PIPE "/tmp/from_chess_engine_pipe"
-#define MAX_NUMBER_OF_THREADS 3
+#define MAX_NUMBER_OF_THREADS 7
+#define MAX_SEC_TO_WAIT_FOR_NM_QUEUE 10
 #define MAX_NUMBER_OF_GAMES 256000
 #define MAX_NUMBER_OF_ECO_LINES 2048
 #define MAX_NUMBER_OF_TAGS 22
@@ -30,6 +32,10 @@
 #define INACCURACY 30
 #define MISTAKE 75
 #define BLUNDER 175
+#define RARE_MOVE_THRESHOLD 0.05
+#define SQLITE_CACHE_SIZE -1000000
+#define SQLITE_MMAP_SIZE 1073709056
+#define SQLITE_JOURNAL_MODE true
 
 #define FILE_A 0x0101010101010101UL
 #define FILE_B 0x0202020202020202UL
@@ -146,11 +152,12 @@ enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTyp
 /// <summary>
 /// Piece enumeration: first three bits are used to encode the type, fourth bit define the color.
 /// Shifting PieceName by 3 to the right will give the PieceColor: color = piece >> 3
-/// Masking 3 lowest bits returns the PieceType: type = piece &amp; 7
+/// Masking 3 lowest bits returns the PieceType: type = piece & 7
 /// </summary>
 enum PieceName {
 	PieceNameNone,
-	WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNameWhite, PieceNameAny,
+	WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNameWhite,
+  PieceNameAny,
 	BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, PieceNameBlack
 };
 
@@ -187,50 +194,6 @@ static const char * moveType[] = {
 };
 
 enum ProblemType { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
-
-/// <summary>
-/// Forthys-Edwards Notation for the position preceding a move 
-/// </summary>
-struct Fen {
-	///<summary>
-	/// FEN string as it is
-	///</summary>
-	char fenString[90];
-	/// <summary>
-	/// 1st field in FEN - ranks, separated by '/'
-	/// </summary>
-	char ranks[8][9];
-	/// <summary>
-	/// 2nd field in FEN - side to move
-	/// </summary>
-	enum Color sideToMove;
-	/// <summary>
-	/// 3rd field in FEN - castling Rights
-	/// </summary>
-	enum CastlingRightsEnum castlingRights;
-	/// <summary>
-	/// 4th field in FEN - EnPassant square - is set after double advancing a pawn regardless of whether an opposite side can capture or not.
-	/// In X-FEN it is only setup when the opposite side can actually capture, although illegal captures (when pinned, for example) may not be checked
-	/// </summary>
-	enum Files enPassant;
-	/// <summary>
-	/// 5th field in FEN - number of plies since last pawn advance or capture
-	/// Used in 50-move draw rule
-	/// </summary>
-	unsigned short halfmoveClock;
-	/// <summary>
-	/// 6th field in FEN - full move number
-	/// </summary>
-	unsigned short moveNumber;
-	/// <summary>
-	/// True if castling rights are indicated by the castling rook file instead of letters for kingside or queenside
-	/// </summary>
-	bool isChess960;
-	/// <summary>
-	/// Castling rook files for chess 960 position indexed by side: 0 - kingside castling (short), 1 - queenside castling (long) and by color: 0 - white, 1 - black
-	/// </summary>
-	enum Files castlingRook[2][2];
-};
 
 ///<summary>
 /// UCI option types
@@ -336,17 +299,51 @@ struct Evaluation {
 };
 
 /// <summary>
-///  Converts FEN string to struct fen
+/// Forthys-Edwards Notation for the position preceding a move 
 /// </summary>
-int strtofen(struct Fen *, char *);
+struct Fen {
+	///<summary>
+	/// FEN string as it is
+	///</summary>
+	char fenString[90];
+	/// <summary>
+	/// 1st field in FEN - ranks, separated by '/'
+	/// </summary>
+	char ranks[8][9];
+	/// <summary>
+	/// 2nd field in FEN - side to move
+	/// </summary>
+	enum Color sideToMove;
+	/// <summary>
+	/// 3rd field in FEN - castling Rights
+	/// </summary>
+	enum CastlingRightsEnum castlingRights;
+	/// <summary>
+	/// 4th field in FEN - EnPassant square - is set after double advancing a pawn regardless of whether an opposite side can capture or not.
+	/// In X-FEN it is only setup when the opposite side can actually capture, although illegal captures (when pinned, for example) may not be checked
+	/// </summary>
+	enum Files enPassant;
+	/// <summary>
+	/// 5th field in FEN - number of plies since last pawn advance or capture
+	/// Used in 50-move draw rule
+	/// </summary>
+	unsigned short halfmoveClock;
+	/// <summary>
+	/// 6th field in FEN - full move number
+	/// </summary>
+	unsigned short moveNumber;
+	/// <summary>
+	/// True if castling rights are indicated by the castling rook file instead of letters for kingside or queenside
+	/// </summary>
+	bool isChess960;
+	/// <summary>
+	/// Castling rook files for chess 960 position indexed by side: 0 - kingside castling (short), 1 - queenside castling (long) and by color: 0 - white, 1 - black
+	/// </summary>
+	enum Files castlingRook[2][2];
+};
 
 /// <summary>
-///  Converts fen struct to FEN string
-/// </summary>
-int fentostr(struct Fen *);
-
-/// <summary>
-/// Square class represents chess board square
+/// Square struct represents chess board square
 /// </summary>
 struct Square {
 	/// <summary>
@@ -456,10 +453,25 @@ struct Board {
 };
 
 /// <summary>
+///  Converts FEN string to struct fen
+/// </summary>
+int strtofen(struct Fen *, char *);
+
+/// <summary>
+///  Converts fen struct to FEN string
+/// </summary>
+int fentostr(struct Fen *);
+
+/// <summary>
+///  Updates FEN (Board->Fen) after the move
+/// </summary>
+void updateFen(struct Board *);
+
+/// <summary>
 /// Array of 841 unique true random unsigned 64-bit integers obtained from random.org
 /// that uses atmospheric noise
 /// </summary>
-static const unsigned long bitStrings[841] = {
+static const unsigned long bitStrings[761] = {
 0x35840e4be496fdc9UL,
 0x726adfa6fb848ccfUL,
 0x8ebc36ddb5dad364UL,
@@ -1220,8 +1232,8 @@ static const unsigned long bitStrings[841] = {
 0xf9323d9fedefcac7UL,
 0x6c0acfaee3a701b2UL,
 0x3ce516ac99438f5aUL,
-0x66fd7b7065c5ccc1UL,
-0x38096c934b44950bUL,
+0x66fd7b7065c5ccc1UL
+/*0x38096c934b44950bUL,
 0xf53f21649109a8d1UL,
 0x29ff9f8d99b977c1UL,
 0xd167e2e6e538676bUL,
@@ -1300,10 +1312,11 @@ static const unsigned long bitStrings[841] = {
 0xcb018c193ed7f85dUL,
 0xccea7d615fe1cae7UL,
 0xe754ffc987cd3c4UL,
-0xe6983662e18e1826UL };
+0xe6983662e18e1826UL */};
 static char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-static const unsigned long STARTPOS_HASH = 0xf012ba38f3542c87UL;
-static const unsigned long STARTPOS_CASTLING_RIGHTS = 0xc415701f13943de3UL;
+//static const unsigned long STARTPOS_HASH = 0xf012ba38f3542c87UL;
+static const unsigned long STARTPOS_HASH = 0xef02eea4e43154a5UL;
+static const unsigned long STARTPOS_CASTLING_RIGHTS = 0x3ce516ac99438f5aUL;
 
 //static unsigned long diagonalMoves[11];
 //static unsigned long antiDiagonalMoves[11];
@@ -1381,7 +1394,7 @@ struct ZobristHash {
 	unsigned long prevEnPassant;
 	unsigned long castling[16];
 	unsigned long enPassant[8];
-	unsigned long piecesAtSquares[13][64];
+	unsigned long piecesAtSquares[15][64];
 	/// <summary>
 	/// Hash of the standard chess starting position
 	/// </summary>
@@ -1471,9 +1484,9 @@ void getHash(struct ZobristHash *, struct Board *);
 void resetHash(struct ZobristHash *);
 
 ///<summary>
-/// updates ZobristHash of a given Board after a given move
+/// updates ZobristHash of a given Board after a given move <- done in makeMove()
 ///</summary>
-int updateHash(struct ZobristHash *, struct Board *, struct Move *);
+//int updateHash(struct ZobristHash *, struct Board *, struct Move *);
 
 ///<summary>
 /// fills Square struct from SquareName enum
@@ -1498,7 +1511,7 @@ unsigned char msBit(unsigned long);
 
 ///<summary>
 /// generates all legal moves on a given board
-/// and fills movesFromSquares member array of the Board sturct
+/// and fills movesFromSquares member array of the Board struct
 ///</summary>
 void generateMoves(struct Board *);
 
@@ -1509,9 +1522,9 @@ void generateMoves(struct Board *);
 int initMove(struct Move *, struct Board *, char *);
 
 ///<summary>
-/// makes a given move on board and updates board and fen struct
+/// makes a given move on board and updates board and fen struct, updates hash if not null
 ///</summary>
-void makeMove(struct Move *);
+void makeMove(struct Move *, struct ZobristHash *);
 
 /// <summary>
 /// Parses the line into tag name and tag value
@@ -1549,13 +1562,18 @@ int eTags(EcoTag, FILE *);
 /// plays a given pgn game
 /// returns 0 on success, non-zero on error
 ///</summary>
-int pgnGame(struct Game * game, bool);
+int pgnGame(struct Game * game, bool, unsigned long);
 
 ///<summary>
-/// plays multiple pgn games from a given pgn file
-/// second arguments is eco file name for ECO classification
+/// plays multiple pgn games from a given pgn file (first arg)
+/// second arg is next_moves sqlite3 db file
+/// third arguments is eco file name for ECO classification
+/// fourth arg is whether create db or not
+/// fifth is whether or not to calculate zobristHash
+/// sixth arg is minElo for pgn game selection
+/// seventh arg is maxEloDiff for pgn game selection
 ///</summary>
-unsigned long pgnGames(char *, char *);
+unsigned long pgnGames(char *, char *, char *, bool, int, int);
 
 /// <summary>
 /// draws a chessboard
