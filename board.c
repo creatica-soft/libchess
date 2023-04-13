@@ -381,33 +381,6 @@ int reconcile(struct Board * board) {
 }
 */
 
-void updateFen(struct Board * board) {
-	for (signed char i = 7; i >= 0; i--) {
-		bool prevSquareEmpty = false;
-		unsigned char n = 0, r = 0;
-		char fenRank[9];
-		for (unsigned char j = 0; j <= 7; j++) {
-			unsigned char s = (i << 3) | j;
-			if (board->piecesOnSquares[s] == PieceNameNone) {
-				if (!prevSquareEmpty) {
-					prevSquareEmpty = true;
-					n = 1;
-				} else n++;
-			} else {
-				if (prevSquareEmpty) {
-					fenRank[r++] = '0' + n;
-					prevSquareEmpty = false;
-				}
-				fenRank[r++] = pieceLetter[board->piecesOnSquares[s]];
-			}
-		}
-		if (prevSquareEmpty) fenRank[r++] = '0' + n;
-		fenRank[r] = '\0';
-		strncpy(board->fen->ranks[i], fenRank, strlen(fenRank) + 1);
-	}
-	fentostr(board->fen);
-}
-
 bool isEnPassantLegal(struct Board * board) {
 	enum Files i;
 	enum SquareName shift;
@@ -1206,19 +1179,38 @@ exit:
 	}
 }
 
-void makeMove(struct Move * move) {
-	//null move
+void makeMove(struct Move * move, struct ZobristHash * hash) {
+	//int srcPieceType;
+  //null move
+  if (hash) {
+    //printf("makeMove: hash at the beginning = %lx\n", hash->hash);    
+    //xor in or out black's move except for the first white's move
+   	if (hash->prevEnPassant > 0) {
+	  	hash->hash ^= hash->prevEnPassant;
+      //printf("makeMove: xored prevEnPassant in %lx, hash = %lx\n", hash->prevEnPassant, hash->hash);
+   	  hash->prevEnPassant = 0;
+    }
+  }
 	if ((move->type & MoveTypeNull) && (move->type & MoveTypeValid)) {
 		move->chessBoard->fen->sideToMove = move->chessBoard->fen->sideToMove == ColorWhite ? ColorBlack : ColorWhite;
 		if (move->chessBoard->fen->sideToMove == ColorWhite) {
 			move->chessBoard->fen->moveNumber++;
 			move->chessBoard->opponentColor = ColorBlack;
-		} else move->chessBoard->opponentColor = ColorWhite;
+		} else
+      move->chessBoard->opponentColor = ColorWhite;
 		generateMoves(move->chessBoard);
 		goto exit;
 	}
 	
-	//remove the piece from its source square
+  if (hash) {
+    //srcPieceType = (move->chessBoard->movingPiece.color + 1) * move->chessBoard->movingPiece.type;
+ 		//xor out the moving piece in its src square
+	  hash->hash ^= hash->piecesAtSquares[move->chessBoard->movingPiece.name][move->sourceSquare.name];
+    //printf("makeMove: xored out the moving piece in its src square %lx, hash = %lx\n", hash->piecesAtSquares[move->chessBoard->movingPiece.name][move->sourceSquare.name], hash->hash);
+ 		//xor in empty square in the src square
+		//hash->hash ^= hash->piecesAtSquares[0][move->sourceSquare.name];
+  }
+  //remove the piece from its source square
 	move->chessBoard->occupations[move->chessBoard->movingPiece.name] ^= move->chessBoard->movingPiece.square.bitSquare;
 	move->chessBoard->piecesOnSquares[move->chessBoard->movingPiece.square.name] = PieceTypeNone;
 	
@@ -1235,6 +1227,13 @@ void makeMove(struct Move * move) {
 			if (castlingSide != CastlingSideNone) {
 				//revoke castling rights
 				move->chessBoard->fen->castlingRights ^= castlingSide << ((move->chessBoard->fen->sideToMove) << 1);
+       	if (hash) {
+          hash->hash ^= hash->prevCastlingRights;
+          //printf("makeMove: xored out prevCastlingRights %lx, hash = %lx\n", hash->prevCastlingRights, hash->hash);
+          hash->hash ^= hash->castling[move->chessBoard->fen->castlingRights];
+          hash->prevCastlingRights = hash->castling[move->chessBoard->fen->castlingRights];
+          //printf("makeMove: revoked castling rights after %s %s rook move, hash = %lx\n", castlingSide == CastlingSideKingside ? "kingside" : "queenside", move->chessBoard->movingPiece.color == ColorWhite ? "white" : "black", hash->hash);
+        }
 				//set castling rook to none
 				move->chessBoard->fen->castlingRook[castlingSide - 1][move->chessBoard->fen->sideToMove] = FileNone;
 			}
@@ -1250,12 +1249,37 @@ void makeMove(struct Move * move) {
 			enum PieceName capturedPiece = (move->chessBoard->opponentColor << 3) | Pawn;
 			move->chessBoard->occupations[capturedPiece] ^= capturedPawnSquare.bitSquare;
 			move->chessBoard->piecesOnSquares[capturedPawnSquare.name] = PieceTypeNone;
+      if (hash) {
+		    //xor out captured piece in the square of the captured pawn 
+		    //hash->hash ^= hash->piecesAtSquares[Pawn | (move->chessBoard->opponentColor + 1)][capturedPawnSquare.name];
+        hash->hash ^= hash->piecesAtSquares[capturedPiece][capturedPawnSquare.name];
+        //printf("makeMove: xored out enPassant pawn, hash = %lx\n", hash->hash);
+    		//xor in empty square in the square of the captured pawn
+		    //hash->hash ^= hash->piecesAtSquares[0][capturedPawnSquare.name];
+    		//xor out empty square in the dst square
+		    //hash->hash ^= hash->piecesAtSquares[0][move->destinationSquare.name];
+		    //xor in the capturing piece in its dst square
+		    hash->hash ^= hash->piecesAtSquares[move->chessBoard->movingPiece.name][move->destinationSquare.name];
+        //printf("makeMove: xored in capturing pawn, hash = %lx\n", hash->hash);
+      }
 		} else {
 			enum PieceName capturedPiece = move->chessBoard->piecesOnSquares[move->destinationSquare.name];
 			move->chessBoard->occupations[move->chessBoard->piecesOnSquares[move->destinationSquare.name]] ^= move->destinationSquare.bitSquare;
+      if (hash) {
+    		//xor out captured piece in the dst square
+		    //hash->hash ^= hash->piecesAtSquares[(capturedPiece & 7) * ((capturedPiece >> 3) + 1)][move->destinationSquare.name];
+        hash->hash ^= hash->piecesAtSquares[capturedPiece][move->destinationSquare.name];
+        //printf("makeMove: xored out captured piece, hash = %lx\n", hash->hash);
+		    if (!(move->type & MoveTypePromotion)) {
+		      //xor in the capturing piece in its dst square
+		      hash->hash ^= hash->piecesAtSquares[move->chessBoard->movingPiece.name][move->destinationSquare.name];
+          //printf("makeMove: xored in capturing piece, hash = %lx\n", hash->hash);
+        }
+      }
 			//if captured piece is a castling rook, then remove the castling rights of the opponent on that side
 			if ((capturedPiece & 7) == Rook) {
 				unsigned char whiteBlack[2] = { 0, 56 };
+        //if (hash)	hash->hash ^= hash->castling[move->chessBoard->fen->castlingRights];
 				if (move->destinationSquare.name == move->chessBoard->fen->castlingRook[0][move->chessBoard->opponentColor] + whiteBlack[move->chessBoard->opponentColor]) {
 					move->chessBoard->fen->castlingRights &= CastlingRightsWhiteBothBlackBoth ^ (CastlingSideKingside << (move->chessBoard->opponentColor << 1));
 					move->chessBoard->fen->castlingRook[0][move->chessBoard->opponentColor] = FileNone;
@@ -1264,6 +1288,13 @@ void makeMove(struct Move * move) {
 					move->chessBoard->fen->castlingRights &= CastlingRightsWhiteBothBlackBoth ^ (CastlingSideQueenside << (move->chessBoard->opponentColor << 1));
 					move->chessBoard->fen->castlingRook[1][move->chessBoard->opponentColor] = FileNone;
 				}
+        if (hash) {
+          hash->hash ^= hash->prevCastlingRights;
+          //printf("makeMove: xored out prevCastlingRights %lx, hash = %lx\n", hash->prevCastlingRights, hash->hash);
+          hash->hash ^= hash->castling[move->chessBoard->fen->castlingRights];
+          //printf("makeMove: revoked CastlingRights after the rook capture, hash = %lx\n", hash->hash);
+          hash->prevCastlingRights = hash->castling[move->chessBoard->fen->castlingRights];
+        }
 			}
 		}
 	}
@@ -1278,7 +1309,26 @@ void makeMove(struct Move * move) {
 			enum SquareName dstRookSquare[2][2] = { { SquareF1, SquareF8 }, { SquareD1, SquareD8 } };
 			enum SquareName srcRookSquare = move->chessBoard->fen->castlingRook[castlingSide][move->chessBoard->fen->sideToMove] + rookOffset[move->chessBoard->fen->sideToMove];
 			enum PieceName rookName = (move->chessBoard->fen->sideToMove << 3) | Rook;
-			//remove castling rook from its source square taking care of
+      if (hash) {
+		    //xor out empty square in the king dst square
+		    //hash->hash ^= hash->piecesAtSquares[0][dstKingSquare[castlingSide][move->chessBoard->fen->sideToMove]];
+		    //xor in the king in its dst square
+		    hash->hash ^= hash->piecesAtSquares[move->chessBoard->movingPiece.name][dstKingSquare[castlingSide][move->chessBoard->fen->sideToMove]];
+        //printf("makeMove: castling - xor in the king in its dst square, hash = %lx\n", hash->hash);
+     		//xor out the rook in its src square
+		    //hash->hash ^= hash->piecesAtSquares[(move->chessBoard->fen->sideToMove + 1) * Rook][srcRookSquare];
+        hash->hash ^= hash->piecesAtSquares[rookName][srcRookSquare];
+        //printf("makeMove: castling - xor out the rook in its src square, hash = %lx\n", hash->hash);
+		    //xor in empty square in rook src square
+		    //hash->hash ^= hash->piecesAtSquares[0][srcRookSquare];
+		    //xor out empty square in rook dst square
+      	//hash->hash ^= hash->piecesAtSquares[0][dstRookSquare[castlingSide][move->chessBoard->fen->sideToMove]];
+      	//xor in the rook in its dst square
+      	//hash->hash ^= hash->piecesAtSquares[(move->chessBoard->fen->sideToMove + 1) * Rook][dstRookSquare[castlingSide][move->chessBoard->fen->sideToMove]];
+        hash->hash ^= hash->piecesAtSquares[rookName][dstRookSquare[castlingSide][move->chessBoard->fen->sideToMove]];
+        //printf("makeMove: castling - xor in the rook in its dst csquare, hash = %lx\n", hash->hash);
+		  }
+      //remove castling rook from its source square taking care of
 			//Chess960 case of rook occupying king's destination square - make sure we are not removing (overwriting) the king with PieceNone!
 			if (srcRookSquare != dstKingSquare[castlingSide][move->chessBoard->fen->sideToMove]) {
 				move->chessBoard->piecesOnSquares[srcRookSquare] = PieceNameNone;
@@ -1293,20 +1343,42 @@ void makeMove(struct Move * move) {
 			move->chessBoard->occupations[rookName] |= (1UL << dstRookSquare[castlingSide][move->chessBoard->fen->sideToMove]);
 			//move->chessBoard->occupations[PieceNameNone] ^= (1UL << dstRookSquare[castlingSide][move->chessBoard->fen->sideToMove]);
 		}
+    //if (hash)	hash->hash ^= hash->castling[move->chessBoard->fen->castlingRights];
 		//update FEN castling rights and rooks
 		move->chessBoard->fen->castlingRights &= CastlingSideBoth << (move->chessBoard->opponentColor << 1);
+    if (hash)	{
+      hash->hash ^= hash->prevCastlingRights;
+      //printf("makeMove: xored out prevCastlingRights %lx, hash = %lx\n", hash->prevCastlingRights, hash->hash);
+      hash->hash ^= hash->castling[move->chessBoard->fen->castlingRights];
+      //printf("makeMove: xored in CastlingRights %lx after King move or castling, hash = %lx\n", hash->castling[move->chessBoard->fen->castlingRights], hash->hash);
+      hash->prevCastlingRights = hash->castling[move->chessBoard->fen->castlingRights];
+    }
 		move->chessBoard->fen->castlingRook[0][move->chessBoard->fen->sideToMove] = FileNone;
 		move->chessBoard->fen->castlingRook[1][move->chessBoard->fen->sideToMove] = FileNone;
 	}
 	
 	//promotion
 	if (move->type & MoveTypePromotion) {
+    if (hash) {
+  		//xor out empty square in the dst square
+	  	//hash->hash ^= hash->piecesAtSquares[0][move->destinationSquare.name];
+		  //xor in the promotion piece in its dst square
+      //hash->hash ^= hash->piecesAtSquares[(move->chessBoard->promoPiece & 7) * ((move->chessBoard->promoPiece >> 3) + 1)][move->destinationSquare.name];
+      hash->hash ^= hash->piecesAtSquares[move->chessBoard->promoPiece][move->destinationSquare.name];
+      //printf("makeMove: xored in promotion piece %lx, hash = %lx\n", hash->piecesAtSquares[move->chessBoard->promoPiece][move->destinationSquare.name], hash->hash);
+    }
 		move->chessBoard->piecesOnSquares[move->destinationSquare.name] = move->chessBoard->promoPiece;
 		move->chessBoard->occupations[move->chessBoard->promoPiece] |= move->destinationSquare.bitSquare;
 	} 
-	
-	//other move
+  //other move
 	else {
+    if (hash && !((move->type & MoveTypeCastlingQueenside) || (move->type & MoveTypeCastlingKingside) || (move->type & MoveTypeCapture))) {
+  		//xor out empty square in the dst square
+	  	//hash->hash ^= hash->piecesAtSquares[0][move->destinationSquare.name];
+		  //xor in the moving piece in its dst square      
+			hash->hash ^= hash->piecesAtSquares[move->chessBoard->movingPiece.name][move->destinationSquare.name];      
+      //printf("makeMove: xored in moving piece in its dst square %lx, hash = %lx\n", hash->piecesAtSquares[move->chessBoard->movingPiece.name][move->destinationSquare.name], hash->hash);
+    }
 		//move the piece to its destination
 		//special case of chess 960 castling
 		if (move->chessBoard->fen->isChess960 && ((move->type & MoveTypeCastlingQueenside) || (move->type & MoveTypeCastlingKingside))) {
@@ -1324,8 +1396,15 @@ void makeMove(struct Move * move) {
 	move->chessBoard->occupations[PieceNameNone] = ~move->chessBoard->occupations[PieceNameAny];
 	
 	//set FEN en passant file if any
-	if ((move->type & MoveTypeEnPassant) && !(move->type & MoveTypeCapture))
+  
+	if ((move->type & MoveTypeEnPassant) && !(move->type & MoveTypeCapture)) {
 		move->chessBoard->fen->enPassant = move->chessBoard->movingPiece.square.file;
+    if (hash) {
+      hash->hash ^= hash->enPassant[move->chessBoard->fen->enPassant];
+  		hash->prevEnPassant = hash->enPassant[move->chessBoard->fen->enPassant];
+      //printf("makeMove: xored in enPassant in FEN %lx, hash = %lx\n", hash->enPassant[move->chessBoard->fen->enPassant], hash->hash);
+    }
+  }
 	else move->chessBoard->fen->enPassant = FileNone;
 	
 	//increment halfmove clock if not a pawn's move and not a capture
@@ -1348,10 +1427,17 @@ void makeMove(struct Move * move) {
 	
 	//update FEN
 	updateFen(move->chessBoard);
-	
+
 	//generate opponent's moves
 	generateMoves(move->chessBoard);
 exit:
+  if (hash) {
+  	if (!(move->chessBoard->fen->sideToMove == ColorWhite && move->chessBoard->fen->moveNumber == 1)) {
+      hash->hash ^= hash->blackMove;
+      move->chessBoard->hash = hash->hash;
+      //printf("makeMove: xored in or out black move %lx, hash = %lx\n", hash->blackMove, hash->hash);
+    }
+  }
 	if (move->chessBoard->isCheck) {
 		if (!(strrchr(move->sanMove, '+'))) strcat(move->sanMove, "+");
 	}
@@ -1359,44 +1445,3 @@ exit:
 		if (!(strrchr(move->sanMove, '#'))) strcat(move->sanMove, "#");
 }
 
-int fentoboard(struct Fen * fen, struct Board * board) {
-	memset(board, 0, sizeof(struct Board));
-	for (unsigned char i = Rank1; i <= Rank8; i++) {
-		unsigned char j = 0;
-		for (unsigned char c = FileA; c <= FileH; c++) {
-			char symbols[] = ".PNBRQK..pnbrqk";
-			unsigned char row = i << 3, idx = row | j, t;
-			if (fen->ranks[i][c] == '\0') break;
-			char * found = strchr(symbols, fen->ranks[i][c]);
-			if (found) {
-				char s = found - symbols;
-				if (s > 0 && s < 15) {
-					board->occupations[s] |= 1UL << idx;
-					board->piecesOnSquares[idx] = (enum PieceName)s;
-				}
-			} else if (isdigit(fen->ranks[i][c])) {
-				for (unsigned char k = j; k < j + fen->ranks[i][c] - '0'; k++) {
-					t = row | k;
-					board->piecesOnSquares[t] = PieceNameNone;
-					board->occupations[PieceNameNone] |= 1UL << t;
-				}
-				j += (fen->ranks[i][c] - '1');
-			} else {
-				printf("Invalid character is found in FEN %s string: %c\n", fen->fenString, fen->ranks[i][c]);
-				return 1;
-			}
-			j++;
-		}
-	}
-	board->occupations[PieceNameWhite] = board->occupations[WhiteBishop] | board->occupations[WhiteKing] | board->occupations[WhiteKnight] | board->occupations[WhitePawn] | board->occupations[WhiteQueen] | board->occupations[WhiteRook];
-	board->occupations[PieceNameBlack] = board->occupations[BlackBishop] | board->occupations[BlackKing] | board->occupations[BlackKnight] | board->occupations[BlackPawn] | board->occupations[BlackQueen] | board->occupations[BlackRook];
-	board->occupations[PieceNameAny] = board->occupations[PieceNameWhite] | board->occupations[PieceNameBlack];
-	board->occupations[PieceNameNone] = ~board->occupations[PieceNameAny];
-	board->fen = fen;
-	board->opponentColor = fen->sideToMove == ColorWhite ? ColorBlack : ColorWhite;
-	board->plyNumber = fen->sideToMove == ColorWhite ? (fen->moveNumber << 1) - 1 : fen->moveNumber << 1;
-	
-	generateMoves(board);
-
-	return 0;
-}

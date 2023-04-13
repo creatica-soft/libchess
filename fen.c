@@ -21,7 +21,7 @@
 int strtofen(struct Fen * fen, char * fenstr) {
 	size_t count = strlen(fenstr) + 1;
 	if (count > sizeof fen->fenString) {
-		printf("strtofen() error: FEN string is too long (%zu), it must be shorter than %zu.\n", count, sizeof fen->fenString);
+		printf("strtofen() error: FEN string is too long (%zu), it must be shorter than %zu.\n", count,  sizeof fen->fenString);
 		return 1;
 	}
 	strncpy(fen->fenString, fenstr, count);
@@ -251,3 +251,76 @@ int fentostr(struct Fen * fen) {
 	return sprintf(fen->fenString, "%s/%s/%s/%s/%s/%s/%s/%s %c %s %s %u %u", fen->ranks[7], fen->ranks[6], fen->ranks[5], fen->ranks[4], fen->ranks[3], fen->ranks[2], fen->ranks[1], fen->ranks[0], fen->sideToMove == ColorWhite ? 'w' : 'b', castling, en_passant, fen->halfmoveClock, fen->moveNumber);
 }
 
+void updateFen(struct Board * board) {
+	for (signed char i = 7; i >= 0; i--) {
+		bool prevSquareEmpty = false;
+		unsigned char n = 0, r = 0;
+		//char fenRank[9];
+		for (unsigned char j = 0; j <= 7; j++) {
+			unsigned char s = (i << 3) | j;
+			if (board->piecesOnSquares[s] == PieceNameNone) {
+				if (!prevSquareEmpty) {
+					prevSquareEmpty = true;
+					n = 1;
+				} else n++;
+			} else {
+				if (prevSquareEmpty) {
+					//fenRank[r++] = '0' + n;
+          board->fen->ranks[i][r++] = '0' + n;
+					prevSquareEmpty = false;
+				}
+				//fenRank[r++] = pieceLetter[board->piecesOnSquares[s]];
+        board->fen->ranks[i][r++] = pieceLetter[board->piecesOnSquares[s]];
+			}
+		}
+		if (prevSquareEmpty) 
+      //fenRank[r++] = '0' + n;
+      board->fen->ranks[i][r++] = '0' + n;
+		//fenRank[r] = '\0';
+    board->fen->ranks[i][r] = '\0';
+		//strncpy(board->fen->ranks[i], fenRank, strlen(fenRank) + 1);
+	}
+	fentostr(board->fen);
+}
+
+int fentoboard(struct Fen * fen, struct Board * board) {
+	memset(board, 0, sizeof(struct Board));
+	for (unsigned char i = Rank1; i <= Rank8; i++) {
+		unsigned char j = 0;
+		for (unsigned char c = FileA; c <= FileH; c++) {
+			char symbols[] = ".PNBRQK..pnbrqk";
+			unsigned char row = i << 3, idx = row | j, t;
+			if (fen->ranks[i][c] == '\0') break;
+			char * found = strchr(symbols, fen->ranks[i][c]);
+			if (found) {
+				char s = found - symbols;
+				if (s > 0 && s < 15) {
+					board->occupations[s] |= 1UL << idx;
+					board->piecesOnSquares[idx] = (enum PieceName)s;
+				}
+			} else if (isdigit(fen->ranks[i][c])) {
+				for (unsigned char k = j; k < j + fen->ranks[i][c] - '0'; k++) {
+					t = row | k;
+					board->piecesOnSquares[t] = PieceNameNone;
+					board->occupations[PieceNameNone] |= 1UL << t;
+				}
+				j += (fen->ranks[i][c] - '1');
+			} else {
+				printf("Invalid character is found in FEN %s string: %c\n", fen->fenString, fen->ranks[i][c]);
+				return 1;
+			}
+			j++;
+		}
+	}
+	board->occupations[PieceNameWhite] = board->occupations[WhiteBishop] | board->occupations[WhiteKing] | board->occupations[WhiteKnight] | board->occupations[WhitePawn] | board->occupations[WhiteQueen] | board->occupations[WhiteRook];
+	board->occupations[PieceNameBlack] = board->occupations[BlackBishop] | board->occupations[BlackKing] | board->occupations[BlackKnight] | board->occupations[BlackPawn] | board->occupations[BlackQueen] | board->occupations[BlackRook];
+	board->occupations[PieceNameAny] = board->occupations[PieceNameWhite] | board->occupations[PieceNameBlack];
+	board->occupations[PieceNameNone] = ~board->occupations[PieceNameAny];
+	board->fen = fen;
+	board->opponentColor = fen->sideToMove == ColorWhite ? ColorBlack : ColorWhite;
+	board->plyNumber = fen->sideToMove == ColorWhite ? (fen->moveNumber << 1) - 1 : fen->moveNumber << 1;
+	
+	generateMoves(board);
+
+	return 0;
+}
