@@ -1,477 +1,22 @@
+///
+/// To compile on MacOS M1 using clang, run:
+/// cc -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt/anaconda3/lib -I /opt/anaconda3/include -L/opt/anaconda3/lib -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c
+/// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
+/// use -g for debugging with lldb instead of -O3 (lldb ./test, then run, then bt)
+/// To build python bindings, use:
+/// conda install cffi
+/// cc -E libchess.h > libchess.ph
+/// vi tasks.py
+/// python3.12 tasks.py (it should produce chess.cpython-312-darwin.so from libchess.so and libchess.ph)
+/// python3.12 test.py (to test chess module stored in chess.cpython-312-darwin.so)
+///
 #include <stdbool.h>
-//#include <sqlite3.h>
-//#include <stdio.h>
-//#define bool _Bool
-#define TO_ENGINE_NAMED_PIPE "/tmp/to_chess_engine_pipe"
-#define FROM_ENGINE_NAMED_PIPE "/tmp/from_chess_engine_pipe"
-#define MAX_NUMBER_OF_THREADS 7
-#define MAX_SEC_TO_WAIT_FOR_NM_QUEUE 10
-#define MAX_NUMBER_OF_GAMES 256000
-#define MAX_NUMBER_OF_ECO_LINES 2048
-#define MAX_NUMBER_OF_TAGS 22
-#define MAX_NUMBER_OF_ECO_TAGS 3
-#define MAX_TAG_NAME_LEN 32
-#define MAX_ECO_TAG_NAME_LEN 10
-#define MAX_TAG_VALUE_LEN 90
-#define MAX_SAN_MOVES_LEN 4096
-#define MAX_ECO_MOVES_LEN 1024
-#define MAX_UCI_OPTION_NAME_LEN 32
-#define MAX_UCI_OPTION_TYPE_LEN 8
-#define MAX_UCI_OPTION_TYPE_NUM 5
-#define MAX_UCI_OPTION_STRING_LEN 32
-#define MAX_UCI_OPTION_BUTTON_NUM 4
-#define MAX_UCI_OPTION_SPIN_NUM 16
-#define MAX_UCI_OPTION_CHECK_NUM 16
-#define MAX_UCI_OPTION_COMBO_NUM 4
-#define MAX_UCI_OPTION_COMBO_VARS 8
-#define MAX_UCI_OPTION_STRING_NUM 8
-#define MAX_UCI_MULTI_PV 8
-#define MAX_VARIATION_PLIES 16
-#define NO_MATE_SCORE 12700
-#define MATE_SCORE 12600
-#define INACCURACY 30
-#define MISTAKE 75
-#define BLUNDER 175
-#define RARE_MOVE_THRESHOLD 0.05
-#define SQLITE_CACHE_SIZE -1000000
-#define SQLITE_MMAP_SIZE 1073709056
-#define SQLITE_JOURNAL_MODE true
-
-#define FILE_A 0x0101010101010101UL
-#define FILE_B 0x0202020202020202UL
-#define FILE_C 0x0404040404040404UL
-#define FILE_D 0x0808080808080808UL
-#define FILE_E 0x1010101010101010UL
-#define FILE_F 0x2020202020202020UL
-#define FILE_G 0x4040404040404040UL
-#define FILE_H 0x8080808080808080UL
-
-#define RANK1 0x00000000000000FFUL
-#define RANK2 0x000000000000FF00UL
-#define RANK3 0x0000000000FF0000UL
-#define RANK4 0x00000000FF000000UL
-#define RANK5 0x000000FF00000000UL
-#define RANK6 0x0000FF0000000000UL
-#define RANK7 0x00FF000000000000UL
-#define RANK8 0xFF00000000000000UL
-
-//enum { false, true };
-
-/// <summary>
-/// Castling types enumeration
-/// </summary>
-enum CastlingSide { CastlingSideNone, CastlingSideKingside, CastlingSideQueenside, CastlingSideBoth };
-
-/// <summary>
-/// Enumeration of castling rights: lowest two bits for white, highest - for black
-/// </summary>
-enum CastlingRightsEnum {
-	CastlingRightsWhiteNoneBlackNone,
-	CastlingRightsWhiteNoneBlackKingside = CastlingSideKingside << 2,
-	CastlingRightsWhiteNoneBlackQueenside = CastlingSideQueenside << 2,
-	CastlingRightsWhiteNoneBlackBoth = CastlingSideBoth << 2,
-	CastlingRightsWhiteKingsideBlackNone = CastlingSideKingside,
-	CastlingRightsWhiteQueensideBlackNone = CastlingSideQueenside,
-	CastlingRightsWhiteBothBlackNone = CastlingSideBoth,
-	CastlingRightsWhiteKingsideBlackKingside = CastlingSideKingside | (CastlingSideKingside << 2),
-	CastlingRightsWhiteQueensideBlackKingside = CastlingSideQueenside | (CastlingSideKingside << 2),
-	CastlingRightsWhiteBothBlackKingside = CastlingSideBoth | (CastlingSideKingside << 2),
-	CastlingRightsWhiteKingsideBlackQueenside = CastlingSideKingside | (CastlingSideQueenside << 2),
-	CastlingRightsWhiteQueensideBlackQueenside = CastlingSideQueenside | (CastlingSideQueenside << 2),
-	CastlingRightsWhiteBothBlackQueenside = CastlingSideBoth | (CastlingSideQueenside << 2),
-	CastlingRightsWhiteKingsideBlackBoth = CastlingSideKingside | (CastlingSideBoth << 2),
-	CastlingRightsWhiteQueensideBlackBoth = CastlingSideQueenside | (CastlingSideBoth << 2),
-	CastlingRightsWhiteBothBlackBoth = CastlingSideBoth | (CastlingSideBoth << 2)
-};
-
-/// <summary>
-/// Color enumeration
-/// </summary>
-enum Color { ColorWhite, ColorBlack};
-
-static char * color[] = { "white", "black" };
-
-/// <summary>
-/// File enumeration from a to h
-/// </summary>
-enum Files {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone};
-
-/// <summary>
-/// Rank enumeration from 1 to 8
-/// </summary>
-enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
-
-/// <summary>
-/// Square enumeration
-/// </summary>
-enum SquareName {
-	SquareA1, SquareB1, SquareC1, SquareD1, SquareE1, SquareF1, SquareG1, SquareH1,
-	SquareA2, SquareB2, SquareC2, SquareD2, SquareE2, SquareF2, SquareG2, SquareH2,
-	SquareA3, SquareB3, SquareC3, SquareD3, SquareE3, SquareF3, SquareG3, SquareH3,
-	SquareA4, SquareB4, SquareC4, SquareD4, SquareE4, SquareF4, SquareG4, SquareH4,
-	SquareA5, SquareB5, SquareC5, SquareD5, SquareE5, SquareF5, SquareG5, SquareH5,
-	SquareA6, SquareB6, SquareC6, SquareD6, SquareE6, SquareF6, SquareG6, SquareH6,
-	SquareA7, SquareB7, SquareC7, SquareD7, SquareE7, SquareF7, SquareG7, SquareH7,
-	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone
-};
-
-static char * squareName[] = {
-	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
-	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
-	"a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
-	"a4", "b4", "c4", "d4", "e4", "f4", "g4", "h4",
-	"a5", "b5", "c5", "d5", "e5", "f5", "g5", "h5",
-	"a6", "b6", "c6", "d6", "e6", "f6", "g6", "h6",
-	"a7", "b7", "c7", "d7", "e7", "f7", "g7", "h7",
-	"a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8", "none"
-};
-
-/// <summary>
-/// Diagonal enumeration
-/// </summary>
-enum Diagonals {
-	DiagonalH1H1, DiagonalG1H2, DiagonalF1H3, DiagonalE1H4, DiagonalD1H5, DiagonalC1H6, 
-	DiagonalB1H7, DiagonalA1H8, DiagonalA2G8, DiagonalA3F8, DiagonalA4E8, DiagonalA5D8, 
-	DiagonalA6C8, DiagonalA7B8, DiagonalA8A8, DiagonalNone
-};
-
-/// <summary>
-/// Anti diagonals
-/// </summary>
-enum Antidiagonals {
-	AntidiagonalA1A1, AntidiagonalA2B1, AntidiagonalA3C1, AntidiagonalA4D1, AntidiagonalA5E1,
-	AntidiagonalA6F1, AntidiagonalA7G1, AntidiagonalA8H1, AntidiagonalB8H2, AntidiagonalC8H3,
-	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone
-};
-
-/// <summary>
-/// Piece type enumeration
-/// </summary>
-enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
-
-/// <summary>
-/// Piece enumeration: first three bits are used to encode the type, fourth bit define the color.
-/// Shifting PieceName by 3 to the right will give the PieceColor: color = piece >> 3
-/// Masking 3 lowest bits returns the PieceType: type = piece & 7
-/// </summary>
-enum PieceName {
-	PieceNameNone,
-	WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNameWhite,
-  PieceNameAny,
-	BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, PieceNameBlack
-};
-
-static char * pieceName[] = {
-	"none", 
-	"white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "whites", "any",
-	"black pawn", "black knight", "black bishop", "black rook", "black queen", "black king", "blacks"
-};
-
-static unsigned char pieceLetter[] = {' ', 'P', 'N', 'B', 'R', 'Q', 'K', 'C', '*', 'p', 'n', 'b', 'r', 'q', 'k', 'c'};
-
-enum PieceLetter { 
-	PieceLetter_e, PieceLetter_P, PieceLetter_N, PieceLetter_B, PieceLetter_R, 
-	PieceLetter_Q, PieceLetter_K, PieceLetter_X, PieceLetter_O, PieceLetter_p, PieceLetter_n,
-	PieceLetter_b, PieceLetter_r, PieceLetter_q, PieceLetter_k, PieceLetter_x
-};
-
-/// <summary>
-/// UCI promo letters, for SAN moves should be converted to uppercase using String.ToUpper() call
-/// </summary>
-enum PromoLetter { PromoLetter_n = 2, PromoLetter_b, PromoLetter_r, PromoLetter_q};
-
-static unsigned char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q' };
-
-enum MoveType {
-	MoveTypeNormal, MoveTypeValid, MoveTypeCapture, MoveTypeCastlingKingside = 4, 
-	MoveTypeCastlingQueenside = 8, MoveTypePromotion = 16, MoveTypeEnPassant = 32, 
-	MoveTypeNull = 64
-};
-
-static const char * moveType[] = {
-	"normal", "valid", "capture", "castling kingside", 
-	"castling queenside", "promotion", "en passant", "null"
-};
-
-enum ProblemType { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
-
-///<summary>
-/// UCI option types
-///</summary>
-enum OptionType {
-	Button, Check, Combo, Spin, String
-};
-
-static const char * optionTypes[] = {
-	"button", "check", "combo", "spin", "string"
-};
-
-///<summary>
-/// UCI spin type option
-///</summary>
-struct OptionSpin {
-	char name[MAX_UCI_OPTION_NAME_LEN];
-	long defaultValue;
-	long value;
-	long min;
-	long max;
-};
-
-///<summary>
-/// UCI check type option
-///</summary>
-struct OptionCheck {
-	char name[MAX_UCI_OPTION_NAME_LEN];
-	bool defaultValue;
-	bool value;
-};
-
-///<summary>
-/// UCI string type option
-///</summary>
-struct OptionString {
-	char name[MAX_UCI_OPTION_NAME_LEN];
-	char defaultValue[MAX_UCI_OPTION_STRING_LEN];
-	char value[MAX_UCI_OPTION_STRING_LEN];
-};
-
-///<summary>
-/// UCI combo type option
-///</summary>
-struct OptionCombo {
-	char name[MAX_UCI_OPTION_NAME_LEN];
-	char defaultValue[MAX_UCI_OPTION_STRING_LEN];
-	char values[MAX_UCI_OPTION_COMBO_VARS][MAX_UCI_OPTION_STRING_LEN];
-	char value[MAX_UCI_OPTION_STRING_LEN];
-};
-
-///<summary>
-/// UCI button type option
-///</summary>
-struct OptionButton {
-	char name[MAX_UCI_OPTION_NAME_LEN];
-	bool value; //if true, the button will be pressed
-};
-
-struct Engine {
-	char id[MAX_UCI_OPTION_STRING_LEN];
-	char authors[2 * MAX_UCI_OPTION_STRING_LEN];
-	int numberOfCheckOptions, numberOfComboOptions, numberOfSpinOptions,
-		numberOfStringOptions, numberOfButtonOptions;
-	struct OptionCheck optionCheck[MAX_UCI_OPTION_CHECK_NUM];
-	struct OptionCombo optionCombo[MAX_UCI_OPTION_COMBO_NUM];
-	struct OptionSpin optionSpin[MAX_UCI_OPTION_SPIN_NUM];
-	struct OptionString optionString[MAX_UCI_OPTION_STRING_NUM];
-	struct OptionButton optionButton[MAX_UCI_OPTION_BUTTON_NUM];
-	char position[90]; //FEN string
-	char moves[4096]; //UCI moves
-	//go() arguments
-	long movetime;
-	int depth;
-	int nodes;
-	int mate;
-	bool ponder;
-	bool infinite;
-	long wtime;
-	long btime;
-	long winc;
-	long binc;
-	int movestogo;
-	char * searchmoves;
-};
-
-struct Evaluation {
-	unsigned char maxPlies;
-	unsigned char depth;
-	unsigned char seldepth;
-	unsigned char multipv;
-	int scorecp;
-	int matein; //mate in <moves>, not <plies>
-	unsigned long nodes;
-	unsigned long nps;
-	unsigned short hashful;//permill (per thousand)
-	unsigned char tbhits;
-	unsigned long time; //ms
-	char pv[1024];
-	char bestmove[6];
-	char ponder[6];
-	unsigned char nag;
-};
-
-/// <summary>
-/// Forthys-Edwards Notation for the position preceding a move 
-/// </summary>
-struct Fen {
-	///<summary>
-	/// FEN string as it is
-	///</summary>
-	char fenString[90];
-	/// <summary>
-	/// 1st field in FEN - ranks, separated by '/'
-	/// </summary>
-	char ranks[8][9];
-	/// <summary>
-	/// 2nd field in FEN - side to move
-	/// </summary>
-	enum Color sideToMove;
-	/// <summary>
-	/// 3rd field in FEN - castling Rights
-	/// </summary>
-	enum CastlingRightsEnum castlingRights;
-	/// <summary>
-	/// 4th field in FEN - EnPassant square - is set after double advancing a pawn regardless of whether an opposite side can capture or not.
-	/// In X-FEN it is only setup when the opposite side can actually capture, although illegal captures (when pinned, for example) may not be checked
-	/// </summary>
-	enum Files enPassant;
-	/// <summary>
-	/// 5th field in FEN - number of plies since last pawn advance or capture
-	/// Used in 50-move draw rule
-	/// </summary>
-	unsigned short halfmoveClock;
-	/// <summary>
-	/// 6th field in FEN - full move number
-	/// </summary>
-	unsigned short moveNumber;
-	/// <summary>
-	/// True if castling rights are indicated by the castling rook file instead of letters for kingside or queenside
-	/// </summary>
-	bool isChess960;
-	/// <summary>
-	/// Castling rook files for chess 960 position indexed by side: 0 - kingside castling (short), 1 - queenside castling (long) and by color: 0 - white, 1 - black
-	/// </summary>
-	enum Files castlingRook[2][2];
-};
-
-/// <summary>
-/// Square struct represents chess board square
-/// </summary>
-struct Square {
-	/// <summary>
-	/// Chessboard square name such as e4 or d5.
-	/// </summary>
-	enum SquareName name;
-	/// <summary>
-	/// Bitboard square
-	/// </summary>
-	unsigned long bitSquare;
-	/// <summary>
-	/// File number of the square - from a to h
-	/// </summary>
-	enum Files file;
-	/// <summary>
-	/// Rank of the square - from r0 to r7
-	/// </summary>
-	enum Ranks rank;
-	/// <summary>
-	/// Diagonal of the square - from 0 to 14
-	/// </summary>
-	enum Diagonals diag;
-	/// <summary>
-	/// Antidiagonal of the square - from 0 to 14
-	/// </summary>
-	enum Antidiagonals antiDiag;
-};
-
-/// <summary>
-/// ChessPiece struct
-/// </summary>
-struct ChessPiece {
-	/// <summary>
-	/// Piece enum type field; for example white pawn is 1
-	/// </summary>
-	enum PieceName name;
-	/// <summary>
-	/// PieceType enum type field. 3 least significant bits in Name define the PieceType; for example, bishop is 2
-	/// </summary>
-	enum PieceType type;
-	/// <summary>
-	/// Piece color enum. 3 out of 6 most significant bits in Name define the color; white is 0, black is 1
-	/// </summary>
-	enum Color color;
-	/// <summary>
-	/// Square index from 0 to 63, where the piece is located
-	/// </summary>
-	struct Square square;
-};
-
-/// <summary>
-/// Board struct represents chess board
-/// </summary>
-struct Board {
-	/// <summary>
-	/// Array of bitboards indexed by PieceName
-	/// </summary>
-	unsigned long occupations[16];
-	/// <summary>
-	/// Array of PieceName enums indexed by SquareName
-	/// </summary>
-	enum PieceName piecesOnSquares[64];
-	/// <summary>
-	/// Array of legal moves indexed by square
-	/// </summary>
-	unsigned long movesFromSquares[64];
-	/// <summary>
-	/// Zobrist hash of the position on the board
-	/// </summary>
-	unsigned long hash;
-	/// <summary>
-	/// Opponent's color is the opposite color of SideToMove
-	/// </summary>
-	enum Color opponentColor;
-	/// <summary>
-	/// Current zero-based ply number (halfmove)
-	/// </summary>
-	unsigned short plyNumber;
-	/// <summary>
-	/// Captured PieceName enum
-	/// </summary>
-	enum PieceName capturedPiece;
-	/// <summary>
-	/// Promotion PieceName enum
-	/// </summary>
-	enum PieceName promoPiece;
-	/// <summary>
-	/// Moving ChessPiece object
-	/// </summary>
-	struct ChessPiece movingPiece;
-	/// <summary>
-	/// True if there is a check
-	/// </summary>
-	bool isCheck;
-	/// <summary>
-	/// True if stalemate
-	/// </summary>
-	bool isStaleMate;
-	/// <summary>
-	/// True if mate
-	/// </summary>
-	bool isMate;
-	/// <summary>
-	/// FEN object
-	/// </summary>
-	struct Fen * fen;
-};
-
-/// <summary>
-///  Converts FEN string to struct fen
-/// </summary>
-int strtofen(struct Fen *, char *);
-
-/// <summary>
-///  Converts fen struct to FEN string
-/// </summary>
-int fentostr(struct Fen *);
-
-/// <summary>
-///  Updates FEN (Board->Fen) after the move
-/// </summary>
-void updateFen(struct Board *);
 
 /// <summary>
 /// Array of 841 unique true random unsigned 64-bit integers obtained from random.org
 /// that uses atmospheric noise
 /// </summary>
-static const unsigned long bitStrings[761] = {
+static const unsigned long bitStrings[841] = {
 0x35840e4be496fdc9UL,
 0x726adfa6fb848ccfUL,
 0x8ebc36ddb5dad364UL,
@@ -1232,8 +777,8 @@ static const unsigned long bitStrings[761] = {
 0xf9323d9fedefcac7UL,
 0x6c0acfaee3a701b2UL,
 0x3ce516ac99438f5aUL,
-0x66fd7b7065c5ccc1UL
-/*0x38096c934b44950bUL,
+0x66fd7b7065c5ccc1UL,
+0x38096c934b44950bUL,
 0xf53f21649109a8d1UL,
 0x29ff9f8d99b977c1UL,
 0xd167e2e6e538676bUL,
@@ -1312,11 +857,714 @@ static const unsigned long bitStrings[761] = {
 0xcb018c193ed7f85dUL,
 0xccea7d615fe1cae7UL,
 0xe754ffc987cd3c4UL,
-0xe6983662e18e1826UL */};
+0xe6983662e18e1826UL };
+
+#define TO_ENGINE_NAMED_PIPE_PREFIX "/tmp/to_chess_engine_pipe"
+#define FROM_ENGINE_NAMED_PIPE_PREFIX "/tmp/from_chess_engine_pipe"
+#define MAX_NUMBER_OF_GAME_THREADS 16 //these threads just process pgn files
+#define MAX_NUMBER_OF_SQL_THREADS 8 //these threads just update NextMovesX.db, where X is thread number. 
+                                    //Use power of 2, i.e. 1, 2, 4, 8. 8 is max!
+#define COMMIT_NEXT_MOVES_ROWS 5000000
+#define COMMIT_GAMES_ROWS 1000000
+#define MAX_SLEEP_COUNTER_FOR_SQLWRITER 3
+#define MAX_NUMBER_OF_GAMES 256000
+#define MAX_NUMBER_OF_ECO_LINES 2048
+#define MAX_NUMBER_OF_GAME_MOVES 512
+#define MAX_NUMBER_OF_NEXT_MOVES 64
+#define MAX_NUMBER_OF_TAGS 22
+#define MAX_NUMBER_OF_ECO_TAGS 3
+#define MAX_TAG_NAME_LEN 32
+#define MAX_ECO_TAG_NAME_LEN 10
+#define MAX_TAG_VALUE_LEN 90
+#define MAX_SAN_MOVES_LEN 4096
+#define MAX_UCI_MOVES_LEN 4096
+#define MAX_ECO_MOVES_LEN 1024
+#define MAX_FEN_STRING_LEN 90
+#define MAX_UCI_OPTION_NAME_LEN 32
+#define MAX_UCI_OPTION_TYPE_LEN 8
+#define MAX_UCI_OPTION_TYPE_NUM 5
+#define MAX_UCI_OPTION_STRING_LEN 32
+#define MAX_UCI_OPTION_BUTTON_NUM 4
+#define MAX_UCI_OPTION_SPIN_NUM 16
+#define MAX_UCI_OPTION_CHECK_NUM 16
+#define MAX_UCI_OPTION_COMBO_NUM 4
+#define MAX_UCI_OPTION_COMBO_VARS 8
+#define MAX_UCI_OPTION_STRING_NUM 8
+#define MAX_UCI_MULTI_PV 8
+#define MAX_VARIATION_PLIES 16
+#define NO_MATE_SCORE 21000
+#define MATE_SCORE 20000
+#define INACCURACY 30
+#define MISTAKE 75
+#define BLUNDER 175
+
+// Time management constants
+#define MIN_MOVES_REMAINING 40
+#define MAX_MOVES_REMAINING 60
+#define TIME_SAFETY_BUFFER 5000 // 5s in ms
+#define CRITICAL_TIME_FACTOR 1.5
+#define MIN_TIME_THRESHOLD 10000 // 10s in ms
+#define MIN_ITERATIONS 1001
+#define MAX_ITERATIONS 1000001 // Safety cap
+
+
+#define FILE_A 0x0101010101010101UL
+#define FILE_B 0x0202020202020202UL
+#define FILE_C 0x0404040404040404UL
+#define FILE_D 0x0808080808080808UL
+#define FILE_E 0x1010101010101010UL
+#define FILE_F 0x2020202020202020UL
+#define FILE_G 0x4040404040404040UL
+#define FILE_H 0x8080808080808080UL
+
+#define RANK1 0x00000000000000FFUL
+#define RANK2 0x000000000000FF00UL
+#define RANK3 0x0000000000FF0000UL
+#define RANK4 0x00000000FF000000UL
+#define RANK5 0x000000FF00000000UL
+#define RANK6 0x0000FF0000000000UL
+#define RANK7 0x00FF000000000000UL
+#define RANK8 0xFF00000000000000UL
+
+
+#ifdef __cplusplus
+extern "C" {
+  enum CastlingSide { CastlingSideNone, CastlingSideKingside, CastlingSideQueenside, CastlingSideBoth };
+  enum CastlingRightsEnum {
+  	CastlingRightsWhiteNoneBlackNone = CastlingSideNone,
+  	CastlingRightsWhiteNoneBlackKingside = CastlingSideKingside << 2,
+  	CastlingRightsWhiteNoneBlackQueenside = CastlingSideQueenside << 2,
+  	CastlingRightsWhiteNoneBlackBoth = CastlingSideBoth << 2,
+  	CastlingRightsWhiteKingsideBlackNone = CastlingSideKingside,
+  	CastlingRightsWhiteQueensideBlackNone = CastlingSideQueenside,
+  	CastlingRightsWhiteBothBlackNone = CastlingSideBoth,
+  	CastlingRightsWhiteKingsideBlackKingside = CastlingSideKingside | (CastlingSideKingside << 2),
+  	CastlingRightsWhiteQueensideBlackKingside = CastlingSideQueenside | (CastlingSideKingside << 2),
+  	CastlingRightsWhiteBothBlackKingside = CastlingSideBoth | (CastlingSideKingside << 2),
+  	CastlingRightsWhiteKingsideBlackQueenside = CastlingSideKingside | (CastlingSideQueenside << 2),
+  	CastlingRightsWhiteQueensideBlackQueenside = CastlingSideQueenside | (CastlingSideQueenside << 2),
+  	CastlingRightsWhiteBothBlackQueenside = CastlingSideBoth | (CastlingSideQueenside << 2),
+  	CastlingRightsWhiteKingsideBlackBoth = CastlingSideKingside | (CastlingSideBoth << 2),
+  	CastlingRightsWhiteQueensideBlackBoth = CastlingSideQueenside | (CastlingSideBoth << 2),
+  	CastlingRightsWhiteBothBlackBoth = CastlingSideBoth | (CastlingSideBoth << 2)
+  };
+  enum Color { ColorWhite, ColorBlack };
+  enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
+  enum Files {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone};
+  enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
+  enum PieceName {
+  	PieceNameNone,
+  	WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNameWhite, PieceNameAny,
+  	BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, PieceNameBlack
+  };
+  enum SquareName {
+  	SquareA1, SquareB1, SquareC1, SquareD1, SquareE1, SquareF1, SquareG1, SquareH1,
+  	SquareA2, SquareB2, SquareC2, SquareD2, SquareE2, SquareF2, SquareG2, SquareH2,
+  	SquareA3, SquareB3, SquareC3, SquareD3, SquareE3, SquareF3, SquareG3, SquareH3,
+  	SquareA4, SquareB4, SquareC4, SquareD4, SquareE4, SquareF4, SquareG4, SquareH4,
+  	SquareA5, SquareB5, SquareC5, SquareD5, SquareE5, SquareF5, SquareG5, SquareH5,
+  	SquareA6, SquareB6, SquareC6, SquareD6, SquareE6, SquareF6, SquareG6, SquareH6,
+  	SquareA7, SquareB7, SquareC7, SquareD7, SquareE7, SquareF7, SquareG7, SquareH7,
+  	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone
+  };
+  enum Diagonals {
+  	DiagonalH1H1, DiagonalG1H2, DiagonalF1H3, DiagonalE1H4, DiagonalD1H5, DiagonalC1H6, 
+  	DiagonalB1H7, DiagonalA1H8, DiagonalA2G8, DiagonalA3F8, DiagonalA4E8, DiagonalA5D8, 
+  	DiagonalA6C8, DiagonalA7B8, DiagonalA8A8, DiagonalNone
+  };
+  enum Antidiagonals {
+  	AntidiagonalA1A1, AntidiagonalA2B1, AntidiagonalA3C1, AntidiagonalA4D1, AntidiagonalA5E1,
+  	AntidiagonalA6F1, AntidiagonalA7G1, AntidiagonalA8H1, AntidiagonalB8H2, AntidiagonalC8H3,
+  	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone
+  };
+  enum MoveType {
+  	MoveTypeNormal, MoveTypeValid, MoveTypeCapture, MoveTypeCastlingKingside = 4, 
+  	MoveTypeCastlingQueenside = 8, MoveTypePromotion = 16, MoveTypeEnPassant = 32, 
+  	MoveTypeNull = 64
+  };
+  static const char * squareName[] = {
+  	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
+  	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
+  	"a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
+  	"a4", "b4", "c4", "d4", "e4", "f4", "g4", "h4",
+  	"a5", "b5", "c5", "d5", "e5", "f5", "g5", "h5",
+  	"a6", "b6", "c6", "d6", "e6", "f6", "g6", "h6",
+  	"a7", "b7", "c7", "d7", "e7", "f7", "g7", "h7",
+  	"a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8", "none"
+  };
+  static const unsigned char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q' };
+  enum GameStage { OpeningGame, MiddleGame, EndGame, FullGame };
+  static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+  struct Square {
+  	enum SquareName name;
+  	unsigned long bitSquare;
+  	enum Files file;
+  	enum Ranks rank;
+  	enum Diagonals diag;
+  	enum Antidiagonals antiDiag;
+  };
+  struct ChessPiece {
+  	enum PieceName name;
+  	enum PieceType type;
+  	enum Color color;
+  	struct Square square;
+  };
+  struct Board {
+  	unsigned long defendedPieces;
+  	unsigned long attackedPieces;
+  	unsigned long attackedSquares;
+  	unsigned long blockingSquares;
+  	unsigned long checkers;
+  	unsigned long pinnedPieces;
+  	unsigned long pinningPieces;
+  	unsigned long occupations[16];
+  	enum PieceName piecesOnSquares[64];
+  	unsigned long movesFromSquares[64];
+  	unsigned long sideToMoveMoves[64];
+  	//float squareCostForOpponent[64]; 
+  	//float squareCostForSideToMove[64]; 
+  	unsigned long hash;
+  	enum Color opponentColor;
+  	unsigned short plyNumber;
+  	enum PieceName capturedPiece;
+  	enum PieceName promoPiece;
+  	struct ChessPiece movingPiece;
+  	bool isCheck;
+  	bool isStaleMate;
+  	bool isMate;
+  	struct Fen * fen;
+  	struct ZobristHash * zh;
+  };
+  struct Fen {
+  	char fenString[90];
+  	char ranks[8][9];
+  	enum Color sideToMove;
+  	enum CastlingRightsEnum castlingRights;
+  	enum Files enPassant;
+  	unsigned long enPassantLegalBit;
+  	unsigned short halfmoveClock;
+  	unsigned short moveNumber;
+  	bool isChess960;
+  	enum Files castlingRook[2][2];
+  	unsigned long castlingBits;
+  };
+  struct ZobristHash {
+  	unsigned long hash;
+  	unsigned long blackMove;
+  	unsigned long prevCastlingRights;
+  	unsigned long prevEnPassant;
+  	unsigned long castling[16];
+  	unsigned long enPassant[8];
+  	unsigned long piecesAtSquares[13][64];
+  };
+  struct Move {
+  	unsigned char type;
+  	struct Square sourceSquare;
+  	struct Square destinationSquare;
+  	char sanMove[12];
+  	char uciMove[6];
+  	struct Board * chessBoard;
+  	enum Files castlingRook;
+  };
+
+  void zobristHash(struct ZobristHash *);
+  void getHash(struct ZobristHash *, struct Board *);
+  void resetHash(struct ZobristHash *);
+  int updateHash(struct ZobristHash *, struct Board *, struct Move *);
+
+  int initMove(struct Move *, struct Board *, char * move);
+  void makeMove(struct Move *);
+  void cleanup_magic_bitboards(void);
+  void init_magic_bitboards(void);
+  struct Board * cloneBoard(struct Board * src);
+  void freeBoard(struct Board * board);
+  int strtofen(struct Fen *, const char *);
+  int fentoboard(struct Fen *, struct Board *);
+  int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
+  enum GameStage getStage(struct Board * board);
+}
+#else
+
+/*
+// B-tree minimum degree (adjust based on performance needs)
+#define T 32
+typedef struct BTreeNode {
+    unsigned long keys[2 * T - 1];    // Array of keys
+    struct BTreeNode *children[2 * T]; // Array of child pointers
+    int num_keys;                 // Current number of keys
+    bool is_leaf;                 // Leaf node flag
+} BTreeNode;
+
+bool BTreeSearch(BTreeNode *, unsigned long);
+BTreeNode* BTreeInsert(BTreeNode*, unsigned long);
+void BTreeCleanUp(BTreeNode * root, void * db);
+*/
+
+/// <summary>
+/// Castling types enumeration
+/// </summary>
+enum CastlingSide { CastlingSideNone, CastlingSideKingside, CastlingSideQueenside, CastlingSideBoth };
+
+/// <summary>
+/// Enumeration of castling rights: lowest two bits for white, highest - for black
+/// </summary>
+enum CastlingRightsEnum {
+	CastlingRightsWhiteNoneBlackNone = CastlingSideNone,
+	CastlingRightsWhiteNoneBlackKingside = CastlingSideKingside << 2,
+	CastlingRightsWhiteNoneBlackQueenside = CastlingSideQueenside << 2,
+	CastlingRightsWhiteNoneBlackBoth = CastlingSideBoth << 2,
+	CastlingRightsWhiteKingsideBlackNone = CastlingSideKingside,
+	CastlingRightsWhiteQueensideBlackNone = CastlingSideQueenside,
+	CastlingRightsWhiteBothBlackNone = CastlingSideBoth,
+	CastlingRightsWhiteKingsideBlackKingside = CastlingSideKingside | (CastlingSideKingside << 2),
+	CastlingRightsWhiteQueensideBlackKingside = CastlingSideQueenside | (CastlingSideKingside << 2),
+	CastlingRightsWhiteBothBlackKingside = CastlingSideBoth | (CastlingSideKingside << 2),
+	CastlingRightsWhiteKingsideBlackQueenside = CastlingSideKingside | (CastlingSideQueenside << 2),
+	CastlingRightsWhiteQueensideBlackQueenside = CastlingSideQueenside | (CastlingSideQueenside << 2),
+	CastlingRightsWhiteBothBlackQueenside = CastlingSideBoth | (CastlingSideQueenside << 2),
+	CastlingRightsWhiteKingsideBlackBoth = CastlingSideKingside | (CastlingSideBoth << 2),
+	CastlingRightsWhiteQueensideBlackBoth = CastlingSideQueenside | (CastlingSideBoth << 2),
+	CastlingRightsWhiteBothBlackBoth = CastlingSideBoth | (CastlingSideBoth << 2)
+};
+
+/// <summary>
+/// Color enumeration
+/// </summary>
+enum Color { ColorWhite, ColorBlack };
+
+static char * color[] = { "white", "black" };
+
+/// <summary>
+/// File enumeration from a to h
+/// </summary>
+enum Files {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone};
+static char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
+/// <summary>
+/// Rank enumeration from 1 to 8
+/// </summary>
+enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
+static char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
+
+/// <summary>
+/// Square enumeration
+/// </summary>
+enum SquareName {
+	SquareA1, SquareB1, SquareC1, SquareD1, SquareE1, SquareF1, SquareG1, SquareH1,
+	SquareA2, SquareB2, SquareC2, SquareD2, SquareE2, SquareF2, SquareG2, SquareH2,
+	SquareA3, SquareB3, SquareC3, SquareD3, SquareE3, SquareF3, SquareG3, SquareH3,
+	SquareA4, SquareB4, SquareC4, SquareD4, SquareE4, SquareF4, SquareG4, SquareH4,
+	SquareA5, SquareB5, SquareC5, SquareD5, SquareE5, SquareF5, SquareG5, SquareH5,
+	SquareA6, SquareB6, SquareC6, SquareD6, SquareE6, SquareF6, SquareG6, SquareH6,
+	SquareA7, SquareB7, SquareC7, SquareD7, SquareE7, SquareF7, SquareG7, SquareH7,
+	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone
+};
+
+static char * squareName[] = {
+	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
+	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
+	"a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
+	"a4", "b4", "c4", "d4", "e4", "f4", "g4", "h4",
+	"a5", "b5", "c5", "d5", "e5", "f5", "g5", "h5",
+	"a6", "b6", "c6", "d6", "e6", "f6", "g6", "h6",
+	"a7", "b7", "c7", "d7", "e7", "f7", "g7", "h7",
+	"a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8", "none"
+};
+
+/// <summary>
+/// Diagonal enumeration
+/// </summary>
+enum Diagonals {
+	DiagonalH1H1, DiagonalG1H2, DiagonalF1H3, DiagonalE1H4, DiagonalD1H5, DiagonalC1H6, 
+	DiagonalB1H7, DiagonalA1H8, DiagonalA2G8, DiagonalA3F8, DiagonalA4E8, DiagonalA5D8, 
+	DiagonalA6C8, DiagonalA7B8, DiagonalA8A8, DiagonalNone
+};
+
+/// <summary>
+/// Anti diagonals
+/// </summary>
+enum Antidiagonals {
+	AntidiagonalA1A1, AntidiagonalA2B1, AntidiagonalA3C1, AntidiagonalA4D1, AntidiagonalA5E1,
+	AntidiagonalA6F1, AntidiagonalA7G1, AntidiagonalA8H1, AntidiagonalB8H2, AntidiagonalC8H3,
+	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone
+};
+
+/// <summary>
+/// Piece type enumeration
+/// </summary>
+enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
+
+static float pieceValue[] = { 0.0, 0.05, 0.15, 0.16, 0.25, 0.45, 1.0 }; //scaled down by kings value of 20
+static float pieceMobility[] = { 0.0, 4.0, 8.0, 11.0, 14.0, 25.0, 8.0 }; //max value - used for norm
+
+/// <summary>
+/// Piece enumeration: first three bits are used to encode the type, fourth bit defines the color.
+/// Shifting PieceName by 3 to the right will give the PieceColor: color = piece >> 3
+/// Masking 3 lowest bits returns the PieceType: type = piece & 7
+/// </summary>
+enum PieceName {
+	PieceNameNone,
+	WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNameWhite, PieceNameAny,
+	BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, PieceNameBlack
+};
+
+static char * pieceName[] = {
+	"none", 
+	"white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "whites", "any",
+	"black pawn", "black knight", "black bishop", "black rook", "black queen", "black king", "blacks"
+};
+
+static unsigned char pieceLetter[] = {' ', 'P', 'N', 'B', 'R', 'Q', 'K', 'C', '*', 'p', 'n', 'b', 'r', 'q', 'k', 'c'};
+
+enum PieceLetter { 
+	PieceLetter_e, PieceLetter_P, PieceLetter_N, PieceLetter_B, PieceLetter_R, 
+	PieceLetter_Q, PieceLetter_K, PieceLetter_X, PieceLetter_O, PieceLetter_p, PieceLetter_n,
+	PieceLetter_b, PieceLetter_r, PieceLetter_q, PieceLetter_k, PieceLetter_x
+};
+
+/// <summary>
+/// UCI promo letters, for SAN moves should be converted to uppercase
+/// </summary>
+enum PromoLetter { PromoLetter_n = 2, PromoLetter_b, PromoLetter_r, PromoLetter_q};
+
+static unsigned char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q' };
+
+enum MoveType {
+	MoveTypeNormal, MoveTypeValid, MoveTypeCapture, MoveTypeCastlingKingside = 4, 
+	MoveTypeCastlingQueenside = 8, MoveTypePromotion = 16, MoveTypeEnPassant = 32, 
+	MoveTypeNull = 64
+};
+
+static const char * moveType[] = {
+	"normal", "valid", "capture", "castling kingside", 
+	"castling queenside", "promotion", "en passant", "null"
+};
+
+enum ProblemType { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
+
+enum GameStage { OpeningGame, MiddleGame, EndGame, FullGame };
+static const char * gameStages[] = { "opening", "middlegame", "endgame", "fullgame" };
+
+/// <summary>
+/// Forthys-Edwards Notation for the position preceding a move 
+/// </summary>
+struct Fen {
+	///<summary>
+	/// FEN string as it is
+	///</summary>
+	char fenString[90];
+	/// <summary>
+	/// 1st field in FEN - ranks, separated by '/'
+	/// </summary>
+	char ranks[8][9];
+	/// <summary>
+	/// 2nd field in FEN - side to move
+	/// </summary>
+	enum Color sideToMove;
+	/// <summary>
+	/// 3rd field in FEN - castling Rights
+	/// </summary>
+	enum CastlingRightsEnum castlingRights;
+	/// <summary>
+	/// 4th field in FEN - EnPassant square - is set after double advancing a pawn regardless of whether an opposite side can capture or not.
+	/// In X-FEN it is only setup when the opposite side can actually capture, although illegal captures (when pinned, for example) may not be checked
+	/// </summary>
+	enum Files enPassant;
+	unsigned long enPassantLegalBit;
+	/// <summary>
+	/// 5th field in FEN - number of plies since last pawn advance or capture
+	/// Used in 50-move draw rule
+	/// </summary>
+	unsigned short halfmoveClock;
+	/// <summary>
+	/// 6th field in FEN - full move number
+	/// </summary>
+	unsigned short moveNumber;
+	/// <summary>
+	/// True if castling rights are indicated by the castling rook file instead of letters for kingside or queenside
+	/// </summary>
+	bool isChess960;
+	/// <summary>
+	/// Castling rook files for chess 960 position indexed by side: 0 - kingside castling (short), 1 - queenside castling (long) and by color: 0 - white, 1 - black
+	/// </summary>
+	enum Files castlingRook[2][2];
+	unsigned long castlingBits;
+};
+
+///<summary>
+/// UCI option types
+///</summary>
+enum OptionType {
+	Button, Check, Combo, Spin, String
+};
+
+static const char * optionTypes[] = {
+	"button", "check", "combo", "spin", "string"
+};
+
+///<summary>
+/// UCI spin type option
+///</summary>
+struct OptionSpin {
+	char name[MAX_UCI_OPTION_NAME_LEN];
+	long defaultValue;
+	long value;
+	long min;
+	long max;
+};
+
+///<summary>
+/// UCI check type option
+///</summary>
+struct OptionCheck {
+	char name[MAX_UCI_OPTION_NAME_LEN];
+	bool defaultValue;
+	bool value;
+};
+
+///<summary>
+/// UCI string type option
+///</summary>
+struct OptionString {
+	char name[MAX_UCI_OPTION_NAME_LEN];
+	char defaultValue[MAX_UCI_OPTION_STRING_LEN];
+	char value[MAX_UCI_OPTION_STRING_LEN];
+};
+
+///<summary>
+/// UCI combo type option
+///</summary>
+struct OptionCombo {
+	char name[MAX_UCI_OPTION_NAME_LEN];
+	char defaultValue[MAX_UCI_OPTION_STRING_LEN];
+	char values[MAX_UCI_OPTION_COMBO_VARS][MAX_UCI_OPTION_STRING_LEN];
+	char value[MAX_UCI_OPTION_STRING_LEN];
+};
+
+///<summary>
+/// UCI button type option
+///</summary>
+struct OptionButton {
+	char name[MAX_UCI_OPTION_NAME_LEN];
+	bool value; //if true, the button will be pressed
+};
+
+struct Engine {
+	char id[MAX_UCI_OPTION_STRING_LEN];
+	char authors[2 * MAX_UCI_OPTION_STRING_LEN];
+	int numberOfCheckOptions, numberOfComboOptions, numberOfSpinOptions,
+		numberOfStringOptions, numberOfButtonOptions;
+	struct OptionCheck optionCheck[MAX_UCI_OPTION_CHECK_NUM];
+	struct OptionCombo optionCombo[MAX_UCI_OPTION_COMBO_NUM];
+	struct OptionSpin optionSpin[MAX_UCI_OPTION_SPIN_NUM];
+	struct OptionString optionString[MAX_UCI_OPTION_STRING_NUM];
+	struct OptionButton optionButton[MAX_UCI_OPTION_BUTTON_NUM];
+	char engineName[255];
+	char namedPipeTo[255];
+	char namedPipeFrom[255];
+	char position[MAX_FEN_STRING_LEN]; //FEN string
+	char moves[MAX_UCI_MOVES_LEN]; //UCI moves
+	//go() arguments
+	long movetime;
+	int depth;
+	int nodes;
+	int mate;
+	bool ponder;
+	bool infinite;
+	long wtime;
+	long btime;
+	long winc;
+	long binc;
+	int movestogo;
+	char * searchmoves;
+	FILE * toEngine;
+	FILE * fromEngine;
+};
+
+struct Evaluation {
+	unsigned char maxPlies;
+	unsigned char depth;
+	unsigned char seldepth;
+	unsigned char multipv;
+	int scorecp;
+	int matein; //mate in <moves>, not <plies>
+	unsigned long nodes;
+	unsigned long nps;
+	unsigned short hashful;//permill (per thousand)
+	unsigned char tbhits;
+	unsigned long time; //ms
+	char pv[1024];
+	char bestmove[6];
+	char ponder[6];
+	unsigned char nag;
+};
+
+/// <summary>
+///  Converts FEN string to struct fen
+/// </summary>
+int strtofen(struct Fen *, const char *);
+
+/// <summary>
+///  Updates fenString in Fen struct
+/// </summary>
+int fentostr(struct Fen *);
+
+/// <summary>
+/// Square class represents chess board square
+/// </summary>
+struct Square {
+	/// <summary>
+	/// Chessboard SquareName type enum such as e4 or d5.
+	/// </summary>
+	enum SquareName name;
+	/// <summary>
+	/// Bitboard square
+	/// </summary>
+	unsigned long bitSquare;
+	/// <summary>
+	/// File number of the square - from a to h
+	/// </summary>
+	enum Files file;
+	/// <summary>
+	/// Rank of the square - from r0 to r7
+	/// </summary>
+	enum Ranks rank;
+	/// <summary>
+	/// Diagonal of the square - from 0 to 14
+	/// </summary>
+	enum Diagonals diag;
+	/// <summary>
+	/// Antidiagonal of the square - from 0 to 14
+	/// </summary>
+	enum Antidiagonals antiDiag;
+};
+
+/// <summary>
+/// ChessPiece struct
+/// </summary>
+struct ChessPiece {
+	/// <summary>
+	/// PieceName enum type field; for example white pawn is 1
+	/// </summary>
+	enum PieceName name;
+	/// <summary>
+	/// PieceType enum type field. 3 least significant bits in name define the PieceType; for example, bishop is 2
+	/// </summary>
+	enum PieceType type;
+	/// <summary>
+	/// Piece Color enum. 4th most significant bit in name define the color; white is 0, black is 1
+	/// </summary>
+	enum Color color;
+	/// <summary>
+	/// Square index from 0 to 63, where the piece is located
+	/// </summary>
+	struct Square square;
+};
+
+/// <summary>
+/// Board struct represents chess board
+/// </summary>
+struct Board {
+	unsigned long defendedPieces; //opponent pieces defended by it
+	unsigned long attackedPieces; //sideToMove pieces attacked by opponent
+	unsigned long attackedSquares; //squares attacked/defended by sideToMove
+	unsigned long blockingSquares;
+	unsigned long checkers;
+	unsigned long pinnedPieces;
+	unsigned long pinningPieces;
+	/// <summary>
+	/// Array of bitboards indexed by PieceName
+	/// </summary>
+	unsigned long occupations[16];
+	/// <summary>
+	/// Array of PieceName enums indexed by SquareName
+	/// </summary>
+	enum PieceName piecesOnSquares[64];
+	/// <summary>
+	/// Array of legal moves indexed by square
+	/// </summary>
+	unsigned long movesFromSquares[64]; //these include opponents moves as well
+	unsigned long sideToMoveMoves[64]; //these are just the moves of sideToMove
+	//how many extra opponent pieces (value) attack/defend a square (index) regardless if it's occupied or not
+	//another words, number of opponent attackers on a square minus number of sideToMove defenders on the same square
+	//if the number is negative, then it goes as positive into sideToMoveSquareAdvantage[64]
+	//float squareCostForOpponent[64]; 
+	//how many extra sideToMove pieces (value) defend/attack a square (index) regardless if it's occupied or not
+	//another words, number of sideToMove attackers on a square minus number of opponent attackers on the same square
+	//if number if negative, then it goes as positive into opponentSquareAdvantage[64]
+	//float squareCostForSideToMove[64]; 
+	/// <summary>
+	/// Zobrist hash of the position on the board
+	/// </summary>
+	unsigned long hash;
+	/// <summary>
+	/// Opponent's color is the opposite color of SideToMove
+	/// </summary>
+	enum Color opponentColor;
+	/// <summary>
+	/// Current zero-based ply number (halfmove)
+	/// </summary>
+	unsigned short plyNumber;
+	/// <summary>
+	/// Captured PieceName enum
+	/// </summary>
+	enum PieceName capturedPiece;
+	/// <summary>
+	/// Promotion PieceName enum
+	/// </summary>
+	enum PieceName promoPiece;
+	/// <summary>
+	/// Moving ChessPiece object
+	/// </summary>
+	struct ChessPiece movingPiece;
+	/// <summary>
+	/// True if there is a check
+	/// </summary>
+	bool isCheck;
+	/// <summary>
+	/// True if stalemate
+	/// </summary>
+	bool isStaleMate;
+	/// <summary>
+	/// True if mate
+	/// </summary>
+	bool isMate;
+	/// <summary>
+	/// FEN object
+	/// </summary>
+	struct Fen * fen;
+	struct ZobristHash * zh;
+};
+///<summary>
+/// BMPR stands for Boards, Moves, Promos, Results
+/// This struct is used in PyTorch IterativeDataset and subsequently in Dataloader for AI model training
+/// batch_size would normally be equal to the number of plies in a game, number of channels depends on the number of
+/// input features. Both batch_size and number of channels determine the size boards_legal_moves memory buffer
+/// which would map to 4-dimentional tensor in PyTorch [batch, channels, 8, 8]
+/// moves, promos and results buffers are labels and used in calculating model loss
+/// moves buffer will map into one-dimentional tensor [batch], where each element is the index from 0 to 4095, 
+/// representing the best uci move (src square -> dst square) Promo to queen is the default
+/// promos buffer will map into one-dimentional tensor [batch], 
+/// where each element is a underpromotion: 1-knight, 2-bishop, 3 - rook
+/// result could be 0: black win, 1 - draw, 2 - white win for the entire batch
+/// This struct is used in initGamesFromPGNs()
+///</summary>
+struct BMPR {
+  int samples;
+  int sample;
+  unsigned char channels;
+  float * boards_legal_moves; // [batch_size, number_of_channels, 8, 8]
+  int * moves; // [batch_size]
+  //int * promos; // [batch_size]
+  int * result; // [batch_size]
+  int * stage; // [batch_size]
+  //float * material_balance; // [batch_size]
+  //float * side_to_move;
+};
+
 static char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-//static const unsigned long STARTPOS_HASH = 0xf012ba38f3542c87UL;
-static const unsigned long STARTPOS_HASH = 0xef02eea4e43154a5UL;
-static const unsigned long STARTPOS_CASTLING_RIGHTS = 0x3ce516ac99438f5aUL;
+static const unsigned long STARTPOS_HASH = 0xf012ba38f3542c87UL;
+static const unsigned long STARTPOS_CASTLING_RIGHTS = 0xc415701f13943de3UL;
 
 //static unsigned long diagonalMoves[11];
 //static unsigned long antiDiagonalMoves[11];
@@ -1334,11 +1582,11 @@ struct Move {
 	/// </summary>
 	unsigned char type;
 	/// <summary>
-	/// Moving piece's source square: number from 1 to 64
+	/// Moving piece's source Square struct
 	/// </summary>
 	struct Square sourceSquare;
 	/// <summary>
-	/// Moving piece's destination square: number from 1 to 64
+	/// Moving piece's destination Square struct
 	/// </summary>
 	struct Square destinationSquare;
 	/// <summary>
@@ -1353,6 +1601,12 @@ struct Move {
 	/// Chessboard instance
 	/// </summary>
 	struct Board * chessBoard;
+	/// <summary>
+	/// For Zobrist hash calculation, we need to preserve castlingRook after castling move, otherwise, it will become FileNone
+	/// Castling rook files for chess 960 position indexed by side: 0 - kingside castling (short), 1 - queenside castling (long) and by color: 0 - white, 1 - black
+	/// </summary>
+	enum Files castlingRook;
+
 	/// <summary>
 	/// Move Numeric Annotation Glyph (NAG) number without '$' sign
 	/// </summary>
@@ -1394,11 +1648,22 @@ struct ZobristHash {
 	unsigned long prevEnPassant;
 	unsigned long castling[16];
 	unsigned long enPassant[8];
-	unsigned long piecesAtSquares[15][64];
+	unsigned long piecesAtSquares[13][64];
 	/// <summary>
 	/// Hash of the standard chess starting position
 	/// </summary>
 //	unsigned long startPosHash;
+};
+
+struct MoveScoreGames {
+  char move[6]; //uci move
+  int score; //position score, i.e. sum of wins and losses by making this move
+  unsigned int games; 
+};
+
+struct MoveScores {
+  char move[6]; //uci move
+  double score; //weighted score, i.e. score / total number of games in NextMoves.db for a given position
 };
 
 enum Tags {
@@ -1454,6 +1719,7 @@ struct Game {
 	/// Chess game PGN header tag array
 	/// </summary>
 	Tag tags;
+	int numberOfPlies;
 };
 
 struct EcoLine {
@@ -1466,6 +1732,14 @@ struct EcoLine {
 	/// </summary>
 	EcoTag tags;
 };
+
+struct Board * cloneBoard(struct Board * src);
+void freeBoard(struct Board * board);
+///<summary>
+/// Generates unbiased random random number from inclusive range [min, max]
+/// The first argument is min, the second is max
+///</summary>
+int randomNumber(const int, const int);
 
 ///<summary>
 /// initializes a ZobristHash struct
@@ -1484,9 +1758,9 @@ void getHash(struct ZobristHash *, struct Board *);
 void resetHash(struct ZobristHash *);
 
 ///<summary>
-/// updates ZobristHash of a given Board after a given move <- done in makeMove()
+/// updates ZobristHash of a given Board after a given move
 ///</summary>
-//int updateHash(struct ZobristHash *, struct Board *, struct Move *);
+int updateHash(struct ZobristHash *, struct Board *, struct Move *);
 
 ///<summary>
 /// fills Square struct from SquareName enum
@@ -1499,7 +1773,7 @@ void square(struct Square *, enum SquareName);
 void piece(struct Square *, struct ChessPiece *, enum PieceName);
 
 ///<summary>
-/// makes a Board struct from a Fen one
+/// makes a Board struct from a Fen one including legal moves generation stored in Board->movesFromSquares
 ///</summary>
 int fentoboard(struct Fen *, struct Board *);
 
@@ -1508,12 +1782,53 @@ unsigned char bitCount(unsigned long);
 enum SquareName lsBit(unsigned long);
 unsigned char genLSBit(unsigned long);
 unsigned char msBit(unsigned long);
+void unpack_bits(unsigned long number, float * bit_array);
+
+///<summary>
+/// This function strips game result from SAN moves string
+///</summary>
+void stripGameResult(struct Game *);
+
+///<summary>
+/// This function strips comments, variations and NAGs from SAN moves string
+///</summary>
+int normalizeMoves(char *);
+
+///<summary>
+/// This function removes move numbers from normalized SAN moves string
+///</summary>
+int movesOnly(char *);
 
 ///<summary>
 /// generates all legal moves on a given board
-/// and fills movesFromSquares member array of the Board struct
+/// stored in movesFromSquares array of the Board struct
 ///</summary>
 void generateMoves(struct Board *);
+
+///<summary>
+/// This function generates board position given an array of enum PieceName[] and its size (the second argument)
+/// as well as sideToMove (third argument), castlingRights (fourth argument) and enPassant (fifth argument)
+/// The board should be passed by reference in the last argument
+///<summary>
+void generateEndGame(enum PieceName *, int, enum Color, enum CastlingRightsEnum, enum Files, struct Board *);
+
+///<summary>
+/// This function will generate end games
+/// The first arg is the max number of games
+/// The second arg is max number of pieces. Only 5 is currenly supported for 5-piece Syzygy tables
+/// The third arg is the filename without an extension. Game positions will be recorded by each thread
+/// in its own file in CSV format (FEN string, UCI move, Result (-1, 0, 1))
+/// The fourth arg is the chess engine binary path
+/// The fifth is movetime in ms
+/// The sixth is depth in halfmoves
+/// The seventh is chess engine hash size in MB
+/// The eightth is chess engine thread numbers
+/// The nineth is syzygy tables path
+/// The tenth arg is MultiPV
+/// The eleventh if true will draw a chess board after each move
+/// The last arg is the number of threads for end game generation
+///</summary>
+int generateEndGames(int, int, char *, char *, long, int, int, int, char *, int, bool, int);
 
 ///<summary>
 /// validates a UCI or SAN move given by the last argument
@@ -1522,9 +1837,9 @@ void generateMoves(struct Board *);
 int initMove(struct Move *, struct Board *, char *);
 
 ///<summary>
-/// makes a given move on board and updates board and fen struct, updates hash if not null
+/// makes a given Move on board and updates Board and Fen struct
 ///</summary>
-void makeMove(struct Move *, struct ZobristHash *);
+void makeMove(struct Move *);
 
 /// <summary>
 /// Parses the line into tag name and tag value
@@ -1539,41 +1854,73 @@ int strtotag(Tag tag, char *);
 int strtoecotag(EcoTag, char *);
 
 ///<summary>
-/// Count number of games, which begin with a line specified by the second argument
-/// from a file stream and index them by a game start position
+/// Count number of games, which begin with a string specified by the second argument
+/// from a FILE stream and index them by a game start position in the array long[].
+/// The last argument is the number of games
 ///</summary>
-unsigned long countGames(FILE *, char *, long[], unsigned long);
+unsigned long countGames(FILE *, char *, unsigned long[], unsigned long);
 
 ///<summary>
-/// reads PGN game tags for a first game pointed by a file stream
+/// Reads PGN game tags for a first game pointed by a file stream
 /// and fills the provided array of typedef Tag
 /// returns 0 on success, non-zero on error
 ///</summary>
 int gTags(Tag, FILE *);
 
 ///<summary>
-/// reads eco file tags for a first eco line pointed by a file stream
+/// Reads eco file tags for a first eco line pointed by a file stream
 /// and fills the provided array of typedef EcoTag
 /// returns 0 on success, non-zero on error
 ///</summary>
 int eTags(EcoTag, FILE *);
 
 ///<summary>
-/// plays a given pgn game
-/// returns 0 on success, non-zero on error
+/// Plays multiple pgn games from a given pgn file (first argument) in MAX_NUMBER_OF_THREADS threads
+/// Second arg is number of game threads
+/// Third arg is number of sql threads (should be 1, 2, 4 or 8 - it will be one more for games update)
+/// Fourth argument is .eco file name for ECO classification or NULL
+/// Fifth argument is to filter games by minElo
+/// Sixth argument is to filter games by maxEloDiff between opponents
+/// Seventh argument if True will generate Zobrist hash
+/// Eighth argument if True will update sqlite db of NextMovesX.db with Zobrist hash, next move, score and the number of games
+/// Ninth arg if True will create AI model training/testing dataset in CSV format: FEN string, UCI move, Game result (-1, 0, 1)
+/// Last arg is the name of the dataset file without an extention, it will be appended threadId and .csv
 ///</summary>
-int pgnGame(struct Game * game, bool, unsigned long);
+unsigned long openGamesFromPGNfile(char *, int, int, char *, int, int, bool, bool, bool, char *);
 
 ///<summary>
-/// plays multiple pgn games from a given pgn file (first arg)
-/// second arg is next_moves sqlite3 db file
-/// third arguments is eco file name for ECO classification
-/// fourth arg is whether create db or not
-/// fifth is whether or not to calculate zobristHash
-/// sixth arg is minElo for pgn game selection
-/// seventh arg is maxEloDiff for pgn game selection
+/// This function is similar to playGames() with a difference that it takes a list of PGN
+/// files and each thread is given the entire file from the list
+/// It saves time by begining to play games one by one from the start of a file
+/// eliminating the need to index them in the file first, which is time consuming for large PGN files
+/// The first arg is an array of file names, the second arg is the number of of files in this array
+/// The rest are the same as in pgnGames()
 ///</summary>
-unsigned long pgnGames(char *, char *, char *, bool, int, int);
+unsigned long openGamesFromPGNfiles(char **, int, int, int, char *, int, int, bool, bool, bool, char *);
+
+//functions for fast data loading in AI model training
+//int initGamesFromPGNs(char * fileNames[], int numberOfFiles, int minElo, int maxEloDiff);
+struct BMPR * dequeueBMPR();
+void * getGame(void * context);
+void * getGameCsv(void * context);
+void getGame_detached(char ** fileNames, int numberOfFiles, int minElo, int maxEloDiff, int numberOfChannels, int numberOfSamples, int bmprQueueLen, enum GameStage gameStage); //gameStage: 0 - opening, 1 - middlegame, 2 - endgame, 3 - all
+void free_bmpr(struct BMPR * bmpr);
+int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
+enum GameStage getStage(struct Board * board);
+float materialBalance(struct Board * board); //from the view of side to move
+void cleanup_magic_bitboards(void);
+void init_magic_bitboards(void);
+
+///<summary>
+/// This function initializes Game struct from a stream position given by FILE
+/// It returns 0 on success and 1 on the EOF
+///</summary>
+int initGame(struct Game *, FILE *);
+
+///<summary>
+/// Plays a game given its struct
+///</summary
+int playGame(struct Game *);
 
 /// <summary>
 /// draws a chessboard
@@ -1597,7 +1944,7 @@ void writeDebug(struct Board *, bool);
 /// returns 0 if occupations reconcile with piecesOnSquares,
 /// otherwise, non-zero error code
 ///</summary>
-//int reconcile(struct Board *);
+int reconcile(struct Board *);
 
 ///<summary>
 /// returns string representation in the first argument
@@ -1610,13 +1957,15 @@ void getMoveType(char *, unsigned char);
 /// second argument - array of ecoLines
 /// third argument - the number of ecoLines
 ///</summary>
-void ecoClassify(struct Game *, struct EcoLine **, unsigned long);
+void ecoClassify(struct Game *, struct EcoLine **, int);
 
 ///<summary>
 /// runs a chess engine in a child process
+/// The second arg is engine binary path
 ///</summary>
-//int engine(char *, struct Engine *, struct Evaluation **);
-int engine(char *);
+int engine(struct Engine *, char *);
+
+struct Engine * initChessEngine(char * engineName, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV);
 
 ///<summary>
 /// returns chess engine option index for a given name and type
@@ -1632,13 +1981,41 @@ int getOptions(struct Engine *);
 int setOption(struct Engine *, char *, enum OptionType, void *);
 void setOptions(struct Engine *);
 
-bool isReady();
-bool newGame();
-void stop();
-void quit();
-bool position(char *, char *);
+bool isReady(struct Engine *);
+bool newGame(struct Engine *);
+void stop(struct Engine *);
+void quit(struct Engine *);
+bool position(struct Engine *);
 //void go(long, int, int, int, char *, bool, bool, long, long, long, long, int, struct Engine *, struct Evaluation **);
 void go(struct Engine *, struct Evaluation **);
+
+unsigned long md5(char *);
+
+///<summary>
+/// This function returns the number of moves for a given Zobrist hash and 
+/// the array of struct MoveScoreGames[MAX_NUMBER_OF_NEXT_MOVES] from NextMovesX.db files
+/// where X is the number encoded by the number of most significant bits of the hash
+/// The number of bits usually corresponds to sqlThreads (the last arg), which
+/// can be 1, 2, 4 or 8. Therefore, X ranges from 0 to 7, i.e. 0 for 1 thread, 0 to 1 for 2 threads,
+/// 0 to 3 for 4 threads and 0 to 7 for 8 threads
+///</summary>
+int nextMoves(unsigned long, struct MoveScoreGames **, int);
+
+///<summary>
+/// This function is similar to nextMoves except it returns the sorted array of moveScores
+/// Sorting is done by weighted absolute scores from the highest to the lowest, 
+/// where score = score / totalNumberOfGames for a given position
+/// The last arg is the number of sql threads, which should be 1, 2, 4 or 8 depending on how many db files you have
+///</summary>
+int bestMoves(unsigned long, enum Color, struct MoveScores *, int);
+
+/*
+int openDb(const char *, sqlite3 *);
+int closeDb(sqlite3 *);
+int getNextMoves(sqlite3 *, sqlite3_int64, struct MoveScoreGames **);
+int getNextMove(sqlite3 *, sqlite3_int64, const char *, struct MoveScoreGames *);
+int updateNextMove(sqlite3 *, sqlite3_int64, const char *, int);
+*/
 
 ///<summary>
 /// naive chess piece (except pawns) move generator
@@ -1647,3 +2024,4 @@ void go(struct Engine *, struct Evaluation **);
 ///<summary>
 //unsigned long moveGenerator(enum PieceType, struct Square *);
 //unsigned long moveGenerator(enum PieceType, enum SquareName);
+#endif
