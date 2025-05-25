@@ -22,7 +22,7 @@ cc -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt
 ```
 Do not forget to run init_magic_bitboards() and cleanup_magic_bitboards() in your programs for ray piece move generation.
 
-For chess AI model trainig:
+For chess AI model training:
 ```
 c++ -O3 -I <path_to_libtorch>/libtorch/include -I <path_to_libtorch>/libtorch/include/torch/csrc/api/include -L <path_to_libtorch>/libtorch/lib -L <path_to_libchess> -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,<path_to_libtorch>/libtorch/lib,-rpath,<path_to_libchess> -o chess_cnn train_chess_cnn.cpp chess_cnn.cpp
 ```
