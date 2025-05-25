@@ -11,7 +11,6 @@ gcc -E libchess.h > libchess.ph
 (install libffi)
 python3 tasks.py
 export LD_LIBRARY_PATH=.
-python3 test.py
 python3 eval.py
 ```
 To compile without cmake using clang (works on MacOS):
