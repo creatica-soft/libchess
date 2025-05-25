@@ -12,8 +12,18 @@ void square(struct Square * square, enum SquareName sqName) {
 	square->name = sqName;
 	if (sqName != SquareNone) {
 		square->bitSquare = 1UL << sqName;
-		square->file = sqName & 7;
-		square->rank = sqName >> 3;
+		square->file = sqName & 7; 
+		square->rank = sqName >> 3; 
+		/*
+	  if (square->file % 2) { //odd file
+			if (square->rank % 2)) square->color = ColorBlack; //odd file, odd rank
+			else square->color = ColorWhite; //odd file, even rank
+		} 
+		else {
+			if (square->rank % 2) square-color = ColorWhite; //even file, odd rank 
+			else square->color = ColorBlack; //even file, even rank
+		} 
+		*/
 		square->diag = (7 + square->rank) - square->file;
 		square->antiDiag = square->file + square->rank;
 	} else {
