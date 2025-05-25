@@ -382,7 +382,10 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 					//tmpLine = strstr(prevLine[i], " mate ");
 					//if (tmpLine) sscanf(tmpLine + 6, "%d", &(eval[0]->matein));
 					//printf("freeing prevLine[%d]\n", i);
-					free(prevLine[i]);
+					if (prevLine[i]) {
+						free(prevLine[i]);
+					  prevLine[i] = NULL;
+					}
 				}
 				//scorecp is given from the point of view of sideToMove, meaning
 				// negative scorecp is losing, positive - winning
@@ -450,7 +453,10 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 							len = eval[pv]->maxPlies;
 					  if (len >= prevLen[pv]) {
 							prevLen[pv] = len;
-							if (prevLine[pv]) free(prevLine[pv]);
+							if (prevLine[pv]) {
+								free(prevLine[pv]);
+								prevLine[pv] = NULL;
+							}
 							prevLine[pv] = malloc(strlen(line) + 1);
 							strcpy(prevLine[pv], line);
 						}
@@ -585,17 +591,6 @@ int engine(struct Engine * engine, char * engineName) {
 		strncat(engine->namedPipeFrom, suffix, 10);
 	} while(mkfifo(engine->namedPipeTo, S_IRUSR | S_IWUSR) == -1 || mkfifo(engine->namedPipeFrom, S_IRUSR | S_IWUSR) == -1);
 	pid_t enginePid;
-	//named pipes, i.e. fifo
-/*	
-	if (mkfifo(engine->namedPipeTo, S_IRUSR | S_IWUSR) == -1) {
-		printf("engine() error: mkfifo(%s, S_IRUSR | S_IWUSR) returned %s\n", engine->namedPipeTo, strerror(errno));
-		return 1;
-	}
-	if (mkfifo(engine->namedPipeFrom, S_IRUSR | S_IWUSR) == -1) {
-		printf("engine() error: mkfifo(%s, S_IRUSR | S_IWUSR) returned %s\n", engine->namedPipeFrom, strerror(errno));
-		return 1;
-	}
-*/	
 	enginePid = fork();
 	if (enginePid < 0) {
 		printf("engine() error: fork failed\n");
@@ -691,4 +686,9 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
   	return NULL;
   }
   return chessEngine;
+}
+
+void releaseChessEngine(struct Engine * chessEngine) {
+  if (chessEngine) free(chessEngine);
+  chessEngine = NULL;
 }

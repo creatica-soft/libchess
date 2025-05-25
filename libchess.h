@@ -1967,6 +1967,8 @@ int engine(struct Engine *, char *);
 
 struct Engine * initChessEngine(char * engineName, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV);
 
+void releaseChessEngine(struct Engine * chessEngine);
+
 ///<summary>
 /// returns chess engine option index for a given name and type
 ///</summary>
