@@ -1,8 +1,8 @@
 # libchess
 
-This is a C/C++ chess library with python bindings (libffi). The same (or almost the same) library but written in C# is used in https://chessgame-analyzer.creatica.org. Additionally, it has CNN-based chess AI model, which can be trained and tested on PGN files as well as a simple UCI chess engine to test the model in UCI-capable chess GUI. 
+This is a C/C++ chess library with python bindings (libffi or ctypes module). The same (or almost the same) library but written in C# is used in https://chessgame-analyzer.creatica.org. Additionally, it has CNN-based chess AI model, which can be trained and tested on PGN files as well as a simple UCI chess engine to test the model in UCI-capable chess GUI. 
 
-It relies on cmake to produce Makefile. To run eval.py, you may need a chess engine such as stockfish. 
+To build with cmake to produce Makefile. To run eval.py, you may need a chess engine such as stockfish. There are other python scripts such as genEndGames.py that will produce a PGN file that could be used for training an AI model. 
 
 ```
 cmake .
@@ -26,7 +26,7 @@ For chess AI model training:
 ```
 c++ -O3 -I <path_to_libtorch>/libtorch/include -I <path_to_libtorch>/libtorch/include/torch/csrc/api/include -L <path_to_libtorch>/libtorch/lib -L <path_to_libchess> -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,<path_to_libtorch>/libtorch/lib,-rpath,<path_to_libchess> -o chess_cnn train_chess_cnn.cpp chess_cnn.cpp
 ```
-Please notice dependencies, i.e. libtorch
+Please notice dependencies, i.e. libtorch. You would need to provide a path to PGN files for training and PGN files for testing in train_chess_cnn.cpp.
 
 For UCI chess engine that will use chess AI model with pre-trained weights or Syzygy tables for moves when the number of pieces is equal or less than 5:
 ```
