@@ -1445,7 +1445,7 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 	
 	if (ecoFileName) {
 		numberOfEcoLines = initEcoLines(ecoFileName, (struct EcoLine **)ecoLines);
-		if (!numberOfEcoLines) printf("pgnGames() warning: initEcoLines(%s) returned 0\n", ecoFileName);
+		if (!numberOfEcoLines) printf("openGamesFromPGNfile() warning: initEcoLines(%s) returned 0\n", ecoFileName);
   }
   
   if (updateDb) {
@@ -1671,7 +1671,7 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 			  	sqlCtx[7]->mutex = &queueMoves7_mutex;
 			  	break;
 			  default:
-			  	printf("pgnGames2 error: only 1, 2, 4 and 8 sql threads are supported\n");
+			  	printf("openGamesFromPGNfile() error: only 1, 2, 4 and 8 sql threads are supported\n");
 			  	exit(1);
 			}
 			if ((res = pthread_create(&(sql_thread_id[t]), &attr, &sqlWriterMoves,   (void *)(sqlCtx[t]))) != 0) {
@@ -1687,7 +1687,7 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 		  exit(1);
 		}
 		if (*(initGameCtx[t]->initGameResult) > 0) numberOfGamesPlayed += *(initGameCtx[t]->initGameResult);
-  	printf("pgnGames2(%d): number of games played so far: %d\n", t, numberOfGamesPlayed);
+  	printf("openGamesFromPGNfile(%d): number of games played so far: %d\n", t, numberOfGamesPlayed);
 		free(initGameCtx[t]->initGameResult);
 		free(initGameCtx[t]);
 	}
