@@ -1,6 +1,6 @@
 # libchess
 
-This is a C chess library with python bindings (libffi). The same (or almost the same) library but written in C# is used in https://chessgame-analyzer.creatica.org.
+This is a C/C++ chess library with python bindings (libffi). The same (or almost the same) library but written in C# is used in https://chessgame-analyzer.creatica.org. Additionally, it has CNN-based chess AI model, which can be trained and tested on PGN files as well as a simple UCI chess engine to test the model in UCI-capable chess GUI. 
 
 It relies on cmake to produce Makefile. To run eval.py, you may need a chess engine such as stockfish. 
 
