@@ -511,12 +511,12 @@ void consumer_test(TensorQueue& queue, ChessCNN& model, torch::Device device) {
 
 int main(int argc, char ** argv) {
     // Configuration (matches Python code)
-    const float learning_rate = 1e-6;
+    const float learning_rate = 1e-4;
     const int epochs = 1;
-    const std::string weights_file = "chessCNN4.pt";
+    const std::string weights_file = "chessCNN.pt";
     const int min_elo = 2300;
     const int max_elo_diff = 300;
-    const int num_channels = 82;
+    const int num_channels = 130;
     const int num_samples = 2000;
     const int game_stage = 3; //Full Game
     const int display_stats_every = 1;

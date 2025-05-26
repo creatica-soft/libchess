@@ -155,25 +155,6 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
 	  printf("boardLegalMoves(%d) error: boards_legal_moves is NULL\n", omp_get_thread_num());
 	  return -1;	  
 	}
-	
-	//white occupation bitboards - 6 channels from 0 (white pawns) to 5 (white king)
-	//maybe, a simpler input could work as well such as all white pieces with their values for one channel
-	//and all black pieces with their values for another
-	//And maybe alternating these channels based on sideToMove is a good idea?
-	/*
-  for (enum PieceName pn = WhitePawn; pn <= WhiteKing; pn++) { //white pieces
-    //printf("pieceName %s occupation %lu\n", pieceName[pn], board->occupations[pn]);
-    offset = sampleXchannels + channel * 64;
-    bitBoard = board->occupations[pn];
-    while (bitBoard) {
-      s = __builtin_ctzl(bitBoard);
-      boards_legal_moves[offset + s] = 1.0;
-      bitBoard &= bitBoard - 1;
-    }
-    channel++;
-  }
-  */
-  
   //sanity check - should be commented out later
   /*
   if ((board->fen->sideToMove == board->opponentColor) ||  board->opponentColor > ColorBlack || board->opponentColor < ColorWhite) {
@@ -181,11 +162,11 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     exit(-1);
   }
   */
-  
   //Channel 0 is all pieces for the sideToMove
   offset = sampleXchannels;// + channel * 64;
-  enum PieceName pnStart = (board->fen->sideToMove << 3) | Pawn;
-  enum PieceName pnEnd = (board->fen->sideToMove << 3) | King;
+  int shiftedColor = board->fen->sideToMove << 3;
+  enum PieceName pnStart = shiftedColor | Pawn;
+  enum PieceName pnEnd = shiftedColor | King;
   for (enum PieceName pn = pnStart; pn <= pnEnd; pn++) { //sideToMove pieces
     bitBoard = board->occupations[pn];
     while (bitBoard) {
@@ -197,32 +178,61 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   //channel++;
   
   //Channel 1 is for all pieces of the opponent
-  //and channels 2 to 17 (16 channels) for opponent's controled squares
   offset = sampleXchannels + 64;
-  channel = 2;
-  enum PieceName pnoStart = (board->opponentColor << 3) | Pawn;
-  enum PieceName pnoEnd = (board->opponentColor << 3) | King;
+  int shiftedOpponentColor = board->opponentColor << 3;
+  enum PieceName pnoStart = shiftedOpponentColor | Pawn;
+  enum PieceName pnoEnd = shiftedOpponentColor | King;
   for (enum PieceName pn = pnoStart; pn <= pnoEnd; pn++) { //opponent pieces
     bitBoard = board->occupations[pn];
     while (bitBoard) {
       s = __builtin_ctzl(bitBoard);
       boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[s] & 7];
-      offset2 = sampleXchannels + channel * 64;
-      bitBoard2 = board->movesFromSquares[s];
-      while (bitBoard2) {
-        s2 = __builtin_ctzl(bitBoard2);
-        boards_legal_moves[offset2 + s2] = pieceValue[board->piecesOnSquares[s] & 7];
-        bitBoard2 &= bitBoard2 - 1;    
-      }
-      channel++;
       bitBoard &= bitBoard - 1;
     }
   }  
+  
+  //channels 2 to 65 (64 channels) for opponent's controled squares
+  channel = 2;
+  for (enum SquareName sq = SquareA1; sq <= SquareH8; sq++) {
+    if (board->piecesOnSquares[sq] == PieceNameNone || (board->piecesOnSquares[sq] >> 3) != board->opponentColor) {
+      channel++;     
+      continue;
+    }
+    offset = sampleXchannels + channel * 64;
+    bitBoard = board->movesFromSquares[sq];
+    while (bitBoard) {
+      s = __builtin_ctzl(bitBoard);
+      boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[sq] & 7];
+      bitBoard &= bitBoard - 1;    
+    }
+    channel++;
+  }
 	
-	//black occupation bitboards - 6 channels from 6 (black pawns) to 11 (black king) 
+  /*
+	//sideToMove occupation bitboards - 6 channels from 0 (pawns) to 5 (king)
+	//maybe, a simpler input could work as well such as all white pieces with their values for one channel
+	//and all black pieces with their values for another - no, the model struggle to learn!
+	//And maybe alternating these channels based on sideToMove is a good idea?
+  enum PieceName pnStart = (board->fen->sideToMove << 3) | Pawn;
+  enum PieceName pnEnd = (board->fen->sideToMove << 3) | King;
+  for (enum PieceName pn = pnStart; pn <= pnEnd; pn++) { //sideToMove pieces
+    //printf("pieceName %s occupation %lu\n", pieceName[pn], board->occupations[pn]);
+    offset = sampleXchannels + channel * 64;
+    bitBoard = board->occupations[pn];
+    while (bitBoard) {
+      s = __builtin_ctzl(bitBoard);
+      boards_legal_moves[offset + s] = 1.0;
+      bitBoard &= bitBoard - 1;
+    }
+    channel++;
+  }
+  
+	//opponent occupation bitboards - 6 channels from 6 (pawns) to 11 (king) 
+	//as well as squares controlled by opponent pieces - 16 channels from 12 to 27
 	//pawn (0.1), knight (0.3), bishop (0.32), rook (0.5), queen (0.9), king (1.0)
-	/*
-  for (enum PieceName pn = BlackPawn; pn <= BlackKing; pn++) { //black pieces
+  enum PieceName pnoStart = (board->opponentColor << 3) | Pawn;
+  enum PieceName pnoEnd = (board->opponentColor << 3) | King;
+  for (enum PieceName pn = pnoStart; pn <= pnoEnd; pn++) { //opponent pieces
     //printf("pieceName %s occupation %lu\n", pieceName[pn], board->occupations[pn]);
     offset = sampleXchannels + channel * 64;
     bitBoard = board->occupations[pn];
@@ -442,10 +452,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   }
   */
 
-  //legal moves from each square - 64 channels 18 to 81 (total 82 channels)
+  //legal moves from each square - 64 channels 66 to 129 (total 130 channels)
   //perhaps, in a simple model, we could use not just legal moves but also opponent's control squares
   //in separate channels and instead of binary channels, use piece values for their moves?
-  channel = 18;
+  channel = 66;
   for (enum SquareName sq = SquareA1; sq <= SquareH8; sq++) {
     offset = sampleXchannels + channel * 64;
 	  //printf("legal moves from square %s %lu\n", squareName[sq], board->sideToMoveMoves[sq]);    

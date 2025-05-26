@@ -1199,7 +1199,7 @@ static float pieceMobility[] = { 0.0, 4.0, 8.0, 11.0, 14.0, 25.0, 8.0 }; //max v
 
 /// <summary>
 /// Piece enumeration: first three bits are used to encode the type, fourth bit defines the color.
-/// Shifting PieceName by 3 to the right will give the PieceColor: color = piece >> 3
+/// Shifting PieceName by 3 to the right gives PieceColor: color = piece >> 3
 /// Masking 3 lowest bits returns the PieceType: type = piece & 7
 /// </summary>
 enum PieceName {

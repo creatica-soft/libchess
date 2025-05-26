@@ -27,7 +27,7 @@ ChessCNNImpl::ChessCNNImpl() {
     //conv2 = register_module("conv2", torch::nn::Conv2d(torch::nn::Conv2dOptions(26, 32, 5).padding(2)));
     //conv3 = register_module("conv3", torch::nn::Conv2d(torch::nn::Conv2dOptions(26, 32, 3).padding(1)));
     board_conv = register_module("board_conv", torch::nn::Sequential(
-        torch::nn::Conv2d(torch::nn::Conv2dOptions(18, 32, 7).padding(3)),    
+        torch::nn::Conv2d(torch::nn::Conv2dOptions(66, 32, 7).padding(3)),    
         torch::nn::ReLU(),
         ResidualBlock(32),
         ResidualBlock(32),
@@ -148,9 +148,9 @@ std::tuple<torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor,
            torch::Tensor> ChessCNNImpl::forward(torch::Tensor x) {
-    // Split input: first 18 channels for board, remaining 64 for legal moves, total 82 channels
-    auto x_board = x.slice(1, 0, 18);
-    auto x_legal = x.slice(1, 18);
+    // Split input: first 66 channels for board, remaining 64 for legal moves, total 140 channels
+    auto x_board = x.slice(1, 0, 66);
+    auto x_legal = x.slice(1, 66);
 
     // Process board and legal move features
     //auto board_features1 = conv1->forward(x_board);
