@@ -546,7 +546,6 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
 	while (token) {
 	  enum GameStage stage = getStage(&board);
 	  //printf("gameStage %s\n", gameStages[stage]);
-	  (*bmpr)->stage[(*bmpr)->sample] = stage;
 	  if (gameStage != FullGame) {
   	  if (stage != gameStage) { //skip moves until we get to the required stage
     		if (initMove(&move, &board, token)) {
@@ -559,7 +558,8 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
   	    continue;
   	  }
 	  }
-	  //populate 82 channels used as input to policy head
+	  (*bmpr)->stage[(*bmpr)->sample] = stage;
+	  //populate 130 channels used as input to policy head
     if (boardLegalMoves((*bmpr)->boards_legal_moves, (*bmpr)->sample, (*bmpr)->channels, &board)) {
       printf("boardLegalMoves() returned non-zero code\n");
       return -1;
