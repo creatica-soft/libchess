@@ -313,12 +313,8 @@ void consumer_train(TensorQueue& queue, ChessCNN& model, torch::optim::Optimizer
                 moves_outputs[s].index_put_({legal_moves == 0}, -std::numeric_limits<float>::infinity());
                 //prevent overflow?
                 //masked_logits = masked_logits - std::get<0>(masked_logits.max(/*dim=*/1, /*keepdim=*/true));
-                auto p_loss = torch::nn::functional::cross_entropy(
-                    moves_outputs[s], batch.move, torch::nn::functional::CrossEntropyFuncOptions().reduction(torch::kNone)
-                ) * mask;
-                auto v_loss = torch::nn::functional::cross_entropy(
-                    value_outputs[s], batch.result, torch::nn::functional::CrossEntropyFuncOptions().reduction(torch::kNone)
-                ) * mask;
+                auto p_loss = torch::nn::functional::cross_entropy(moves_outputs[s], batch.move, torch::nn::functional::CrossEntropyFuncOptions().reduction(torch::kNone)) * mask;
+                auto v_loss = torch::nn::functional::cross_entropy(value_outputs[s], batch.result, torch::nn::functional::CrossEntropyFuncOptions().reduction(torch::kNone)) * mask;
                 /*
                 auto promo_mask = (batch.promo >= 0).to(torch::kFloat32) * mask;
                 auto pr_loss = torch::tensor(0.0).to(device);

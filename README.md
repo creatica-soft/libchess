@@ -29,8 +29,9 @@ Please notice dependencies, i.e. libtorch. You would need to provide a path to P
 
 For UCI chess engine that will use chess AI model with pre-trained weights or Syzygy tables for moves when the number of pieces is equal or less than 5:
 ```
-c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I <path_to_libtorch>/libtorch/include -I <path_to_libtorch>/libtorch/include/torch/csrc/api/include -I <path_to_libchess> -L <path_to_libtorch>/libtorch/lib -L <path_to_libchess> -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,<path_to_libtorch>/libtorch/lib,-rpath,<path_to_libchess> chess_cnn_mcts.cpp uci.cpp chess_cnn.cpp tbcore.c tbprobe.c magic_bitboards.c -o chess_engine
+c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I <path_to_libtorch>/libtorch/include -I <path_to_libtorch>/libtorch/include/torch/csrc/api/include -I <path_to_libchess> -L <path_to_libtorch>/libtorch/lib -L <path_to_libchess> -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,<path_to_libtorch>/libtorch/lib,-rpath,<path_to_libchess> chess_cnn_mcts.cpp uci.cpp chess_cnn.cpp tbcore.c tbprobe.c -o chess_engine
 ```
+You would need to download Syzygy tables and update TB_PATH and TB_MAX_PIECES in uci.cpp before compiling chess_engine.
 
 To comply with licensing of Fathom Syzygy Table Bases:
 
