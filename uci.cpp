@@ -271,8 +271,9 @@ extern "C" {
       int res = 0;
       enum GameStage stage = getStage(board);
       if (stage != EndGame) {
-          res = neuralEvaluateDirect(board, uciMove);
+          neuralEvaluateDirect(board, uciMove);
           // Respect movetime if neural evaluation is too fast
+          /*
           if (movetime > 0) {
               double elapsed = ((double)(clock() - start_time)) / CLOCKS_PER_SEC * 1000;
               if (elapsed < timeAllocated) {
@@ -283,6 +284,7 @@ extern "C" {
                   nanosleep(&delay, NULL);
               }
           }
+          */
       } else {
           if (__builtin_popcountl(board->occupations[PieceNameAny]) > TB_MAX_PIECES) 
             res = runMCTS(board, timeAllocated, uciMove);
@@ -352,11 +354,13 @@ extern "C" {
             }
           }
       }
+      
       if (res) {
           fprintf(stderr, "handleGo() error: evaluation returned %d\n", res);
           dprintf(logfile, "handleGo() error: evaluation returned %d\n", res);
           exit(-1);
       }
+    
       printf("bestmove %s\n", uciMove);
       dprintf(logfile, "bestmove %s\n", uciMove);
       fflush(stdout);
