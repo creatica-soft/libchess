@@ -147,10 +147,10 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 //this function fills BMPR structure member - an array of boards_legal_moves
 int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board) {
 	unsigned char channel = 0;
-  unsigned long bitBoard, bitBoard2;
-	int offset, offset2;
+  unsigned long bitBoard;
+	int offset;
 	int sampleXchannels = sample * channels * 64;
-	enum SquareName s, s2;
+	enum SquareName s;
 	if (!boards_legal_moves) {
 	  printf("boardLegalMoves(%d) error: boards_legal_moves is NULL\n", omp_get_thread_num());
 	  return -1;	  
@@ -178,11 +178,11 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   //channel++;
   
   //Channel 1 is for all pieces of the opponent
-  offset = sampleXchannels + 64;
-  int shiftedOpponentColor = board->opponentColor << 3;
-  enum PieceName pnoStart = shiftedOpponentColor | Pawn;
-  enum PieceName pnoEnd = shiftedOpponentColor | King;
-  for (enum PieceName pn = pnoStart; pn <= pnoEnd; pn++) { //opponent pieces
+  offset = sampleXchannels + 64; // * channel;
+  shiftedColor = board->opponentColor << 3;
+  pnStart = shiftedColor | Pawn;
+  pnEnd = shiftedColor | King;
+  for (enum PieceName pn = pnStart; pn <= pnEnd; pn++) { //opponent pieces
     bitBoard = board->occupations[pn];
     while (bitBoard) {
       s = __builtin_ctzl(bitBoard);
