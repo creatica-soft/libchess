@@ -10,7 +10,6 @@
 #include <time.h>
 #include <math.h>
 #include <pthread.h> //use -pthread when compiling and linking
-//#include <sqlite3.h>
 #include "uthash.h"
 #include "magic_bitboards.h"
 #include "libchess.h"
@@ -176,13 +175,15 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   */
   
   //sanity check - should be commented out later
+  /*
   if ((board->fen->sideToMove == board->opponentColor) ||  board->opponentColor > ColorBlack || board->opponentColor < ColorWhite) {
     fprintf(stderr, "boardLegalMoves() error: opponentColor is either the same as sideToMove or greater than 1 or smaller than 0\n");
     exit(-1);
   }
-
+  */
+  
   //Channel 0 is all pieces for the sideToMove
-  offset = sampleXchannels + channel * 64;
+  offset = sampleXchannels;// + channel * 64;
   enum PieceName pnStart = (board->fen->sideToMove << 3) | Pawn;
   enum PieceName pnEnd = (board->fen->sideToMove << 3) | King;
   for (enum PieceName pn = pnStart; pn <= pnEnd; pn++) { //sideToMove pieces
@@ -193,12 +194,12 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
       bitBoard &= bitBoard - 1;
     }
   }
-  channel++;
+  //channel++;
   
   //Channel 1 is for all pieces of the opponent
   //and channels 2 to 17 (16 channels) for opponent's controled squares
-  offset = sampleXchannels + channel * 64;
-  channel++;
+  offset = sampleXchannels + 64;
+  channel = 2;
   enum PieceName pnoStart = (board->opponentColor << 3) | Pawn;
   enum PieceName pnoEnd = (board->opponentColor << 3) | King;
   for (enum PieceName pn = pnoStart; pn <= pnoEnd; pn++) { //opponent pieces
@@ -210,7 +211,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
       bitBoard2 = board->movesFromSquares[s];
       while (bitBoard2) {
         s2 = __builtin_ctzl(bitBoard2);
-        boards_legal_moves[offset2 + s2] = pieceValue[board->piecesOnSquares[s] & 7];;
+        boards_legal_moves[offset2 + s2] = pieceValue[board->piecesOnSquares[s] & 7];
         bitBoard2 &= bitBoard2 - 1;    
       }
       channel++;
@@ -457,10 +458,13 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     channel++;
   } 
   
+  //sanity check, could be commented out once verified
+  /*
   if (channel != channels) {
 	  printf("boardLegalMoves(%d) error: number of channels (%d) != channels (%d)\n", omp_get_thread_num(), channel, channels);
 	  return -2;
 	}
+	*/
 	return 0;
 }
 
@@ -474,6 +478,7 @@ enum GameStage getStage(struct Board * board) {
 
 //scalar value used in value head as an input
 //not currently used
+/*
 float materialBalance(struct Board * board) {
   float white = 0, black = 0;
   for (enum PieceName pn = WhitePawn; pn <= WhiteQueen; pn++) {
@@ -487,7 +492,8 @@ float materialBalance(struct Board * board) {
   //printf("materialBalance: white=%.2f, black=%.2f, balance=%.2f, sideToMove=%d\n", white, black, balance, board->fen->sideToMove);
   return balance;
 }
-  
+*/
+
 ///<summary>
 /// Plays a given game using Game struct
 /// Returns struct BMPR *
@@ -532,7 +538,7 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
 	  //printf("gameStage %s\n", gameStages[stage]);
 	  (*bmpr)->stage[(*bmpr)->sample] = stage;
 	  if (gameStage != FullGame) {
-  	  if (stage != gameStage) {
+  	  if (stage != gameStage) { //skip moves until we get to the required stage
     		if (initMove(&move, &board, token)) {
     			printf("playGameAI(%d) error: invalid move %u%s%s (%s); FEN %s\n", omp_get_thread_num(), move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
     			if (sanMoves) free(sanMoves);
@@ -543,13 +549,11 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
   	    continue;
   	  }
 	  }
-	  //populate 90 channels used as input to policy head
-	  //printf("calling boardLegalMoves()...\n");
+	  //populate 82 channels used as input to policy head
     if (boardLegalMoves((*bmpr)->boards_legal_moves, (*bmpr)->sample, (*bmpr)->channels, &board)) {
       printf("boardLegalMoves() returned non-zero code\n");
       return -1;
     }
-	  //printf("calling boardLegalMoves()...done\n");
 		if (initMove(&move, &board, token)) {
 			printf("playGameAI(%d) error: invalid move %u%s%s (%s); FEN %s\n", omp_get_thread_num(), move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
 			if (sanMoves) free(sanMoves);
@@ -601,7 +605,6 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
       }
     }
     //printf("playGameAI(%d): sample %d, result %d, gameResult %d, sideToMove %d\n", omp_get_thread_num(), (*bmpr)->sample, (*bmpr)->result[(*bmpr)->sample], gameResult, board.fen->sideToMove);
-    //printf("calling materialBalance...\n");
     //material balance is used as scalar input in boath policy and value heads 
     //material balance seems to be irrelevant for a single position, which could just be in the middle
     //of the exchange, so let's drop it
@@ -610,7 +613,6 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
     //side to move is used as scalar input in both policy and value head
     //it is not useful, let's skip it
     //(*bmpr)->side_to_move[(*bmpr)->sample] = board.fen->sideToMove == ColorWhite ? 1.0 : -1.0;
-    //printf("calling materialBalance...done\n");
     if ((*bmpr)->sample == (*bmpr)->samples - 1) {
       *bmpr = bmprNew(*bmpr, (*bmpr)->channels, (*bmpr)->samples);
   	} else {

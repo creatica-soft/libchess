@@ -29,7 +29,7 @@
 #include "libchess.h"
 
 #define TB_MAX_PIECES 5
-#define TB_PATH "/Users/ap/libchess/syzygy"
+#define TB_PATH "/Users/ap/syzygy"
 
 torch::Device device(torch::kCPU);
 ChessCNN model;
