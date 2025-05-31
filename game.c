@@ -1173,7 +1173,7 @@ int initGameFromPGNFile(FILE * file, int minElo, int maxEloDiff, int minMoves, b
   
   if (initGame(&game, file)) return 1;
 
-	if (minElo > atoi(game.tags[WhiteElo]) || minElo > atoi(game.tags[BlackElo]) || maxEloDiff < abs(atoi(game.tags[WhiteElo]) - atoi(game.tags[BlackElo])) || minMoves * 2 > game.numberOfPlies) {
+	if (minElo > atoi(game.tags[WhiteElo]) || minElo > atoi(game.tags[BlackElo]) || maxEloDiff < abs(atoi(game.tags[WhiteElo]) - atoi(game.tags[BlackElo])) || minMoves * 2 > game.numberOfPlies - 1) {
 		return 2;
   }
  
@@ -1209,7 +1209,7 @@ int initGameFromPGNFile(FILE * file, int minElo, int maxEloDiff, int minMoves, b
 		  //printf("ECO %s\nOpening %s\nVariation %s\n", game.tags[ECO], game.tags[Opening], game.tags[Variation]);
 	}
 	if (playGameExt(&game, generateZobristHash, updateNextMoves, createDataset, dataset, threadId, sqlThreads)) {
-		printf("initGameFromPGNFile(%d) error: playGame() returned non-zero result\n", threadId);
+		printf("initGameFromPGNFile(%d) error: playGameExt() returned non-zero result\n", threadId);
 		return -1;
 	}
 	return 0;
@@ -1303,12 +1303,12 @@ void * initGamesFromPGNfiles(void * context) {
 		while (true) {
 			res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->minMoves, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads);
 			if (res < 0) {
-		    printf("initGameFromPGNfile(%d) exited with the result %d, file %s\n", ctx->threadNumber, res, ctx->fileNames[fNumber]);
+		    printf("initGameFromPGNFile(%d) exited with the result %d, file %s\n", ctx->threadNumber, res, ctx->fileNames[fNumber]);
 			  *(ctx->initGameResult) = -1;
 			  break;
 		  }
 		  else if (res == 1) {
-	      printf("initGameFromPGNfile(%d): end of file %s\n", ctx->threadNumber, ctx->fileNames[fNumber]);
+	      printf("initGameFromPGNFile(%d): end of file %s\n", ctx->threadNumber, ctx->fileNames[fNumber]);
 		  	break;
 		  }
 		  else if (res == 2) {

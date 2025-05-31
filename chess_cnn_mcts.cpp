@@ -1,4 +1,4 @@
-//c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn5.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
+//c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn6.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
 /*
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +10,7 @@
 */
 #include "uthash.h"
 #include "libchess.h"
-#include "chess_cnn4.h"
+#include "chess_cnn6.h"
 #include <torch/torch.h>
 #include <vector>
 #include <random>
@@ -365,14 +365,14 @@ int run_inference(struct Board ** board, int samples, int * top_moves, float * t
     for (int i = 0; i < samples; i++) {
         for (int j = 0; j < branching; j++) {
           top_moves[i * branching + j] = move_pred.index({i, j}).item<int>();
-          top_probs[i * branching + j] = top_move_probs.index({i, j}).item<float>();
+          top_probs[i * branching + j] = top_move_prob.index({i, j}).item<float>();
         }
         outcome[i] = outcome_pred.index({i}).item<int>();
     }
     //fprintf(stderr, "run_inference(): copying the results...done\n");
     
     free(board_moves);
-    free(stages);
+    //free(stages);
     return 0;
 }
 
