@@ -1,5 +1,5 @@
 cmake_minimum_required (VERSION 3.8)
 project(libchess)
-add_library (chess SHARED "bitscanner.c" "board.c" "engine.c" "fen.c" "game.c" "game_omp.c" "move.c" "piece.c" "square.c" "tag.c" "zobrist-hash.c" "sqlite.c" "my_md5.c" "magic_bitboards.c")
+add_library (chess SHARED "bitscanner.c" "board.c" "engine.c" "fen.c" "game.c" "game_omp.c" "move.c" "piece.c" "square.c" "tag.c" "zobrist-hash.c" "sqlite.c" "my_md5.c" "magic_bitboards.c" "boards_lega_moves.c")
 target_link_libraries(chess pthread sqlite3 omp)
 #add_compile_options(-fPIC)
