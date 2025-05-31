@@ -1,4 +1,4 @@
-//c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
+//c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn5.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
 /*
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +10,7 @@
 */
 #include "uthash.h"
 #include "libchess.h"
-#include "chess_cnn.h"
+#include "chess_cnn4.h"
 #include <torch/torch.h>
 #include <vector>
 #include <random>
@@ -20,7 +20,7 @@
 #define UCB_C 1.4 // Exploration constant
 
 // Global stop flag for MCTS interruption
-const int num_channels = 82;
+const int num_channels = 128;
 extern volatile int stopFlag;
 extern int logfile;
 extern torch::Device device;
@@ -280,7 +280,7 @@ extern "C" {
 
 int run_inference(struct Board ** board, int samples, int * top_moves, float * top_probs, int * outcome, int branching) {
     float * board_moves = NULL;
-    enum GameStage * stages = NULL;
+    //enum GameStage * stages = NULL;
     size_t input_size = samples * num_channels * 8 * 8; // samples, num_channels, 8x8 bitboards
     board_moves = (float *)calloc(input_size, sizeof(float));
     if (!board_moves) {
@@ -288,12 +288,13 @@ int run_inference(struct Board ** board, int samples, int * top_moves, float * t
       fprintf(stderr, "run_inference() error: calloc failed to allocate board_moves: %s\n", strerror(errno));
       exit(-1);
     }
+    /*
     stages = (enum GameStage *)calloc(samples, sizeof(enum GameStage));
     if (!stages) {
       dprintf(logfile, "run_inference() error: calloc failed to allocate stages: %s\n", strerror(errno));
       fprintf(stderr, "run_inference() error: calloc failed to allocate stages: %s\n", strerror(errno));
       exit(-1);
-    }
+    }*/
 
     int res;
     for (int i = 0; i < samples; i++) {
@@ -302,82 +303,71 @@ int run_inference(struct Board ** board, int samples, int * top_moves, float * t
         fprintf(stderr, "run_inference() error: boardLegalMoves() return non-zero code %d\n", res);
         exit(-1);
       }
-      stages[i] = getStage(board[i]);
+      //stages[i] = getStage(board[i]);
     }
 
-    auto stage = torch::from_blob(stages, {samples}, torch::kInt32).to(device, false);
+    //auto stage = torch::from_blob(stages, {samples}, torch::kInt32).to(device, false);
     auto boardMoves = torch::from_blob(board_moves, {samples, num_channels, 8, 8}, torch::kFloat32).to(device, false);
 
     //fprintf(stderr, "run_inference(): calling model->forward()...\n");    
-    auto [moves_logits_opening, value_logits_opening,
-          moves_logits_middlegame, value_logits_middlegame,
-          moves_logits_endgame, value_logits_endgame,
-          x_legal] = model->forward(boardMoves);
+    auto [moves_logits, value_logits, x_legal] = model->forward(boardMoves);
     //fprintf(stderr, "run_inference(): calling model->forward()...done\n");    
     //std::cerr << "moves_logits_endgame:\n" << moves_logits_endgame << std::endl;
     
     auto legal_moves = x_legal.view({boardMoves.size(0), -1});
     //std::cerr << "legal_moves:\n" << legal_moves << std::endl;
 
-    auto top_move_prob_opening = torch::empty({samples, branching}).to(device, torch::kFloat32);
-    auto top_move_prob_middlegame = torch::empty({samples, branching}).to(device, torch::kFloat32);
-    auto top_move_prob_endgame = torch::empty({samples, branching}).to(device, torch::kFloat32);
-    auto move_prob_opening = torch::empty({samples, 4096}).to(device, torch::kFloat32);
-    auto move_prob_middlegame = torch::empty({samples, 4096}).to(device, torch::kFloat32);
-    auto move_prob_endgame = torch::empty({samples, 4096}).to(device, torch::kFloat32);
-    auto move_pred_opening = torch::empty({samples, branching}).to(device, torch::kInt32);
-    auto move_pred_middlegame = torch::empty({samples, branching}).to(device, torch::kInt32);
-    auto move_pred_endgame = torch::empty({samples, branching}).to(device, torch::kInt32);
-    //auto promo_pred_opening = torch::empty({samples}).to(device, torch::kInt32);
-    //auto promo_pred_middlegame = torch::empty({samples}).to(device, torch::kInt32);
-    //auto promo_pred_endgame = torch::empty({samples}).to(device, torch::kInt32);
-    auto outcome_pred_opening = torch::empty({samples}).to(device, torch::kInt32);
-    auto outcome_pred_middlegame = torch::empty({samples}).to(device, torch::kInt32);
-    auto outcome_pred_endgame = torch::empty({samples}).to(device, torch::kInt32);
-    
+    auto top_move_prob = torch::empty({samples, branching}).to(device, torch::kFloat32);
+    //auto top_move_prob_middlegame = torch::empty({samples, branching}).to(device, torch::kFloat32);
+    //auto top_move_prob_endgame = torch::empty({samples, branching}).to(device, torch::kFloat32);
+    auto move_prob = torch::empty({samples, 4096}).to(device, torch::kFloat32);
+    //auto move_prob_middlegame = torch::empty({samples, 4096}).to(device, torch::kFloat32);
+    //auto move_prob_endgame = torch::empty({samples, 4096}).to(device, torch::kFloat32);
+    auto move_pred = torch::empty({samples, branching}).to(device, torch::kInt32);
+    //auto move_pred_middlegame = torch::empty({samples, branching}).to(device, torch::kInt32);
+    //auto move_pred_endgame = torch::empty({samples, branching}).to(device, torch::kInt32);
+    auto outcome_pred = torch::empty({samples}).to(device, torch::kInt32);
+    //auto outcome_pred_middlegame = torch::empty({samples}).to(device, torch::kInt32);
+    //auto outcome_pred_endgame = torch::empty({samples}).to(device, torch::kInt32);
+    /*
     std::vector<torch::Tensor> moves_outputs = {moves_logits_opening, moves_logits_middlegame, moves_logits_endgame};
-    //std::vector<torch::Tensor> promo_outputs = {promo_logits_opening, promo_logits_middlegame, promo_logits_endgame};
     std::vector<torch::Tensor> value_outputs = {value_logits_opening, value_logits_middlegame, value_logits_endgame};
     std::vector<torch::Tensor> top_move_probs = {top_move_prob_opening, top_move_prob_middlegame, top_move_prob_endgame};
     std::vector<torch::Tensor> move_probs = {move_prob_opening, move_prob_middlegame, move_prob_endgame};
     std::vector<torch::Tensor> move_pred = {move_pred_opening, move_pred_middlegame, move_pred_endgame};
-    //std::vector<torch::Tensor> promo_pred = {promo_pred_opening, promo_pred_middlegame, promo_pred_endgame};
     std::vector<torch::Tensor> outcome_pred = {outcome_pred_opening, outcome_pred_middlegame, outcome_pred_endgame};
-
+    */
     //fprintf(stderr, "run_inference(): processing stages...\n");
-    for (int s = 0; s < 3; ++s) {
-        auto mask_int = (stage == s);
+    //for (int s = 0; s < 3; ++s) {
+    //    auto mask_int = (stage == s);
         //std::cerr << "mask_int:\n" << mask_int << std::endl;
-        auto mask = mask_int.to(torch::kFloat32);
+    //    auto mask = mask_int.to(torch::kFloat32);
         //std::cerr << "mask:\n" << mask << std::endl;
-        auto mask_sum = mask.sum().item<float>(); //number of samples for stage s
-        if (mask_sum > 0) {
+    //    auto mask_sum = mask.sum().item<float>(); //number of samples for stage s
+    //    if (mask_sum > 0) {
             //Completely suppress illegal moves
-            moves_outputs[s].index_put_({legal_moves == 0}, -std::numeric_limits<float>::infinity());
-            //std::cerr << "moves_outputs[]:\n" << moves_outputs[s] << std::endl;
-            move_probs[s] = torch::softmax(moves_outputs[s], 1);// * mask;
-            //std::cerr << "move_probs[]:\n" << move_probs[s] << std::endl;
-            auto topk_result = torch::topk(move_probs[s], branching, 1);
-            //std::cerr << "topk_result[]:\n" << topk_result << std::endl;
-            top_move_probs[s] = std::get<0>(topk_result);
-            //std::cerr << "top_move_probs[]:\n" << top_move_probs[s] << std::endl;
-            move_pred[s] = std::get<1>(topk_result);
-            //std::cerr << "move_pred[]:\n" << move_pred[s] << std::endl;
-            //promo_pred[s] = promo_outputs[s].index({mask_int}).argmax(1);
-            //std::cerr << "promo_pred[]:\n" << promo_pred[s] << std::endl;
-            outcome_pred[s] = value_outputs[s].index({mask_int}).argmax(1);
-            //std::cerr << "outcome_pred[]:\n" << outcome_pred[s] << std::endl;
-        }
-    }
+            moves_logits.index_put_({legal_moves == 0}, -std::numeric_limits<float>::infinity());
+            //std::cerr << "moves_logits:\n" << moves_logits << std::endl;
+            move_prob = torch::softmax(moves_logits, 1);
+            //std::cerr << "move_prob:\n" << move_prob << std::endl;
+            auto topk_result = torch::topk(move_prob, branching, 1);
+            //std::cerr << "topk_result:\n" << topk_result << std::endl;
+            top_move_prob = std::get<0>(topk_result);
+            //std::cerr << "top_move_prob:\n" << top_move_prob << std::endl;
+            move_pred = std::get<1>(topk_result);
+            //std::cerr << "move_pred:\n" << move_pred << std::endl;
+            outcome_pred = value_logits.argmax(1);
+            //std::cerr << "outcome_pred:\n" << outcome_pred << std::endl;
+    //    }
+    //}
     //fprintf(stderr, "run_inference(): processing stages...done\n");
     //fprintf(stderr, "run_inference(): copying the results...\n");
     for (int i = 0; i < samples; i++) {
         for (int j = 0; j < branching; j++) {
-          top_moves[i * branching + j] = move_pred[stages[i]].index({i, j}).item<int>();
-          top_probs[i * branching + j] = top_move_probs[stages[i]].index({i, j}).item<float>();
+          top_moves[i * branching + j] = move_pred.index({i, j}).item<int>();
+          top_probs[i * branching + j] = top_move_probs.index({i, j}).item<float>();
         }
-        //promo[i] = promo_pred[stages[i]].index({i}).item<int>();
-        outcome[i] = outcome_pred[stages[i]].index({i}).item<int>();
+        outcome[i] = outcome_pred.index({i}).item<int>();
     }
     //fprintf(stderr, "run_inference(): copying the results...done\n");
     
@@ -385,73 +375,6 @@ int run_inference(struct Board ** board, int samples, int * top_moves, float * t
     free(stages);
     return 0;
 }
-
-/*
-    // Post-process
-    for (int b = 0; b < batch_size; b++) {
-        int stage = getStage(boards[b]); // 0=opening, 1=middlegame, 2=endgame
-        float * moves = moves_logits[stage] + b * 4096;
-        float * promo = promo_logits[stage] + b * 4;
-        float * value = value_logits[stage] + b * 3;
-        float * legal = x_legal + b * 64 * 8 * 8;
-
-        // Mask illegal moves
-        for (int i = 0; i < 4096; i++) {
-            int legal_idx = i / 64;
-            if (legal[legal_idx] < 0.0001) moves[i] = -1e9;
-        }
-
-        // Moves softmax
-        float max_logit = moves[0];
-        for (int i = 1; i < 4096; i++) if (moves[i] > max_logit) max_logit = moves[i];
-        float sum_exp = 0.0;
-        for (int i = 0; i < 4096; i++) {
-            moves[i] = expf(moves[i] - max_logit);
-            sum_exp += moves[i];
-        }
-        for (int i = 0; i < 4096; i++) moves[i] /= sum_exp;
-
-        // Top-3 moves
-        for (int k = 0; k < 3; k++) {
-            int max_idx = 0;
-            float max_prob = moves[0];
-            for (int i = 1; i < 4096; i++) {
-                if (moves[i] > max_prob) {
-                    max_prob = moves[i];
-                    max_idx = i;
-                }
-            }
-            top_move_pred[b * 3 + k] = max_idx;
-            top_move_probs[b * 3 + k] = max_prob;
-            moves[max_idx] = -1e9;
-        }
-
-        // Promo softmax
-        max_logit = promo[0];
-        for (int i = 1; i < 4; i++) if (promo[i] > max_logit) max_logit = promo[i];
-        sum_exp = 0.0;
-        for (int i = 0; i < 4; i++) {
-            promo[i] = expf(promo[i] - max_logit);
-            sum_exp += promo[i];
-        }
-        for (int i = 0; i < 4; i++) {
-            promo_probs[b * 3 + i] = promo[i] / sum_exp;
-            promo_pred[b * 3 + i] = i + 2; // Knight=2, bishop=3, rook=4, queen=5
-        }
-
-        // Value softmax
-        max_logit = value[0];
-        for (int i = 1; i < 3; i++) if (value[i] > max_logit) max_logit = value[i];
-        sum_exp = 0.0;
-        for (int i = 0; i < 3; i++) {
-            value[i] = expf(value[i] - max_logit);
-            sum_exp += value[i];
-        }
-        int max_idx = 0;
-        for (int i = 1; i < 3; i++) if (value[i] > value[max_idx]) max_idx = i;
-        outcome[b] = max_idx - 1; // -1, 0, 1
-    }
-*/
 
 extern "C" {
   void mcts_search(struct Board * board, int num_simulations, int branching) {

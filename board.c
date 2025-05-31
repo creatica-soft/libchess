@@ -799,11 +799,13 @@ void generateMoves(struct Board * board) {
 	board->movesFromSquares[king.square.name] = generateKingMoves(board, &(king.square));
 	//filter these moves to find the legal ones: 
 	//the king cannot capture defended opponent's pieces
-	board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & board->defendedPieces;
+	//board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & board->defendedPieces;
 	//it can't go to a square occupied by other pieces of its color
-	board->movesFromSquares[king.square.name] ^= board->occupations[shiftedColor | PieceTypeAny] & board->movesFromSquares[king.square.name];
+	//board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & board->occupations[shiftedColor | PieceTypeAny];
 	//and it can't go to a square attacked by opponent piece(s)
-	board->movesFromSquares[king.square.name] ^= attackedSquares & board->movesFromSquares[king.square.name];
+	//board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & attackedSquares;
+	//all three ops above in one go
+	board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & (board->defendedPieces | board->occupations[shiftedColor | PieceTypeAny] | attackedSquares);
 	
 	moves |= board->movesFromSquares[king.square.name];
 	//is king checked?
@@ -1211,13 +1213,15 @@ next:
 	}
 
 exit:
+  board->numberOfMoves = 0;
 	while (any) {
 		sn = __builtin_ctzl(any);
 		board->sideToMoveMoves[sn] = board->movesFromSquares[sn];
+		board->numberOfMoves += __builtin_popcountl(board->movesFromSquares[sn]);
   	any &= any - 1;
   }
   //printf("generateMoves(): moves %lu\n", moves);
-  board->attackedSquares = moves;
+  //board->moves = moves;
 	if (moves == 0) {
 		if (board->isCheck) {
 			board->isMate = true;

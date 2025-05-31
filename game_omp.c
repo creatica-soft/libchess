@@ -14,6 +14,7 @@
 #include "magic_bitboards.h"
 #include "libchess.h"
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
 
 struct GameHash {
     uint8_t hash[8];    // Key: 8-byte half-MD5 hash to filter identical games
@@ -40,6 +41,8 @@ struct getGameCtx {
   int numberOfFiles;
   int minElo;
   int maxEloDiff;
+  int minMoves;
+  unsigned long steps; //for curriculum learning
   int numberOfChannels;
   int numberOfSamples;
   int bmprQueueLen;
@@ -114,12 +117,6 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 	  printf("bmprNew(%d) error: calloc() for moves returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
-	/*
-	bmpr->promos = (int *)calloc(bmpr->samples, sizeof(int));
-	if (!bmpr->promos) {
-	  printf("bmprNew(%d) error: calloc() for promos returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
-	  return NULL;
-	}*/
 	bmpr->result = (int *)calloc(bmpr->samples, sizeof(int));
 	if (!bmpr->result) {
 	  printf("bmprNew(%d) error: calloc() for result returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
@@ -130,359 +127,14 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 	  printf("bmprNew(%d) error: calloc() for stage returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
-	/*
-	bmpr->material_balance = (float *)calloc(bmpr->samples, sizeof(float));
-	if (!bmpr->material_balance) {
-	  printf("bmprNew(%d) error: calloc() for material_balance returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
-	  return NULL;
-	}
-	bmpr->side_to_move = (float *)calloc(bmpr->samples, sizeof(float));
-	if (!bmpr->side_to_move) {
-	  printf("bmprNew(%d) error: calloc() for side_to_move returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
-	  return NULL;
-	}*/
   return bmpr;
-}
-
-//this function fills BMPR structure member - an array of boards_legal_moves
-int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board) {
-	unsigned char channel = 0;
-  unsigned long bitBoard;
-	int offset;
-	int sampleXchannels = sample * channels * 64;
-	enum SquareName s;
-	if (!boards_legal_moves) {
-	  printf("boardLegalMoves(%d) error: boards_legal_moves is NULL\n", omp_get_thread_num());
-	  return -1;	  
-	}
-  //sanity check - should be commented out later
-  /*
-  if ((board->fen->sideToMove == board->opponentColor) ||  board->opponentColor > ColorBlack || board->opponentColor < ColorWhite) {
-    fprintf(stderr, "boardLegalMoves() error: opponentColor is either the same as sideToMove or greater than 1 or smaller than 0\n");
-    exit(-1);
-  }
-  */
-  //Channel 0 is all pieces for the sideToMove
-  offset = sampleXchannels;// + channel * 64;
-  int shiftedColor = board->fen->sideToMove << 3;
-  enum PieceName pnStart = shiftedColor | Pawn;
-  enum PieceName pnEnd = shiftedColor | King;
-  for (enum PieceName pn = pnStart; pn <= pnEnd; pn++) { //sideToMove pieces
-    bitBoard = board->occupations[pn];
-    while (bitBoard) {
-      s = __builtin_ctzl(bitBoard);
-      boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[s] & 7];
-      bitBoard &= bitBoard - 1;
-    }
-  }
-  //channel++;
-  
-  //Channel 1 is for all pieces of the opponent
-  offset = sampleXchannels + 64; // * channel;
-  shiftedColor = board->opponentColor << 3;
-  pnStart = shiftedColor | Pawn;
-  pnEnd = shiftedColor | King;
-  for (enum PieceName pn = pnStart; pn <= pnEnd; pn++) { //opponent pieces
-    bitBoard = board->occupations[pn];
-    while (bitBoard) {
-      s = __builtin_ctzl(bitBoard);
-      boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[s] & 7];
-      bitBoard &= bitBoard - 1;
-    }
-  }  
-  
-  //channels 2 to 65 (64 channels) for opponent's controled squares
-  channel = 2;
-  for (enum SquareName sq = SquareA1; sq <= SquareH8; sq++) {
-    if (board->piecesOnSquares[sq] == PieceNameNone || (board->piecesOnSquares[sq] >> 3) != board->opponentColor) {
-      channel++;     
-      continue;
-    }
-    offset = sampleXchannels + channel * 64;
-    bitBoard = board->movesFromSquares[sq];
-    while (bitBoard) {
-      s = __builtin_ctzl(bitBoard);
-      boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[sq] & 7];
-      bitBoard &= bitBoard - 1;    
-    }
-    channel++;
-  }
-	
-  /*
-	//sideToMove occupation bitboards - 6 channels from 0 (pawns) to 5 (king)
-	//maybe, a simpler input could work as well such as all white pieces with their values for one channel
-	//and all black pieces with their values for another - no, the model struggle to learn!
-	//And maybe alternating these channels based on sideToMove is a good idea?
-  enum PieceName pnStart = (board->fen->sideToMove << 3) | Pawn;
-  enum PieceName pnEnd = (board->fen->sideToMove << 3) | King;
-  for (enum PieceName pn = pnStart; pn <= pnEnd; pn++) { //sideToMove pieces
-    //printf("pieceName %s occupation %lu\n", pieceName[pn], board->occupations[pn]);
-    offset = sampleXchannels + channel * 64;
-    bitBoard = board->occupations[pn];
-    while (bitBoard) {
-      s = __builtin_ctzl(bitBoard);
-      boards_legal_moves[offset + s] = 1.0;
-      bitBoard &= bitBoard - 1;
-    }
-    channel++;
-  }
-  
-	//opponent occupation bitboards - 6 channels from 6 (pawns) to 11 (king) 
-	//as well as squares controlled by opponent pieces - 16 channels from 12 to 27
-	//pawn (0.1), knight (0.3), bishop (0.32), rook (0.5), queen (0.9), king (1.0)
-  enum PieceName pnoStart = (board->opponentColor << 3) | Pawn;
-  enum PieceName pnoEnd = (board->opponentColor << 3) | King;
-  for (enum PieceName pn = pnoStart; pn <= pnoEnd; pn++) { //opponent pieces
-    //printf("pieceName %s occupation %lu\n", pieceName[pn], board->occupations[pn]);
-    offset = sampleXchannels + channel * 64;
-    bitBoard = board->occupations[pn];
-    while (bitBoard) {
-      s = __builtin_ctzl(bitBoard);
-      boards_legal_moves[offset + s] = 1.0;
-      bitBoard &= bitBoard - 1;      
-    }
-    channel++;
-  }
-  
-  //all white piece values (for material balance) - channel 12
-  //printf("pieceName %s occupation %lu\n", pieceName[PieceNameWhite], board->occupations[PieceNameWhite]);
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->occupations[PieceNameWhite];
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[s] & 7];
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  
-  //all black piece values (for material balance) - channel 13
-  //printf("pieceName %s occupation %lu\n", pieceName[PieceNameBlack], board->occupations[PieceNameBlack]);
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->occupations[PieceNameBlack];
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[s] & 7];
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  
-  //opponent pieces that it defends - channel 14
-  //printf("defended opponent's pieces %lu\n", board->defendedPieces);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->defendedPieces;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //sideToMove pieces that opponent attacks  - channel 15
-  //printf("attacked sideToMove pieces %lu\n", board->attackedPieces);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->attackedPieces;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //channels 14 and 15 (opponent's defended pieces and sideToMove attacked pieces) seem to create
-  //a disbalance. What about sideToMove defeneded pieces and opponent's pieces that sideToMove attacks?
-  //are these channels even important?
-  
-  //sideToMove pieces that it defends - channel 16
-  //printf("defended sideToMove pieces %lu\n", ...);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->attackedSquares & board->occupations[(board->fen->sideToMove << 3) | PieceTypeAny];
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //opponent's pieces that sideToMove attacks  - channel 17
-  //printf("attacked opponent's pieces %lu\n", ...);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->attackedSquares & board->occupations[(board->opponentColor << 3) | PieceTypeAny];
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  
-  //if king is checked, then the squares that could be used to block the check - channel 18
-  //printf("blockingSquares %lu\n", board->blockingSquares);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->blockingSquares;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;        
-  }
-  channel++;
-  
-  //pieces that check king - channel 19
-  //printf("checkers %lu\n", board->checkers);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->checkers;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //pieces that are pinned - channel 20
-  //printf("pinnedPieces %lu\n", board->pinnedPieces);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->pinnedPieces;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //pieces that pin - channel 21
-  //printf("pinningPieces %lu\n", board->pinningPieces);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->pinningPieces;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //en passant bit (legal) - channel 22
-  //not needed as legal moves are provided
-  //printf("enPassantLegalBit %lu\n", board->fen->enPassantLegalBit);    
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->fen->enPassantLegalBit;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //castling rights - channel 23 - probably not needed because they included in legal moves
-  //printf("castlingBits %lu\n", board->fen->castlingBits);   
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->fen->castlingBits;
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = 1.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
-  
-  //square advantage from the side to move perspective - non-binary channel 22
-  //this is wrong, it does not factor in that the last piece in exchange will stay on board
-  //perhaps, it is better to provide non-binary 64 maps of pieces that attack/defend each of 64 squares.
-  //Opposite to legal moves. Legal moves provide binary 64 maps of destinations for each square
-  //square advantage would provide a non-binary maps for pieces that can move to or control the square
-  //piece values would be negative for the side to move and positive for the opponent
-  //or maybe a simpler approach of binary channel where 1 encourages the exchange on a square and 0 
-  //doesn't? Again, it won't be perfect because of possible pins of the opponent's pieces, which can't 
-  //really participate in exchange
-  //offset = sampleXchannels + channel * 64;
-  //for (enum SquareName sq = SquareA1; sq <= SquareH8; sq++)
-  //  boards_legal_moves[offset + sq] = board->squareCostForOpponent[sq] - board->squareCostForSideToMove[sq];
-  //channel++;
-
-  //promo distance - channel 4 //channel 24
-  //maybe not needed in a simple model
-  offset = sampleXchannels + channel * 64;
-  bitBoard = board->occupations[WhitePawn];
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = (7.0 - (float)(s >> 3)) / 6.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  bitBoard = board->occupations[BlackPawn];
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    boards_legal_moves[offset + s] = (float)(s >> 3) / 6.0;
-    bitBoard &= bitBoard - 1;    
-  }
-  channel++;
- 
-  //mobility of sideToMove pieces scaled by their values and the pieces that can move - 2 channels 25 - 26
-  //in a simple model not needed, legal moves could probably compensate it
-  offset = sampleXchannels + channel * 64;
-  channel++;
-  offset2 = sampleXchannels + channel * 64;
-  bitBoard = board->occupations[(board->fen->sideToMove << 3) | PieceTypeAny];
-  while (bitBoard) {
-    s = __builtin_ctzl(bitBoard);
-    unsigned long bitBoardMoves = board->sideToMoveMoves[s];
-    enum PieceType piece = board->piecesOnSquares[s] & 7;
-    boards_legal_moves[offset + s] = (float)__builtin_popcountl(bitBoardMoves) / pieceMobility[piece] * pieceValue[piece];
-    if (bitBoardMoves > 0) boards_legal_moves[offset2 + s] = 1.0;
-    bitBoard &= bitBoard - 1;
-  }
-  channel++;
-  */
-  
-  //square advantage for each square - channels from 27 to 90 (64 channels)
-  //probably just confuse the model
-  /*
-  for (enum SquareName sq = SquareA1; sq <= SquareH8; sq++) {
-    offset = sampleXchannels + channel * 64;
-    unsigned long bitSquare = (1UL << sq);
-	  //printf("square advantage for square %s %f\n", squareName[sq], ...);    
-    for (enum SquareName sqr = SquareA1; sqr <= SquareH8; sqr++) {
-      if (board->movesFromSquares[sqr] & bitSquare) {
-        float value = pieceValue[board->piecesOnSquares[sqr] & 7];
-        boards_legal_moves[offset + sqr] = (board->piecesOnSquares[sqr] >> 3) == board->fen->sideToMove ? -value : value;
-      }
-    }
-    //we include piece value on the square as well if any
-    float value = pieceValue[board->piecesOnSquares[sq] & 7];
-    boards_legal_moves[offset + sq] = (board->piecesOnSquares[sq] >> 3) == board->fen->sideToMove ? -value : value;
-    channel++;
-  }
-  */
-
-  //legal moves from each square - 64 channels 66 to 129 (total 130 channels)
-  //perhaps, in a simple model, we could use not just legal moves but also opponent's control squares
-  //in separate channels and instead of binary channels, use piece values for their moves?
-  channel = 66;
-  for (enum SquareName sq = SquareA1; sq <= SquareH8; sq++) {
-    offset = sampleXchannels + channel * 64;
-	  //printf("legal moves from square %s %lu\n", squareName[sq], board->sideToMoveMoves[sq]);    
-    bitBoard = board->sideToMoveMoves[sq];
-    while (bitBoard) {
-      s = __builtin_ctzl(bitBoard);
-      boards_legal_moves[offset + s] = pieceValue[board->piecesOnSquares[sq] & 7];
-      bitBoard &= bitBoard - 1;    
-    }
-    channel++;
-  } 
-  
-  //sanity check, could be commented out once verified
-  /*
-  if (channel != channels) {
-	  printf("boardLegalMoves(%d) error: number of channels (%d) != channels (%d)\n", omp_get_thread_num(), channel, channels);
-	  return -2;
-	}
-	*/
-	return 0;
 }
 
 //return a game stage such as opening, middlegame or endgame enum GameStage
 enum GameStage getStage(struct Board * board) {
-  int numberOfPieces = __builtin_popcountl(board->occupations[PieceTypeAny]);
-  if (numberOfPieces >= 20) return OpeningGame;
-  else if (numberOfPieces < 10) return EndGame;
+  int numberOfPieces = __builtin_popcountl(board->occupations[PieceNameAny]);
+  if (numberOfPieces >= 24) return OpeningGame;
+  else if (numberOfPieces <= 12) return EndGame;
   else return MiddleGame;
 }
 
@@ -508,7 +160,7 @@ float materialBalance(struct Board * board) {
 /// Plays a given game using Game struct
 /// Returns struct BMPR *
 ///</summary>
-int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage) {
+int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage, unsigned long * step, const unsigned long steps) {
   int gameResult = 0;
 	struct Move move;
 	struct Board board;
@@ -557,9 +209,32 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
     		token = strtok_r(NULL, " ", &saveptr);
   	    continue;
   	  }
-	  }
+	  } /*else {
+	    //this blocks attempts to balance the number of positions for each game stage in a batch
+  	  //so that each AI model head (opening, middlegame, endgame) receives approximately the same
+  	  //number of samples
+  	  //curriculum learning: start with simple positions of 5 legal moves, gradually increase to 20 legal moves
+    	
+    	float weights[] = {0.45, 0.65, 1.0}; // Opening, middlegame, endgame
+    	float r = rand() / (float)RAND_MAX;
+    	float r2;
+    	#pragma omp critical
+    	r2 = *step / (float)steps;
+      if (r > weights[stage] || board.numberOfMoves > 5 + 15 * r2) {
+    		if (initMove(&move, &board, token)) {
+    			printf("playGameAI(%d) error: invalid move %u%s%s (%s); FEN %s\n", omp_get_thread_num(), move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+    			if (sanMoves) free(sanMoves);
+    			return -2;
+    		}
+    		makeMove(&move);    
+    		token = strtok_r(NULL, " ", &saveptr);
+  	    continue;        
+      }
+      #pragma omp critical
+      (*step)++;
+	  }*/
 	  (*bmpr)->stage[(*bmpr)->sample] = stage;
-	  //populate 130 channels used as input to policy head
+	  //populate channels used as input for AI model
     if (boardLegalMoves((*bmpr)->boards_legal_moves, (*bmpr)->sample, (*bmpr)->channels, &board)) {
       printf("boardLegalMoves() returned non-zero code\n");
       return -1;
@@ -600,12 +275,13 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
 		}
 		//we attempt to correct wrong result by using the end of move result in stripGameResult()
 		//but it also may be wrong
-		//result is from a point of view of the side to move
+		//result is from a point of view of the side to move - which I think confuses the model during training!
+		//so let's provide constant result regardless of the side to move!
 		//result class is used as a target in value loss calculation
-		if (board.fen->sideToMove == ColorBlack) //move is made, so sideToMove has already changed
-      (*bmpr)->result[(*bmpr)->sample] = gameResult + 1;
-    else 
-      (*bmpr)->result[(*bmpr)->sample] = -gameResult + 1;
+		//if (board.fen->sideToMove == ColorBlack) //move is made, so sideToMove if White has already changed to Black
+    (*bmpr)->result[(*bmpr)->sample] = gameResult + 1; //(0 (white lost/black won), 1 (draw), 2 (white won/black lost))
+    //else 
+    //(*bmpr)->result[(*bmpr)->sample] = -gameResult + 1; //from black perspective (0 (loss), 1 (draw), 2 (win))
     //we attempt to correct the wrong game result by rewinding backwards by the number of plies in a game
     //if the game started in previous batch, then those positions won't be updated, of course
     if (wrong_result) {
@@ -639,32 +315,16 @@ void free_bmpr(struct BMPR * bmpr) {
   if (!bmpr) return;
   if (bmpr->boards_legal_moves) {
     free(bmpr->boards_legal_moves);
-    //bmpr->boards_legal_moves = NULL;
   }
   if (bmpr->moves) {
     free(bmpr->moves);
-    //bmpr->moves = NULL;
   }
-  /*if (bmpr->promos) {
-    free(bmpr->promos);
-    //bmpr->promos = NULL;
-  }*/
   if (bmpr->result) {
     free(bmpr->result);
-    //bmpr->result = NULL;
   }
   if (bmpr->stage) {
     free(bmpr->stage);
-    //bmpr->stage = NULL;
   }
-  /*if (bmpr->material_balance) {
-    free(bmpr->material_balance);
-    //bmpr->material_balance = NULL;
-  }
-  if (bmpr->side_to_move) {
-    free(bmpr->side_to_move);
-    //bmpr->side_to_move = NULL;
-  }*/
   //printf("Freeing bmpr at %p in thread %d\n", (void*)bmpr, omp_get_thread_num());
   free(bmpr);
   bmpr = NULL;
@@ -675,7 +335,7 @@ void free_bmpr(struct BMPR * bmpr) {
 //you might want to increase the number of threads in #pragma omp parallel num_threads(1)
 void * getGame(void * context) {
   //printf("getGame() thread id: %d\n", omp_get_thread_num());
-  unsigned long numberOfGames, skipped, duplicate, numberOfPlies; 
+  unsigned long numberOfGames, skipped, duplicate, numberOfPlies, step; 
   pthread_mutex_lock(&queue_mutex);
   queueBMPR.len = 0;
   queueBMPR.maxLen = ((struct getGameCtx *)context)->bmprQueueLen;
@@ -686,9 +346,10 @@ void * getGame(void * context) {
   skipped = 0;
   duplicate = 0;
   numberOfPlies = 0;
+  step = 0;
   pthread_mutex_unlock(&queue_mutex);
   omp_set_dynamic(1); // when set to 1, num_threads(x) will allow any number betweem 0 and x
-  #pragma omp parallel shared(queueBMPR,games,numberOfGames,skipped,duplicate,numberOfPlies) num_threads(1)
+  #pragma omp parallel shared(queueBMPR,games,numberOfGames,skipped,duplicate,numberOfPlies,step) num_threads(1)
   {
 //commented out block is used for testing to empty BMPR queue
 /*
@@ -736,12 +397,14 @@ void * getGame(void * context) {
         for (i = 0; i < ctx->numberOfFiles; i++) {
           char filename[256];
           strncpy(filename, ctx->fileNames[i], 256);
-          int minElo = ctx->minElo;
-          int maxEloDiff = ctx->maxEloDiff;
-          int numberOfChannels = ctx->numberOfChannels;
-          int numberOfSamples = ctx->numberOfSamples;
-          enum GameStage gameStage = ctx->gameStage;
-      	  #pragma omp task firstprivate(filename, minElo, maxEloDiff, numberOfChannels, numberOfSamples, gameStage) shared(queueBMPR, games, numberOfGames, skipped, duplicate, numberOfPlies)
+          const int minElo = ctx->minElo;
+          const int maxEloDiff = ctx->maxEloDiff;
+          const int minMoves = ctx->minMoves;
+          const unsigned long steps = ctx->steps;
+          const int numberOfChannels = ctx->numberOfChannels;
+          const int numberOfSamples = ctx->numberOfSamples;
+          const enum GameStage gameStage = ctx->gameStage;
+      	  #pragma omp task firstprivate(filename, minElo, maxEloDiff, minMoves, steps, numberOfChannels, numberOfSamples, gameStage) shared(queueBMPR, games, numberOfGames, skipped, duplicate, numberOfPlies, step)
       	  {
         	  int res = 0;
         	  printf("getGame(%d) opening file %s...\n", omp_get_thread_num(), filename);
@@ -765,7 +428,7 @@ void * getGame(void * context) {
               }
               #pragma omp critical
               numberOfGames++;
-            	if (minElo > atoi(game.tags[WhiteElo]) || minElo > atoi(game.tags[BlackElo]) || maxEloDiff < abs(atoi(game.tags[WhiteElo]) - atoi(game.tags[BlackElo]))) {
+            	if (minElo > atoi(game.tags[WhiteElo]) || minElo > atoi(game.tags[BlackElo]) || maxEloDiff < abs(atoi(game.tags[WhiteElo]) - atoi(game.tags[BlackElo])) || minMoves * 2 > game.numberOfPlies - 1) {
                 #pragma omp critical
             	  skipped++;
             		continue;
@@ -791,7 +454,7 @@ void * getGame(void * context) {
               }
               #pragma omp critical
               numberOfPlies += game.numberOfPlies;
-              res = playGameAI(&game, &bmpr2, gameStage);
+              res = playGameAI(&game, &bmpr2, gameStage, &step, steps);
               if (res < 0) break;
             } //end of while (true)
             if (bmpr2) {
@@ -821,7 +484,7 @@ void * getGame(void * context) {
   }
   cleanup_magic_bitboards();
   games = NULL;
-  printf("Total games %lu: played %lu, skipped %lu, duplicate %lu. Number of plies in played games: %lu\n", numberOfGames, numberOfGames - skipped - duplicate, skipped, duplicate, numberOfPlies);
+  printf("Total games %lu: played %lu, skipped %lu, duplicate %lu. Number of plies in played games: %lu, step %lu\n", numberOfGames, numberOfGames - skipped - duplicate, skipped, duplicate, numberOfPlies, step);
 	return NULL;
 }
 
@@ -1014,7 +677,7 @@ void * getGameCsv(void * context) {
 }
 
 //this function starts a detached thread that runs getGame() or getGameCSV() depending on file extension
-void getGame_detached(char ** fileNames, int numberOfFiles, int minElo, int maxEloDiff, int numberOfChannels, int numberOfSamples, int bmprQueueLen, enum GameStage gameStage) {
+void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const enum GameStage gameStage, const unsigned long steps) {
   int res;
   struct getGameCtx * ctx = (struct getGameCtx *)malloc(sizeof(struct getGameCtx));
   if (numberOfFiles > 256) {
@@ -1026,6 +689,8 @@ void getGame_detached(char ** fileNames, int numberOfFiles, int minElo, int maxE
   ctx->numberOfFiles = numberOfFiles;
   ctx->minElo = minElo;
   ctx->maxEloDiff = maxEloDiff;
+  ctx->minMoves = minMoves;
+  ctx->steps = steps;
   ctx->numberOfChannels = numberOfChannels;
   ctx->numberOfSamples = numberOfSamples;
   ctx->bmprQueueLen = bmprQueueLen;
