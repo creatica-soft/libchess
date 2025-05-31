@@ -7,14 +7,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-//#include <time.h>
-//#include <math.h>
-//#include <pthread.h> //use -pthread when compiling and linking
-//#include "uthash.h"
-//#include "magic_bitboards.h"
 #include "libchess.h"
 
-// this function attemps to prioritise moves of major pieces attacked by minor pieces,
+// this function attempts to prioritise moves of major pieces attacked by minor pieces,
 // captures of major pieces by minor pieces or capture of undefended pieces and
 // avoid moves to squares attacked by minor pieces
 float moveValue(struct Board * board, enum SquareName src, enum SquareName dst) {

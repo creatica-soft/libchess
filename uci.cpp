@@ -128,7 +128,12 @@ extern "C" {
           if (token != NULL) {
             strncpy(engine.optionString[0].value, token, MAX_UCI_OPTION_STRING_LEN);
             if (!tb_init_done) {
+              dprintf(logfile, "setoption name SyzygyPath value %s\n", engine.optionString[0].value);
               tb_init(engine.optionString[0].value);
+              if (TB_LARGEST == 0) {
+                  fprintf(stderr, "error: unable to initialize tablebase; no tablebase files found\n");
+                  exit(-1);
+              }              
               tb_init_done = true;
             }
           }
@@ -275,7 +280,7 @@ extern "C" {
       if (engine.movetime > 0) {
           timeAllocated = engine.movetime * 0.95;
       }
-      else if (infinite) {
+      else if (engine.infinite) {
           timeAllocated = 1e9;
       }
       else {
@@ -420,11 +425,12 @@ int main(int argc, char **argv) {
     logfile = open("uci.log", O_RDWR | O_APPEND | O_CREAT | O_TRUNC);
     fchmod(logfile, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     init_magic_bitboards();
-    //tb_init(TB_PATH);
+    /*
+    tb_init(TB_PATH);
     if (TB_LARGEST == 0) {
         fprintf(stderr, "error: unable to initialize tablebase; no tablebase files found\n");
         exit(-1);
-    }
+    }*/
 
     // Device selection
     if (torch::cuda::is_available()) {
