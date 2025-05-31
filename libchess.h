@@ -1,6 +1,6 @@
 ///
 /// To compile on MacOS M1 using clang, run:
-/// cc -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt/anaconda3/lib -I /opt/anaconda3/include -L/opt/anaconda3/lib -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c
+/// cc -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt/anaconda3/lib -I /opt/anaconda3/include -L/opt/anaconda3/lib -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves.c
 /// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
 /// use -g for debugging with lldb instead of -O3 (lldb ./test, then run, then bt)
 /// To build python bindings, use:
@@ -994,6 +994,7 @@ extern "C" {
   };
   static const unsigned char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q' };
   enum GameStage { OpeningGame, MiddleGame, EndGame, FullGame };
+  static const char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
   static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
   struct Square {
@@ -1013,7 +1014,7 @@ extern "C" {
   struct Board {
   	unsigned long defendedPieces;
   	unsigned long attackedPieces;
-  	unsigned long attackedSquares;
+  	//unsigned long moves; //all sideToMove moves
   	unsigned long blockingSquares;
   	unsigned long checkers;
   	unsigned long pinnedPieces;
@@ -1027,6 +1028,7 @@ extern "C" {
   	unsigned long hash;
   	enum Color opponentColor;
   	unsigned short plyNumber;
+  	unsigned short numberOfMoves;
   	enum PieceName capturedPiece;
   	enum PieceName promoPiece;
   	struct ChessPiece movingPiece;
@@ -1083,6 +1085,80 @@ extern "C" {
   int fentoboard(struct Fen *, struct Board *);
   int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
   enum GameStage getStage(struct Board * board);
+  enum OptionType {Button, Check, Combo, Spin, String};
+  static const char * optionTypes[] = {"button", "check", "combo", "spin", "string"};
+
+  struct OptionSpin {
+  	char name[MAX_UCI_OPTION_NAME_LEN];
+  	long defaultValue;
+  	long value;
+  	long min;
+  	long max;
+  };
+
+  struct OptionCheck {
+  	char name[MAX_UCI_OPTION_NAME_LEN];
+  	bool defaultValue;
+  	bool value;
+  };
+
+  struct OptionString {
+  	char name[MAX_UCI_OPTION_NAME_LEN];
+  	char defaultValue[MAX_UCI_OPTION_STRING_LEN];
+  	char value[MAX_UCI_OPTION_STRING_LEN];
+  };
+
+  struct OptionCombo {
+  	char name[MAX_UCI_OPTION_NAME_LEN];
+  	char defaultValue[MAX_UCI_OPTION_STRING_LEN];
+  	char values[MAX_UCI_OPTION_COMBO_VARS][MAX_UCI_OPTION_STRING_LEN];
+  	char value[MAX_UCI_OPTION_STRING_LEN];
+  };
+
+  struct OptionButton {
+  	char name[MAX_UCI_OPTION_NAME_LEN];
+  	bool value; //if true, the button will be pressed
+  };
+
+  struct Engine {
+  	char id[MAX_UCI_OPTION_STRING_LEN];
+  	char authors[2 * MAX_UCI_OPTION_STRING_LEN];
+  	int numberOfCheckOptions, numberOfComboOptions, numberOfSpinOptions,
+  		numberOfStringOptions, numberOfButtonOptions;
+  	struct OptionCheck optionCheck[MAX_UCI_OPTION_CHECK_NUM];
+  	struct OptionCombo optionCombo[MAX_UCI_OPTION_COMBO_NUM];
+  	struct OptionSpin optionSpin[MAX_UCI_OPTION_SPIN_NUM];
+  	struct OptionString optionString[MAX_UCI_OPTION_STRING_NUM];
+  	struct OptionButton optionButton[MAX_UCI_OPTION_BUTTON_NUM];
+  	char position[MAX_FEN_STRING_LEN]; //FEN string
+  	char moves[MAX_UCI_MOVES_LEN]; //UCI moves
+  	//go() arguments
+  	long movetime;
+  	int depth;
+  	int nodes;
+  	int mate;
+  	bool ponder;
+  	bool infinite;
+  	long wtime;
+  	long btime;
+  	long winc;
+  	long binc;
+  	int movestogo;
+  	char * searchmoves;
+  };
+  struct BMPR {
+    int samples;
+    int sample;
+    unsigned char channels;
+    float * boards_legal_moves; // [batch_size, number_of_channels, 8, 8]
+    int * moves; // [batch_size]
+    int * result; // [batch_size]
+    int * stage; // [batch_size]
+  };
+  struct BMPR * dequeueBMPR();
+  void free_bmpr(struct BMPR * bmpr);
+  
+  void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const enum GameStage gameStage, const unsigned long steps);
 }
 #else
 
@@ -1146,6 +1222,9 @@ static char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
 enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
 static char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
+static unsigned long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
+static unsigned long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
+
 /// <summary>
 /// Square enumeration
 /// </summary>
@@ -1193,6 +1272,7 @@ enum Antidiagonals {
 /// Piece type enumeration
 /// </summary>
 enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
+static char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
 
 static float pieceValue[] = { 0.0, 0.05, 0.15, 0.16, 0.25, 0.45, 1.0 }; //scaled down by kings value of 20
 static float pieceMobility[] = { 0.0, 4.0, 8.0, 11.0, 14.0, 25.0, 8.0 }; //max value - used for norm
@@ -1243,7 +1323,7 @@ static const char * moveType[] = {
 enum ProblemType { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
 
 enum GameStage { OpeningGame, MiddleGame, EndGame, FullGame };
-static const char * gameStages[] = { "opening", "middlegame", "endgame", "fullgame" };
+static const char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
 
 /// <summary>
 /// Forthys-Edwards Notation for the position preceding a move 
@@ -1465,9 +1545,9 @@ struct ChessPiece {
 /// Board struct represents chess board
 /// </summary>
 struct Board {
-	unsigned long defendedPieces; //opponent pieces defended by it
+	unsigned long defendedPieces; //defended opponent pieces 
 	unsigned long attackedPieces; //sideToMove pieces attacked by opponent
-	unsigned long attackedSquares; //squares attacked/defended by sideToMove
+	//unsigned long moves; //sideToMove moves
 	unsigned long blockingSquares;
 	unsigned long checkers;
 	unsigned long pinnedPieces;
@@ -1505,6 +1585,7 @@ struct Board {
 	/// Current zero-based ply number (halfmove)
 	/// </summary>
 	unsigned short plyNumber;
+	unsigned short numberOfMoves;
 	/// <summary>
 	/// Captured PieceName enum
 	/// </summary>
@@ -1555,11 +1636,8 @@ struct BMPR {
   unsigned char channels;
   float * boards_legal_moves; // [batch_size, number_of_channels, 8, 8]
   int * moves; // [batch_size]
-  //int * promos; // [batch_size]
   int * result; // [batch_size]
   int * stage; // [batch_size]
-  //float * material_balance; // [batch_size]
-  //float * side_to_move;
 };
 
 static char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -1875,18 +1953,9 @@ int gTags(Tag, FILE *);
 int eTags(EcoTag, FILE *);
 
 ///<summary>
-/// Plays multiple pgn games from a given pgn file (first argument) in MAX_NUMBER_OF_THREADS threads
-/// Second arg is number of game threads
-/// Third arg is number of sql threads (should be 1, 2, 4 or 8 - it will be one more for games update)
-/// Fourth argument is .eco file name for ECO classification or NULL
-/// Fifth argument is to filter games by minElo
-/// Sixth argument is to filter games by maxEloDiff between opponents
-/// Seventh argument if True will generate Zobrist hash
-/// Eighth argument if True will update sqlite db of NextMovesX.db with Zobrist hash, next move, score and the number of games
-/// Ninth arg if True will create AI model training/testing dataset in CSV format: FEN string, UCI move, Game result (-1, 0, 1)
-/// Last arg is the name of the dataset file without an extention, it will be appended threadId and .csv
+/// Plays multiple pgn games from a given pgn file
 ///</summary>
-unsigned long openGamesFromPGNfile(char *, int, int, char *, int, int, bool, bool, bool, char *);
+unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset);
 
 ///<summary>
 /// This function is similar to playGames() with a difference that it takes a list of PGN
@@ -1896,18 +1965,18 @@ unsigned long openGamesFromPGNfile(char *, int, int, char *, int, int, bool, boo
 /// The first arg is an array of file names, the second arg is the number of of files in this array
 /// The rest are the same as in pgnGames()
 ///</summary>
-unsigned long openGamesFromPGNfiles(char **, int, int, int, char *, int, int, bool, bool, bool, char *);
+unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int numberOfGames, int maxEloDiff, int minMoves, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset);
 
 //functions for fast data loading in AI model training
 //int initGamesFromPGNs(char * fileNames[], int numberOfFiles, int minElo, int maxEloDiff);
 struct BMPR * dequeueBMPR();
 void * getGame(void * context);
 void * getGameCsv(void * context);
-void getGame_detached(char ** fileNames, int numberOfFiles, int minElo, int maxEloDiff, int numberOfChannels, int numberOfSamples, int bmprQueueLen, enum GameStage gameStage); //gameStage: 0 - opening, 1 - middlegame, 2 - endgame, 3 - all
+void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const enum GameStage gameStage, const unsigned long steps);
 void free_bmpr(struct BMPR * bmpr);
 int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
 enum GameStage getStage(struct Board * board);
-float materialBalance(struct Board * board); //from the view of side to move
+//float materialBalance(struct Board * board); //from the view of side to move
 void cleanup_magic_bitboards(void);
 void init_magic_bitboards(void);
 

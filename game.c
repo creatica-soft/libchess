@@ -60,6 +60,8 @@ struct InitGameFromPGNfileContext {
 	int threadNumber;
 	int minElo;
 	int maxEloDiff;
+	int minMoves;
+	int numberOfGames;
 	int numberOfEcoLines;
 	struct EcoLine ** ecoLines;	
 	bool updateDb;
@@ -76,6 +78,8 @@ struct InitGameFromPGNfilesContext {
 	int threadNumber;
 	int minElo;
 	int maxEloDiff;
+	int minMoves;
+	int numberOfGames;
 	int numberOfEcoLines;
 	struct EcoLine ** ecoLines;
 	bool updateDb;
@@ -1096,9 +1100,31 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 		}
 	}
 	if (createDataset && dataset) {
+	  /*
 		for (int i = 0; i < hashIndex; i++) {
       fprintf(dataset, "%s,%s,%d\n", fenStringCache[i], uciMoveCache[i], gameResult);
+    }*/
+    fprintf(dataset, "[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n[Result \"%s\"]\n[WhiteElo \"%s\"]\n[BlackElo \"%s\"]\n\n", game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black], game->tags[Result], game->tags[WhiteElo], game->tags[BlackElo]);
+    sanMoves = strndup(game->sanMoves, strlen(game->sanMoves));
+  	if (!sanMoves) {
+  		printf("playGameExt(%d) error: strndup() returned NULL: %s. sanMoves %s\n", threadId, strerror(errno), game->sanMoves);
+  		return errno;
+  	}
+  	token = strtok_r(sanMoves, " ", &saveptr);
+  	int moveNumber = 1;
+  	bool whiteMove = true;
+  	while (token) {
+  	  if (whiteMove) {
+        fprintf(dataset, "%d.%s ", moveNumber, token);
+        whiteMove = false;
+      } else {
+        fprintf(dataset, "%s ", token);
+        whiteMove = true; 
+        moveNumber++;       
+      }
+  		token = strtok_r(NULL, " ", &saveptr);	  
     }
+    fprintf(dataset, "%s\n\n", game->tags[Result]);    
 	}
 	free(sanMoves);
 	return 0;
@@ -1107,7 +1133,11 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 int initGame(struct Game * game, FILE * file) {
 	char line[80];
 	//read game PGN tags
-	if (gTags(game->tags, file)) return 1; //eof
+	if (gTags(game->tags, file)) {
+	  //fprintf(stderr, "initGame(): gTags() returned EOF\n");
+	  return 1; //eof
+	} 
+	//fprintf(stderr, "initGame(): [Event \"%s\"]\n", game->tags[Event]);
 
 	//skip empty lines and tag lines if any           
 	while (fgets(line, sizeof line, file)) {
@@ -1121,7 +1151,10 @@ int initGame(struct Game * game, FILE * file) {
 		if (isEmptyLine(line)) break;
 		strcat(game->sanMoves, line);
 	}
-	if (feof(file)) return 1;			
+	if (feof(file)) {
+	  //fprintf(stderr, "initGame() returned EOF\n");
+	  return 1;			
+	 }
 
 	//strip the game result;
   stripGameResult(game);
@@ -1134,14 +1167,14 @@ int initGame(struct Game * game, FILE * file) {
 	return 0;
 }
 
-int initGameFromPGNFile(FILE * file, int minElo, int maxEloDiff, bool updateDb, sqlite3 * db, int numberOfEcoLines, struct EcoLine ** ecoLines, bool generateZobristHash, bool createDataset, FILE * dataset, int threadId, int sqlThreads) {
+int initGameFromPGNFile(FILE * file, int minElo, int maxEloDiff, int minMoves, bool updateDb, sqlite3 * db, int numberOfEcoLines, struct EcoLine ** ecoLines, bool generateZobristHash, bool createDataset, FILE * dataset, int threadId, int sqlThreads) {
   bool updateNextMoves = false;
   struct Game game;
   
   if (initGame(&game, file)) return 1;
 
-	if (minElo > atoi(game.tags[WhiteElo]) || minElo > atoi(game.tags[BlackElo]) || maxEloDiff < abs(atoi(game.tags[WhiteElo]) - atoi(game.tags[BlackElo]))) {
-		return 0;
+	if (minElo > atoi(game.tags[WhiteElo]) || minElo > atoi(game.tags[BlackElo]) || maxEloDiff < abs(atoi(game.tags[WhiteElo]) - atoi(game.tags[BlackElo])) || minMoves * 2 > game.numberOfPlies) {
+		return 2;
   }
  
   if (updateDb) {
@@ -1196,7 +1229,7 @@ void * initGamesFromPGNfile(void * context) {
 	}
 	if (ctx->createDataset) {
 		char filename[255];
-		sprintf(filename, "%s%d.csv", ctx->dataset, ctx->threadNumber);
+		sprintf(filename, "%s%d.pgn", ctx->dataset, ctx->threadNumber);
 		dataset = fopen(filename, "a");
 		if (!dataset) {
 			printf("initGamesFromPGNfile(%d) error: failed to open/create a file %s, %s\n", ctx->threadNumber, filename, strerror(errno));
@@ -1213,17 +1246,23 @@ void * initGamesFromPGNfile(void * context) {
 		pthread_mutex_unlock(&gameNumber_mutex);
 		if (gNumber >= numberOfGames) break;
 		fseek(file, gameStartPositions[gNumber], SEEK_SET);
-		res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads);
+		res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->minMoves, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads);
 		if (res < 0) {
-	    printf("initGameFromPGNfile(%d) exited with the result %d, file %s\n", ctx->threadNumber, res, ctx->fileName);
+	    printf("initGamesFromPGNfile(%d) exited with the result %d, file %s\n", ctx->threadNumber, res, ctx->fileName);
 		  *(ctx->initGameResult) = -1;
 		  break;
 	  }
-	  else if (res > 0) {
-      printf("initGameFromPGNfile(%d): end of file %s\n", ctx->threadNumber, ctx->fileName);
+	  else if (res == 1) {
+      printf("initGamesFromPGNfile(%d): end of file %s\n", ctx->threadNumber, ctx->fileName);
 	  	break;
 	  }
-    else *(ctx->initGameResult) += 1;
+	  else if (res == 2) {
+	  	continue;
+	  }
+    else {
+      *(ctx->initGameResult) += 1;
+      if (*(ctx->initGameResult) >= ctx->numberOfGames) break;
+    }
 	}
 	fclose(file);
 	if (ctx->createDataset) fclose(dataset);
@@ -1240,7 +1279,7 @@ void * initGamesFromPGNfiles(void * context) {
 	FILE * dataset = NULL;
 	if (ctx->createDataset) {
 		char filename[255];
-		sprintf(filename, "%s%d.csv", ctx->dataset, ctx->threadNumber);
+		sprintf(filename, "%s%d.pgn", ctx->dataset, ctx->threadNumber);
 		dataset = fopen(filename, "a");
 		if (!dataset) {
 			printf("initGamesFromPGNfiles(%d) error: failed to open/create a file %s, %s\n", ctx->threadNumber, filename, strerror(errno));
@@ -1262,17 +1301,23 @@ void * initGamesFromPGNfiles(void * context) {
 			return ctx->initGameResult;
 		}
 		while (true) {
-			res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads);
+			res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->minMoves, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads);
 			if (res < 0) {
 		    printf("initGameFromPGNfile(%d) exited with the result %d, file %s\n", ctx->threadNumber, res, ctx->fileNames[fNumber]);
 			  *(ctx->initGameResult) = -1;
 			  break;
 		  }
-		  else if (res > 0) {
+		  else if (res == 1) {
 	      printf("initGameFromPGNfile(%d): end of file %s\n", ctx->threadNumber, ctx->fileNames[fNumber]);
 		  	break;
 		  }
-	    else *(ctx->initGameResult) += 1;
+		  else if (res == 2) {
+		    continue;
+		  }
+	    else {
+	      *(ctx->initGameResult) += 1;
+	      if (*(ctx->initGameResult) >= ctx->numberOfGames) break;
+	    }
 		}
   	fclose(file);
 	}
@@ -1430,12 +1475,13 @@ void * sqlWriterGames(void * context) {
 /// this implements multi-threading process where each thread plays
 /// a single game
 ///</summary>
-unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset) {
+unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int games, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset) {
 	int res = 0, numberOfGamesPlayed = 0, numberOfEcoLines = 0;
 	sqlite3 * db = NULL;
 	struct EcoLine * ecoLines[MAX_NUMBER_OF_ECO_LINES];
 
 	gameNumber = 0;
+	init_magic_bitboards();
 	
 	FILE * file = fopen(fileName, "r");
 	if (!file) {
@@ -1569,6 +1615,8 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 		initGameCtx[t]->threadNumber = t;
 		initGameCtx[t]->minElo = minElo;
 		initGameCtx[t]->maxEloDiff = maxEloDiff;
+		initGameCtx[t]->minMoves = minMoves;
+		initGameCtx[t]->numberOfGames = games;
 		initGameCtx[t]->numberOfEcoLines = numberOfEcoLines;
 		initGameCtx[t]->ecoLines = (struct EcoLine **)ecoLines;
 		initGameCtx[t]->updateDb = updateDb;
@@ -1742,6 +1790,7 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 	  }
 	  closeDb(db);
   }
+	cleanup_magic_bitboards();
 	if (res) return res;
 	return numberOfGamesPlayed;
 }
@@ -1752,11 +1801,12 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 /// It saves time by begin playing games one by one from the start of a file
 /// eliminating the need to index games in the file first, which is time consuming
 ///</summary>
-unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset) {
+unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset) {
 	int res = 0, numberOfGamesPlayed = 0, numberOfEcoLines = 0;;
 	struct EcoLine * ecoLines[MAX_NUMBER_OF_ECO_LINES];
 	sqlite3 * db = NULL;
 	
+	init_magic_bitboards();
 	if (ecoFileName) {
 		numberOfEcoLines = initEcoLines(ecoFileName, (struct EcoLine **)ecoLines);
 		if (!numberOfEcoLines) {
@@ -1876,6 +1926,8 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 		initGameCtx[t]->threadNumber = t;
 		initGameCtx[t]->minElo = minElo;
 		initGameCtx[t]->maxEloDiff = maxEloDiff;
+		initGameCtx[t]->minMoves = minMoves;
+		initGameCtx[t]->numberOfGames = numberOfGames;
 		initGameCtx[t]->numberOfEcoLines = numberOfEcoLines;
 		initGameCtx[t]->ecoLines = (struct EcoLine **)ecoLines;		
 		initGameCtx[t]->updateDb = updateDb;
@@ -1999,7 +2051,6 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 		free(initGameCtx[t]->initGameResult);
 		free(initGameCtx[t]);
 	}
-	
 	if (updateDb) {
 		if ((res = pthread_create(&(sql_thread_id[sqlThreads]), &attr, &sqlWriterGames, NULL) != 0)) {
 			printf("openGamesFromPGNfiles(): pthread_create(sqlWriterGames) returned %d\n", res);
@@ -2053,6 +2104,7 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	  }
 	  closeDb(db);
   }
+	cleanup_magic_bitboards();
 	if (res) return res;
 	return numberOfGamesPlayed;
 }

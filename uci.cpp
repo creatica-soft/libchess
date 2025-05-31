@@ -9,7 +9,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include "chess_cnn.h"
+#include "chess_cnn4.h"
 #include <torch/torch.h>
 #include <torch/script.h>
 #include <torch/serialize.h>
@@ -29,12 +29,14 @@
 #include "libchess.h"
 
 #define TB_MAX_PIECES 5
-#define TB_PATH "/Users/ap/syzygy"
+//#define TB_PATH "/Users/ap/syzygy" //this is now handled via uci "setoption name SyzygyPath value ...""
 
 torch::Device device(torch::kCPU);
 ChessCNN model;
 volatile int stopFlag = 0;
 int logfile;
+struct Engine engine;
+bool tb_init_done = false;
 
 extern "C" {  
   //UCI protocol in uci.c
@@ -43,6 +45,7 @@ extern "C" {
   void handleIsReady(void);
   void handleNewGame(struct Fen * fen, struct Board * board, struct ZobristHash * zh);
   int handlePosition(struct Fen * fen, struct Board * board, struct ZobristHash * zh, char * command);
+  int handleOption(char * command);
   void handleGo(struct Board * board, char * command);
   void handleStop(struct Board * board);
   void handleQuit(void);
@@ -54,8 +57,8 @@ extern "C" {
   
   void uciLoop(struct Fen *fen, struct Board *board, struct ZobristHash *zh) {
       char line[2048];
-      printf("id name Creatica Chess Engine 1.0\n");
-      dprintf(logfile, "id name Creatica Chess Engine 1.0\n");
+      printf("id name %s\n", engine.id);
+      dprintf(logfile, "id name %s\n", engine.id);
       while (1) {
           if (fgets(line, sizeof(line), stdin) == NULL) {
               dprintf(logfile, "uciloop() error: fgets() returned NULL\n");
@@ -68,6 +71,10 @@ extern "C" {
               dprintf(logfile, "uci\n");
               handleUCI();
           }
+          else if (strncmp(line, "setoption", 9) == 0) {
+              dprintf(logfile, "%s\n", line);
+              handleOption(line);
+          }
           else if (strncmp(line, "isready", 7) == 0) {
               dprintf(logfile, "isready\n");
               handleIsReady();
@@ -77,9 +84,11 @@ extern "C" {
               handleNewGame(fen, board, zh);
           }
           else if (strncmp(line, "position", 8) == 0) {
+              dprintf(logfile, "%s\n", line);
               handlePosition(fen, board, zh, line);
           }
           else if (strncmp(line, "go", 2) == 0) {
+              dprintf(logfile, "%s\n", line);
               handleGo(board, line);
           }
           else if (strncmp(line, "stop", 4) == 0) {
@@ -96,12 +105,37 @@ extern "C" {
   }
   
   void handleUCI(void) {
-      printf("id name Creatica Chess Engine 1.0\n");
-      dprintf(logfile, "id name Creatica Chess Engine 1.0\n");
-      printf("id author Creatica\n");
-      dprintf(logfile, "id author Creatica\n");
+      printf("id name %s\n", engine.id);
+      dprintf(logfile, "id name %s\n", engine.id);
+      printf("id author %s\n\n", engine.authors);
+      dprintf(logfile, "id author %s\n\n", engine.authors);
+      printf("option name %s type string default %s\n", engine.optionString[0].name, engine.optionString[0].defaultValue);
+      dprintf(logfile, "option name %s type string default %s\n", engine.optionString[0].name, engine.optionString[0].defaultValue);
       printf("uciok\n");
       dprintf(logfile, "uciok\n");
+  }
+  
+  int handleOption(char * command) {
+    char * token = strtok(command, " ");
+    if (strncmp(token, "setoption", 9) != 0) return -1;
+    token = strtok(NULL, " ");
+    if (strncmp(token, "name", 4) == 0) {
+      token = strtok(NULL, " ");
+      if (strncmp(token, "SyzygyPath", 10) == 0) {
+        token = strtok(NULL, " ");
+        if (strncmp(token, "value", 5) == 0) {
+          token = strtok(NULL, " ");
+          if (token != NULL) {
+            strncpy(engine.optionString[0].value, token, MAX_UCI_OPTION_STRING_LEN);
+            if (!tb_init_done) {
+              tb_init(engine.optionString[0].value);
+              tb_init_done = true;
+            }
+          }
+        }
+      }    
+    }
+    return 0;
   }
   
   void handleIsReady(void) {
@@ -120,7 +154,6 @@ extern "C" {
       char *token;
       char tempFen[MAX_FEN_STRING_LEN];
       struct Move move;
-      dprintf(logfile, "%s\n", command);
       token = strtok(command, " ");
       if (strncmp(token, "position", 8) != 0) {
           return -1;
@@ -202,54 +235,53 @@ extern "C" {
   
   void handleGo(struct Board * board, char * command) {
       char *token;
-      int wtime = 0, btime = 0, winc = 0, binc = 0, movestogo = 0;
-      int movetime = 0, infinite = 0;
+      //int wtime = 0, btime = 0, winc = 0, binc = 0, movestogo = 0;
+      //int movetime = 0, infinite = 0;
       double timeAllocated = 0.0;
       char uciMove[6] = "";
-      dprintf(logfile, "%s\n", command);
       clock_t start_time = clock();
       
       token = strtok(command, " ");
       while ((token = strtok(NULL, " ")) != NULL) {
           if (strcmp(token, "wtime") == 0) {
               token = strtok(NULL, " ");
-              wtime = atoi(token);
+              engine.wtime = atoi(token);
           }
           else if (strcmp(token, "btime") == 0) {
               token = strtok(NULL, " ");
-              btime = atoi(token);
+              engine.btime = atoi(token);
           }
           else if (strcmp(token, "winc") == 0) {
               token = strtok(NULL, " ");
-              winc = atoi(token);
+              engine.winc = atoi(token);
           }
           else if (strcmp(token, "binc") == 0) {
               token = strtok(NULL, " ");
-              binc = atoi(token);
+              engine.binc = atoi(token);
           }
           else if (strcmp(token, "movestogo") == 0) {
               token = strtok(NULL, " ");
-              movestogo = atoi(token);
+              engine.movestogo = atoi(token);
           }
           else if (strcmp(token, "movetime") == 0) {
               token = strtok(NULL, " ");
-              movetime = atoi(token);
+              engine.movetime = atoi(token);
           }
           else if (strcmp(token, "infinite") == 0) {
-              infinite = 1;
+              engine.infinite = true;
           }
       }
   
-      if (movetime > 0) {
-          timeAllocated = movetime * 0.95;
+      if (engine.movetime > 0) {
+          timeAllocated = engine.movetime * 0.95;
       }
       else if (infinite) {
           timeAllocated = 1e9;
       }
       else {
-          int remainingTime = board->fen->sideToMove == ColorWhite ? wtime : btime;
-          int increment = board->fen->sideToMove == ColorWhite ? winc : binc;
-          int movesLeft = movestogo ? movestogo : MIN_MOVES_REMAINING;
+          int remainingTime = board->fen->sideToMove == ColorWhite ? engine.wtime : engine.btime;
+          int increment = board->fen->sideToMove == ColorWhite ? engine.winc : engine.binc;
+          int movesLeft = engine.movestogo ? engine.movestogo : MIN_MOVES_REMAINING;
           if (strstr(board->fen->fenString, "rnbqkbnr") != NULL) {
               movesLeft = MAX_MOVES_REMAINING;
           }
@@ -380,7 +412,7 @@ extern "C" {
 }
 
 int main(int argc, char **argv) {
-    const std::string weights_file = "chessCNN4.pt";
+    const std::string weights_file = "chessCNN6.pt";
     struct Fen fen;
     struct Board board;
     struct ZobristHash zh;
@@ -388,7 +420,7 @@ int main(int argc, char **argv) {
     logfile = open("uci.log", O_RDWR | O_APPEND | O_CREAT | O_TRUNC);
     fchmod(logfile, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     init_magic_bitboards();
-    tb_init(TB_PATH);
+    //tb_init(TB_PATH);
     if (TB_LARGEST == 0) {
         fprintf(stderr, "error: unable to initialize tablebase; no tablebase files found\n");
         exit(-1);
@@ -457,6 +489,16 @@ int main(int argc, char **argv) {
     }
             
     model->to(device);
+
+    strcpy(engine.id, "Creatica Chess Engine 1.0");
+    strcpy(engine.authors, "Creatica");
+    engine.numberOfCheckOptions = 0;
+	  engine.numberOfComboOptions = 0;
+	  engine.numberOfSpinOptions = 0;
+		engine.numberOfStringOptions = 1;
+		engine.numberOfButtonOptions = 0;
+	  strcpy(engine.optionString[0].name, "SyzygyPath");
+	  strcpy(engine.optionString[0].defaultValue, "<empty>");
 
     uciLoop(&fen, &board, &zh);
 exit:
