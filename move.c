@@ -58,7 +58,7 @@ bool parseUciMove(char * move) {
 	return false;
 }
 
-__attribute__((no_sanitize("address")))
+//__attribute__((no_sanitize("address")))
 int validateSanMove(struct Move * move) {
 	if (strcmp(move->sanMove, "--") == 0) {
 		move->type = MoveTypeNull | MoveTypeValid;
@@ -200,7 +200,9 @@ int validateSanMove(struct Move * move) {
 			//detect EnPassant move
 			enum Ranks dstRanks[] = { Rank4, Rank5 };
 			enum Ranks srcRanks[] = { Rank2, Rank7 };
-			enum SquareName srcSquare = (srcRanks[move->chessBoard->fen->sideToMove] << 3) + srcFile;
+			enum SquareName srcSquare = (srcRanks[move->chessBoard->fen->sideToMove] << 3) | srcFile;
+			struct Square srcSq;
+			square(&srcSq, srcSquare);
 			if (move->destinationSquare.rank == dstRanks[move->chessBoard->fen->sideToMove]) {
 				if ((move->chessBoard->movesFromSquares[srcSquare] & move->destinationSquare.bitSquare) > 0) {
 					struct Square oppositePawnSquare;
@@ -211,7 +213,7 @@ int validateSanMove(struct Move * move) {
 					while (oppositePawnSquare.name < SquareNone) {
 						if (oppositePawnSquare.rank == dstRanks[move->chessBoard->fen->sideToMove] && ((oppositePawnSquare.file == srcFile + 1 && srcFile < FileH) || (oppositePawnSquare.file == srcFile - 1 && srcFile > FileA))) {
 							move->type |= (MoveTypeValid | MoveTypeEnPassant);
-							memcpy(&(move->sourceSquare), &srcSquare, sizeof(struct Square));
+							memcpy(&(move->sourceSquare), &srcSq, sizeof(struct Square));
 							square(&(move->chessBoard->movingPiece.square), move->sourceSquare.name);
 							break;
 						}
