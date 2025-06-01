@@ -571,7 +571,7 @@ void genEndGame(int pieceMaxNumber, struct Board * board, enum Color sideToMove,
   pieces[0] = '\0';
   for (int i = 0; i < pieceNumber + 2; i++) {
   	strncat(pieces, pieceName[pn[i]], strlen(pieceName[pn[i]]));
-  	if (i != pieceNumber + 1) strncat(pieces, ", ", 2);
+  	if (i != pieceNumber + 1) strcat(pieces, ", ");
   }
   printf("genEndGame(%u): number of pieces %d: %s\n", threadId, pieceNumber + 2, pieces);
   generateEndGame(pn, pieceNumber + 2, sideToMove, castlingRights, enPassant, board);
@@ -1932,7 +1932,8 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 		initGameCtx[t]->ecoLines = (struct EcoLine **)ecoLines;		
 		initGameCtx[t]->updateDb = updateDb;
 		initGameCtx[t]->createDataset = createDataset;
-		strncpy(initGameCtx[t]->dataset, dataset, 255);
+		if (dataset)
+		  strncpy(initGameCtx[t]->dataset, dataset, 255);
 		initGameCtx[t]->db = db;
 		initGameCtx[t]->sqlThreads = sqlThreads;
 		initGameCtx[t]->initGameResult = malloc(sizeof(int));
