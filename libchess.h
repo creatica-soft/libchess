@@ -3,6 +3,8 @@
 /// cc -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt/anaconda3/lib -I /opt/anaconda3/include -L/opt/anaconda3/lib -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves.c
 /// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
 /// use -g for debugging with lldb instead of -O3 (lldb ./test, then run, then bt)
+/// To compile on alpine linux, run:
+/// gcc -O3 -fopenmp -fPIC -I /usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include -shared -Wl,-rpath,/home/apoliakevitch/libchess -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves6.c -lgomp -lsqlite3
 /// To build python bindings, use:
 /// conda install cffi
 /// cc -E libchess.h > libchess.ph
@@ -865,8 +867,8 @@ static const unsigned long bitStrings[841] = {
 #define MAX_NUMBER_OF_SQL_THREADS 8 //these threads just update NextMovesX.db, where X is thread number. 
                                     //Use power of 2, i.e. 1, 2, 4, 8. 8 is max!
 #define COMMIT_NEXT_MOVES_ROWS 5000000
-#define COMMIT_GAMES_ROWS 1000000
-#define MAX_SLEEP_COUNTER_FOR_SQLWRITER 3
+#define COMMIT_GAMES_ROWS 10
+#define MAX_SLEEP_COUNTER_FOR_SQLWRITER 16
 #define MAX_NUMBER_OF_GAMES 256000
 #define MAX_NUMBER_OF_ECO_LINES 2048
 #define MAX_NUMBER_OF_GAME_MOVES 1024
@@ -1736,7 +1738,8 @@ struct ZobristHash {
 struct MoveScoreGames {
   char move[6]; //uci move
   int score; //position score, i.e. sum of wins and losses by making this move
-  unsigned int games; 
+  unsigned int games;
+  int scorecp; // evaluated by a chess engine but negative values meaning black winning, positive - white
 };
 
 struct MoveScores {
@@ -1955,7 +1958,7 @@ int eTags(EcoTag, FILE *);
 ///<summary>
 /// Plays multiple pgn games from a given pgn file
 ///</summary>
-unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset);
+unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV);
 
 ///<summary>
 /// This function is similar to playGames() with a difference that it takes a list of PGN
@@ -1965,7 +1968,7 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 /// The first arg is an array of file names, the second arg is the number of of files in this array
 /// The rest are the same as in pgnGames()
 ///</summary>
-unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int numberOfGames, int maxEloDiff, int minMoves, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset);
+unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int numberOfGames, int maxEloDiff, int minMoves, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV);
 
 //functions for fast data loading in AI model training
 //int initGamesFromPGNs(char * fileNames[], int numberOfFiles, int minElo, int maxEloDiff);
