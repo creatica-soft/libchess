@@ -334,7 +334,7 @@ bool position(struct Engine * engine) {
 	else sprintf(line, "position startpos");
 	if (strlen(engine->moves) >= 4) { //min uci move length
 		strcat(line, " moves ");
-		strncat(line, engine->moves, sizeof line - strlen(line));
+		strncat(line, engine->moves, sizeof line - strlen(line) - 1);
 	}
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
@@ -363,6 +363,7 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 		if (strstr(line, "bestmove ") - line == 0) {
 			if (((sscanf(line, "bestmove %5s ponder %5s\n", eval[0]->bestmove, eval[0]->ponder) == 2) || (sscanf(line, "bestmove %5s\n", eval[0]->bestmove) == 1)) && strncmp(eval[0]->bestmove, "(none", 5) != 0) {
 				for (int i = 0; i < multiPV; i++) {
+					if (!prevLine[i]) break;
 					//printf("scanning prevLine[%d] %s with score cp\n", i, prevLine[i]);
 					if (sscanf(prevLine[i], "info depth %hhu seldepth %hhu multipv %hhu score cp %d nodes %lu nps %lu hashfull %hu tbhits %hhu time %lu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
   					//printf("scanning prevLine[%d] %s with score mate\n", i, prevLine[i]);
@@ -386,7 +387,7 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 						free(prevLine[i]);
 					  prevLine[i] = NULL;
 					}
-				}
+				} //end of for multiPV
 				//scorecp is given from the point of view of sideToMove, meaning
 				// negative scorecp is losing, positive - winning
 				if (strlen(engine->position) >= 25) {

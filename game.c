@@ -14,13 +14,13 @@
 #include "libchess.h"
 
 sqlite3 * openDb(const char *, int);
-void closeDb(sqlite3 *);
-int gameExists(sqlite3 *, sqlite3_int64);
-int insertGame(sqlite3 *, sqlite3_int64, char *);
-void updateNextMove(sqlite3 *, sqlite3_int64, const char *, int);
-int getNextMoves(sqlite3 *, sqlite3_int64, struct MoveScoreGames **);
+void closeDb(sqlite3 * db);
+int gameExists(sqlite3 * db, sqlite3_int64 md5hash);
+int insertGame(sqlite3 * db, sqlite3_int64 md5hash, char * moves);
+void updateNextMove(sqlite3 * db, sqlite3_int64 hash, const char * uci_move, int score, int scorecp);
+int getNextMoves(sqlite3 * db, sqlite3_int64 hash, struct MoveScoreGames **);
 struct GameHash {
-    uint8_t hash[8];    // Key: 8-byte half-MD5 hash used to filter identical games
+    unsigned long md5hash;    // Key: 8-byte half-MD5 hash used to filter identical games
     UT_hash_handle hh;  // Required for uthash
 };
 extern struct GameHash * games;
@@ -31,14 +31,7 @@ static pthread_mutex_t gameNumber_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t fileNumber_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t queueGames_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t ecoLines_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t queueMoves0_mutex;
-static pthread_mutex_t queueMoves1_mutex;
-static pthread_mutex_t queueMoves2_mutex;
-static pthread_mutex_t queueMoves3_mutex;
-static pthread_mutex_t queueMoves4_mutex;
-static pthread_mutex_t queueMoves5_mutex;
-static pthread_mutex_t queueMoves6_mutex;
-static pthread_mutex_t queueMoves7_mutex;
+static pthread_mutex_t queueMoves_mutex[8];
 struct GenEndGamesCtx {
   int threadId;
   int maxGameNumber;
@@ -70,6 +63,14 @@ struct InitGameFromPGNfileContext {
 	sqlite3 * db;
 	int sqlThreads;
 	int * initGameResult;
+	bool eval;
+	char engine[255];
+	long movetime;
+	int depth;
+	int hashSize;
+	int engineThreads;
+	char syzygyPath[255];
+	int multiPV;
 };
 struct InitGameFromPGNfilesContext {
   bool generateZobristHash;
@@ -88,10 +89,19 @@ struct InitGameFromPGNfilesContext {
 	sqlite3 * db;
 	int sqlThreads;
 	int * initGameResult;
+	bool eval;
+	char engine[255];
+	long movetime;
+	int depth;
+	int hashSize;
+	int engineThreads;
+	char syzygyPath[255];
+	int multiPV;
 };
 struct NodeMoves {
   unsigned long hash;
   char score;
+  int scorecp;
   char nextMove[6];
   struct NodeMoves * next;
 };
@@ -115,20 +125,14 @@ struct QueueGames {
   int len;
 };
 
-static struct QueueMoves * nextMoves0 = NULL;
-static struct QueueMoves * nextMoves1 = NULL;
-static struct QueueMoves * nextMoves2 = NULL;
-static struct QueueMoves * nextMoves3 = NULL;
-static struct QueueMoves * nextMoves4 = NULL;
-static struct QueueMoves * nextMoves5 = NULL;
-static struct QueueMoves * nextMoves6 = NULL;
-static struct QueueMoves * nextMoves7 = NULL;
+static struct QueueMoves * nextMovesQueue[8] = { NULL };
 
-void enqueueMoves(struct QueueMoves * queue, unsigned long hash, char * nextMove, char score) {
+void enqueueMoves(struct QueueMoves * queue, unsigned long hash, char * nextMove, char score, int scorecp) {
   if (queue == NULL) return;
   struct NodeMoves * node = (struct NodeMoves *)malloc(sizeof(struct NodeMoves));
   node->hash = hash;
   node->score = score;
+  node->scorecp = scorecp;
   strncpy(node->nextMove, nextMove, 6);
   node->next = NULL;
   if (queue->last == NULL)
@@ -590,7 +594,7 @@ int playEndGame(struct Engine * chessEngine, struct Board * board, struct Evalua
     nanosleep(&delay, NULL);
     timeout++;
   }
-  if (!newGame(chessEngine)) {
+  if (timeout >= 3) {
     printf("playEndGame() error: newGame() returned false, returning error 2 to a caller\n");
   	return 2;
   }
@@ -714,11 +718,11 @@ void * genEndGames(void * context) {
   while (*(ctx->genEndGamesResult) < ctx->maxGameNumber) {
     *(ctx->genEndGamesResult) += 1;
     struct Fen * fen;
-    fen = malloc(sizeof(struct Fen));
+    fen = calloc(1, sizeof(struct Fen));
     struct Board * board;
-    board = malloc(sizeof(struct Board));
+    board = calloc(1, sizeof(struct Board));
     board->fen = fen;
-    eval1 = malloc(sizeof(struct Evaluation));
+    eval1 = calloc(1, sizeof(struct Evaluation));
     eval1->maxPlies = 16;
     evals[0] = eval1;
     genEndGame(ctx->maxPieceNumber - 2, board, 2, CastlingRightsWhiteNoneBlackNone, FileNone, ctx->threadId);
@@ -833,8 +837,20 @@ int nextMoves(unsigned long hash, struct MoveScoreGames ** moves, int sqlThreads
   return numberOfMoves;
 }
 
-int compareScore(void * sideToMove, const void * a, const void * b) {
-    enum Color s = *((enum Color *)sideToMove);
+#ifdef __APPLE__ // macOS
+#define QSORT_R(base, nmemb, size, compar, arg) qsort_r(base, nmemb, size, arg, compar)
+#define COMPAR_TYPE void *thunk, const void *a, const void *b
+#else // glibc-style for Alpine
+#define QSORT_R(base, nmemb, size, compar, arg) qsort_r(base, nmemb, size, compar, arg)
+#define COMPAR_TYPE const void *a, const void *b, void *arg
+#endif
+
+int compareScore(COMPAR_TYPE) {
+#ifdef __APPLE__
+enum Color s = *((enum Color *)thunk);
+#else
+enum Color s = *((enum Color *)arg);
+#endif
     struct MoveScores * s1 = (struct MoveScores *)a;
     struct MoveScores * s2 = (struct MoveScores *)b;
     if (s == ColorWhite) {
@@ -864,7 +880,7 @@ int bestMoves(unsigned long hash, enum Color sideToMove, struct MoveScores * mov
   }
   //sort the moves from the one with the highest weighted score to the lowest for whites and
   //lowest to highest for blacks
-  qsort_r(moves, nextMovesNumber, sizeof(struct MoveScores), &sideToMove, compareScore);
+  QSORT_R(moves, nextMovesNumber, sizeof(struct MoveScores), compareScore, &sideToMove);
   return nextMovesNumber;
 }
 
@@ -914,7 +930,7 @@ int playGame(struct Game * game) {
 ///<summary>
 /// Plays a given game using Game struct plus do other things
 ///</summary>
-int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, bool createDataset, FILE * dataset, int threadId, int sqlThreads) {
+int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, bool createDataset, FILE * dataset, int threadId, int sqlThreads, struct Engine * chessEngine) {
 	struct Move move;
 	struct Board board;
 	struct ZobristHash zh;//, zh2;
@@ -923,7 +939,18 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 	unsigned long hashCache[MAX_NUMBER_OF_GAME_MOVES];
 	char uciMoveCache[MAX_NUMBER_OF_GAME_MOVES][6];
 	char fenStringCache[MAX_NUMBER_OF_GAME_MOVES][MAX_FEN_STRING_LEN];
-
+  unsigned char q = 0;
+  int t = 0, idx = 0, multiPV = 1;
+  struct Evaluation * evaluation = NULL;
+  struct Evaluation * evaluations[8] = { NULL };
+  if (updateDb && sqlThreads > 0) {
+  	t = __builtin_ctzl(sqlThreads);
+  	if (t > 4) {
+  	  printf("playGameExt(%d) error: only 1, 2, 4 and 8 sql threads are supported, provided %d\n", threadId, sqlThreads);
+    	exit(1);
+  	}
+  	t = 65 - t;
+  }
 	struct Fen fen;
 	char * fenString;
 	if (game->tags[FEN][0] == '\0') fenString = startPos;
@@ -936,7 +963,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 		printf("playGameExt(%d) error: fentoboard() failed; FEN %s\n", threadId, fen.fenString);
 		return 1;
 	}
-
+  
   if (strcmp(game->tags[Result], "1-0") == 0) gameResult = 1;
   else if (strcmp(game->tags[Result], "0-1") == 0) gameResult = -1;
 	
@@ -952,13 +979,71 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 		//for (int i = 0; i < bestMovesNumber; i++)
 		//	printf("%s %.8f %s\n", moves[i]->move, moves[i]->score, color[board.fen->sideToMove]);
 	}
-	
+
+  if (chessEngine && updateDb) {
+    idx = nametoindex(chessEngine, "MultiPV", Spin);
+    multiPV = chessEngine->optionSpin[idx].value;
+    if (multiPV > 8) {
+      printf("playGameExt() error: multiPV must be less than 8\n");
+      exit(1);      
+    }
+    for (int i = 0; i < multiPV; i++) {
+      evaluation = calloc(1, sizeof(struct Evaluation));
+      evaluation->maxPlies = 16;
+      evaluations[i] = evaluation;
+    }
+    int timeout = 0;
+    struct timespec delay;
+    delay.tv_sec = 1;
+    delay.tv_nsec = 0;
+
+    while (!newGame(chessEngine) && timeout < 3) {
+      printf("playGameExt() warning: newGame() returned false\n");
+      nanosleep(&delay, NULL);
+      timeout++;
+    }
+    if (timeout >= 3) {
+      printf("playGameExt() error: newGame() returned false, returning error 2 to a caller\n");
+    	return 2;
+    }
+    strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
+    //printf("playGameExt(%d): calling position first time...()\n", threadId);
+    position(chessEngine);
+    //printf("playGameExt(%d): calling go first time...()\n", threadId);
+    go(chessEngine, evaluations);
+    if (evaluations[0]->bestmove[0] == '\0' || strcmp(evaluations[0]->bestmove, "(none") == 0) {
+      printf("playGameExt() error: best move is blank or (none)\n");
+      return 2;
+    }
+    if (evaluations[0]->nag == 18 || evaluations[0]->nag == 20) gameResult = 1;
+    else if (evaluations[0]->nag == 19 || evaluations[0]->nag == 21) gameResult = -1;
+    else gameResult = 0;
+    
+    q = board.hash >> t;
+    for (int i = 0; i < multiPV; i++) {
+      if (i > 0) {
+        if (abs(evaluations[i]->scorecp - evaluations[0]->scorecp) > MISTAKE) break;
+        char * ptr = NULL;
+  	    char * move = strtok_r(evaluations[i]->pv, " ", &ptr);
+  	    if (move) {
+          pthread_mutex_lock(&(queueMoves_mutex[q]));
+      	  enqueueMoves(nextMovesQueue[q], board.hash, move, gameResult, board.fen->sideToMove == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+      	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
+    	  }
+  	  } else {
+    	    pthread_mutex_lock(&(queueMoves_mutex[q]));
+      	  enqueueMoves(nextMovesQueue[q], board.hash, evaluations[i]->bestmove, gameResult, board.fen->sideToMove == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+      	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
+  	  }
+	  }
+  }
+  	
 	char * sanMoves = strndup(game->sanMoves, strlen(game->sanMoves));
 	if (!sanMoves) {
 		printf("playGameExt(%d) error: strndup() returned NULL: %s. sanMoves %s\n", threadId, strerror(errno), game->sanMoves);
 		return errno;
 	}
-	char * saveptr;
+	char * saveptr = NULL;
 	char * token = strtok_r(sanMoves, " ", &saveptr);
 	while (token) {
 		if (initMove(&move, &board, token)) {
@@ -966,7 +1051,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 			free(sanMoves);
 			return 1;
 		}
-		if (updateDb) {
+		if (updateDb && !chessEngine) {
     	//store the hash and uciMove in the cache to correct gameResult in NextMoves.db
     	//if it happens to be wrong in pgn file
 
@@ -1017,86 +1102,79 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 				free(sanMoves);
 				return 1;
 			}
+      q = board.hash >> t;
 		}
 		if (board.isStaleMate && strcmp(game->tags[Result], "1/2-1/2") != 0) {
 			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '1/2-1/2' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
 			strcpy(game->tags[Result], "1/2-1/2");
 			gameResult = 0;
+			if (chessEngine && updateDb) {
+        pthread_mutex_lock(&(queueMoves_mutex[q]));
+      	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, 0);
+      	pthread_mutex_unlock(&(queueMoves_mutex[q]));
+    	}
+			break;
 		}
 		else if (board.isMate && board.movingPiece.color == ColorWhite && strcmp(game->tags[Result], "1-0") != 0) {
 			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '1-0' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
 			strcpy(game->tags[Result], "1-0");
 			gameResult = 1;
+			if (chessEngine && updateDb) {
+        pthread_mutex_lock(&(queueMoves_mutex[q]));
+      	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, MATE_SCORE);
+      	pthread_mutex_unlock(&(queueMoves_mutex[q]));
+    	}
+			break;
 		}
 		else if (board.isMate && board.movingPiece.color == ColorBlack && strcmp(game->tags[Result], "0-1") != 0) {
 			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '0-1' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
 			strcpy(game->tags[Result], "0-1");
 			gameResult = -1;
+			if (chessEngine && updateDb) {
+        pthread_mutex_lock(&(queueMoves_mutex[q]));
+      	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, -MATE_SCORE);
+      	pthread_mutex_unlock(&(queueMoves_mutex[q]));
+    	}
+			break;
+		} 
+		if (chessEngine && updateDb) {
+      strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
+      //printf("playGameExt(%d): calling position...()\n", threadId);
+      position(chessEngine);
+      //printf("playGameExt(%d): calling go...()\n", threadId);
+      go(chessEngine, evaluations);
+      if (evaluations[0]->bestmove[0] == '\0' || strcmp(evaluations[0]->bestmove, "(none") == 0) {
+        printf("playGameExt() error: best move is blank or (none)\n");
+        return 2;
+      }
+      if (evaluations[0]->nag == 18 || evaluations[0]->nag == 20) gameResult = 1;
+      else if (evaluations[0]->nag == 19 || evaluations[0]->nag == 21) gameResult = -1;
+      else gameResult = 0;
+      for (int i = 0; i < multiPV; i++) {
+        if (i > 0) {
+          if (abs(evaluations[i]->scorecp - evaluations[0]->scorecp) > MISTAKE) break;
+          char * ptr = NULL;
+    	    char * move = strtok_r(evaluations[i]->pv, " ", &ptr);
+    	    if (move) {
+            pthread_mutex_lock(&(queueMoves_mutex[q]));
+        	  enqueueMoves(nextMovesQueue[q], board.hash, move, gameResult, board.movingPiece.color == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+        	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
+      	  }
+    	  } else {
+      	    pthread_mutex_lock(&(queueMoves_mutex[q]));
+        	  enqueueMoves(nextMovesQueue[q], board.hash, evaluations[i]->bestmove, gameResult, board.movingPiece.color == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+        	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
+    	  }
+  	  }
 		}
 		token = strtok_r(NULL, " ", &saveptr);
 	}
-	if (updateDb) {
-    struct QueueMoves * queue = NULL;
-    unsigned char q = 0;
+	if (updateDb && !chessEngine) {
 		for (int i = 0; i < hashIndex; i++) {
-    	switch (sqlThreads) {
-    		case 1:
-    			q = 0; 
-    		  break;
-    		case 2:
-    			q = hashCache[i] >> 63;
-    		  break;
-    		case 4: 
-    			q = hashCache[i] >> 62;
-    		  break;
-    		case 8: 
-    			q = hashCache[i] >> 61;
-    		  break;
-    		default:
-    			printf("playGameExt(%d) error: only 1, 2, 4 and 8 sql threads are supported, provided %d\n", threadId, sqlThreads);
-    			exit(1);
-    	}
-      pthread_mutex_t * mutex = NULL;
-			switch (q) {
-				case 0:
-    		  queue = nextMoves0;
-    		  mutex = &queueMoves0_mutex;
-					break;
-				case 1:
-    		  queue = nextMoves1;
-    		  mutex = &queueMoves1_mutex;
-					break;
-				case 2:
-    		  queue = nextMoves2;
-    		  mutex = &queueMoves2_mutex;
-					break;
-				case 3:
-    		  queue = nextMoves3;
-    		  mutex = &queueMoves3_mutex;
-					break;
-				case 4:
-    		  queue = nextMoves4;
-    		  mutex = &queueMoves4_mutex;
-					break;
-				case 5:
-    		  queue = nextMoves5;
-    		  mutex = &queueMoves5_mutex;
-					break;
-				case 6:
-    		  queue = nextMoves6;
-    		  mutex = &queueMoves6_mutex;
-					break;
-				case 7:
-    		  queue = nextMoves7;
-    		  mutex = &queueMoves7_mutex;
-					break;
-				default:
-					printf("playGameExt(%d): unknown queue\n", threadId);
-					exit(1);
-      }
-    	pthread_mutex_lock(mutex);
-		  enqueueMoves(queue, hashCache[i], uciMoveCache[i], gameResult);
-		  pthread_mutex_unlock(mutex);
+		  q = hashCache[i] >> t;
+    	pthread_mutex_lock(&(queueMoves_mutex[q]));
+		  enqueueMoves(nextMovesQueue[q], hashCache[i], uciMoveCache[i], gameResult, 0);
+		  pthread_mutex_unlock(&(queueMoves_mutex[q]));
 		}
 	}
 	if (createDataset && dataset) {
@@ -1110,6 +1188,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
   		printf("playGameExt(%d) error: strndup() returned NULL: %s. sanMoves %s\n", threadId, strerror(errno), game->sanMoves);
   		return errno;
   	}
+  	saveptr = NULL;
   	token = strtok_r(sanMoves, " ", &saveptr);
   	int moveNumber = 1;
   	bool whiteMove = true;
@@ -1127,6 +1206,13 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
     fprintf(dataset, "%s\n\n", game->tags[Result]);    
 	}
 	free(sanMoves);
+	if (chessEngine) {
+	  for (int i = 0; i < multiPV; i++) {
+	    if (evaluation) free(evaluation);
+	    evaluation = NULL;
+      evaluations[i] = NULL;
+    }
+	}
 	return 0;
 }
 
@@ -1167,30 +1253,30 @@ int initGame(struct Game * game, FILE * file) {
 	return 0;
 }
 
-int initGameFromPGNFile(FILE * file, int minElo, int maxEloDiff, int minMoves, bool updateDb, sqlite3 * db, int numberOfEcoLines, struct EcoLine ** ecoLines, bool generateZobristHash, bool createDataset, FILE * dataset, int threadId, int sqlThreads) {
+int initGameFromPGNFile(FILE * file, int minElo, int maxEloDiff, int minMoves, bool updateDb, sqlite3 * db, int numberOfEcoLines, struct EcoLine ** ecoLines, bool generateZobristHash, bool createDataset, FILE * dataset, int threadId, int sqlThreads, struct Engine * chessEngine) {
   bool updateNextMoves = false;
   struct Game game;
   
-  if (initGame(&game, file)) return 1;
+  if (initGame(&game, file)) return 1; //eof
 
 	if (minElo > atoi(game.tags[WhiteElo]) || minElo > atoi(game.tags[BlackElo]) || maxEloDiff < abs(atoi(game.tags[WhiteElo]) - atoi(game.tags[BlackElo])) || minMoves * 2 > game.numberOfPlies - 1) {
-		return 2;
+		return 3; //not an error
   }
  
   if (updateDb) {
     //generate md5 128-bit hash of game.sanMoves, split it in half
     //and XOR both halfs resulting in 64-bit unsigned int used for game de-duplication
-    unsigned long hash = md5(game.sanMoves);			  	   
+    unsigned long md5hash = md5(game.sanMoves);			  	   
     pthread_mutex_lock(&queueGames_mutex);
     struct GameHash * entry = NULL;
-    HASH_FIND(hh, games, (void *)(&hash), 8, entry);
-    if (entry || gameExists(db, hash)) {
+    HASH_FIND(hh, games, (void *)(&md5hash), 8, entry);
+    if (entry || gameExists(db, md5hash)) {
       updateNextMoves = false;
     }
     else { 
       entry = malloc(sizeof(struct GameHash));
-      memcpy(entry->hash, (void *)(&hash), 8);
-      HASH_ADD(hh, games, hash, 8, entry);
+      entry->md5hash = md5hash;
+      HASH_ADD(hh, games, md5hash, 8, entry);
       updateNextMoves = true;
     }
  		pthread_mutex_unlock(&queueGames_mutex);
@@ -1208,11 +1294,10 @@ int initGameFromPGNFile(FILE * file, int minElo, int maxEloDiff, int minMoves, b
 		  ecoClassify(&game, ecoLines, numberOfEcoLines);
 		  //printf("ECO %s\nOpening %s\nVariation %s\n", game.tags[ECO], game.tags[Opening], game.tags[Variation]);
 	}
-	if (playGameExt(&game, generateZobristHash, updateNextMoves, createDataset, dataset, threadId, sqlThreads)) {
+	int res = 0;
+	if ((res = playGameExt(&game, generateZobristHash, updateNextMoves, createDataset, dataset, threadId, sqlThreads, chessEngine)))
 		printf("initGameFromPGNFile(%d) error: playGameExt() returned non-zero result\n", threadId);
-		return -1;
-	}
-	return 0;
+	return res;
 }
 
 void * initGamesFromPGNfile(void * context) {
@@ -1223,10 +1308,11 @@ void * initGamesFromPGNfile(void * context) {
   
 	FILE * file = fopen((char *)ctx->fileName, "r");
 	if (!file) {
-		printf("initGamesFromPGNfile(%d) error: failed to open a file %s, %s\n", ctx->threadNumber, (char *)ctx->fileName, strerror(errno));
+		printf("initGamesFromPGNfile(%d) error: failed to open file %s, %s\n", ctx->threadNumber, (char *)ctx->fileName, strerror(errno));
 		*(ctx->initGameResult) = -1;
 		return ctx->initGameResult;
 	}
+	printf("initGamesFromPGNfile(%d): opened file %s\n", ctx->threadNumber, (char *)ctx->fileName);
 	if (ctx->createDataset) {
 		char filename[255];
 		sprintf(filename, "%s%d.pgn", ctx->dataset, ctx->threadNumber);
@@ -1237,6 +1323,12 @@ void * initGamesFromPGNfile(void * context) {
 			return ctx->initGameResult;
 		}
 	}
+  
+	struct Engine * chessEngine = NULL;
+  if (ctx->eval) {
+    chessEngine = initChessEngine(ctx->engine, ctx->movetime, ctx->depth, ctx->hashSize, ctx->engineThreads, ctx->syzygyPath, ctx->multiPV);
+    printf("initGamesFromPGNfile(%d): chessEngine %s, %s\n", ctx->threadNumber, chessEngine->id, chessEngine->engineName);
+  }
 
 	*(ctx->initGameResult) = 0;
 
@@ -1246,7 +1338,7 @@ void * initGamesFromPGNfile(void * context) {
 		pthread_mutex_unlock(&gameNumber_mutex);
 		if (gNumber >= numberOfGames) break;
 		fseek(file, gameStartPositions[gNumber], SEEK_SET);
-		res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->minMoves, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads);
+		res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->minMoves, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads, chessEngine);
 		if (res < 0) {
 	    printf("initGamesFromPGNfile(%d) exited with the result %d, file %s\n", ctx->threadNumber, res, ctx->fileName);
 		  *(ctx->initGameResult) = -1;
@@ -1257,16 +1349,25 @@ void * initGamesFromPGNfile(void * context) {
 	  	break;
 	  }
 	  else if (res == 2) {
+      printf("initGamesFromPGNfile(%d) warning: restarting chess engine %s...\n", ctx->threadNumber, ctx->engine);
+      quit(chessEngine);
+      free(chessEngine);
+      chessEngine = initChessEngine(ctx->engine, ctx->movetime, ctx->depth, ctx->hashSize, ctx->threadNumber, ctx->syzygyPath, ctx->multiPV);
+      printf("initGamesFromPGNfile(%d): chessEngine %s %s\n", ctx->threadNumber, chessEngine->id, chessEngine->engineName);
+      continue;	    
+	  }
+	  else if (res == 3) {
 	  	continue;
 	  }
     else {
       *(ctx->initGameResult) += 1;
+      printf("initGamesFromPGNfile(%d): finished game %u\n", ctx->threadNumber, *(ctx->initGameResult));
       if (*(ctx->initGameResult) >= ctx->numberOfGames) break;
     }
 	}
 	fclose(file);
 	if (ctx->createDataset) fclose(dataset);
-
+  if (chessEngine) free(chessEngine);
 	return ctx->initGameResult;
 }
 
@@ -1287,7 +1388,11 @@ void * initGamesFromPGNfiles(void * context) {
 			return ctx->initGameResult;
 		}
 	}
-
+	struct Engine * chessEngine = NULL;
+  if (ctx->eval) {
+    chessEngine = initChessEngine(ctx->engine, ctx->movetime, ctx->depth, ctx->hashSize, ctx->engineThreads, ctx->syzygyPath, ctx->multiPV);
+    printf("initGamesFromPGNfiles(%d): chessEngine %s, %s\n", ctx->threadNumber, chessEngine->id, chessEngine->engineName);
+  }
 	while (true) {
 		pthread_mutex_lock(&fileNumber_mutex);
 		fNumber = fileNumber++;
@@ -1296,12 +1401,13 @@ void * initGamesFromPGNfiles(void * context) {
 		
 		FILE * file = fopen(ctx->fileNames[fNumber], "r");
 		if (!file) {
-			printf("initGamesFromPGNfiles() error: failed to open a file %s, %s\n", ctx->fileNames[fNumber], strerror(errno));
+			printf("initGamesFromPGNfiles() error: failed to open file %s, %s\n", ctx->fileNames[fNumber], strerror(errno));
 			*(ctx->initGameResult) = -1;
 			return ctx->initGameResult;
 		}
+		printf("initGamesFromPGNfiles(): opened file %s\n", ctx->fileNames[fNumber]);
 		while (true) {
-			res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->minMoves, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads);
+			res = initGameFromPGNFile(file, ctx->minElo, ctx->maxEloDiff, ctx->minMoves, ctx->updateDb, ctx->db, ctx->numberOfEcoLines, ctx->ecoLines, ctx->generateZobristHash, ctx->createDataset, dataset, ctx->threadNumber, ctx->sqlThreads, chessEngine);
 			if (res < 0) {
 		    printf("initGameFromPGNFile(%d) exited with the result %d, file %s\n", ctx->threadNumber, res, ctx->fileNames[fNumber]);
 			  *(ctx->initGameResult) = -1;
@@ -1311,17 +1417,27 @@ void * initGamesFromPGNfiles(void * context) {
 	      printf("initGameFromPGNFile(%d): end of file %s\n", ctx->threadNumber, ctx->fileNames[fNumber]);
 		  	break;
 		  }
-		  else if (res == 2) {
-		    continue;
-		  }
-	    else {
-	      *(ctx->initGameResult) += 1;
-	      if (*(ctx->initGameResult) >= ctx->numberOfGames) break;
-	    }
+  	  else if (res == 2) {
+        printf("initGamesFromPGNfiles(%d) warning: restarting chess engine %s...\n", ctx->threadNumber, ctx->engine);
+        quit(chessEngine);
+        free(chessEngine);
+        chessEngine = initChessEngine(ctx->engine, ctx->movetime, ctx->depth, ctx->hashSize, ctx->threadNumber, ctx->syzygyPath, ctx->multiPV);
+        printf("initGamesFromPGNfiles(%d): chessEngine %s %s\n", ctx->threadNumber, chessEngine->id, chessEngine->engineName);
+        continue;	    
+  	  }
+  	  else if (res == 3) {
+  	  	continue;
+  	  }
+      else {
+        *(ctx->initGameResult) += 1;
+        printf("initGamesFromPGNfiles(%d): finished game %u\n", ctx->threadNumber, *(ctx->initGameResult));
+        if (*(ctx->initGameResult) >= ctx->numberOfGames) break;
+      }
 		}
   	fclose(file);
 	}
 	if (ctx->createDataset) fclose(dataset);
+	if (chessEngine) free(chessEngine);
 	return ctx->initGameResult;
 }
 
@@ -1332,7 +1448,8 @@ void * sqlWriterMoves(void * context) {
 
   unsigned long hash, rowNumber = 0, queueLen = 0;
   char nextMove[6];
-  char score;
+  char score = 0;
+  int scorecp = 0;
   char * errmsg = NULL;
   int sleepCounter = 0;
   struct SqlContext * ctx = NULL;
@@ -1346,7 +1463,7 @@ void * sqlWriterMoves(void * context) {
   char filename[15];
   sprintf(filename, "NextMoves%d.db", ctx->threadNumber);
   sqlite3 * db = openDb(filename, flags);
-  const char * sql = "create table if not exists next_moves (hash integer, next_move varchar(7), score int, games int, constraint hash_move primary key (hash, next_move) on conflict ignore) without rowid;";
+  const char * sql = "create table if not exists next_moves (hash integer, next_move varchar(7), score int, games int, scorecp int, constraint hash_move primary key (hash, next_move) on conflict ignore) without rowid;";
   int res = sqlite3_exec(db, sql, NULL, NULL, &errmsg);
   if (res != SQLITE_OK) {
      printf("sqlWriterMoves() error: sqlite3_exec(create table if not exists next_moves...) returns %d (%s): %s, ext err code %d \n", res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
@@ -1366,15 +1483,18 @@ void * sqlWriterMoves(void * context) {
   while(sleepCounter < MAX_SLEEP_COUNTER_FOR_SQLWRITER) {
     pthread_mutex_lock(ctx->mutex);
     queueLen = ctx->queue->len;
-    //printf("nextMoves len is %d\n", nextMoves->len);
+    //printf("nextMovesQueue len is %d\n", queueLen);
     if (queueLen > 0) {
       hash = ctx->queue->first->hash;
       score = ctx->queue->first->score;
+      scorecp = ctx->queue->first->scorecp;
     	strncpy(nextMove, ctx->queue->first->nextMove, 6);
 		  dequeueMoves(ctx->queue);
   		pthread_mutex_unlock(ctx->mutex);
   		rowNumber++;
-    } else {
+  		sleepCounter = 0;
+  		delay.tv_sec = 1;
+    } else { //queueLen == 0
   		pthread_mutex_unlock(ctx->mutex);
   		printf("sqlWriterMoves(%d): queue is empty. sleepCounter %d, delay %ld sec\n", ctx->threadNumber, sleepCounter, delay.tv_sec);
 	    if (rowNumber > 0) {
@@ -1394,16 +1514,16 @@ void * sqlWriterMoves(void * context) {
 			    sqlite3_close_v2(db);
 			    exit(1);
 			  }
-			} else {
-	    	delay.tv_sec += 1;
+			} else { //rowNumber == 0
+	    	delay.tv_sec *= 2;
 			  sleepCounter++;
 		  }
 			nanosleep(&delay, NULL);
 			continue;
-    }
-    updateNextMove(db, hash, nextMove, score);
+    } //end of else (queueLen == 0)
+    updateNextMove(db, hash, nextMove, score, scorecp);
     if (rowNumber >= COMMIT_NEXT_MOVES_ROWS) {
-    	printf("sqlWriterMoves(%d): committing %u rows to next_moves. Queue len %lu\n", ctx->threadNumber, COMMIT_NEXT_MOVES_ROWS, queueLen);
+    	printf("sqlWriterMoves(%d): committing %lu rows to next_moves. Queue len %lu\n", ctx->threadNumber, rowNumber, queueLen);
 		  res = sqlite3_exec(db, "commit transaction;", NULL, NULL, &errmsg);
 		  if (res != SQLITE_OK) {
 		    printf("sqlWriterMoves(%d) sqlite3_exec(commit transaction;) returns %d (%s): %s, ext err code %d\n", ctx->threadNumber, res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
@@ -1419,8 +1539,8 @@ void * sqlWriterMoves(void * context) {
 		    sqlite3_close_v2(db);
 		    exit(1);
 		  }
-		}
-  }
+		} //end of rowNumber >= COMMIT_NEXT_MOVES_ROWS
+  } //end of while(sleepCounter < MAX_SLEEP_COUNTER_FOR_SQLWRITER)
   res = sqlite3_exec(db, "commit transaction;", NULL, NULL, &errmsg);
   if (res != SQLITE_OK) {
     printf("sqlWriterMoves(%d) sqlite3_exec(commit transaction;) returns %d (%s): %s, ext err code %d\n", ctx->threadNumber, res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
@@ -1433,11 +1553,18 @@ void * sqlWriterMoves(void * context) {
 }
 
 void * sqlWriterGames(void * context) {
-  int res;
+	struct timespec delay;
+  delay.tv_sec = 1;
+  delay.tv_nsec = 0;
+  int res, sleepCounter = 0;
+  unsigned long rowNumber = 0, queueLen;
   char * errmsg = NULL;
   int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX;
   sqlite3 * db = openDb("Games.db", flags);
-  
+  if (!db) {
+    printf("sqlWriterGames() error: opebDb(Games.db) returned NULL\n");
+    exit(1);
+  }
   res = sqlite3_exec(db, "begin transaction;", NULL, NULL, &errmsg);
   if (res != SQLITE_OK) {
      printf("sqlWriterGames() error: sqlite3_exec(begin transaction;) returns %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
@@ -1445,18 +1572,71 @@ void * sqlWriterGames(void * context) {
      sqlite3_close_v2(db);
      exit(1);
   }
+  while (sleepCounter < MAX_SLEEP_COUNTER_FOR_SQLWRITER) {
+    unsigned int gamesCount;
+    pthread_mutex_lock(&queueGames_mutex);
+    gamesCount = HASH_COUNT(games);
+    pthread_mutex_unlock(&queueGames_mutex);
+    //printf("sqlWriterGames(): games in UTHASH: %u\n", games);
+    if (gamesCount > 0) {
+      pthread_mutex_lock(&queueGames_mutex);
+      struct GameHash * entry = NULL, * tmp = NULL;
+      HASH_ITER(hh, games, entry, tmp) {
+        insertGame(db, entry->md5hash, NULL);
+    		rowNumber++;
+        HASH_DEL(games, entry);
+        free(entry);
+      }
+      games = NULL;
+      pthread_mutex_unlock(&queueGames_mutex);
+  		sleepCounter = 0;
+  		delay.tv_sec = 1;
+    } else { //gamesCount == 0
+  		printf("sqlWriterGames(): Uthash is empty. sleepCounter %d, delay %ld sec\n", sleepCounter, delay.tv_sec);
+	    if (rowNumber > 0) {
+	    	printf("sqlWriterGames(): committing %lu rows to games. Uthash count %u\n", rowNumber, gamesCount);
+			  res = sqlite3_exec(db, "commit transaction;", NULL, NULL, &errmsg);
+			  if (res != SQLITE_OK) {
+			    printf("sqlWriterGames() sqlite3_exec(commit transaction;) returned %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
+			    sqlite3_free(errmsg);
+			    sqlite3_close_v2(db);
+			    exit(1);
+			  }
+			  rowNumber = 0;
+		    res = sqlite3_exec(db, "begin transaction;", NULL, NULL, &errmsg);
+			  if (res != SQLITE_OK) {
+			    printf("sqlWriterGames() error: sqlite3_exec(begin transaction;) returned %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
+			    sqlite3_free(errmsg);
+			    sqlite3_close_v2(db);
+			    exit(1);
+			  }
+			} else { //rowNumber == 0
+	    	delay.tv_sec *= 2;
+			  sleepCounter++;
+		  }
+			nanosleep(&delay, NULL);
+			continue;
+    } //end of else (gamesCount == 0)
+    if (rowNumber >= COMMIT_GAMES_ROWS) {
+    	printf("sqlWriterGames(): committing %lu rows to games. Uthash count %u\n", rowNumber, gamesCount);
+		  res = sqlite3_exec(db, "commit transaction;", NULL, NULL, &errmsg);
+		  if (res != SQLITE_OK) {
+		    printf("sqlWriterGames() sqlite3_exec(commit transaction;) returns %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
+		    sqlite3_free(errmsg);
+		    sqlite3_close_v2(db);
+		    exit(1);
+		  }
+		  rowNumber = 0;
+	    res = sqlite3_exec(db, "begin transaction;", NULL, NULL, &errmsg);
+		  if (res != SQLITE_OK) {
+		    printf("sqlWriterGames() error: sqlite3_exec(begin transaction;) returns %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
+		    sqlite3_free(errmsg);
+		    sqlite3_close_v2(db);
+		    exit(1);
+		  }
+		} //end of if (rowNumber >= COMMIT_GAMES_ROWS)
+  } //end of while (sleepCounter < MAX_SLEEP_COUNTER_FOR_SQLWRITER)
   
-  pthread_mutex_lock(&queueGames_mutex);
-  //BTreeDestroy(games, db); //this will insert md5 hash into games table if it's not there
-  struct GameHash * entry = NULL, * tmp = NULL;
-  HASH_ITER(hh, games, entry, tmp) {
-    if (db) insertGame(db, (unsigned long)(*(entry->hash)), NULL);
-    HASH_DEL(games, entry);
-    free(entry);
-  }
-  games = NULL;
-  pthread_mutex_unlock(&queueGames_mutex);
-
   res = sqlite3_exec(db, "commit transaction;", NULL, NULL, &errmsg);
   if (res != SQLITE_OK) {
     printf("sqlWriterGames() sqlite3_exec(commit transaction;) returns %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), errmsg, sqlite3_extended_errcode(db));
@@ -1475,7 +1655,7 @@ void * sqlWriterGames(void * context) {
 /// this implements multi-threading process where each thread plays
 /// a single game
 ///</summary>
-unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int games, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset) {
+unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int games, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV) {
 	int res = 0, numberOfGamesPlayed = 0, numberOfEcoLines = 0;
 	sqlite3 * db = NULL;
 	struct EcoLine * ecoLines[MAX_NUMBER_OF_ECO_LINES];
@@ -1520,75 +1700,18 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 	struct InitGameFromPGNfileContext * initGameCtx[gameThreads];
 	struct SqlContext * sqlCtx[sqlThreads];
 	if (updateDb) {
-	  switch (sqlThreads) {
-	  	case 8:
-				nextMoves7 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves7) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves7->first = nextMoves7->last = NULL;
-			  nextMoves7->len = 0;
-	
-				nextMoves6 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves6) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves6->first = nextMoves6->last = NULL;
-			  nextMoves6->len = 0;
-				
-				nextMoves5 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves5) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves5->first = nextMoves5->last = NULL;
-			  nextMoves5->len = 0;
-				
-				nextMoves4 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves4) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves4->first = nextMoves4->last = NULL;
-			  nextMoves4->len = 0;
-	  	case 4:
-				nextMoves3 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves3) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves3->first = nextMoves3->last = NULL;
-			  nextMoves3->len = 0;
-	
-				nextMoves2 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves2) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves2->first = nextMoves2->last = NULL;
-			  nextMoves2->len = 0;
-	  	case 2:
-				nextMoves1 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves1) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves1->first = nextMoves1->last = NULL;
-			  nextMoves1->len = 0;
-	  	case 1:
-				nextMoves0 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves0) {
-					printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves0->first = nextMoves0->last = NULL;
-			  nextMoves0->len = 0;
-			  break;
-			default:
-				printf("openGamesFromPGNfile: only 1, 2, 4 and 8 sql threads are supported, provided %d\n", sqlThreads);
+		if (sqlThreads != 1 && sqlThreads != 2 && sqlThreads != 4 && sqlThreads != 8) {
+			printf("openGamesFromPGNfile: only 1, 2, 4 and 8 sql threads are supported, provided %d\n", sqlThreads);
+			exit(1);
+	  }
+	  for (int i = 0; i < sqlThreads; i++) {
+			nextMovesQueue[i] = malloc(sizeof(struct QueueMoves));
+			if (!(nextMovesQueue[i])) {
+				printf("openGamesFromPGNfile() error: malloc(QueueMoves) returned NULL for nextMovesQueue\n");
 				exit(1);
+			}
+			nextMovesQueue[i]->first = nextMovesQueue[i]->last = NULL;
+		  nextMovesQueue[i]->len = 0;	    
 	  }
   }
 	//Multi-threading implementation, where each thread will 
@@ -1629,6 +1752,19 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 		  printf("openGamesFromPGNfile() error: malloc(initGameResult[t]) returned NULL\n");
 		  exit(1);
 		}
+		if (eval) {
+		  initGameCtx[t]->eval = eval;
+  		if (engine)
+  		  strncpy(initGameCtx[t]->engine, engine, 255);
+  		initGameCtx[t]->movetime = movetime;
+  		initGameCtx[t]->depth = depth;
+  		initGameCtx[t]->hashSize = hashSize;
+  		initGameCtx[t]->engineThreads = engineThreads;
+  		if (syzygyPath)
+  		  strncpy(initGameCtx[t]->syzygyPath, syzygyPath, 255);
+  		initGameCtx[t]->multiPV = multiPV;
+    }
+    
 		if ((res = pthread_create(&(game_thread_id[t]), &attr, &initGamesFromPGNfile, (void *)(initGameCtx[t]))) != 0) {
 			printf("openGamesFromPGNfile(): pthread_create() returned %d\n", res);
 		  exit(1);
@@ -1638,6 +1774,14 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 	pthread_t sql_thread_id[sqlThreads + 1]; //an extra sql thread is 
 		//for writing sanMoves MD5 hashes in Games.db for game de-duplication
 	if (updateDb) {
+		if ((res = pthread_create(&(sql_thread_id[sqlThreads]), &attr, &sqlWriterGames, NULL) != 0)) {
+			printf("openGamesFromPGNfile(): pthread_create(sqlWriterGames) returned %d\n", res);
+			exit(1);
+		}
+		if (sqlThreads != 1 && sqlThreads != 2 && sqlThreads != 4 && sqlThreads != 8) {
+	  	printf("openGamesFromPGNfile() error: only 1, 2, 4 and 8 sql threads are supported\n");
+	  	exit(1);
+		}
 		for (unsigned int t = 0; t < sqlThreads; t++) {
 			sqlCtx[t] = malloc(sizeof(struct SqlContext));
 			if (!sqlCtx[t]) {
@@ -1645,84 +1789,15 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 	      exit(1);		
 			}
 			sqlCtx[t]->threadNumber = t;
-			switch (t) {
-			  case 0:
-			  	sqlCtx[0]->queue = nextMoves0;
-			  	res = pthread_mutex_init(&queueMoves0_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves0_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[0]->mutex = &queueMoves0_mutex;
-			  	break;
-			  case 1:
-			  	sqlCtx[1]->queue = nextMoves1;
-			  	res = pthread_mutex_init(&queueMoves1_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves1_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[1]->mutex = &queueMoves1_mutex;
-			  	break;
-			  case 2:
-			  	sqlCtx[2]->queue = nextMoves2;
-			  	res = pthread_mutex_init(&queueMoves2_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves2_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[2]->mutex = &queueMoves2_mutex;
-			  	break;
-			  case 3:
-			  	sqlCtx[3]->queue = nextMoves3;
-			  	res = pthread_mutex_init(&queueMoves3_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves3_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[3]->mutex = &queueMoves3_mutex;
-			  	break;
-			  case 4:
-			  	sqlCtx[4]->queue = nextMoves4;
-			  	res = pthread_mutex_init(&queueMoves4_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves4_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[4]->mutex = &queueMoves4_mutex;
-			  	break;
-			  case 5:
-			  	sqlCtx[5]->queue = nextMoves5;
-			  	res = pthread_mutex_init(&queueMoves5_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves5_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[5]->mutex = &queueMoves5_mutex;
-			  	break;
-			  case 6:
-			  	sqlCtx[6]->queue = nextMoves6;
-			  	res = pthread_mutex_init(&queueMoves6_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves6_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[6]->mutex = &queueMoves6_mutex;
-			  	break;
-			  case 7:
-			  	sqlCtx[7]->queue = nextMoves7;
-			  	res = pthread_mutex_init(&queueMoves7_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&queueMoves7_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[7]->mutex = &queueMoves7_mutex;
-			  	break;
-			  default:
-			  	printf("openGamesFromPGNfile() error: only 1, 2, 4 and 8 sql threads are supported\n");
-			  	exit(1);
-			}
-			if ((res = pthread_create(&(sql_thread_id[t]), &attr, &sqlWriterMoves,   (void *)(sqlCtx[t]))) != 0) {
+	  	sqlCtx[t]->queue = nextMovesQueue[t];
+	  	res = pthread_mutex_init(&(queueMoves_mutex[t]), NULL);
+	  	if (res) {
+	  		printf("openGamesFromPGNfile() error: pthread_mutex_init(&(queueMoves_mutex[%d])) returned %d\n", t, res);
+	  		exit(1);
+	  	}
+	  	sqlCtx[t]->mutex = &(queueMoves_mutex[t]);
+
+			if ((res = pthread_create(&(sql_thread_id[t]), &attr, &sqlWriterMoves, (void *)(sqlCtx[t]))) != 0) {
 				printf("openGamesFromPGNfile(): pthread_create(sqlWriterMoves) returned %d\n", res);
 			  exit(1);
 			}
@@ -1740,10 +1815,6 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 		free(initGameCtx[t]);
 	}
 	if (updateDb) {
-		if ((res = pthread_create(&(sql_thread_id[sqlThreads]), &attr, &sqlWriterGames, NULL) != 0)) {
-			printf("openGamesFromPGNfile(): pthread_create(sqlWriterGames) returned %d\n", res);
-			exit(1);
-		}
 		res = pthread_join(sql_thread_id[sqlThreads], NULL);
 		if (res != 0) {
 			printf("openGamesFromPGNfile() error: pthread_join[%d] returned %d\n", sqlThreads, res);
@@ -1766,27 +1837,9 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 		
 	for (int i = 0; i < numberOfEcoLines; i++) free(ecoLines[i]);
 	if (updateDb) {
-		switch (sqlThreads) {
-	  	case 8:
-	    	free(nextMoves7);
-	    	free(nextMoves6);
-	    	free(nextMoves5);
-	    	free(nextMoves4);
-	    	pthread_mutex_destroy(&queueMoves7_mutex);
-	    	pthread_mutex_destroy(&queueMoves6_mutex);
-	    	pthread_mutex_destroy(&queueMoves5_mutex);
-	    	pthread_mutex_destroy(&queueMoves4_mutex);
-	  	case 4:
-	    	free(nextMoves3);
-	    	free(nextMoves2);
-	    	pthread_mutex_destroy(&queueMoves3_mutex);
-	    	pthread_mutex_destroy(&queueMoves2_mutex);
-	  	case 2:
-	    	free(nextMoves1);
-	    	pthread_mutex_destroy(&queueMoves2_mutex);
-	  	case 1:
-	    	free(nextMoves0);
-	    	pthread_mutex_destroy(&queueMoves0_mutex);
+	  for (int i = 0; i < sqlThreads; i++) {
+	    if (nextMovesQueue[i]) free(nextMovesQueue[i]);
+	    pthread_mutex_destroy(&(queueMoves_mutex[i]));
 	  }
 	  closeDb(db);
   }
@@ -1801,7 +1854,7 @@ unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThre
 /// It saves time by begin playing games one by one from the start of a file
 /// eliminating the need to index games in the file first, which is time consuming
 ///</summary>
-unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset) {
+unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV) {
 	int res = 0, numberOfGamesPlayed = 0, numberOfEcoLines = 0;;
 	struct EcoLine * ecoLines[MAX_NUMBER_OF_ECO_LINES];
 	sqlite3 * db = NULL;
@@ -1832,75 +1885,18 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	struct InitGameFromPGNfilesContext * initGameCtx[gameThreads];
 	struct SqlContext * sqlCtx[sqlThreads];
 	if (updateDb) {
-	  switch (sqlThreads) {
-	  	case 8:
-				nextMoves7 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves7) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves7->first = nextMoves7->last = NULL;
-			  nextMoves7->len = 0;
-	
-				nextMoves6 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves6) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves6->first = nextMoves6->last = NULL;
-			  nextMoves6->len = 0;
-				
-				nextMoves5 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves5) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves5->first = nextMoves5->last = NULL;
-			  nextMoves5->len = 0;
-				
-				nextMoves4 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves4) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves4->first = nextMoves4->last = NULL;
-			  nextMoves4->len = 0;
-	  	case 4:
-				nextMoves3 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves3) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves3->first = nextMoves3->last = NULL;
-			  nextMoves3->len = 0;
-	
-				nextMoves2 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves2) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves2->first = nextMoves2->last = NULL;
-			  nextMoves2->len = 0;
-	  	case 2:
-				nextMoves1 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves1) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves1->first = nextMoves1->last = NULL;
-			  nextMoves1->len = 0;
-	  	case 1:
-				nextMoves0 = malloc(sizeof(struct QueueMoves));
-				if (!nextMoves0) {
-					printf("openGamesFromPGNfiles() error: malloc(QueueMoves) returned NULL for nextMoves\n");
-					exit(1);
-				}
-				nextMoves0->first = nextMoves0->last = NULL;
-			  nextMoves0->len = 0;
-			  break;
-			default:
-				printf("openGamesFromPGNfiles(): only 1, 2, 4 and 8 sql threads are supported, provided %d\n", sqlThreads);
+	  if (sqlThreads != 1 && sqlThreads != 2 && sqlThreads != 4 && sqlThreads != 8) {
+			printf("openGamesFromPGNfiles(): only 1, 2, 4 and 8 sql threads are supported, provided %d\n", sqlThreads);
+			exit(1);
+	  }
+	  for (int i = 0; i < sqlThreads; i++) {
+			nextMovesQueue[i] = malloc(sizeof(struct QueueMoves));
+			if (!nextMovesQueue[i]) {
+				printf("openGamesFromPGNfiles() error: malloc(nextMovesQueue[%d]) returned NULL for nextMovesQueue\n", i);
 				exit(1);
+			}
+			nextMovesQueue[i]->first = nextMovesQueue[i]->last = NULL;
+		  nextMovesQueue[i]->len = 0;	    
 	  }
   }
 	//Multi-threading implementation, where each thread will 
@@ -1941,6 +1937,18 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 		  printf("openGamesFromPGNfiles() error: malloc(initGameResult[t]) returned NULL\n");
 		  exit(1);
 		}
+		if (eval) {
+		  initGameCtx[t]->eval = eval;
+  		if (engine)
+  		  strncpy(initGameCtx[t]->engine, engine, 255);
+  		initGameCtx[t]->movetime = movetime;
+  		initGameCtx[t]->depth = depth;
+  		initGameCtx[t]->hashSize = hashSize;
+  		initGameCtx[t]->engineThreads = engineThreads;
+  		if (syzygyPath)
+  		  strncpy(initGameCtx[t]->syzygyPath, syzygyPath, 255);
+  		initGameCtx[t]->multiPV = multiPV;
+		}
 		if ((res = pthread_create(&(game_thread_id[t]), &attr, &initGamesFromPGNfiles, (void *)(initGameCtx[t]))) != 0) {
 			printf("openGamesFromPGNfiles(): pthread_create() returned %d\n", res);
 		  exit(1);
@@ -1950,6 +1958,14 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	pthread_t sql_thread_id[sqlThreads + 1]; //an extra sql thread is 
 		                                    //for writing sanMoves MD5 hashes in Games.db for game de-duplication
   if (updateDb) {
+    if (sqlThreads != 1 && sqlThreads != 2 && sqlThreads != 4 && sqlThreads != 8) {
+		  	printf("openGamesFromPGNfiles() error: only 1, 2, 4 and 8 sql threads are supported\n");
+		  	exit(1);
+		}
+		if ((res = pthread_create(&(sql_thread_id[sqlThreads]), &attr, &sqlWriterGames, NULL) != 0)) {
+			printf("openGamesFromPGNfiles(): pthread_create(sqlWriterGames) returned %d\n", res);
+			exit(1);
+		}
 		for (unsigned int t = 0; t < sqlThreads; t++) {
 			sqlCtx[t] = malloc(sizeof(struct SqlContext));
 			if (!sqlCtx[t]) {
@@ -1957,83 +1973,13 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	      exit(1);		
 			}
 			sqlCtx[t]->threadNumber = t;
-			switch (t) {
-			  case 0:
-			  	sqlCtx[0]->queue = nextMoves0;
-			  	res = pthread_mutex_init(&queueMoves0_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves0_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[0]->mutex = &queueMoves0_mutex;
-			  	break;
-			  case 1:
-			  	sqlCtx[1]->queue = nextMoves1;
-			  	res = pthread_mutex_init(&queueMoves1_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves1_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[1]->mutex = &queueMoves1_mutex;
-			  	break;
-			  case 2:
-			  	sqlCtx[2]->queue = nextMoves2;
-			  	res = pthread_mutex_init(&queueMoves2_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves2_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[2]->mutex = &queueMoves2_mutex;
-			  	break;
-			  case 3:
-			  	sqlCtx[3]->queue = nextMoves3;
-			  	res = pthread_mutex_init(&queueMoves3_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves3_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[3]->mutex = &queueMoves3_mutex;
-			  	break;
-			  case 4:
-			  	sqlCtx[4]->queue = nextMoves4;
-			  	res = pthread_mutex_init(&queueMoves4_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves4_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[4]->mutex = &queueMoves4_mutex;
-			  	break;
-			  case 5:
-			  	sqlCtx[5]->queue = nextMoves5;
-			  	res = pthread_mutex_init(&queueMoves5_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves5_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[5]->mutex = &queueMoves5_mutex;
-			  	break;
-			  case 6:
-			  	sqlCtx[6]->queue = nextMoves6;
-			  	res = pthread_mutex_init(&queueMoves6_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves6_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[6]->mutex = &queueMoves6_mutex;
-			  	break;
-			  case 7:
-			  	sqlCtx[7]->queue = nextMoves7;
-			  	res = pthread_mutex_init(&queueMoves7_mutex, NULL);
-			  	if (res) {
-			  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&queueMoves7_mutex) returned %d\n", res);
-			  		exit(1);
-			  	}
-			  	sqlCtx[7]->mutex = &queueMoves7_mutex;
-			  	break;
-			  default:
-			  	printf("openGamesFromPGNfiles() error: only 1, 2, 4 and 8 sql threads are supported\n");
-			  	exit(1);
-			}
+	  	sqlCtx[t]->queue = nextMovesQueue[t];
+	  	res = pthread_mutex_init(&(queueMoves_mutex[t]), NULL);
+	  	if (res) {
+	  		printf("openGamesFromPGNfiles() error: pthread_mutex_init(&(queueMoves_mutex[%d])) returned %d\n", t, res);
+	  		exit(1);
+	  	}
+	  	sqlCtx[t]->mutex = &(queueMoves_mutex[t]);
 			if ((res = pthread_create(&(sql_thread_id[t]), &attr, &sqlWriterMoves,  (void *)(sqlCtx[t]))) != 0) {
 				printf("openGamesFromPGNfiles(): pthread_create(sqlWriterMoves) returned %d\n", res);
 			  exit(1);
@@ -2053,10 +1999,6 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 		free(initGameCtx[t]);
 	}
 	if (updateDb) {
-		if ((res = pthread_create(&(sql_thread_id[sqlThreads]), &attr, &sqlWriterGames, NULL) != 0)) {
-			printf("openGamesFromPGNfiles(): pthread_create(sqlWriterGames) returned %d\n", res);
-			exit(1);
-		}
 		res = pthread_join(sql_thread_id[sqlThreads], NULL);
 		if (res != 0) {
 			printf("openGamesFromPGNfiles() error: pthread_join[%d] returned %d\n", sqlThreads, res);
@@ -2081,27 +2023,9 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	for (int i = 0; i < numberOfEcoLines; i++) free(ecoLines[i]);
 	
 	if (updateDb) {
-		switch (sqlThreads) {
-	  	case 8:
-	    	free(nextMoves7);
-	    	free(nextMoves6);
-	    	free(nextMoves5);
-	    	free(nextMoves4);
-	    	pthread_mutex_destroy(&queueMoves7_mutex);
-	    	pthread_mutex_destroy(&queueMoves6_mutex);
-	    	pthread_mutex_destroy(&queueMoves5_mutex);
-	    	pthread_mutex_destroy(&queueMoves4_mutex);
-	  	case 4:
-	    	free(nextMoves3);
-	    	free(nextMoves2);
-	    	pthread_mutex_destroy(&queueMoves3_mutex);
-	    	pthread_mutex_destroy(&queueMoves2_mutex);
-	  	case 2:
-	    	free(nextMoves1);
-	    	pthread_mutex_destroy(&queueMoves2_mutex);
-	  	case 1:
-	    	free(nextMoves0);
-	    	pthread_mutex_destroy(&queueMoves0_mutex);
+	  for (int i = 0; i < sqlThreads; i++) {
+	    if (nextMovesQueue[i])	free(nextMovesQueue[i]);
+	    pthread_mutex_destroy(&(queueMoves_mutex[i]));
 	  }
 	  closeDb(db);
   }
