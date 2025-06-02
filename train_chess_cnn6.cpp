@@ -330,10 +330,8 @@ void consumer_test(TensorQueue& queue, ChessCNN& model, torch::Device device) {
         
         //Completely suppress illegal moves
         moves_logits.index_put_({legal_moves == 0}, -std::numeric_limits<float>::infinity());
-        auto policy_loss = torch::nn::functional::cross_entropy(
-            moves_logits, batch.move, torch::nn::functional::CrossEntropyFuncOptions().reduction(torch::kNone));
-        auto value_loss = torch::nn::functional::cross_entropy(
-            value_logits, batch.result, torch::nn::functional::CrossEntropyFuncOptions().reduction(torch::kNone));
+        auto policy_loss = torch::nn::functional::cross_entropy(moves_logits, batch.move);
+        auto value_loss = torch::nn::functional::cross_entropy(value_logits, batch.result);
         auto loss = policy_loss + 0.2 * value_loss;
         // Compute accuracy
         move_probs = torch::softmax(moves_logits, 1);
