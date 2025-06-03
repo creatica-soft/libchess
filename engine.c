@@ -1,15 +1,16 @@
-#define _POSIX_SOURCE
+//#define _POSIX_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <fcntl.h>
 #include <assert.h>
 #include <errno.h>
 #include <ctype.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <math.h>
 #include "libchess.h"
@@ -21,6 +22,7 @@ int getOptions(struct Engine * engine) {
 
 	fprintf(engine->toEngine, "uci\n");
 	fflush(engine->toEngine);
+	dprintf(engine->logfile, "uci\n");
 	//fprintf(stderr, "uci\n");
 	char line[256];
 	engine->numberOfCheckOptions = 0;
@@ -30,6 +32,7 @@ int getOptions(struct Engine * engine) {
 	engine->numberOfButtonOptions = 0;
 	char * lineMod = NULL, * tmp = NULL;
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
+		dprintf(engine->logfile, "%s", line);
 		//fprintf(stderr, "%s", line);
 		if (strcmp(line, "uciok\n") == 0) break;
 		if (strstr(line, "option name ") - line == 0) {
@@ -242,6 +245,7 @@ int setOption(struct Engine * engine, char * name, enum OptionType type, void * 
 	}
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
+	dprintf(engine->logfile, "%s\n", line);	
 	//fprintf(stderr, "%s\n", line);
 	// without any output from the engine, fgets() will block
 	//while (fgets(line, sizeof(line), stdin)) {
@@ -295,8 +299,10 @@ bool isReady(struct Engine * engine) {
 	char line[256];
 	fprintf(engine->toEngine, "isready\n");
 	fflush(engine->toEngine);
+	dprintf(engine->logfile, "isready\n");
 	//fprintf(stderr, "isready\n");
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
+  	dprintf(engine->logfile, "%s", line);
 		//fprintf(stderr, "%s", line);
 		if (strcmp(line, "readyok\n") == 0) {
 			ready = true;
@@ -309,6 +315,7 @@ bool isReady(struct Engine * engine) {
 bool newGame(struct Engine * engine) {
 	fprintf(engine->toEngine, "ucinewgame\n");
 	fflush(engine->toEngine);
+  dprintf(engine->logfile, "ucinewgame\n");	
 	//fprintf(stderr, "ucinewgame\n");
 	return isReady(engine);
 }
@@ -316,13 +323,18 @@ bool newGame(struct Engine * engine) {
 void stop(struct Engine * engine) {
 	fprintf(engine->toEngine, "stop\n");
 	fflush(engine->toEngine);
+  dprintf(engine->logfile, "stop\n");	
 	//fprintf(stderr, "stop\n");
 }
 
 void quit(struct Engine * engine) {
 	fprintf(engine->toEngine, "quit\n");
 	fflush(engine->toEngine);
+  dprintf(engine->logfile, "quit\n");	
 	//fprintf(stderr, "quit\n");
+	fclose(engine->toEngine);
+	fclose(engine->fromEngine);
+	close(engine->logfile);
 	remove(engine->namedPipeTo);
 	remove(engine->namedPipeFrom);
 }
@@ -338,6 +350,7 @@ bool position(struct Engine * engine) {
 	}
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
+  dprintf(engine->logfile, "%s\n", line);
 	//fprintf(stderr, "%s\n", line);
 	return isReady(engine);
 }
@@ -361,9 +374,24 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
 		//fprintf(stderr, "%s", line);
 		if (strstr(line, "bestmove ") - line == 0) {
-			if (((sscanf(line, "bestmove %5s ponder %5s\n", eval[0]->bestmove, eval[0]->ponder) == 2) || (sscanf(line, "bestmove %5s\n", eval[0]->bestmove) == 1)) && strncmp(eval[0]->bestmove, "(none", 5) != 0) {
+			if ((sscanf(line, "bestmove %5s ponder %5s\n", eval[0]->bestmove, eval[0]->ponder) == 2) || (sscanf(line, "bestmove %5s\n", eval[0]->bestmove) == 1)) {
+				if (strncmp(eval[0]->bestmove, "(none", 5) == 0 || eval[0]->bestmove[0] == '\0') {
+					for (int i = 0; i < multiPV; i++) {
+					  if (prevLine[i]) free(prevLine[i]);
+					}
+					dprintf(engine->logfile, "getPV() error: bestmove is either (none) or blank:\n");
+					dprintf(engine->logfile, "%s", line);
+					fprintf(stderr, "getPV() error: bestmove is either (none) or blank\n");
+					return 1;
+				}
 				for (int i = 0; i < multiPV; i++) {
-					if (!prevLine[i]) break;
+					if (!prevLine[i]) {
+						for (int j = i - 1; j >= 0; j--) {
+						  free(prevLine[j]);
+						  prevLine[j] = NULL;	
+						}		  
+						break;
+					}
 					//printf("scanning prevLine[%d] %s with score cp\n", i, prevLine[i]);
 					if (sscanf(prevLine[i], "info depth %hhu seldepth %hhu multipv %hhu score cp %d nodes %lu nps %lu hashfull %hu tbhits %hhu time %lu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
   					//printf("scanning prevLine[%d] %s with score mate\n", i, prevLine[i]);
@@ -383,10 +411,8 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 					//tmpLine = strstr(prevLine[i], " mate ");
 					//if (tmpLine) sscanf(tmpLine + 6, "%d", &(eval[0]->matein));
 					//printf("freeing prevLine[%d]\n", i);
-					if (prevLine[i]) {
-						free(prevLine[i]);
-					  prevLine[i] = NULL;
-					}
+					free(prevLine[i]);
+					prevLine[i] = NULL;
 				} //end of for multiPV
 				//scorecp is given from the point of view of sideToMove, meaning
 				// negative scorecp is losing, positive - winning
@@ -461,11 +487,26 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 							prevLine[pv] = malloc(strlen(line) + 1);
 							strcpy(prevLine[pv], line);
 						}
+					} //end of if pv
+				} //end of if pv number
+			} //end of if (muptipv)
+			else { //if (neither bestmove, nor multipv) - this is usually when is mate, the last line before bestmove (none) is
+			       //info depth 0 score mate 0
+  			if ((tmpLine = strstr(line, " score mate 0"))) {
+				  if (strlen(engine->position) >= 25) {
+						const char * position = engine->position;
+						position = strchr(engine->position, ' ');
+						eval[0]->depth = 0;
+						eval[0]->matein = 0;
+						strcpy(eval[0]->bestmove, "none");
+						eval[0]->scorecp = position[1] == 'w' ? -MATE_SCORE : MATE_SCORE;
+						eval[0]->nag = position[1] == 'w' ? 21 : 20; //there is no nag for mate
+						return 0;
 					}
-				}
+        }				
 			}
-		}
-	}
+		} //end of else (not bestmove)
+	} //end of while (fgets(line...))
 	return 0;
 }
 
@@ -509,7 +550,16 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 	search until the "stop" command. Do not exit the search without being told so in this mode!
 */
 //void go(long movetime, int depth, int nodes, int mate, char * searchmoves, bool ponder, bool infinite, long wtime, long btime, long winc, long binc, int movestogo, struct Engine * engine, struct Evaluation ** eval) {
-void go(struct Engine * engine, struct Evaluation ** eval) {
+int go(struct Engine * engine, struct Evaluation ** eval) {
+  if (!engine) {
+		printf("go() error: argument engine is NULL\n");
+  	return 1;
+  }
+	if (!eval) {
+		printf("go() error: argument eval is NULL\n");
+		return 1;			
+	}
+
 	char line[4096], tmp[256];
 	sprintf(line, "go");
 	if (engine->movetime) {
@@ -552,45 +602,55 @@ void go(struct Engine * engine, struct Evaluation ** eval) {
 		sprintf(tmp, " movestogo %d", engine->movestogo);
 		strcat(line, tmp);
 	}
-	if (engine->ponder) strcat(line, " engine->ponder");
-	if (engine->infinite) strcat(line, " engine->infinite");
+	if (engine->ponder) strcat(line, " ponder");
+	if (engine->infinite) strcat(line, " infinite");
 
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
+  dprintf(engine->logfile, "%s\n", line);
 	//fprintf(stderr, "%s\n", line);
 
 	int multiPV = nametoindex(engine, "MultiPV", Spin);
 	if (multiPV < 0) {
+    dprintf(engine->logfile, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
 		fprintf(stderr, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
-		return;
+		return 1;
 	}
 	//fprintf(stderr, "multiPV %ld\n", engine->optionSpin[multiPV].value);
-	getPV(engine, eval, engine->optionSpin[multiPV].value);
+	return getPV(engine, eval, engine->optionSpin[multiPV].value);
 }
 
 int engine(struct Engine * engine, char * engineName) {
   if (!engine) {
-		printf("engine() error: engine argument is NULL\n");
+		printf("engine() error: argument engine is NULL\n");
   	return 1;
   }
-	if (!(engineName)) {
-		printf("engine() error: engineName is NULL\n");
+	if (!engineName) {
+		printf("engine() error: argument engineName is NULL\n");
 		return 1;			
 	}
 	strcpy(engine->engineName, engineName);
 	char symbols[62] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 	char suffix[10];
-	strcpy(engine->namedPipeTo, TO_ENGINE_NAMED_PIPE_PREFIX);
-	strcpy(engine->namedPipeFrom, FROM_ENGINE_NAMED_PIPE_PREFIX);
 	do {
 		suffix[0] = '.';
 		for (int i = 1; i < 9; i++) {
 			suffix[i] = symbols[randomNumber(0, 61)];
 		}
 		suffix[9] = '\0';
+  	strcpy(engine->namedPipeTo, TO_ENGINE_NAMED_PIPE_PREFIX);
 		strncat(engine->namedPipeTo, suffix, 10);
+	} while(mkfifo(engine->namedPipeTo, S_IRUSR | S_IWUSR) == -1);
+  do {
+		suffix[0] = '.';
+		for (int i = 1; i < 9; i++) {
+			suffix[i] = symbols[randomNumber(0, 61)];
+		}
+		suffix[9] = '\0';
+  	strcpy(engine->namedPipeFrom, FROM_ENGINE_NAMED_PIPE_PREFIX);
 		strncat(engine->namedPipeFrom, suffix, 10);
-	} while(mkfifo(engine->namedPipeTo, S_IRUSR | S_IWUSR) == -1 || mkfifo(engine->namedPipeFrom, S_IRUSR | S_IWUSR) == -1);
+	} while(mkfifo(engine->namedPipeFrom, S_IRUSR | S_IWUSR) == -1);
+
 	pid_t enginePid;
 	enginePid = fork();
 	if (enginePid < 0) {
@@ -665,6 +725,23 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
     printf("initChessEngine() error: engine(%s) returned %d\n", engineName, res);
     return NULL;
   } 
+  char symbols[62] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	char suffix[10];
+	struct stat * buf = malloc(sizeof(struct stat));
+  char logfile[255] = "";
+  do {
+		suffix[0] = '.';
+		for (int i = 1; i < 9; i++) {
+			suffix[i] = symbols[randomNumber(0, 61)];
+		}
+		suffix[9] = '\0';
+    strcpy(logfile, "engine_log");
+		strncat(logfile, suffix, 10);
+	} while(!stat(logfile, buf));
+	free(buf);
+  chessEngine->logfile = open(logfile, O_RDWR | O_APPEND | O_CREAT | O_TRUNC);
+  fchmod(chessEngine->logfile, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
   getOptions(chessEngine);
   int idx = nametoindex(chessEngine, "MultiPV", Spin);
   chessEngine->optionSpin[idx].value = multiPV;
@@ -674,14 +751,33 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
   chessEngine->optionSpin[idx].value = threadNumber;
   idx = nametoindex(chessEngine, "SyzygyPath", String);
   strncpy(chessEngine->optionString[idx].value, syzygyPath, MAX_UCI_OPTION_STRING_LEN);
+  
+  //enable stockfish debug logging
+  /*
+  idx = nametoindex(chessEngine, "Debug Log File", String);
+	buf = malloc(sizeof(struct stat));
+  do {
+		suffix[0] = '.';
+		for (int i = 1; i < 9; i++) {
+			suffix[i] = symbols[randomNumber(0, 61)];
+		}
+		suffix[9] = '\0';
+    strcpy(logfile, "stockfish_log");
+		strncat(logfile, suffix, 10);
+	} while(!stat(logfile, buf));
+	free(buf);
+  strncpy(chessEngine->optionString[idx].value, logfile, MAX_UCI_OPTION_STRING_LEN);
+  */
   setOptions(chessEngine);
   int timeout = 0;
   while (!isReady(chessEngine) && timeout < 3) {
+  	dprintf(chessEngine->logfile, "initChessEngine() warning: isReady() returned false\n");
     printf("initChessEngine() warning: isReady() returned false\n");
     nanosleep(&delay, NULL);
     timeout++;
   }
   if (!isReady(chessEngine)) {
+  	dprintf(chessEngine->logfile, "initChessEngine() error: isReady() returned false\n");
   	free(chessEngine);
     printf("initChessEngine() error: isReady() returned false\n");
   	return NULL;
@@ -690,6 +786,8 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
 }
 
 void releaseChessEngine(struct Engine * chessEngine) {
+  dprintf(chessEngine->logfile, "releaseChessEngine(): closing logfile...\n");
+  close(chessEngine->logfile);
   if (chessEngine) free(chessEngine);
   chessEngine = NULL;
 }

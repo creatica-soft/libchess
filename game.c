@@ -611,11 +611,13 @@ int playEndGame(struct Engine * chessEngine, struct Board * board, struct Evalua
     strlcat(san_moves, full_move, MAX_SAN_MOVES_LEN);
   }
   while (true) {
-    position(chessEngine);
-    go(chessEngine, evaluations);
-    if (evaluations[0]->bestmove[0] == '\0' || strncmp(evaluations[0]->bestmove, "(none", 5) == 0) {
-      printf("playEndGame() error: best move is blank or (none)\n");
+    if (!position(chessEngine)) {
+      printf("playEndGame() error: position(chessEngine) returned false\n");
       return 2;
+    }
+    if (go(chessEngine, evaluations)) {
+      printf("playEndGame() error: go(chessEngine, evaluations) returned non-zero code\n");
+      return 2;      
     }
     if (writedebug)
       printf("best move %s, score %d, mate in %d, nag %d, hashfull %d, tbhits %d, pv %s\n", evaluations[0]->bestmove, evaluations[0]->scorecp, evaluations[0]->matein, evaluations[0]->nag, evaluations[0]->hashful, evaluations[0]->tbhits, evaluations[0]->pv);
@@ -989,7 +991,8 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
     }
     for (int i = 0; i < multiPV; i++) {
       evaluation = calloc(1, sizeof(struct Evaluation));
-      evaluation->maxPlies = 16;
+      evaluation->maxPlies = 1; //we just need the next move
+      evaluation->matein = NO_MATE_SCORE;
       evaluations[i] = evaluation;
     }
     int timeout = 0;
@@ -1008,12 +1011,14 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
     }
     strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
     //printf("playGameExt(%d): calling position first time...()\n", threadId);
-    position(chessEngine);
-    //printf("playGameExt(%d): calling go first time...()\n", threadId);
-    go(chessEngine, evaluations);
-    if (evaluations[0]->bestmove[0] == '\0' || strcmp(evaluations[0]->bestmove, "(none") == 0) {
-      printf("playGameExt() error: best move is blank or (none)\n");
+    if (!position(chessEngine)) {
+      printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);
       return 2;
+    }
+    //printf("playGameExt(%d): calling go first time...()\n", threadId);
+    if (go(chessEngine, evaluations)) {
+      printf("playGameExt(%d) error: go(chessEngine, evaluations) returned non-zero code\n", threadId);
+      return 2;      
     }
     if (evaluations[0]->nag == 18 || evaluations[0]->nag == 20) gameResult = 1;
     else if (evaluations[0]->nag == 19 || evaluations[0]->nag == 21) gameResult = -1;
@@ -1139,13 +1144,14 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 		} 
 		if (chessEngine && updateDb) {
       strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
-      //printf("playGameExt(%d): calling position...()\n", threadId);
-      position(chessEngine);
-      //printf("playGameExt(%d): calling go...()\n", threadId);
-      go(chessEngine, evaluations);
-      if (evaluations[0]->bestmove[0] == '\0' || strcmp(evaluations[0]->bestmove, "(none") == 0) {
-        printf("playGameExt() error: best move is blank or (none)\n");
+      if (!position(chessEngine)) {
+        printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);
         return 2;
+      }
+      //printf("playGameExt(%d): calling go first time...()\n", threadId);
+      if (go(chessEngine, evaluations)) {
+        printf("playGameExt(%d) error: go(chessEngine, evaluations) returned non-zero code\n", threadId);
+        return 2;      
       }
       if (evaluations[0]->nag == 18 || evaluations[0]->nag == 20) gameResult = 1;
       else if (evaluations[0]->nag == 19 || evaluations[0]->nag == 21) gameResult = -1;

@@ -1134,6 +1134,7 @@ extern "C" {
   	struct OptionButton optionButton[MAX_UCI_OPTION_BUTTON_NUM];
   	char position[MAX_FEN_STRING_LEN]; //FEN string
   	char moves[MAX_UCI_MOVES_LEN]; //UCI moves
+  	int logfile;
   	//go() arguments
   	long movetime;
   	int depth;
@@ -1446,6 +1447,7 @@ struct Engine {
 	char namedPipeFrom[255];
 	char position[MAX_FEN_STRING_LEN]; //FEN string
 	char moves[MAX_UCI_MOVES_LEN]; //UCI moves
+	int logfile;
 	//go() arguments
 	long movetime;
 	int depth;
@@ -2061,7 +2063,7 @@ void stop(struct Engine *);
 void quit(struct Engine *);
 bool position(struct Engine *);
 //void go(long, int, int, int, char *, bool, bool, long, long, long, long, int, struct Engine *, struct Evaluation **);
-void go(struct Engine *, struct Evaluation **);
+int go(struct Engine *, struct Evaluation **);
 
 unsigned long md5(char *);
 

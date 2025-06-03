@@ -12,6 +12,18 @@
 #include "magic_bitboards.h"
 #include "libchess.h"
 
+#ifndef __APPLE__ // macOS
+unsigned int arc4random_uniform(unsigned int upper_bound) {
+    if (upper_bound == 0) return 0;
+    unsigned int min = -upper_bound % upper_bound; // Compute rejection threshold
+    unsigned int r;
+    do {
+        r = random();
+    } while (r < min); // Reject to ensure uniformity
+    return r % upper_bound;
+}
+#endif
+
 ///<summary>
 /// draws moves from a given square sq
 /// it is called from writeDebug
