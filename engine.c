@@ -370,7 +370,9 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 		unsigned char maxPlies = eval[i]->maxPlies;
 	  memset(eval[i], 0, sizeof(struct Evaluation));
 	  eval[i]->maxPlies = maxPlies;
-  } 
+  }
+	enum Color sideToMove;
+	sideToMove = strchr(engine->position, 'w') ? ColorWhite : ColorBlack;
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
 		//fprintf(stderr, "%s", line);
 		if (strstr(line, "bestmove ") - line == 0) {
@@ -416,54 +418,32 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 				} //end of for multiPV
 				//scorecp is given from the point of view of sideToMove, meaning
 				// negative scorecp is losing, positive - winning
-				if (strlen(engine->position) >= 25) {
-  				enum Color sideToMove;
-					const char * position = engine->position;
-					position = strchr(engine->position, ' ');
-					sideToMove = position[1] == 'w' ? ColorWhite : ColorBlack;
-					//White or Black has a slight advantage
-					if (eval[0]->scorecp > INACCURACY && eval[0]->scorecp <= MISTAKE) {
-						if (sideToMove == ColorWhite) eval[0]->nag = 14;
-						else eval[0]->nag = 15;
-					}
-					//White or Black has a slight advantage
-					else if (eval[0]->scorecp < -INACCURACY && eval[0]->scorecp >= -MISTAKE) {
-						if (sideToMove == ColorWhite) eval[0]->nag = 15;
-						else eval[0]->nag = 14;
-					}
-					//White or Black has a moderate advantage
-					else if (eval[0]->scorecp > MISTAKE && eval[0]->scorecp <= BLUNDER) {
-						if (sideToMove == ColorWhite) eval[0]->nag = 16;
-						else eval[0]->nag = 17;
-					}
-					//White or Black has a moderate advantage
-					else if (eval[0]->scorecp < -MISTAKE && eval[0]->scorecp >= -BLUNDER) {
-						if (sideToMove == ColorWhite) eval[0]->nag = 17;
-						else eval[0]->nag = 16;
-					}
-					//White or Black has a decisive advantage
-					else if (eval[0]->scorecp > BLUNDER && eval[0]->scorecp < MATE_SCORE / 2) {
-						if (sideToMove == ColorWhite) eval[0]->nag = 18;
-						else eval[0]->nag = 19;
-					}
-					//White or Black has a decisive advantage
-					else if (eval[0]->scorecp < -BLUNDER && eval[0]->scorecp > -MATE_SCORE / 2) {
-						if (sideToMove == ColorWhite) eval[0]->nag = 19;
-						else eval[0]->nag = 18;
-					}
-					//White or Black has a crushing advantage (one should resign)
-					else if (eval[0]->scorecp >= MATE_SCORE / 2 && eval[0]->scorecp <= MATE_SCORE) {
-					  if (sideToMove == ColorWhite) eval[0]->nag = 20;
-					  else eval[0]->nag = 21;
-					}
-					//White or Black has a crushing advantage (one should resign)
-					else if (eval[0]->scorecp <= -MATE_SCORE / 2 && eval[0]->scorecp >= -MATE_SCORE) {
-						if (sideToMove == ColorWhite) eval[0]->nag = 21;
-						else eval[0]->nag = 20;
-					}
-					//Drawish position
-					else eval[0]->nag = 10;
-				}
+				//White or Black has a slight advantage
+				if (eval[0]->scorecp > INACCURACY && eval[0]->scorecp <= MISTAKE)
+					eval[0]->nag = sideToMove == ColorWhite ? 14 : 15;
+				//White or Black has a slight advantage
+				else if (eval[0]->scorecp < -INACCURACY && eval[0]->scorecp >= -MISTAKE)
+					eval[0]->nag = sideToMove == ColorWhite ? 15 : 14;
+				//White or Black has a moderate advantage
+				else if (eval[0]->scorecp > MISTAKE && eval[0]->scorecp <= BLUNDER)
+					eval[0]->nag = sideToMove == ColorWhite ? 16 : 17;				
+				//White or Black has a moderate advantage
+				else if (eval[0]->scorecp < -MISTAKE && eval[0]->scorecp >= -BLUNDER)
+					eval[0]->nag = sideToMove == ColorWhite ? 17 : 16;
+				//White or Black has a decisive advantage
+				else if (eval[0]->scorecp > BLUNDER && eval[0]->scorecp < MATE_SCORE / 2)
+					eval[0]->nag = sideToMove == ColorWhite ? 18 : 19;
+				//White or Black has a decisive advantage
+				else if (eval[0]->scorecp < -BLUNDER && eval[0]->scorecp > -MATE_SCORE / 2)
+					eval[0]->nag = sideToMove == ColorWhite ? 19 : 18;
+				//White or Black has a crushing advantage (one should resign)
+				else if (eval[0]->scorecp >= MATE_SCORE / 2 && eval[0]->scorecp <= MATE_SCORE)
+				  eval[0]->nag = sideToMove == ColorWhite ? 20 : 21;
+				//White or Black has a crushing advantage (one should resign)
+				else if (eval[0]->scorecp <= -MATE_SCORE / 2 && eval[0]->scorecp >= -MATE_SCORE)
+					eval[0]->nag = sideToMove == ColorWhite ? 21 : 20;
+				//Drawish position
+				else eval[0]->nag = 10;
 				return 0;
 			} //end of if bestmove ponder || bestmove
 		} //end of if bestmove
@@ -490,21 +470,27 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 					} //end of if pv
 				} //end of if pv number
 			} //end of if (muptipv)
-			else { //if (neither bestmove, nor multipv) - this is usually when is mate, the last line before bestmove (none) is
-			       //info depth 0 score mate 0
-  			if ((tmpLine = strstr(line, " score mate 0"))) {
-				  if (strlen(engine->position) >= 25) {
-						const char * position = engine->position;
-						position = strchr(engine->position, ' ');
-						eval[0]->depth = 0;
-						eval[0]->matein = 0;
-						strcpy(eval[0]->bestmove, "none");
-						eval[0]->scorecp = position[1] == 'w' ? -MATE_SCORE : MATE_SCORE;
-						eval[0]->nag = position[1] == 'w' ? 21 : 20; //there is no nag for mate
-						return 0;
+			else if ((tmpLine = strstr(line, " score mate 0"))) { //if (neither bestmove, nor multipv)
+			//this is usually when is mate or stalemate, the last line before bestmove (none) is
+			// either "info depth 0 score mate 0" or "info depth 0 score cp 0"
+					eval[0]->depth = 0;
+					eval[0]->matein = 0;
+					strcpy(eval[0]->bestmove, "none");
+					if (sideToMove == ColorWhite) {
+					  eval[0]->scorecp = -MATE_SCORE;
+					  eval[0]->nag = 21; //there is no nag for mate
+					} else {
+					  eval[0]->scorecp = MATE_SCORE;						
+  					eval[0]->nag = 20; //there is no nag for mate
 					}
+					return 0;
+        } else if ((tmpLine = strstr(line, " score cp 0"))) {//info depth 0 score cp 0 (stalemate)
+					eval[0]->depth = 0;
+					strcpy(eval[0]->bestmove, "none");
+					eval[0]->scorecp = 0;
+					eval[0]->nag = 10;
+					return 0;        	
         }				
-			}
 		} //end of else (not bestmove)
 	} //end of while (fgets(line...))
 	return 0;

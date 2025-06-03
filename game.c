@@ -1109,21 +1109,25 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 			}
       q = board.hash >> t;
 		}
-		if (board.isStaleMate && strcmp(game->tags[Result], "1/2-1/2") != 0) {
-			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '1/2-1/2' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
-			strcpy(game->tags[Result], "1/2-1/2");
+		if (board.isStaleMate) {
+		  if (strcmp(game->tags[Result], "1/2-1/2") != 0) {
+  			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '1/2-1/2' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
+  			strcpy(game->tags[Result], "1/2-1/2");
+			}
 			gameResult = 0;
 			if (chessEngine && updateDb) {
         pthread_mutex_lock(&(queueMoves_mutex[q]));
       	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, 0);
       	pthread_mutex_unlock(&(queueMoves_mutex[q]));
     	}
-			break;
+		  break;
 		}
-		else if (board.isMate && board.movingPiece.color == ColorWhite && strcmp(game->tags[Result], "1-0") != 0) {
-			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '1-0' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
-			strcpy(game->tags[Result], "1-0");
-			gameResult = 1;
+		else if (board.isMate) {
+		  if (board.movingPiece.color == ColorWhite && strcmp(game->tags[Result], "1-0") != 0) {
+  			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '1-0' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
+  			strcpy(game->tags[Result], "1-0");
+			}
+			gameResult = 1;		
 			if (chessEngine && updateDb) {
         pthread_mutex_lock(&(queueMoves_mutex[q]));
       	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, MATE_SCORE);
@@ -1131,9 +1135,11 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
     	}
 			break;
 		}
-		else if (board.isMate && board.movingPiece.color == ColorBlack && strcmp(game->tags[Result], "0-1") != 0) {
-			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '0-1' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
-			strcpy(game->tags[Result], "0-1");
+		else if (board.isMate) {
+		  if (board.movingPiece.color == ColorBlack && strcmp(game->tags[Result], "0-1") != 0) {
+  			printf("playGameExt(%d): game tag Result '%s' did not match the actual one '0-1' - corrected in db\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", threadId, game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
+  			strcpy(game->tags[Result], "0-1");
+  		}
 			gameResult = -1;
 			if (chessEngine && updateDb) {
         pthread_mutex_lock(&(queueMoves_mutex[q]));
