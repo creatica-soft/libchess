@@ -814,22 +814,11 @@ int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dataset, char
 
 int nextMoves(unsigned long hash, struct MoveScoreGames ** moves, int sqlThreads) {
   unsigned char q;
-	switch (sqlThreads) {
-		case 1:
-			q = 0; 
-		  break;
-		case 2:
-			q = hash >> 63;
-		  break;
-		case 4: 
-			q = hash >> 62;
-		  break;
-		case 8: 
-			q = hash >> 61;
-		  break;
-		default:
-			printf("nextMoves() error: only 1, 2, 4 and 8 sql threads are supported, provided %d\n", sqlThreads);
-			exit(1);
+  if (sqlThreads == 1 || sqlThreads == 2 || sqlThreads == 4 || sqlThreads == 8) {
+    q = hash >> (65 - __builtin_clzl(sqlThreads));
+  } else {
+		printf("nextMoves() error: only 1, 2, 4 and 8 sql threads are supported, provided %d\n", sqlThreads);
+		exit(1);
 	}
   char filename[15];
   sprintf(filename, "NextMoves%d.db", q);
@@ -856,12 +845,22 @@ enum Color s = *((enum Color *)arg);
     struct MoveScores * s1 = (struct MoveScores *)a;
     struct MoveScores * s2 = (struct MoveScores *)b;
     if (s == ColorWhite) {
-      if (s1->score < s2->score) return 1;
-      if (s1->score > s2->score) return -1;
+    	if (s1->scorecp != 0 && s2->scorecp != 0) {
+	      if (s1->score < s2->score && s1->scorecp < s2->scorecp) return 1;
+	      if (s1->score > s2->score && s1->scorecp > s2->scorecp) return -1;
+      } else {
+	      if (s1->score < s2->score) return 1;
+	      if (s1->score > s2->score) return -1;      	
+      }
     }
     if (s == ColorBlack) {
-	    if (s1->score > s2->score) return 1;
-	    if (s1->score < s2->score) return -1;    	
+    	if (s1->scorecp != 0 && s2->scorecp != 0) {    	
+		    if (s1->score > s2->score && s1->scorecp > s2->scorecp) return 1;
+		    if (s1->score < s2->score && s1->scorecp < s2->scorecp) return -1;
+		  } else {
+		    if (s1->score > s2->score) return 1;
+		    if (s1->score < s2->score) return -1;		  	
+		  }
     }
     return 0;
 }
@@ -877,6 +876,7 @@ int bestMoves(unsigned long hash, enum Color sideToMove, struct MoveScores * mov
   for (int i = 0; i < nextMovesNumber; i++) {
     strncpy(moves[i].move, moveScoreGames[i]->move, 6);
     moves[i].score = (double)moveScoreGames[i]->score / (double)totalGames;
+    moves[i].scorecp = moveScoreGames[i]->scorecp;
     //printf("%s %f\n", moves[i].move, moves[i].score); 
     free(moveScoreGames[i]);
   }
@@ -945,13 +945,14 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
   int t = 0, idx = 0, multiPV = 1;
   struct Evaluation * evaluation = NULL;
   struct Evaluation * evaluations[8] = { NULL };
-  if (updateDb && sqlThreads > 0) {
-  	t = __builtin_ctzl(sqlThreads);
-  	if (t > 4) {
+  if (updateDb) {
+  	if (sqlThreads == 1 || sqlThreads == 2 || sqlThreads == 4 || sqlThreads == 8) {
+	  	t = __builtin_ctzl(sqlThreads);
+	  	t = 65 - t;
+	  } else {
   	  printf("playGameExt(%d) error: only 1, 2, 4 and 8 sql threads are supported, provided %d\n", threadId, sqlThreads);
     	exit(1);
-  	}
-  	t = 65 - t;
+    }
   }
 	struct Fen fen;
 	char * fenString;
@@ -1149,6 +1150,12 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 			break;
 		} 
 		if (chessEngine && updateDb) {
+			struct MoveScoreGames * moveScoreGames[MAX_NUMBER_OF_NEXT_MOVES];
+	    int nextMovesNumber = nextMoves(board.hash, (struct MoveScoreGames **)moveScoreGames, sqlThreads);
+	    if (nextMovesNumber >= 3) {
+	    	token = strtok_r(NULL, " ", &saveptr);
+	    	continue;
+	    }
       strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
       if (!position(chessEngine)) {
         printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);

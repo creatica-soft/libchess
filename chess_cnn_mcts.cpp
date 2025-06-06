@@ -10,7 +10,7 @@
 */
 #include "uthash.h"
 #include "libchess.h"
-#include "chess_cnn6.h"
+#include "chess_cnn7.h"
 #include <torch/torch.h>
 #include <vector>
 #include <random>
@@ -20,7 +20,7 @@
 #define UCB_C 1.4 // Exploration constant
 
 // Global stop flag for MCTS interruption
-const int num_channels = 128;
+const int num_channels = 89;
 extern volatile int stopFlag;
 extern int logfile;
 extern torch::Device device;
@@ -87,7 +87,15 @@ extern "C" {
     }
     uci_move[0] = '\0';
     div_t move = div(move_idx, 64);
-    enum SquareName source_square = (enum SquareName)move.quot;
+    //enum SquareName source_square = move.quot;
+    int move_src = move.quot; //piece channel
+    enum SquareName source_square = SquareNone;
+    for (enum SquareName sn = SquareA1; sn <= SquareH8; sn++) {
+      if (board->channel[sn] == move_src) {
+        source_square = sn;
+        break;
+      }
+    }
     enum SquareName destination_square = (enum SquareName)move.rem;
     strncat(uci_move, squareName[source_square], 2);
     strncat(uci_move, squareName[destination_square], 2);

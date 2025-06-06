@@ -1,6 +1,6 @@
 //c++ -O3 -I /opt/anaconda3/include -I /opt/anaconda3/include/torch/csrc/api/include -L /opt/anaconda3/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/opt/anaconda3/lib,-rpath,/Users/ap/libchess -o chess_cnn2 train_chess_cnn2.cpp chess_cnn2.cpp
-//c++ -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess -o chess_cnn6 train_chess_cnn6.cpp chess_cnn6.cpp
-#include "chess_cnn6.h"
+//c++ -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess -o chess_cnn7 train_chess_cnn7.cpp chess_cnn7.cpp
+#include "chess_cnn7.h"
 #include <torch/torch.h>
 #include <torch/script.h>
 #include <torch/serialize.h>
@@ -56,9 +56,10 @@ private:
 // Thread-safe queue for tensors
 struct TensorBatch {
     torch::Tensor board_moves;
-    torch::Tensor move;
+    torch::Tensor move_src;
+    torch::Tensor move_dst;
     torch::Tensor result;
-    torch::Tensor stage;
+    //torch::Tensor stage;
 };
 
 class TensorQueue {
@@ -149,26 +150,32 @@ void producer(const std::vector<std::string>& files, int min_elo, int max_elo_di
                 torch::kFloat32
             ).to(device, false);
 
-            auto move = torch::from_blob(
-                bmpr->moves,
+            auto move_src = torch::from_blob(
+                bmpr->move_src,
                 {bmpr->samples},
-                torch::kInt32
+                torch::kInt64
+            ).to(device, false);
+
+            auto move_dst = torch::from_blob(
+                bmpr->move_dst,
+                {bmpr->samples},
+                torch::kInt64
             ).to(device, false);
 
             auto result = torch::from_blob(
                 bmpr->result,
                 {bmpr->samples},
-                torch::kInt32
+                torch::kInt64
             ).to(device, false);
-
+/*
             auto stage = torch::from_blob(
                 bmpr->stage,
                 {bmpr->samples},
-                torch::kInt32
+                torch::kInt64
             ).to(device, false);
-
+*/
             // Enqueue tensor batch
-            queue.enqueue({board_moves, move, result, stage});
+            queue.enqueue({board_moves, move_src, move_dst, result});
         } catch (const std::exception& e) {
             std::cerr << "Producer: Error processing BMPR: " << e.what() << std::endl;
         }
@@ -183,9 +190,10 @@ void producer(const std::vector<std::string>& files, int min_elo, int max_elo_di
 void consumer_train(TensorQueue& queue, ChessCNN& model, torch::optim::Optimizer& optimizer, CosineAnnealingLR& scheduler, int display_stats_every, int save_weights_every, const std::string& weights_file, torch::Device device, const int accumulation_steps) {
     auto start = std::chrono::steady_clock::now();
     int64_t samples_total = 0, samples = 0, steps = 0;
-    double policy_loss_total = 0, value_loss_total = 0, total_loss_avg = 0;
+    double channel_loss_total = 0, destination_loss_total = 0, value_loss_total = 0, total_loss_avg = 0;
     double dequeue_time = 0, model_time = 0, loss_time = 0, back_time = 0, optim_time = 0;
     int accum_count = 0;
+    bool debug_mode = false;
     
     model->train();
     while (true) {
@@ -223,20 +231,66 @@ for (int64_t i = 0; i < batch.board_moves.size(0); i++) {
 
         // Forward pass
         auto model_start = std::chrono::steady_clock::now();
-        auto [moves_logits, value_logits, x_legal] = model->forward(batch.board_moves);
+        //moves_logits
+        auto [channel_logits, destination_logits, value_logits, x_legal] = model->forward(batch.board_moves);
         model_time += std::chrono::duration<double>(std::chrono::steady_clock::now() - model_start).count();
-
-        // Compute loss
+        
+        // channel_logits: [batch, 21]
+        // destination_logits: [batch, 64]
+        // value_logits: [batch, 3]
+        // x_legal: [batch, 21, 8, 8], 1s for legal destination squares, 0s for illegal
+    
+        if (debug_mode) {
+            std::cout << "target_channel values (first 10): " << batch.move_src.slice(0, 0, 10) << std::endl;
+            std::cout << "target_destination values (first 10): " << batch.move_dst.slice(0, 0, 10) << std::endl;            
+            // Log raw input mask channel
+            std::cout << "input mask channel (batch 0, 68 + target_channel[0]): " << batch.board_moves[0][68 + batch.move_src[0].item<int64_t>()] << std::endl;            
+            assert(!destination_logits.isnan().any().item<bool>());
+            assert(!destination_logits.isinf().any().item<bool>());
+            std::cout << "x_legal_mask shape: " << x_legal.sizes() << std::endl;
+            std::cout << "destination_logits before mask (first sample): " << destination_logits[0] << std::endl;
+        }
+    
+       // Reshape target_channel for batched indexing
+        auto target_indices = batch.move_src.view({batch.board_moves.size(0), 1, 1, 1}).expand({batch.board_moves.size(0), 1, 8, 8});; // Shape: [batch, 1, 1, 1]
+        // Use gather to select one channel per batch sample
+        //auto channel_mask = x_legal.gather(1, target_indices); // Shape: [batch, 1, 8, 8]
+        //channel_mask = channel_mask.squeeze(1); // Shape: [batch, 8, 8]
+        //channel_mask = torch::flatten(channel_mask, 1, 2); // Shape: [batch, 64]
+        //combine above three lines into one
+        auto channel_mask = x_legal.gather(1, target_indices).squeeze(1).flatten(1, 2);
+        //auto mask_bool = (channel_mask == 0).to(torch::kBool); // Shape: [batch, 64] - unnecessary
+        // Debug: Verify shapes
+        if (debug_mode) {
+          std::cout << "channel_mask after flatten: " << channel_mask.sizes() << std::endl;
+          std::cout << "mask_bool: " << mask_bool.sizes() << std::endl;
+          std::cout << "destination_logits: " << destination_logits.sizes() << std::endl;
+          std::cout << "channel_mask values: " << channel_mask[0] << std::endl; // First sample
+          std::cout << "mask_bool values: " << mask_bool[0] << std::endl; // First sample
+          assert(channel_mask.sizes() == destination_logits.sizes());
+          assert(mask_bool.sizes() == destination_logits.sizes());
+        }
+        // Apply legal move mask to destination logits
+        destination_logits.masked_fill_(channel_mask == 0, -1e9);
+    
+        // Optional: Verify masking
+        if (debug_mode) {
+            //std::cout << "destination_logits after mask: " << destination_logits[0] << "\n";
+            auto destination_probs = torch::softmax(destination_logits.clamp(-50, 50), 1);
+            auto illegal_probs = destination_probs.masked_select(mask_bool);
+            auto max_illegal_prob = illegal_probs.size(0) > 0 ? illegal_probs.max().item<float>() : 0.0f;
+            std::cout << "Max illegal probability: " << max_illegal_prob << "\n";
+        }    
+    
+        // Compute losses
         auto loss_start = std::chrono::steady_clock::now();
-        auto legal_moves = x_legal.view({batch.board_moves.size(0), -1}); //first dim 0 is batch size (1000), second (-1) is inferred from number of channels and 8 x 8 board, i.e. 64 x 64 = 4096, so legal_moves is 1000 x 4096
-
-        //Completely suppress illegal moves
-        moves_logits.index_put_({legal_moves == 0}, -std::numeric_limits<float>::infinity());
-        auto policy_loss = torch::nn::functional::cross_entropy(moves_logits, batch.move);
+        auto channel_loss = torch::nn::functional::cross_entropy(channel_logits, batch.move_src);
+        auto destination_loss = torch::nn::functional::cross_entropy(destination_logits, batch.move_dst);
         auto value_loss = torch::nn::functional::cross_entropy(value_logits, batch.result);
-        auto loss = policy_loss + 0.2 * value_loss;
+        auto loss = (channel_loss + destination_loss) + 0.2 * value_loss;
                 
-        policy_loss_total += policy_loss.item<double>();
+        channel_loss_total += channel_loss.item<double>();
+        destination_loss_total += destination_loss.item<double>();
         value_loss_total += value_loss.item<double>();
         total_loss_avg += loss.item<double>();
         loss_time += std::chrono::duration<double>(std::chrono::steady_clock::now() - loss_start).count();
@@ -263,8 +317,8 @@ for (int64_t i = 0; i < batch.board_moves.size(0); i++) {
         if (steps % display_stats_every == 0) {
             samples_total += samples;
             auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-            std::printf("Current loss: policy %.3f + %.6f = %.6f\n", policy_loss.item<float>(), value_loss.item<float>(), loss.item<float>());
-            std::printf("Avg loss: policy %.3f + value %.6f = %.6f\n", policy_loss_total / steps, value_loss_total / steps, total_loss_avg / steps);
+            std::printf("Current loss: channel %.3f + destination %.3f + %.6f = %.6f\n", channel_loss.item<float>(), destination_loss.item<float>(), value_loss.item<float>(), loss.item<float>());
+            std::printf("Avg loss: channel %.3f + destination %.3f + value %.6f = %.6f\n", channel_loss_total / steps, destination_loss_total / steps, value_loss_total / steps, total_loss_avg / steps);
             std::printf("[Current / Total samples]: [%lld / %lld]: %.0f samples/s or %.6f s/sample\n", samples, samples_total, samples / elapsed, elapsed / samples);
             std::printf("Stats per sample: dequeueTime %.6fs, modelTime %.6fs, lossTime %.6fs, backTime %.6fs, optimTime %.6fs\n", dequeue_time / samples, model_time / samples, loss_time / samples, back_time / samples, optim_time / samples);
             samples = 0;
@@ -292,7 +346,7 @@ void consumer_test(TensorQueue& queue, ChessCNN& model, torch::Device device) {
     auto start = std::chrono::steady_clock::now();
     int64_t samples = 0, steps = 0;
     double correct = 0;
-    double policy_loss_total = 0, value_loss_total = 0, total_loss_avg = 0;
+    double channel_loss_total = 0, destination_loss_total = 0, value_loss_total = 0, total_loss_avg = 0;
     double dequeue_time = 0, model_time = 0, loss_time = 0;
 
     model->eval();
@@ -320,28 +374,45 @@ void consumer_test(TensorQueue& queue, ChessCNN& model, torch::Device device) {
 
         // Forward pass
         auto model_start = std::chrono::steady_clock::now();
-        auto [moves_logits, value_logits, x_legal] = model->forward(batch.board_moves);
+        auto [channel_logits, destination_logits, value_logits, x_legal] = model->forward(batch.board_moves);
         model_time += std::chrono::duration<double>(std::chrono::steady_clock::now() - model_start).count();
+
+        // x_legal: [batch, 21, 8, 8]
+        
+        // Predict channel
+        auto channel_probs = torch::softmax(channel_logits, /*dim=*/1); // Shape: [batch, 21]
+        auto predicted_channel = torch::argmax(channel_probs, /*dim=*/1); // Shape: [batch]
+        
+        // Apply legal move mask for the predicted channel
+        auto channel_mask = x_legal.index_select(1, predicted_channel).squeeze(1); // Shape: [batch, 8, 8]
+        channel_mask = torch::flatten(channel_mask, 1); // Shape: [batch, 64]
+        auto mask_bool = (channel_mask == 0).to(torch::kBool); // Shape: [batch, 64]
+        // Mask illegal destination squares in-place
+        destination_logits.masked_fill_(mask_bool, -1e9);        
+    
+        // Predict destination
+        auto predicted_destination = torch::argmax(destination_logits, /*dim=*/1); // Shape: [batch]
+        
+        // Predict value (e.g., for evaluation)
+        auto value_probs = torch::softmax(value_logits, /*dim=*/1); // Shape: [batch, 3]
+        auto predicted_value = torch::argmax(value_probs, /*dim=*/1); // Shape: [batch]
 
         // Compute loss
         auto loss_start = std::chrono::steady_clock::now();
-        auto move_probs = torch::tensor(0.0).to(device);
-        auto legal_moves = x_legal.view({batch.board_moves.size(0), -1});
-        
-        //Completely suppress illegal moves
-        moves_logits.index_put_({legal_moves == 0}, -std::numeric_limits<float>::infinity());
-        auto policy_loss = torch::nn::functional::cross_entropy(moves_logits, batch.move);
+        auto channel_loss = torch::nn::functional::cross_entropy(channel_logits, batch.move_src);
+        auto destination_loss = torch::nn::functional::cross_entropy(destination_logits, batch.move_dst);
         auto value_loss = torch::nn::functional::cross_entropy(value_logits, batch.result);
-        auto loss = policy_loss + 0.2 * value_loss;
-        // Compute accuracy
-        move_probs = torch::softmax(moves_logits, 1);
-        auto pred = move_probs.argmax(1);
-        auto target = batch.move;
-        correct += (pred == target).to(torch::kFloat32).sum().item<float>();
-        
-        policy_loss_total += policy_loss.item<double>();
+        auto loss = (channel_loss + destination_loss) + 0.2 * value_loss;
+                
+        channel_loss_total += channel_loss.item<double>();
+        destination_loss_total += destination_loss.item<double>();
         value_loss_total += value_loss.item<double>();
         total_loss_avg += loss.item<double>();
+        
+        auto pred_move = predicted_channel * 64 + predicted_destination;
+        auto target_move = batch.move_src * 64 + batch.move_dst;
+        correct += (pred_move == target_move).to(torch::kFloat32).sum().item<float>();
+        
         loss_time += std::chrono::duration<double>(std::chrono::steady_clock::now() - loss_start).count();
 
         steps++;
@@ -350,7 +421,7 @@ void consumer_test(TensorQueue& queue, ChessCNN& model, torch::Device device) {
     if (samples > 0) {
         correct /= samples;
         auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        std::printf("Test loss: policy  %.3f + value %.6f = %.6f\n", policy_loss_total / steps, value_loss_total / steps, total_loss_avg / steps);
+        std::printf("Test loss: channel  %.3f + destination %.3f + value %.6f = %.6f\n", channel_loss_total / steps, destination_loss_total / steps, value_loss_total / steps, total_loss_avg / steps);
         std::printf("Test Error: Accuracy: %.1f%%, Avg loss: %.6f. %.0f samples/s or %.6f s/sample\n", (100 * correct), total_loss_avg / steps, samples / elapsed, elapsed / samples);
         std::printf("Stats per sample: dequeueTime %.6f, modelTime %.6f, lossTime %.6f\n", dequeue_time / samples, model_time / samples, loss_time / samples);
     } else {
@@ -370,13 +441,13 @@ int main(int argc, char ** argv) {
     const int T_max = 500;
     const int epochs = 1;
     const unsigned long steps = 10000000; //for curriculum learning (from simple positions of 5 legal moves to complex positions of 20 legal moves over number of steps)
-    const std::string weights_file = "chessCNN6.pt";
+    const std::string weights_file = "chessCNN7.pt";
     const int min_elo = 2400;
     const int max_elo_diff = 200;
     const int minMoves = 40;
-    const int num_channels = 132;
+    const int num_channels = 89;
     const int num_samples = 1000;
-    const enum GameStage game_stage = FullGame;
+    const enum GameStage game_stage = FullGame; //not used anymore
     const int display_stats_every = 1;
     const int save_weights_every = 1000;
     const int bmpr_queue_len_train = 2;
