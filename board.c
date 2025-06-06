@@ -644,6 +644,7 @@ void generateMoves(struct Board * board) {
 	square(&sq, SquareNone);
 	memset(board->movesFromSquares, 0, sizeof board->movesFromSquares);
 	memset(board->sideToMoveMoves, 0, sizeof board->sideToMoveMoves);
+	memset(board->channel, 0, sizeof board->channel);
 	enum Files ii;
 	enum Ranks jj;
 	enum SquareName sn;
@@ -667,6 +668,7 @@ void generateMoves(struct Board * board) {
   board->checkers = 0;
   board->pinnedPieces = 0;
   board->pinningPieces = 0;
+  board->oPawnMoves = board->oKnightMoves = board->oBishopMoves = board->oRookMoves = board->oQueenMoves = board->oKingMoves = board->pawnMoves = board->knightMoves = board->bishopMoves = board->rookMoves = board->queenMoves = board->kingMoves = 0;
   
 	//for opponent color sliding piece moves we need to temporary remove the king, 
 	//so the rays can light through it
@@ -701,6 +703,7 @@ void generateMoves(struct Board * board) {
 		//board->movesFromSquares[sq.name] = generateBishopMoves(board, &sq);
 		board->movesFromSquares[sn] = generate_bishop_moves(board, sn);
 		attackedSquares |= board->movesFromSquares[sn];
+		board->oBishopMoves |= board->movesFromSquares[sn];
 		//find pinned by this bishop pieces
 		//in bishopPinFinder() we move from the board->fen->sideToMove king toward the opponent 
 		//bishop if it's on the same diagonal (NE-SW) or antidiagonal (NW-SE)
@@ -727,6 +730,7 @@ void generateMoves(struct Board * board) {
   	square(&sq, sn);
 		board->movesFromSquares[sn] = generate_rook_moves(board, sn);
 		attackedSquares |= board->movesFromSquares[sq.name];
+		board->oRookMoves |= board->movesFromSquares[sq.name];
 		d = rookPinFinder(board, &sq, &(king.square));
 		d &= board->movesFromSquares[sq.name];
 		d &= board->occupations[shiftedColor | PieceTypeAny];
@@ -742,6 +746,7 @@ void generateMoves(struct Board * board) {
   	square(&sq, sn);
 		board->movesFromSquares[sn] = generate_bishop_moves(board, sn) | generate_rook_moves(board, sn);
 		attackedSquares |= board->movesFromSquares[sq.name];
+		board->oQueenMoves |= board->movesFromSquares[sq.name];
 		d = bishopPinFinder(board, &sq, &(king.square)) | rookPinFinder(board, &sq, &(king.square));
 		d &= board->movesFromSquares[sq.name];
 		d &= board->occupations[shiftedColor | PieceTypeAny];
@@ -773,6 +778,7 @@ void generateMoves(struct Board * board) {
 		}
 		board->movesFromSquares[sq.name] = d;
 		attackedSquares |= d;
+		board->oPawnMoves |= d;
 		opponentPawns &= opponentPawns - 1;
 	}
 	//find the squares attacked and defended by opponent knights
@@ -782,6 +788,7 @@ void generateMoves(struct Board * board) {
 		//generate opponent knight moves limited by board boudaries only
 		unsigned long knight_moves = generateKnightMoves(board, &sq);
 		board->movesFromSquares[sq.name] = knight_moves;
+		board->oKnightMoves |= knight_moves;
 		attackedSquares |= knight_moves;
 		opponentKnights &= opponentKnights - 1;
 	}
@@ -789,6 +796,7 @@ void generateMoves(struct Board * board) {
 	//generate opponent king moves limited by board boundaries only
 	unsigned long opponentKingMoves = generateKingMoves(board, &(opponentKing.square));
 	board->movesFromSquares[opponentKing.square.name] = opponentKingMoves;
+	board->oKingMoves = opponentKingMoves;
   attackedSquares |= opponentKingMoves;
   
   //this is from the opponent point of view, meaning its defended pieces and the pieces that it attacks
@@ -796,6 +804,7 @@ void generateMoves(struct Board * board) {
   //whether it can capture opponent's piece or not
 	board->defendedPieces = attackedSquares & board->occupations[shiftedOpponentColor | PieceTypeAny];
 	//attacked pieces are not used in generateMoves()
+  board->attackedSquares = attackedSquares;
   board->attackedPieces = attackedSquares & board->occupations[shiftedColor | PieceTypeAny];
     
 	//checkers
@@ -820,6 +829,7 @@ void generateMoves(struct Board * board) {
 	board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & (board->defendedPieces | board->occupations[shiftedColor | PieceTypeAny] | attackedSquares);
 	
 	moves |= board->movesFromSquares[king.square.name];
+	board->kingMoves = board->movesFromSquares[king.square.name];
 	//is king checked?
 	if ((board->isCheck = board->occupations[shiftedColor | King] & attackedSquares)) {
 		//if double check, no other moves rather than the king's move are possible
@@ -924,6 +934,7 @@ void generateMoves(struct Board * board) {
 			}
 		}
 		moves |= board->movesFromSquares[king.square.name];
+		board->kingMoves = board->movesFromSquares[king.square.name];
   }
   
 	//legal other moves
@@ -967,6 +978,7 @@ void generateMoves(struct Board * board) {
 			board->movesFromSquares[sq.name] &= (board->blockingSquares | checker);
 		}
 		moves |= board->movesFromSquares[sq.name];
+		board->bishopMoves |= board->movesFromSquares[sq.name];
 		bishops &= bishops - 1;
 	}
 
@@ -1002,6 +1014,7 @@ void generateMoves(struct Board * board) {
 		board->movesFromSquares[sq.name] = d ^ (d & board->occupations[shiftedColor | PieceTypeAny]);
 		if (checker > 0) board->movesFromSquares[sq.name] &= (board->blockingSquares | checker);
 		moves |= board->movesFromSquares[sq.name];		
+		board->rookMoves |= board->movesFromSquares[sq.name];
 		rooks &= rooks - 1;
 	}
 
@@ -1043,6 +1056,7 @@ void generateMoves(struct Board * board) {
 		board->movesFromSquares[sq.name] = d ^ (d & board->occupations[shiftedColor | PieceTypeAny]);
 		if (checker > 0) board->movesFromSquares[sq.name] &= (board->blockingSquares | checker);
 		moves |= board->movesFromSquares[sq.name];
+		board->queenMoves |= board->movesFromSquares[sq.name];
 		queens &= queens - 1;
 	}
 	
@@ -1193,6 +1207,7 @@ void generateMoves(struct Board * board) {
 			}
 		}
 		moves |= board->movesFromSquares[sq.name];
+		board->pawnMoves |= board->movesFromSquares[sq.name];
 next:
 		pawns &= pawns - 1;
 	}
@@ -1220,6 +1235,7 @@ next:
 			board->movesFromSquares[sq.name] = d ^ (d & board->occupations[shiftedColor | PieceTypeAny]);
 			if (checker > 0) board->movesFromSquares[sq.name] &= (board->blockingSquares | checker);
 			moves |= board->movesFromSquares[sq.name];
+			board->knightMoves |= board->movesFromSquares[sq.name];
 		}
 		knights &= knights - 1;
 	}

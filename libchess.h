@@ -1016,15 +1016,18 @@ extern "C" {
   struct Board {
   	unsigned long defendedPieces;
   	unsigned long attackedPieces;
+  	unsigned long attackedSquares;
   	//unsigned long moves; //all sideToMove moves
   	unsigned long blockingSquares;
   	unsigned long checkers;
   	unsigned long pinnedPieces;
   	unsigned long pinningPieces;
   	unsigned long occupations[16];
+	  unsigned long oPawnMoves, oKnightMoves, oBishopMoves, oRookMoves, oQueenMoves, oKingMoves, pawnMoves, knightMoves, bishopMoves, rookMoves, queenMoves, kingMoves;  	
   	enum PieceName piecesOnSquares[64];
   	unsigned long movesFromSquares[64];
   	unsigned long sideToMoveMoves[64];
+  	unsigned char channel[64];
   	//float squareCostForOpponent[64]; 
   	//float squareCostForSideToMove[64]; 
   	unsigned long hash;
@@ -1152,11 +1155,12 @@ extern "C" {
   struct BMPR {
     int samples;
     int sample;
-    unsigned char channels;
+    int channels;
     float * boards_legal_moves; // [batch_size, number_of_channels, 8, 8]
-    int * moves; // [batch_size]
-    int * result; // [batch_size]
-    int * stage; // [batch_size]
+    long * move_src; // this is piece channel [0, 20] [batch_size]
+    long * move_dst; // this is a square [0, 63] [batch_size]
+    long * result; // [batch_size]
+    //int * stage; // [batch_size]
   };
   struct BMPR * dequeueBMPR();
   void free_bmpr(struct BMPR * bmpr);
@@ -1277,7 +1281,7 @@ enum Antidiagonals {
 enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
 static char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
 
-static float pieceValue[] = { 0.0, 0.05, 0.15, 0.16, 0.25, 0.45, 1.0 }; //scaled down by kings value of 20
+static float pieceValue[] = { 0.0, 0.1, 0.30, 0.32, 0.50, 0.90, 1.0 }; //scaled down by kings value of 10
 static float pieceMobility[] = { 0.0, 4.0, 8.0, 11.0, 14.0, 25.0, 8.0 }; //max value - used for norm
 
 /// <summary>
@@ -1551,6 +1555,7 @@ struct ChessPiece {
 struct Board {
 	unsigned long defendedPieces; //defended opponent pieces 
 	unsigned long attackedPieces; //sideToMove pieces attacked by opponent
+	unsigned long attackedSquares; //all squares attacked by opponent
 	//unsigned long moves; //sideToMove moves
 	unsigned long blockingSquares;
 	unsigned long checkers;
@@ -1564,11 +1569,13 @@ struct Board {
 	/// Array of PieceName enums indexed by SquareName
 	/// </summary>
 	enum PieceName piecesOnSquares[64];
+	unsigned long oPawnMoves, oKnightMoves, oBishopMoves, oRookMoves, oQueenMoves, oKingMoves, pawnMoves, knightMoves, bishopMoves, rookMoves, queenMoves, kingMoves;
 	/// <summary>
 	/// Array of legal moves indexed by square
 	/// </summary>
 	unsigned long movesFromSquares[64]; //these include opponents moves as well
 	unsigned long sideToMoveMoves[64]; //these are just the moves of sideToMove
+	unsigned char channel[64]; //AI model input channels
 	//how many extra opponent pieces (value) attack/defend a square (index) regardless if it's occupied or not
 	//another words, number of opponent attackers on a square minus number of sideToMove defenders on the same square
 	//if the number is negative, then it goes as positive into sideToMoveSquareAdvantage[64]
@@ -1637,11 +1644,12 @@ struct Board {
 struct BMPR {
   int samples;
   int sample;
-  unsigned char channels;
+  int channels;
   float * boards_legal_moves; // [batch_size, number_of_channels, 8, 8]
-  int * moves; // [batch_size]
-  int * result; // [batch_size]
-  int * stage; // [batch_size]
+  long * move_src; // piece channel [0, 20] [batch_size]
+  long * move_dst; // destination square
+  long * result; // [batch_size]
+  //int * stage; // [batch_size]
 };
 
 static char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -1747,6 +1755,7 @@ struct MoveScoreGames {
 struct MoveScores {
   char move[6]; //uci move
   double score; //weighted score, i.e. score / total number of games in NextMoves.db for a given position
+  int scorecp;
 };
 
 enum Tags {

@@ -12,7 +12,7 @@ if __name__ == "__main__":
   minElo = 2400
   maxEloDiff = 200
   minMoves = 40
-  engineEval = True
+  engineEval = False
   multiPV = 3
   hashSize = 128
   engineThreads = 1

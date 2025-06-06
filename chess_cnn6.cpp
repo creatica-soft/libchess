@@ -24,33 +24,33 @@ torch::Tensor ResidualBlockImpl::forward(torch::Tensor x) {
 ChessCNNImpl::ChessCNNImpl() {
     // Board convolution branch
     board_conv = register_module("board_conv", torch::nn::Sequential(
-        torch::nn::Conv2d(torch::nn::Conv2dOptions(64, 128, 3).padding(1)),
+        torch::nn::Conv2d(torch::nn::Conv2dOptions(68, 192, 3).padding(1)),
         torch::nn::ReLU(),
-        ResidualBlock(128),
-        ResidualBlock(128),
-        ResidualBlock(128),
-        ResidualBlock(128),
-        ResidualBlock(128)
+        ResidualBlock(192),
+        ResidualBlock(192),
+        ResidualBlock(192),
+        ResidualBlock(192),
+        ResidualBlock(192)
     ));
 
-    // Policy moves opening
+    // Policy moves
     policy_moves = register_module("policy_moves", torch::nn::Sequential(
-        torch::nn::Conv2d(torch::nn::Conv2dOptions(128, 64, 1)),
+        torch::nn::Conv2d(torch::nn::Conv2dOptions(192, 64, 1)),
         torch::nn::Flatten(),
-        torch::nn::Linear(4096, 1024),
+        torch::nn::Linear(4096, 512),
         torch::nn::ReLU(),
-        torch::nn::Dropout(0.3), //could be increased to 0.5 for better regularization
-        torch::nn::Linear(1024, 4096)
+        torch::nn::Dropout(0.2), //could be increased to 0.5 for better regularization
+        torch::nn::Linear(512, 4096)
     ));
 
-    // Value head opening
+    // Value head
     value_head = register_module("value_head", torch::nn::Sequential(
-        torch::nn::Conv2d(torch::nn::Conv2dOptions(128, 64, 1)),
+        torch::nn::Conv2d(torch::nn::Conv2dOptions(192, 64, 1)),
         torch::nn::Flatten(),
-        torch::nn::Linear(4096, 128),
+        torch::nn::Linear(4096, 64),
         torch::nn::ReLU(),
-        torch::nn::Dropout(0.3),
-        torch::nn::Linear(128, 3)
+        torch::nn::Dropout(0.2),
+        torch::nn::Linear(64, 3)
     ));
 
     // Xavier normal initialization for linear layers
@@ -71,8 +71,8 @@ ChessCNNImpl::ChessCNNImpl() {
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ChessCNNImpl::forward(torch::Tensor x) {
     // Split input: first 64 channels for board, then 
     // the rest 64 channels is for masking model predictions, total 128 channels
-    auto x_board = x.slice(1, 0, 64);
-    auto x_legal_mask = x.slice(1, 64);
+    auto x_board = x.slice(1, 0, 68); //slice along dim 1 from 0 to 64 (not inclusive?)
+    auto x_legal_mask = x.slice(1, 68); //slice along dim 1 from 64 to the end
 
     // Process board and legal move features
     auto board_features = board_conv->forward(x_board);

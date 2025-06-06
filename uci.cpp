@@ -9,7 +9,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include "chess_cnn4.h"
+#include "chess_cnn7.h"
 #include <torch/torch.h>
 #include <torch/script.h>
 #include <torch/serialize.h>

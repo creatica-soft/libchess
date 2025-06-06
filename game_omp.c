@@ -112,21 +112,27 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 	  printf("bmprNew(%d) error: calloc() for boards_legal_moves returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
-	bmpr->moves = (int *)calloc(bmpr->samples, sizeof(int));
-	if (!bmpr->moves) {
-	  printf("bmprNew(%d) error: calloc() for moves returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
+	bmpr->move_src = (long *)calloc(bmpr->samples, sizeof(long));
+	if (!bmpr->move_src) {
+	  printf("bmprNew(%d) error: calloc() for move_src returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
-	bmpr->result = (int *)calloc(bmpr->samples, sizeof(int));
+	bmpr->move_dst = (long *)calloc(bmpr->samples, sizeof(long));
+	if (!bmpr->move_dst) {
+	  printf("bmprNew(%d) error: calloc() for move_dst returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
+	  return NULL;
+	}
+	bmpr->result = (long *)calloc(bmpr->samples, sizeof(long));
 	if (!bmpr->result) {
 	  printf("bmprNew(%d) error: calloc() for result returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
+	/*
 	bmpr->stage = (int *)calloc(bmpr->samples, sizeof(int));
 	if (!bmpr->stage) {
 	  printf("bmprNew(%d) error: calloc() for stage returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
-	}
+	}*/
   return bmpr;
 }
 
@@ -196,6 +202,7 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
 	char * saveptr;
 	char * token = strtok_r(sanMoves, " ", &saveptr);
 	while (token) {
+/*
 	  enum GameStage stage = getStage(&board);
 	  //printf("gameStage %s\n", gameStages[stage]);
 	  if (gameStage != FullGame) {
@@ -209,7 +216,7 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
     		token = strtok_r(NULL, " ", &saveptr);
   	    continue;
   	  }
-	  } /*else {
+	  } else {
 	    //this blocks attempts to balance the number of positions for each game stage in a batch
   	  //so that each AI model head (opening, middlegame, endgame) receives approximately the same
   	  //number of samples
@@ -232,29 +239,38 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
       }
       #pragma omp critical
       (*step)++;
-	  }*/
+	  }
 	  (*bmpr)->stage[(*bmpr)->sample] = stage;
+*/
 	  //populate channels used as input for AI model
-    if (boardLegalMoves((*bmpr)->boards_legal_moves, (*bmpr)->sample, (*bmpr)->channels, &board)) {
-      printf("boardLegalMoves() returned non-zero code\n");
-      return -1;
+	  int res;
+    if ((res = boardLegalMoves((*bmpr)->boards_legal_moves, (*bmpr)->sample, (*bmpr)->channels, &board))) {
+      if (res == 1) { //extra promotion piece detected (usually more than 3 queens, rooks, knights or bishops)
+        if (initMove(&move, &board, token)) {
+    			printf("playGameAI(%d) error: invalid move %u%s%s (%s); FEN %s\n", omp_get_thread_num(), move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+    			if (sanMoves) free(sanMoves);
+    			return -2;
+    		}
+    		makeMove(&move);    
+    		token = strtok_r(NULL, " ", &saveptr);
+  	    continue;
+      } else {
+        printf("boardLegalMoves() returned non-zero code\n");
+        return -1;
+      }
     }
 		if (initMove(&move, &board, token)) {
 			printf("playGameAI(%d) error: invalid move %u%s%s (%s); FEN %s\n", omp_get_thread_num(), move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
 			if (sanMoves) free(sanMoves);
 			return -2;
 		}
-    //calculate legal move index (move prediction class) - used as target in policy loss calculation
-    (*bmpr)->moves[(*bmpr)->sample] = move.sourceSquare.name * 64 + move.destinationSquare.name;
-    //calculate promo index (promo prediction class) - used as target in promo loss calculation
-    //I think underpromotions are extremely rare, so I think it would be impossible to learn them
-    //We just always use default promotion to queen and be done with it
-    /* 
-    if (board.promoPiece != PieceNameNone)
-      // promo classes: knight is 0, bishop is 1, rook is 2, queen is 3 
-      (*bmpr)->promos[(*bmpr)->sample] = board.promoPiece - 1; 
-      else (*bmpr)->promos[(*bmpr)->sample] = -1; //it should be masked to avoid negative numbers in loss
-    */
+    //board.channel[src_sqr] is an array of channels from 0 to 20 (16 channels for pieces and 5 for promotions)
+    //channels 0 to 7 are for pawns on files a to h respectively. There could be multiple pawns on the same file
+    //channels 8 to 10 are for knights, 11-13 - bishops, 14-16 - rooks, 17-19 - queens, 20 - king
+    //the array is filled in boardLegalMoves() defined in boards_legal_movesX.c
+    (*bmpr)->move_src[(*bmpr)->sample] = board.channel[move.sourceSquare.name];
+    (*bmpr)->move_dst[(*bmpr)->sample] = move.destinationSquare.name;
+
 		makeMove(&move);
 		
 		if (board.isStaleMate && strcmp(game->tags[Result], "1/2-1/2") != 0) {
@@ -278,10 +294,10 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
 		//result is from a point of view of the side to move - which I think confuses the model during training!
 		//so let's provide constant result regardless of the side to move!
 		//result class is used as a target in value loss calculation
-		//if (board.fen->sideToMove == ColorBlack) //move is made, so sideToMove if White has already changed to Black
-    (*bmpr)->result[(*bmpr)->sample] = gameResult + 1; //(0 (white lost/black won), 1 (draw), 2 (white won/black lost))
-    //else 
-    //(*bmpr)->result[(*bmpr)->sample] = -gameResult + 1; //from black perspective (0 (loss), 1 (draw), 2 (win))
+		if (board.fen->sideToMove == ColorBlack) //move is made, so sideToMove if White has already changed to Black
+      (*bmpr)->result[(*bmpr)->sample] = gameResult + 1; //(0 (white lost/black won), 1 (draw), 2 (white won/black lost))
+    else 
+      (*bmpr)->result[(*bmpr)->sample] = -gameResult + 1; //from black perspective (0 (loss), 1 (draw), 2 (win))
     //we attempt to correct the wrong game result by rewinding backwards by the number of plies in a game
     //if the game started in previous batch, then those positions won't be updated, of course
     if (wrong_result) {
@@ -316,15 +332,19 @@ void free_bmpr(struct BMPR * bmpr) {
   if (bmpr->boards_legal_moves) {
     free(bmpr->boards_legal_moves);
   }
-  if (bmpr->moves) {
-    free(bmpr->moves);
+  if (bmpr->move_src) {
+    free(bmpr->move_src);
+  }
+  if (bmpr->move_dst) {
+    free(bmpr->move_dst);
   }
   if (bmpr->result) {
     free(bmpr->result);
   }
+  /*
   if (bmpr->stage) {
     free(bmpr->stage);
-  }
+  }*/
   //printf("Freeing bmpr at %p in thread %d\n", (void*)bmpr, omp_get_thread_num());
   free(bmpr);
   bmpr = NULL;
@@ -617,7 +637,8 @@ void * getGameCsv(void * context) {
           			break;
           		}
               //calculate legal move index (move prediction class) - used as target in policy loss calculation
-              bmpr->moves[bmpr->sample] = move.sourceSquare.name * 64 + move.destinationSquare.name;
+              bmpr->move_src[bmpr->sample] = board.channel[move.sourceSquare.name];
+              bmpr->move_dst[bmpr->sample] = move.destinationSquare.name;
               //calculate promo index (promo prediction class) - used as target in promo loss calculation
               /*if (board.promoPiece != PieceNameNone)
               // promo classes: knight is 0, bishop is 1, rook is 2, queen is 3 

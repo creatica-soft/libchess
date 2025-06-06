@@ -228,7 +228,7 @@ for (int64_t i = 0; i < batch.board_moves.size(0); i++) {
 
         // Compute loss
         auto loss_start = std::chrono::steady_clock::now();
-        auto legal_moves = x_legal.view({batch.board_moves.size(0), -1});
+        auto legal_moves = x_legal.view({batch.board_moves.size(0), -1}); //first dim 0 is batch size (1000), second (-1) is inferred from number of channels and 8 x 8 board, i.e. 64 x 64 = 4096, so legal_moves is 1000 x 4096
 
         //Completely suppress illegal moves
         moves_logits.index_put_({legal_moves == 0}, -std::numeric_limits<float>::infinity());
@@ -367,21 +367,21 @@ int main(int argc, char ** argv) {
     //learning_rate (1e-4) to lr_min (0.1 * learning_rate = 1e-5) over T_max (10000) steps
     //it can be reset at each epoch or alternatively increase T_max
     const double lr_min = 0.1; //i.e. a factor such as min_lr = 0.1 * learning_rate, another words, 10 times less
-    const int T_max = 1000;
+    const int T_max = 500;
     const int epochs = 1;
     const unsigned long steps = 10000000; //for curriculum learning (from simple positions of 5 legal moves to complex positions of 20 legal moves over number of steps)
     const std::string weights_file = "chessCNN6.pt";
     const int min_elo = 2400;
     const int max_elo_diff = 200;
     const int minMoves = 40;
-    const int num_channels = 128;
+    const int num_channels = 132;
     const int num_samples = 1000;
     const enum GameStage game_stage = FullGame;
     const int display_stats_every = 1;
     const int save_weights_every = 1000;
     const int bmpr_queue_len_train = 2;
     const int bmpr_queue_len_test = 3;
-    const int accumulation_steps = 8; // Accumulate gradients over 16 batches
+    const int accumulation_steps = 16; // Accumulate gradients over 16 batches
     const std::string pgn_dir = "/Users/ap/Downloads/Lichess Elite Database/";
     const std::vector<std::string> test_files = {"KingBaseLite2019.pgn"};
 
