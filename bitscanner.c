@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include "libchess.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /// <summary>
 /// Count the number of bits set to 1 in a ulong, probably the best substitution to POPCNT processor instruction 
 /// </summary>
@@ -36,9 +40,9 @@ unsigned char magicTable[] = {
 /// </summary>
 /// <param name="b">64-bit unsigned positive integer</param>
 /// <returns>Zero-based least significant bit, or 64 for zero argument</returns>
-enum SquareName lsBit(unsigned long b) {
+unsigned char lsBit(unsigned long b) {
 	if (b == 0) return SquareNone;
-	return __builtin_ctzl(b);
+	return (enum SquareName)__builtin_ctzl(b);
 	// there is no difference in performance between gcc built-in function
 	// and the table lookup (at least on armv8 it is not a factor)
 	//return (enum SquareName)__builtin_ctzl(b);
@@ -80,3 +84,6 @@ void unpack_bits(unsigned long number, float * bit_array) {
         }
     }
 }
+#ifdef __cplusplus
+}
+#endif

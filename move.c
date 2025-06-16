@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include "libchess.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 ///<summary>
 /// returns string representation in the first argument
 /// of a bit field move type given in a secondary argument
@@ -26,7 +30,7 @@ void getMoveType(char * mvType, unsigned char type) {
 	}
 }
 
-unsigned char moveCandidateScore(struct Square * sq, enum Files srcFile, enum Ranks srcRank)
+unsigned char moveCandidateScore(struct Square * sq, int srcFile, int srcRank)
 {
 	unsigned char score = 1;
 	if (sq->file == srcFile && sq->rank == srcRank)
@@ -76,7 +80,7 @@ int validateSanMove(struct Move * move) {
 	strncpy(sanMove, move->sanMove, len + 1);
 	if (sanMove[len - 1] == '+' || sanMove[len - 1] == '#')
 		sanMove[len - 1] = '\0';
-	enum CastlingSide castlingSide = CastlingSideNone;
+	int castlingSide = CastlingSideNone;
 	if (strcmp(sanMove, "O-O-O") == 0)
 		castlingSide = CastlingSideQueenside;
 	else if (strcmp(sanMove, "O-O") == 0)
@@ -126,8 +130,8 @@ int validateSanMove(struct Move * move) {
 	//castling
 	if (castlingSide != CastlingSideNone) {
 		move->type |= (castlingSide << 2);
-		enum SquareName kingCastlingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
-		enum PieceName kingPc = move->chessBoard->fen->sideToMove << 3 | King;
+		int kingCastlingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
+		int kingPc = move->chessBoard->fen->sideToMove << 3 | King;
 		struct Square kingSrcSq, kingDstSq;
 		square(&kingSrcSq, lsBit(move->chessBoard->occupations[kingPc]));
 		memcpy(&(move->sourceSquare), &kingSrcSq, sizeof(struct Square));
@@ -156,18 +160,18 @@ int validateSanMove(struct Move * move) {
 		return 0;
 	}
 
-	enum Files dstFile = FileNone;
-	enum Files srcFile = FileNone;
-	enum Ranks dstRank = RankNone;
-	enum Ranks srcRank = RankNone;
+	int dstFile = FileNone;
+	int srcFile = FileNone;
+	int dstRank = RankNone;
+	int srcRank = RankNone;
 
 	for (signed char i = (signed char)strlen(sanMove) - 1; i >= 0; i--) {
 		if (sanMove[i] >= '1' && sanMove[i] <= '8') {
-			enum Ranks x = sanMove[i] - '1';
+			int x = sanMove[i] - '1';
 			if (dstRank == RankNone) dstRank = x;
 			else srcRank = x;
 		} else if (sanMove[i] >= 'a' && sanMove[i] <= 'h') {
-			enum Files x = sanMove[i] - 'a';
+			int x = sanMove[i] - 'a';
 			if (dstFile == FileNone) dstFile = x;
 			else srcFile = x;
 		} else {
@@ -198,9 +202,9 @@ int validateSanMove(struct Move * move) {
 		if ((move->type & MoveTypeCapture) != MoveTypeCapture) {
 			srcFile = move->destinationSquare.file;
 			//detect EnPassant move
-			enum Ranks dstRanks[] = { Rank4, Rank5 };
-			enum Ranks srcRanks[] = { Rank2, Rank7 };
-			enum SquareName srcSquare = (srcRanks[move->chessBoard->fen->sideToMove] << 3) | srcFile;
+			int dstRanks[] = { Rank4, Rank5 };
+			int srcRanks[] = { Rank2, Rank7 };
+			int srcSquare = (srcRanks[move->chessBoard->fen->sideToMove] << 3) | srcFile;
 			struct Square srcSq;
 			square(&srcSq, srcSquare);
 			if (move->destinationSquare.rank == dstRanks[move->chessBoard->fen->sideToMove]) {
@@ -236,7 +240,7 @@ int validateSanMove(struct Move * move) {
 		unsigned long cp = move->chessBoard->occupations[move->chessBoard->movingPiece.name];
 		struct Square * s;
 		unsigned char n = 0; //number of candidates
-		s = malloc(sizeof(struct Square));
+		s = (struct Square *)malloc(sizeof(struct Square));
 		//iterate over all squares where movingPiece.name are located
 		square(s, lsBit(cp));
 		while (s->name < SquareNone) {
@@ -276,7 +280,7 @@ int validateSanMove(struct Move * move) {
 			  //if last candidate is on square s
 				if (moveCandidates[n - 1] == s)
 				  //allocate a new square s
-					s = malloc(sizeof(struct Square));
+					s = (struct Square *)malloc(sizeof(struct Square));
 			square(s, lsBit(cp));
 		} //end of while() loop over squares
 		if (n == 0) free(s); //free square s if there are no candidates
@@ -356,7 +360,7 @@ int validateUciMove(struct Move * move) {
 	if ((move->chessBoard->movesFromSquares[move->sourceSquare.name] & move->destinationSquare.bitSquare) > 0)
 		move->type |= MoveTypeValid;
 	else {
-		printf("%s move from %s to %s is illegal in %u%s%s; legal moves %lu\n", pieceName[move->chessBoard->movingPiece.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, move->chessBoard->movesFromSquares[move->sourceSquare.name]);
+		printf("%s move from %s to %s is illegal in %u%s%s; legal moves %llu\n", pieceName[move->chessBoard->movingPiece.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, move->chessBoard->movesFromSquares[move->sourceSquare.name]);
 		writeDebug(move->chessBoard, true);
 		reconcile(move->chessBoard);
 		return 1;
@@ -365,12 +369,12 @@ int validateUciMove(struct Move * move) {
 }
 
 void san2uci(struct Move * move) {
-	enum CastlingSide castling = ((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside)) - 1) >> 3;
+	int castling = ((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside)) - 1) >> 3;
 	struct Square s;
 	if (castling != CastlingSideNone && move->chessBoard->fen->isChess960)
 	{
 		//need to move the king on the kingside rook
-		enum Ranks r[2] = { Rank1, Rank8 };
+		int r[2] = { Rank1, Rank8 };
 		unsigned long rooks = move->chessBoard->occupations[move->chessBoard->movingPiece.color << 3 | Rook];
 		struct Square king;
 		square(&king, lsBit(move->chessBoard->occupations[move->chessBoard->movingPiece.color << 3 | King]));
@@ -411,7 +415,7 @@ void san2uci(struct Move * move) {
 }
 
 void uci2san(struct Move * move) {
-	enum CastlingSide castling = ((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside))) >> 2;
+	int castling = ((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside))) >> 2;
 	if (castling == CastlingSideQueenside) {
 		strcpy(move->sanMove, "O-O-O");
 		return;
@@ -430,7 +434,7 @@ void uci2san(struct Move * move) {
 		struct Square * moveCandidates[10];
 		unsigned long cp = move->chessBoard->occupations[move->chessBoard->movingPiece.name];
 		struct Square * s;
-		s = malloc(sizeof(struct Square));
+		s = (struct Square *)malloc(sizeof(struct Square));
 		square(s, lsBit(cp));
 		unsigned char idx = 0;
 		while (s->name < SquareNone) {
@@ -448,7 +452,7 @@ void uci2san(struct Move * move) {
 			}
 			if (idx)
 				if (moveCandidates[idx - 1] == s)
-					s = malloc(sizeof(struct Square));
+					s = (struct Square *)malloc(sizeof(struct Square));
 			square(s, lsBit(cp));
 		}
 		if (idx == 0) free(s);
@@ -499,7 +503,7 @@ void setUciMoveType(struct Move * move) {
 		{
 			struct Square s;
 			unsigned long pawns = move->chessBoard->occupations[(move->chessBoard->opponentColor << 3) | Pawn];
-			enum Ranks ranks[2] = { Rank4, Rank5 };
+			int ranks[2] = { Rank4, Rank5 };
 			square(&s, lsBit(pawns));
 			while (s.name < SquareNone)
 			{
@@ -533,7 +537,7 @@ void setUciMoveType(struct Move * move) {
 		{
 			char diff = move->sourceSquare.name - move->destinationSquare.name;
 			if (abs(diff) == 2) {
-				enum SquareName dstKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
+				int dstKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
 				if (move->destinationSquare.name == dstKingSquare[1][move->chessBoard->fen->sideToMove])
 					move->type |= MoveTypeCastlingQueenside;
 				else if (move->destinationSquare.name == dstKingSquare[0][move->chessBoard->fen->sideToMove])
@@ -555,9 +559,9 @@ int initMove(struct Move * move, struct Board * board, char * moveString) {
 	memset(move, 0, sizeof(struct Move));
 	board->capturedPiece = PieceNameNone;
 	board->promoPiece = PieceNameNone;
-	board->isCheck = false;
-	board->isMate = false;
-	board->isStaleMate = false;
+	//board->isCheck = false;
+	//board->isMate = false;
+	//board->isStaleMate = false;
 	square(&(board->movingPiece.square), SquareNone);
 	piece(&(board->movingPiece.square), &(board->movingPiece), PieceNameNone);
 
@@ -586,3 +590,6 @@ int initMove(struct Move * move, struct Board * board, char * moveString) {
 	return 0;
 }
 
+#ifdef __cplusplus
+}
+#endif

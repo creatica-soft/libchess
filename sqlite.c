@@ -8,6 +8,10 @@
 #include <sqlite3.h>
 #include "libchess.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 //PRAGMA busy_timeout = milliseconds
 //PRAGMA cache_size = pages //default is -2000 KB (or 512 pages); each page is 4096 bytes
 //PRAGMA journal_mode = DELETE | TRUNCATE | PERSIST | MEMORY | WAL | OFF Default is DELETE 
@@ -18,7 +22,7 @@ sqlite3 * openDb(const char * filename, int flags) {
   
   int res = sqlite3_open_v2(filename, &db, flags, NULL);
   if (res != SQLITE_OK) {
-     printf("openDb() error: sqlite3_open_v2() returned %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), sqlite3_errmsg(db), sqlite3_extended_errcode(db));
+     printf("openDb(%s, %d) error: sqlite3_open_v2() returned %d (%s): %s, ext err code %d\n", filename, flags, res, sqlite3_errstr(res), sqlite3_errmsg(db), sqlite3_extended_errcode(db));
      exit(1);
   }
   res = sqlite3_exec(db, "pragma journal_mode=OFF", NULL, NULL, &errmsg);
@@ -144,27 +148,35 @@ int getNextMoves(sqlite3 * db, sqlite3_int64 hash, struct MoveScoreGames ** next
   const char * sql = "select next_move, score, games, scorecp from next_moves where hash=:hash;";
   sqlite3_stmt * query = NULL;
   int numberOfMoves = 0;
-  
+  struct timespec delay;
+  delay.tv_sec = 0;
+  delay.tv_nsec = 10;
+
   if (!db) {
     printf("getNextMoves() error: db is NULL\n");
     exit(1);
   }
   int res = sqlite3_prepare_v2(db, sql, strlen(sql) + 1,&query, NULL);
+  while (res == 5) { //database is locked
+    nanosleep(&delay, NULL);
+    delay.tv_nsec *= 2;
+    res = sqlite3_prepare_v2(db, sql, strlen(sql) + 1,&query, NULL);
+  }
   if (res != SQLITE_OK) {
      printf("getNextMoves() error: sqlite3_prepare_v2() returned %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), sqlite3_errmsg(db), sqlite3_extended_errcode(db));
      exit(2);
   }  
   res = sqlite3_bind_int64(query, sqlite3_bind_parameter_index(query, ":hash"), hash);
-  if (res != SQLITE_OK) {
-     printf("getNextMoves() error: sqlite3_bind_int64(hash) returned %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), sqlite3_errmsg(db), sqlite3_extended_errcode(db));
-     sqlite3_finalize(query);
-     exit(3);
+  if (res != SQLITE_OK) {    
+    printf("getNextMoves() error: sqlite3_bind_int64(hash) returned %d (%s): %s, ext err code %d\n", res, sqlite3_errstr(res), sqlite3_errmsg(db), sqlite3_extended_errcode(db));
+    sqlite3_finalize(query);
+    exit(3);
   }
   int i = 0;
   while (res != SQLITE_DONE) {
     res = sqlite3_step(query);
     if (res == SQLITE_ROW) {
-      nextMove[i] = malloc(sizeof(struct MoveScoreGames));
+      nextMove[i] = (struct MoveScoreGames *)malloc(sizeof(struct MoveScoreGames));
       strncpy(nextMove[i]->move, (const char *)sqlite3_column_text(query, 0), 6);
       nextMove[i]->score = sqlite3_column_int(query, 1);
       nextMove[i]->games = sqlite3_column_int(query, 2);
@@ -314,3 +326,6 @@ void updateNextMove(sqlite3 * db, sqlite3_int64 hash, const char * move, int gam
      exit(6);
   }
 }
+#ifdef __cplusplus
+}
+#endif

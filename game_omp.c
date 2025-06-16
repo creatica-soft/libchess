@@ -13,6 +13,11 @@
 #include "uthash.h"
 #include "magic_bitboards.h"
 #include "libchess.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
 
@@ -46,7 +51,7 @@ struct getGameCtx {
   int numberOfChannels;
   int numberOfSamples;
   int bmprQueueLen;
-  enum GameStage gameStage;
+  int gameStage;
 };
 
 static struct QueueBMPR queueBMPR;
@@ -112,14 +117,19 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 	  printf("bmprNew(%d) error: calloc() for boards_legal_moves returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
-	bmpr->move_src = (long *)calloc(bmpr->samples, sizeof(long));
-	if (!bmpr->move_src) {
-	  printf("bmprNew(%d) error: calloc() for move_src returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
+	bmpr->move_type = (long *)calloc(bmpr->samples, sizeof(long));
+	if (!bmpr->move_type) {
+	  printf("bmprNew(%d) error: calloc() for move_type returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
-	bmpr->move_dst = (long *)calloc(bmpr->samples, sizeof(long));
-	if (!bmpr->move_dst) {
-	  printf("bmprNew(%d) error: calloc() for move_dst returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
+	bmpr->src_sq = (long *)calloc(bmpr->samples, sizeof(long));
+	if (!bmpr->src_sq) {
+	  printf("bmprNew(%d) error: calloc() for src_sq returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
+	  return NULL;
+	}
+	bmpr->dst_sq = (long *)calloc(bmpr->samples, sizeof(long));
+	if (!bmpr->dst_sq) {
+	  printf("bmprNew(%d) error: calloc() for dst_sq returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
 	bmpr->result = (long *)calloc(bmpr->samples, sizeof(long));
@@ -137,7 +147,7 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 }
 
 //return a game stage such as opening, middlegame or endgame enum GameStage
-enum GameStage getStage(struct Board * board) {
+int getStage(struct Board * board) {
   int numberOfPieces = __builtin_popcountl(board->occupations[PieceNameAny]);
   if (numberOfPieces >= 24) return OpeningGame;
   else if (numberOfPieces <= 12) return EndGame;
@@ -149,10 +159,10 @@ enum GameStage getStage(struct Board * board) {
 /*
 float materialBalance(struct Board * board) {
   float white = 0, black = 0;
-  for (enum PieceName pn = WhitePawn; pn <= WhiteQueen; pn++) {
+  for (int pn = WhitePawn; pn <= WhiteQueen; pn++) {
     white += 2.0 * pieceValue[pn & 7] * __builtin_popcountl(board->occupations[pn]);
   }
-  for (enum PieceName pn = BlackPawn; pn <= BlackQueen; pn++) {
+  for (intpn = BlackPawn; pn <= BlackQueen; pn++) {
     black += 2.0 * pieceValue[pn & 7] * __builtin_popcountl(board->occupations[pn]);
   }
   float balance = board->fen->sideToMove == ColorBlack ? (white - black) : (black - white);
@@ -166,7 +176,7 @@ float materialBalance(struct Board * board) {
 /// Plays a given game using Game struct
 /// Returns struct BMPR *
 ///</summary>
-int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage, unsigned long * step, const unsigned long steps) {
+int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned long * step, const unsigned long steps) {
   int gameResult = 0;
 	struct Move move;
 	struct Board board;
@@ -203,7 +213,7 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
 	char * token = strtok_r(sanMoves, " ", &saveptr);
 	while (token) {
 /*
-	  enum GameStage stage = getStage(&board);
+	  int stage = getStage(&board);
 	  //printf("gameStage %s\n", gameStages[stage]);
 	  if (gameStage != FullGame) {
   	  if (stage != gameStage) { //skip moves until we get to the required stage
@@ -265,11 +275,13 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, enum GameStage gameStage
 			return -2;
 		}
     //board.channel[src_sqr] is an array of channels from 0 to 20 (16 channels for pieces and 5 for promotions)
-    //channels 0 to 7 are for pawns on files a to h respectively. There could be multiple pawns on the same file
+    //channels 0 to 7 are for pawns on files a to h respectively.
     //channels 8 to 10 are for knights, 11-13 - bishops, 14-16 - rooks, 17-19 - queens, 20 - king
     //the array is filled in boardLegalMoves() defined in boards_legal_movesX.c
-    (*bmpr)->move_src[(*bmpr)->sample] = board.channel[move.sourceSquare.name];
-    (*bmpr)->move_dst[(*bmpr)->sample] = move.destinationSquare.name;
+    (*bmpr)->move_type[(*bmpr)->sample] = board.channel[move.sourceSquare.name];
+    //printf("playGameAI(%d): board.channel[%s] %u\n", omp_get_thread_num(), squareName[move.sourceSquare.name], board.channel[move.sourceSquare.name]);
+    (*bmpr)->src_sq[(*bmpr)->sample] = move.sourceSquare.name;
+    (*bmpr)->dst_sq[(*bmpr)->sample] = move.destinationSquare.name;
 
 		makeMove(&move);
 		
@@ -332,11 +344,14 @@ void free_bmpr(struct BMPR * bmpr) {
   if (bmpr->boards_legal_moves) {
     free(bmpr->boards_legal_moves);
   }
-  if (bmpr->move_src) {
-    free(bmpr->move_src);
+  if (bmpr->move_type) {
+    free(bmpr->move_type);
   }
-  if (bmpr->move_dst) {
-    free(bmpr->move_dst);
+  if (bmpr->src_sq) {
+    free(bmpr->src_sq);
+  }
+  if (bmpr->dst_sq) {
+    free(bmpr->dst_sq);
   }
   if (bmpr->result) {
     free(bmpr->result);
@@ -423,7 +438,7 @@ void * getGame(void * context) {
           const unsigned long steps = ctx->steps;
           const int numberOfChannels = ctx->numberOfChannels;
           const int numberOfSamples = ctx->numberOfSamples;
-          const enum GameStage gameStage = ctx->gameStage;
+          const int gameStage = ctx->gameStage;
       	  #pragma omp task firstprivate(filename, minElo, maxEloDiff, minMoves, steps, numberOfChannels, numberOfSamples, gameStage) shared(queueBMPR, games, numberOfGames, skipped, duplicate, numberOfPlies, step)
       	  {
         	  int res = 0;
@@ -463,7 +478,7 @@ void * getGame(void * context) {
                 res = 2;
               }
               else { 
-                entry = malloc(sizeof(struct GameHash));
+                entry = (struct GameHash *)malloc(sizeof(struct GameHash));
                 memcpy(entry->hash, (void *)(&hash), 8);
                 #pragma omp critical
                 HASH_ADD(hh, games, hash, 8, entry);
@@ -572,7 +587,7 @@ void * getGameCsv(void * context) {
           strncpy(filename, ctx->fileNames[i], 256);
           int numberOfChannels = ctx->numberOfChannels;
           int numberOfSamples = ctx->numberOfSamples;
-          enum GameStage gameStage = ctx->gameStage;
+          int gameStage = ctx->gameStage;
       	  #pragma omp task firstprivate(filename, numberOfChannels, numberOfSamples, gameStage) shared(queueBMPR, numberOfPlies)
       	  {
         	  int res = 0;
@@ -637,8 +652,9 @@ void * getGameCsv(void * context) {
           			break;
           		}
               //calculate legal move index (move prediction class) - used as target in policy loss calculation
-              bmpr->move_src[bmpr->sample] = board.channel[move.sourceSquare.name];
-              bmpr->move_dst[bmpr->sample] = move.destinationSquare.name;
+              bmpr->move_type[bmpr->sample] = board.channel[move.sourceSquare.name];
+              bmpr->dst_sq[bmpr->sample] = move.destinationSquare.name;
+              bmpr->src_sq[bmpr->sample] = move.sourceSquare.name;
               //calculate promo index (promo prediction class) - used as target in promo loss calculation
               /*if (board.promoPiece != PieceNameNone)
               // promo classes: knight is 0, bishop is 1, rook is 2, queen is 3 
@@ -698,7 +714,7 @@ void * getGameCsv(void * context) {
 }
 
 //this function starts a detached thread that runs getGame() or getGameCSV() depending on file extension
-void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const enum GameStage gameStage, const unsigned long steps) {
+void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const int gameStage, const unsigned long steps) {
   int res;
   struct getGameCtx * ctx = (struct getGameCtx *)malloc(sizeof(struct getGameCtx));
   if (numberOfFiles > 256) {
@@ -751,3 +767,6 @@ void getGame_detached(char ** fileNames, const int numberOfFiles, const int minE
     }
   }
 }
+#ifdef __cplusplus
+}
+#endif

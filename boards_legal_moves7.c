@@ -73,24 +73,24 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   //white or black controlled squares or moves: (16 channels - one for each piece)
   unsigned char sideToMove = board->fen->sideToMove << 3;
   unsigned char oppositeSide = board->opponentColor << 3;
-  unsigned long knights = board->occupations[sideToMove | Knight], 
-                bishops = board->occupations[sideToMove | Bishop], 
-                rooks = board->occupations[sideToMove | Rook], 
-                queens = board->occupations[sideToMove | Queen], 
-                all = board->occupations[sideToMove | PieceTypeAny],
+  //unsigned long knights = board->occupations[sideToMove | Knight], 
+                //bishops = board->occupations[sideToMove | Bishop], 
+                //rooks = board->occupations[sideToMove | Rook], 
+                //queens = board->occupations[sideToMove | Queen], 
+                //all = board->occupations[sideToMove | PieceTypeAny],
                 //allMoves = board->pawnMoves | board->knightMoves | board->bishopMoves | board->rookMoves | board->queenMoves | board->kingMoves,
-                oKnights = board->occupations[oppositeSide | Knight],
-                oBishops = board->occupations[oppositeSide | Bishop],
-                oRooks = board->occupations[oppositeSide | Rook],
-                oQueens = board->occupations[oppositeSide | Queen],
-                oAll = board->occupations[oppositeSide | PieceTypeAny], 
+                //oKnights = board->occupations[oppositeSide | Knight],
+                //oBishops = board->occupations[oppositeSide | Bishop],
+                //oRooks = board->occupations[oppositeSide | Rook],
+                //oQueens = board->occupations[oppositeSide | Queen],
+                //oAll = board->occupations[oppositeSide | PieceTypeAny], 
                 //oAllMoves = board->oPawnMoves | board->oKnightMoves | board->oBishopMoves | board->oRookMoves | board->QueenMoves | board->oKingMoves,
-                oUndefended = (oAll ^ board->defendedPieces) & oAll, 
-                attackedSuperior = 0, 
-                attackedUndefended = 0, 
-                attackedByInferior = 0, 
-                controlledByInferior = 0;
-  unsigned char pnCount[16][64] = {{0}, {0}}; //how many piece names attack/defend a square
+                //oUndefended = (oAll ^ board->defendedPieces) & oAll, 
+                //attackedSuperior = 0, 
+                //attackedUndefended = 0, 
+                //attackedByInferior = 0, 
+                //controlledByInferior = 0;
+  //unsigned char pnCount[16][64] = {{0}, {0}}; //how many piece names attack/defend a square
 
   for (int c = 0; c < 2; c++) {
     enum Color color = c == 0 ? board->opponentColor : board->fen->sideToMove;
@@ -98,37 +98,39 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     //8 channels for white or black pawns and 8 channels for their moves or control squares (diag moves)
     //opponent's channels are first, sideToMove channels are second
     enum PieceName pawn = shiftedColor | Pawn;
-    unsigned long pawns = board->occupations[pawn];
+    bitBoard = board->occupations[pawn];
     for (enum Files f = FileA; f <= FileH; f++) {
-      bitBoard = pawns & bitFiles[f]; //pawn occupations on a file
       if (bitBoard) {
         offset = sampleXchannels + channel * 64; 
-        offset2 = offset + 64 * 47; //move control squares and moves channels to the end
-      } 
-      while (bitBoard) { //loop over all white or black pawns
+        offset2 = offset + 64 * 42; //move control squares and moves channels to the end
         src = __builtin_ctzl(bitBoard); //src square for a pawn
         boards_legal_moves[offset + src] = 1.0;
-        board->channel[src] = channel - 21; // 0 to 7 - pawn channels for moves
+        //printf("boardLegalMoves(%d): %s board->channel[%s] = %d\n", omp_get_thread_num(), pieceName[pawn], squareName[src], channel - 21);
+        board->channel[src] = channel - 21; // 0 to 7 - pawn channels for moves (channel is incremented from 0 to 41)
+        board->sourceSquare[channel - 21] = src;
         bitBoard2 = board->movesFromSquares[src]; //all moves or control squares from src square
+/*
         if (board->fen->sideToMove == color) {
           attackedSuperior |= bitBoard2 & (oKnights | oBishops | oRooks | oQueens);
           attackedUndefended |= bitBoard2 & oUndefended;
         } else {
           attackedByInferior |= bitBoard2 & (knights | bishops | rooks | queens);
         }
+*/
         while (bitBoard2) { //loop over pawn moves (for opponent these are just diagonal pawn moves)
           dst = __builtin_ctzl(bitBoard2);
+          /*
           if (board->fen->sideToMove == color) {
             unsigned char diff = src > dst ? src - dst : dst - src;
             if (diff == 7 || diff == 9) pnCount[pawn][dst]++; //just diag moves for sideToMove pawns
-          } else pnCount[pawn][dst]++;
+          } else pnCount[pawn][dst]++;*/
           boards_legal_moves[offset2 + dst] = 1.0; 
           bitBoard2 &= bitBoard2 - 1;    
         }
         bitBoard &= bitBoard - 1;
-      }
+      } //end of if (bitBoard)
       channel++;
-    }
+    } //end of for loop over chessboard files from A to H
     //12 channels for pairs of white or black knights, bishops, rooks and queens (3 channels per type to handle promotions)
     //plus another 12 channels for either their moves or control squares
     //if there are more than a pair (very rare), we add extra piece(s) to the same channel(s)
@@ -140,11 +142,14 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
       for (int i = 0; i < 3; i++) { //three channels for knights, bishops, rooks and queens to handle promotions
         if (bitBoard) {
           offset = sampleXchannels + channel * 64;
-          offset2 = offset + 64 * 47;
+          offset2 = offset + 64 * 42;
           src = __builtin_ctzl(bitBoard);
+          //printf("boardLegalMoves(%d): %s board->channel[%s] = %d\n", omp_get_thread_num(), pieceName[pn], squareName[src], channel - 21);
           board->channel[src] = channel - 21; // 8-10 (knight move channels), 11-13 (bishop), 14-16 (rook), 17-19 (queen)
+          board->sourceSquare[channel - 21] = src;
           boards_legal_moves[offset + src] = 1.0;
           bitBoard2 = board->movesFromSquares[src];
+/*
           if (board->fen->sideToMove == color) {
             if (pn < rook) {
               attackedSuperior |= bitBoard2 & (oRooks | oQueens);
@@ -161,15 +166,16 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
             if (pn < rook) attackedByInferior |= bitBoard2 & (rooks | queens);
             else attackedByInferior |= bitBoard2 & queens;
           }
+*/
           while (bitBoard2) {
             dst = __builtin_ctzl(bitBoard2);
-            pnCount[pn][dst]++;
+            //pnCount[pn][dst]++;
             boards_legal_moves[offset2 + dst] = 1.0; 
             bitBoard2 &= bitBoard2 - 1;    
           }
           bitBoard &= bitBoard - 1;
           if (bitBoard && i == 2) {
-            fprintf(stderr, "Warning: 4th %s detected, skiping this unusual rare position to maintain 21 channels...\n", pieceName[pn]);
+            fprintf(stderr, "boardLegalMoves(%d) warning: 4th %s detected, skiping this unusual rare position to maintain 21 channels...\n", omp_get_thread_num(), pieceName[pn]);
             memset(boards_legal_moves + sampleXchannels * sizeof(float), 0, sizeof(float) * channels * 64);
             return 1;
           }
@@ -182,22 +188,27 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     enum PieceName king = shiftedColor | King;
     bitBoard = board->occupations[king];
     offset = sampleXchannels + channel * 64;
-    offset2 = offset + 64 * 47;
+    offset2 = offset + 64 * 42;
     src = __builtin_ctzl(bitBoard);
+    //printf("boardLegalMoves(%d): %s board->channel[%s] = %d\n", omp_get_thread_num(), pieceName[king], squareName[src], channel - 21);
     board->channel[src] = channel - 21; // channel 20 is king moves
+    board->sourceSquare[channel - 21] = src;
     boards_legal_moves[offset + src] = 1.0;
     bitBoard2 = board->movesFromSquares[src];
-    if (board->fen->sideToMove == color) attackedUndefended |= bitBoard2 & oUndefended;
+    //if (board->fen->sideToMove == color) attackedUndefended |= bitBoard2 & oUndefended;
     while (bitBoard2) {
       dst = __builtin_ctzl(bitBoard2);
-      pnCount[king][dst]++;
+      //pnCount[king][dst]++;
       boards_legal_moves[offset2 + dst] = 1.0;
       bitBoard2 &= bitBoard2 - 1;    
     }
     channel++;
   }
-
+  channel += 42; //42 channels for moves and control squares
+  
+/*
   // channel 42: attacked superior opponent's pieces defended or not
+  //this does not work
   if (attackedSuperior) offset = sampleXchannels + channel * 64;
   while (attackedSuperior) {
     dst = __builtin_ctzl(attackedSuperior);
@@ -205,8 +216,8 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     attackedSuperior &= attackedSuperior - 1;
   }
   channel++;
-
   // channel 43: attacked undefended opponent's pieces
+  //this does not work
   if (attackedUndefended) offset = sampleXchannels + channel * 64;
   while (attackedUndefended) {
     dst = __builtin_ctzl(attackedUndefended);
@@ -216,15 +227,18 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   channel++;
   
   //channel 44: pieces attacked by opponent's inferior pieces
+  //this does not work
   if (attackedByInferior) offset = sampleXchannels + channel * 64;
   while (attackedByInferior) {
     src = __builtin_ctzl(attackedByInferior);
-    boards_legal_moves[offset + src] = 1.0; //move away from this attacked by inferior piece square
+    boards_legal_moves[offset + src] = 1.0; //move away from this square attacked by inferior piece
     attackedByInferior &= attackedByInferior - 1;
   }
   channel++;
   
   //channel 45: dst squares controlled by opponent's inferior pieces
+  //it's not perfect as sideToMove even more inferior pieces could still move to these squares!
+  //so this should be multiple per piece channels!
   if (controlledByInferior) offset = sampleXchannels + channel * 64;
   while (controlledByInferior) {
     dst = __builtin_ctzl(controlledByInferior);
@@ -234,12 +248,13 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   channel++;
   
   //channel 46: dst undefended squares controlled by opponent's pieces - avoid moves to these squares
+  //without actually making a move, it is impossible to figure out for sure if dst square is undefended or not!
+
   offset = sampleXchannels + channel * 64;
   channel++;
-  channel += 42; //42 channels for moves and control squares
-  //channels 47 to 67 are for opponent's control squares (21 channels)
-  //channels 68 to 88 are for sideToMove moves (21 channels)
-  //89 total channels (89 channels x 64 squares = 5696 input features)
+  //channels 42 to 62 are for opponent's control squares (21 channels)
+  //channels 63 to 83 are for sideToMove moves (21 channels)
+  //84 total channels (84 channels x 64 squares = 5376 input features)
   //model output should be also 16 channels flattened to 1024 but could be problematic because of promotions
   //in theory up to 8 channels could be reserved for promotions, 
   //so total 24 channels are still better than 64 for source squares! 
@@ -259,13 +274,13 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   enum PieceName oQueen = oppositeSide | Queen;
   enum PieceName king = sideToMove | King;
   enum PieceName oKing = oppositeSide | King;
-  bitBoard = all;
+  bitBoard = all; //all sideToMove occupations
   //for (src = SquareA1; src <= SquareH8; src++) { //not sure which loop is faster, probably depends on the number of pieces
-  while (bitBoard) {
-    src = __builtin_ctzl(bitBoard);
-    bitBoard2 = board->sideToMoveMoves[src];
-    while (bitBoard2) {
-      dst = __builtin_ctzl(bitBoard2);
+  while (bitBoard) { //loop over all sideToMove pieces
+    src = __builtin_ctzl(bitBoard); //sideToMove piece src square
+    bitBoard2 = board->sideToMoveMoves[src]; //all moves from src square
+    while (bitBoard2) { //loop over moves from src square
+      dst = __builtin_ctzl(bitBoard2); // destination square for a move
       float value = pieceValue[board->piecesOnSquares[dst] & 7] - pieceValue[board->piecesOnSquares[src] & 7];
       enum PieceName last = board->piecesOnSquares[src];
       while (true) {
@@ -323,13 +338,14 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
         else 
           value -= pieceValue[pt];        
       }
+      printf("boardLegalMoves(%d): %s move from %s to %s value %f\n", omp_get_thread_num(), pieceName[board->piecesOnSquares[src]], squareName[src], squareName[dst], value);
       if (value < 0)
         boards_legal_moves[offset + dst] = 1.0; //avoid moves to undefended squares
       bitBoard2 &= bitBoard2 - 1;    
     } //end of while (bitBoard2)
     bitBoard &= bitBoard - 1;    
   } //end while (bitBoard)
-
+*/
   //sanity check, could be commented out once verified
   if (channel != channels) {
 	  printf("boardLegalMoves(%d) error: number of channels (%d) != channels (%d)\n", omp_get_thread_num(), channel, channels);

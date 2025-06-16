@@ -12,6 +12,10 @@
 #include "magic_bitboards.h"
 #include "libchess.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef __APPLE__ // macOS
 unsigned int arc4random_uniform(unsigned int upper_bound) {
     if (upper_bound == 0) return 0;
@@ -28,20 +32,20 @@ unsigned int arc4random_uniform(unsigned int upper_bound) {
 /// draws moves from a given square sq
 /// it is called from writeDebug
 ///</summary>
-void drawMoves(struct Board * board, enum SquareName sq) {
-	enum SquareName squareIndex = SquareA1, sqStart = SquareA1;
+void drawMoves(struct Board * board, int  sq) {
+	int squareIndex = SquareA1, sqStart = SquareA1;
 	char buffer[8][255];
-	enum Ranks rank = Rank1;
+	int rank = Rank1;
 	unsigned long moves = board->movesFromSquares[sq];
 	const char * m = (board->fen->sideToMove == ColorWhite && (board->piecesOnSquares[sq] >> 3) == ColorWhite) || (board->fen->sideToMove == ColorBlack && (board->piecesOnSquares[sq] >> 3) == ColorBlack) ? " moves (x): " : " controlled squares (x): ";
 
-	for (enum Ranks r = Rank1; r <= Rank8; r++) buffer[r][0] = '\0';
+	for (int r = Rank1; r <= Rank8; r++) buffer[r][0] = '\0';
 
 	printf("%s on %s %s %lx\n", pieceName[board->piecesOnSquares[sq]], squareName[sq], m, moves);
 	char s[6];
 	while ((squareIndex = lsBit(moves)) < SquareNone) {
 		moves ^= (1UL << squareIndex);
-		for (enum SquareName k = sqStart; k < squareIndex; k++) {
+		for (int k = sqStart; k < squareIndex; k++) {
 			if ((k + 1) % 8 == 0) {
 				sprintf(s, "| %c |", pieceLetter[board->piecesOnSquares[k]]);
 				strcat(buffer[rank++], s);
@@ -58,7 +62,7 @@ void drawMoves(struct Board * board, enum SquareName sq) {
 		sqStart = squareIndex;
 		sqStart++;
 	}
-	for (enum SquareName k = sqStart; k < SquareNone; k++) {
+	for (int k = sqStart; k < SquareNone; k++) {
 		if ((k + 1) % 8 == 0) {
 			sprintf(s, "| %c |", pieceLetter[board->piecesOnSquares[k]]);
 			strcat(buffer[rank++], s);
@@ -80,10 +84,10 @@ void drawMoves(struct Board * board, enum SquareName sq) {
 /// </summary>
 void writeDebug(struct Board * board, bool displayMoves) {
 	char buffer[8][255];
-	enum Ranks rank = Rank1;
+	int rank = Rank1;
 	printf("chess board\n");
-	for (enum Ranks r = Rank1; r <= Rank8; r++) buffer[r][0] = '\0';
-	for (enum SquareName i = SquareA1; i <= SquareH8; i++) {
+	for (int r = Rank1; r <= Rank8; r++) buffer[r][0] = '\0';
+	for (int i = SquareA1; i <= SquareH8; i++) {
 		char s[6];
 		if ((i + 1) % 8 == 0) {
 			sprintf(s, "| %c |", pieceLetter[board->piecesOnSquares[i]]);
@@ -101,7 +105,7 @@ void writeDebug(struct Board * board, bool displayMoves) {
 		printf("+---+---+---+---+---+---+---+---+\n");
 	}
 	if (displayMoves) {
-		enum SquareName square;
+		int  square;
 		unsigned long d = board->occupations[PieceNameAny];
 		while ((square = lsBit(d)) < 64) {
 			d ^= (1UL << square);
@@ -119,13 +123,13 @@ void writeDebug(struct Board * board, bool displayMoves) {
 ///</summary>
 int reconcile(struct Board * board) {
 	int err = 0;
-	for (enum SquareName i = SquareA1; i <= SquareH8; i++) {
+	for (int i = SquareA1; i <= SquareH8; i++) {
 		if (!(board->occupations[board->piecesOnSquares[i]] & (1UL << i))) {
-			printf("reconcile() error: piecesOnSquares[%s] %s does not match its occupation bitboard %lx\n", squareName[i], pieceName[board->piecesOnSquares[i]], board->occupations[board->piecesOnSquares[i]]);
+			printf("reconcile() error: piecesOnSquares[%s] %s does not match its occupation bitboard %llx\n", squareName[i], pieceName[board->piecesOnSquares[i]], board->occupations[board->piecesOnSquares[i]]);
 			err = 1;
 		}
 	}
-	for (enum PieceName j = PieceNameNone; j <= PieceNameBlack; j++) {
+	for (int j = PieceNameNone; j <= PieceNameBlack; j++) {
 		unsigned char s;
 		unsigned long o = board->occupations[j];
 		while ((s = lsBit(o)) < SquareNone) {
@@ -178,17 +182,6 @@ void updateFen(struct Board * board) {
 	fentostr(board->fen);
 }
 
-enum Color squareColor(enum SquareName sqName) {
-  if ((sqName & 7) % 2) {
-		if ((sqName >> 3) % 2) return ColorBlack;
-		else return ColorWhite;
-	} 
-	else {
-		if ((sqName >> 3) % 2) return ColorWhite;
-		else return ColorBlack;
-	}
-}
-
 int randomNumber(const int min, const int max) {
     const int range = max - min + 1;
     const unsigned int max_random = 0xFFFFFFFFU; // Maximum value of random()
@@ -200,10 +193,10 @@ int randomNumber(const int min, const int max) {
     return (num % range) + min; // Adjust to desired range
 }
 
-void generateEndGame(enum PieceName * pn, int numberOfPieces, enum Color sideToMove, enum CastlingRightsEnum castlingRights, enum Files enPassant, struct Board * board) {
+void generateEndGame(int * pn, int numberOfPieces, int sideToMove, int castlingRights, int enPassant, struct Board * board) {
   srandom(time(NULL));
   int bottomRandNumber, topRandNumber;
-  enum SquareName sn;
+  int sn;
   struct Fen * f;
   int roundNumber = 0;
 	do {
@@ -216,8 +209,8 @@ void generateEndGame(enum PieceName * pn, int numberOfPieces, enum Color sideToM
 		  board->occupations[PieceNameNone] = 0xffffffffffffffffUL;
 		  //printf("occupations[PieceNameNone] %lx\n", board->occupations[PieceNameNone]);
 		  for (int i = 0; i < numberOfPieces; i++) {
-		  	enum SquareName kingSquare = SquareNone;
-		  	enum PieceName opponentKing = PieceNameNone;
+		  	int kingSquare = SquareNone;
+		  	int opponentKing = PieceNameNone;
 		  	bottomRandNumber = 0;
 		  	topRandNumber = bitCount(board->occupations[PieceNameNone]) - 1;
 		  	switch (pn[i]) {
@@ -234,9 +227,9 @@ void generateEndGame(enum PieceName * pn, int numberOfPieces, enum Color sideToM
 		  		break;
 		  		default: break;
 		  	}
-		  	sn = (enum SquareName)(randomNumber(bottomRandNumber, topRandNumber));
+		  	sn = randomNumber(bottomRandNumber, topRandNumber);
 		  	//printf("bottomRandNum %d, topRandNum %d, sn %s pn[%d] %s\n", bottomRandNumber, topRandNumber, squareName[sn], i, pieceName[pn[i]]);
-		  	enum Color color = squareColor(sn);
+		  	int color = squareColor(sn);
 			  switch(pn[i]) {
 		  		case WhiteBishop:
 		  		case BlackBishop:
@@ -336,15 +329,15 @@ void generateEndGame(enum PieceName * pn, int numberOfPieces, enum Color sideToM
 }
 
 bool isEnPassantLegal(struct Board * board) {
-	enum Files i;
-	enum SquareName shift;
+	int  i;
+	int  shift;
 	struct Square kingSquare;
 	struct Square opponentRookOrQueenSquare;
 	unsigned char enPassantShift = board->fen->sideToMove == ColorWhite ? 16 : 40;
 	board->fen->enPassantLegalBit = 0;
 
 	square(&kingSquare, lsBit(board->occupations[(board->fen->sideToMove << 3) | King]));
-	for (enum PieceType pt = Rook; pt <= Queen; pt++) {
+	for (int pt = Rook; pt <= Queen; pt++) {
 		unsigned long opponentRooksOrQueens = board->occupations[(board->opponentColor << 3) | pt];
 		square(&opponentRookOrQueenSquare, lsBit(opponentRooksOrQueens));
 		// a loop for all opponent rooks (or queens)
@@ -383,10 +376,10 @@ bool isEnPassantLegal(struct Board * board) {
 //known as magic bitboards (see magic_bitboards.c)
 //to use them, they must be initialized by calling init_magic_bitboards();
 //and freed at the end by calling cleanup_magic_bitboards();
-unsigned long generate_bishop_moves(struct Board * board, enum SquareName sn) {
+unsigned long generate_bishop_moves(struct Board * board, int  sn) {
   return get_bishop_moves(sn, board->occupations[PieceNameAny]);
 }
-unsigned long generate_rook_moves(struct Board * board, enum SquareName sn) {
+unsigned long generate_rook_moves(struct Board * board, int  sn) {
   return get_rook_moves(sn, board->occupations[PieceNameAny]);
 }
 
@@ -396,9 +389,9 @@ unsigned long generate_rook_moves(struct Board * board, enum SquareName sn) {
 /*
 unsigned long generateBishopMoves(struct Board * board, struct Square * sq) {
 	unsigned long d = 0;
-	enum Files i = sq->file;
-	enum Ranks j = sq->rank;
-	enum SquareName shift = sq->name;
+	int  i = sq->file;
+	int  j = sq->rank;
+	int  shift = sq->name;
 	while (i++ < FileH && j++ < Rank8) {
 	  shift += 9;
 	  d |= (1UL << shift);
@@ -432,7 +425,7 @@ unsigned long generateBishopMoves(struct Board * board, struct Square * sq) {
 /*
 unsigned long generateRookMoves(struct Board * board, struct Square * sq) {
 	int i;
-	enum SquareName shift;
+	int  shift;
 	unsigned long d = 0;
 	i = sq->rank; shift = sq->name;
 	while (i++ < Rank8) {
@@ -496,9 +489,9 @@ unsigned long generateKingMoves(struct Board * board, struct Square * sq) {
 }
 unsigned long rookPinFinder(struct Board * board, struct Square * sq, struct Square * kingSquare) {
 	unsigned long d = 0;
-	enum Files ii = kingSquare->file; 
-	enum Ranks jj = kingSquare->rank; 
-	enum SquareName shift = kingSquare->name;
+	int  ii = kingSquare->file; 
+	int  jj = kingSquare->rank; 
+	int  shift = kingSquare->name;
 	//King and opponent rook (or queen) are on the same file
 	if (sq->file == kingSquare->file) {
 		//We move the king along the file towards the opponent rook (or queen) until we bump into something.
@@ -531,9 +524,9 @@ unsigned long rookPinFinder(struct Board * board, struct Square * sq, struct Squ
 }
 unsigned long bishopPinFinder(struct Board * board, struct Square * sq, struct Square * kingSquare) {
 	unsigned long d = 0;
-	enum Files ii = kingSquare->file; 
-	enum Ranks jj = kingSquare->rank; 
-	enum SquareName shift = kingSquare->name;
+	int  ii = kingSquare->file; 
+	int  jj = kingSquare->rank; 
+	int  shift = kingSquare->name;
 	//King and opponent bishop (or queen) are on the same diagonal
 	if (sq->diag == kingSquare->diag) {
 		//We move the king along this diagonal towards the opponent bishop (or queen) until we bump into something.
@@ -566,9 +559,9 @@ unsigned long bishopPinFinder(struct Board * board, struct Square * sq, struct S
 }
 unsigned long pinnedBishopMoves(struct Board * board, struct Square * sq, struct Square * pinnedBy) {
 	unsigned long d = 0;  
-	enum Files ii = sq->file;
-	enum Ranks jj = sq->rank;
-	enum SquareName shift = sq->name;
+	int  ii = sq->file;
+	int  jj = sq->rank;
+	int  shift = sq->name;
 	//if pinned on diagonal, then it can only move along it
 	if (pinnedBy->diag == sq->diag) {
 		while (ii++ < FileH && jj++ < Rank8) {
@@ -601,9 +594,9 @@ unsigned long pinnedBishopMoves(struct Board * board, struct Square * sq, struct
 }
 unsigned long pinnedRookMoves(struct Board * board, struct Square * sq, struct Square * pinnedBy) {
 	unsigned long d = 0;
-	enum Files ii = sq->file;
-	enum Ranks jj = sq->rank;
-	enum SquareName shift = sq->name;
+	int  ii = sq->file;
+	int  jj = sq->rank;
+	int  shift = sq->name;
 	//if the rook is pinned on a file, it can only move along it
 	if (pinnedBy->file == sq->file) {
 		while (jj++ < Rank8) {
@@ -636,7 +629,9 @@ unsigned long pinnedRookMoves(struct Board * board, struct Square * sq, struct S
 }
 
 void generateMoves(struct Board * board) {
-	enum SquareName whiteBlack[] = { SquareA1, SquareA8 }; //first squares of the pieces' ranks
+	int  whiteBlack[] = { SquareA1, SquareA8 }; //first squares of the pieces' ranks
+	signed char pawnShifts[3][3] = { { 8, 7, 9 }, { -8, -9, -7 } };
+	int  pawnRanks[3][3] = { { Rank2, Rank5, Rank6 }, { Rank7, Rank4, Rank3 } };
 	unsigned long d = 0, checker = 0, moves = 0, attackedSquares = 0;
 	struct Square pinnedBy, attackerSquare, sq, p;
 	square(&pinnedBy, SquareNone);
@@ -645,23 +640,24 @@ void generateMoves(struct Board * board) {
 	memset(board->movesFromSquares, 0, sizeof board->movesFromSquares);
 	memset(board->sideToMoveMoves, 0, sizeof board->sideToMoveMoves);
 	memset(board->channel, 0, sizeof board->channel);
-	enum Files ii;
-	enum Ranks jj;
-	enum SquareName sn;
-	enum SquareName shift;
-	enum SquareName shiftedColor = board->fen->sideToMove << 3;
-	enum SquareName shiftedOpponentColor = board->opponentColor << 3;
-	enum SquareName pinnedPieceSquare = SquareNone;
+	memset(board->sourceSquare, 0, sizeof board->sourceSquare);
+	int  ii;
+	int  jj;
+	int  sn;
+	int  shift;
+	int  shiftedColor = board->fen->sideToMove << 3;
+	int  shiftedOpponentColor = board->opponentColor << 3;
+	int  pinnedPieceSquare = SquareNone;
 	board->isCheck = false; board->isStaleMate = false; board->isMate = false;
 
 	struct ChessPiece king;
 	struct Square kingSquare;
-	enum PieceName _king = shiftedColor | King;
+	int _king = shiftedColor | King;
 	square(&kingSquare, lsBit(board->occupations[_king]));
 	piece(&kingSquare, &king, _king);
 	struct ChessPiece opponentKing;
 	struct Square opponentKingSquare;
-	enum PieceName _oking = shiftedOpponentColor | King;
+	int _oking = shiftedOpponentColor | King;
 	square(&opponentKingSquare, lsBit(board->occupations[_oking]));
 	piece(&opponentKingSquare, &opponentKing, _oking);
   board->blockingSquares = 0;
@@ -888,8 +884,8 @@ void generateMoves(struct Board * board) {
 		}
 	} else { //king is not checked
 		//to complete legal king moves include castling
-		enum SquareName castlingKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
-		enum PieceName _rook = shiftedColor | Rook;
+		int  castlingKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
+		int _rook = shiftedColor | Rook;
 		//short castling moves
 		if ((((board->fen->castlingRights >> (board->fen->sideToMove << 1)) & 3) & CastlingSideKingside) == CastlingSideKingside) {
 			struct Square shortCastlingRookSquare;
@@ -948,7 +944,7 @@ void generateMoves(struct Board * board) {
 		if (board->pinnedPieces & sq.bitSquare) {
  			d = board->pinningPieces;
  			while (d) {
- 				enum SquareName s = __builtin_ctzl(d);
+ 				int  s = __builtin_ctzl(d);
  				square(&p, s);
  				if ((p.file == sq.file && p.file == kingSquare.file) || (p.rank == sq.rank && p.rank == kingSquare.rank) || (p.diag == sq.diag && p.diag == kingSquare.diag) || (p.antiDiag == sq.antiDiag && p.antiDiag == kingSquare.antiDiag)) {
  				  square(&pinnedBy, p.name);
@@ -991,7 +987,7 @@ void generateMoves(struct Board * board) {
 		if (board->pinnedPieces & sq.bitSquare) {
  			d = board->pinningPieces;
  			while (d) {
- 				enum SquareName s = __builtin_ctzl(d);
+ 				int  s = __builtin_ctzl(d);
  				square(&p, s);
  				if ((p.file == sq.file && p.file == kingSquare.file) || (p.rank == sq.rank && p.rank == kingSquare.rank) || (p.diag == sq.diag && p.diag == kingSquare.diag) || (p.antiDiag == sq.antiDiag && p.antiDiag == kingSquare.antiDiag)) {
  				  square(&pinnedBy, p.name);
@@ -1027,7 +1023,7 @@ void generateMoves(struct Board * board) {
 		if (board->pinnedPieces & sq.bitSquare) {
  			d = board->pinningPieces;
  			while (d) {
- 				enum SquareName s = __builtin_ctzl(d);
+ 				int  s = __builtin_ctzl(d);
  				square(&p, s);
  				if ((p.file == sq.file && p.file == kingSquare.file) || (p.rank == sq.rank && p.rank == kingSquare.rank) || (p.diag == sq.diag && p.diag == kingSquare.diag) || (p.antiDiag == sq.antiDiag && p.antiDiag == kingSquare.antiDiag)) {
  				  square(&pinnedBy, p.name);
@@ -1061,8 +1057,6 @@ void generateMoves(struct Board * board) {
 	}
 	
 	//pawn moves
-	signed char pawnShifts[3][3] = { { 8, 7, 9 }, { -8, -9, -7 } };
-	enum Ranks pawnRanks[3][3] = { { Rank2, Rank5, Rank6 }, { Rank7, Rank4, Rank3 } };
 	while (pawns) {
 		sn = __builtin_ctzl(pawns);
 		square(&sq, sn);
@@ -1072,7 +1066,7 @@ void generateMoves(struct Board * board) {
 		if (board->pinnedPieces & sq.bitSquare) {
  			d = board->pinningPieces;
  			while (d) {
- 				enum SquareName s = __builtin_ctzl(d);
+ 				int  s = __builtin_ctzl(d);
  				square(&p, s);
  				if ((p.file == sq.file && p.file == kingSquare.file) || (p.rank == sq.rank && p.rank == kingSquare.rank) || (p.diag == sq.diag && p.diag == kingSquare.diag) || (p.antiDiag == sq.antiDiag && p.antiDiag == kingSquare.antiDiag)) {
  				  square(&pinnedBy, p.name);
@@ -1083,74 +1077,40 @@ void generateMoves(struct Board * board) {
     }
     d = 0;		
 		if (pinnedBy.name < SquareNone) {
-			if (board->isCheck) goto next;
+			if (board->isCheck) goto next; // this pawn can't do much
 			if (pinnedBy.diag == sq.diag) {
-				switch (board->fen->sideToMove) {
-				case ColorWhite:
-					if (ii < FileH) {
-						shift = sq.name + 9;
-						if (board->piecesOnSquares[shift] != PieceNameNone) {
-							if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
-								d |= 1UL << shift;
-						}
-						else if (board->fen->enPassant == sq.file + 1 && sq.rank == Rank5)
+				shift = board->fen->sideToMove == ColorWhite ? sq.name + 9 : sq.name - 9;
+				int  enPassantFile = board->fen->sideToMove == ColorWhite ? sq.file + 1 : sq.file - 1;
+				if ((board->fen->sideToMove == ColorWhite && ii < FileH) || (board->fen->sideToMove == ColorBlack && ii > FileA)) {
+					if (board->piecesOnSquares[shift] != PieceNameNone) {
+						if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
 							d |= 1UL << shift;
 					}
-					break;
-				case ColorBlack:
-					if (ii > FileA) {
-						shift = sq.name - 9;
-						if (board->piecesOnSquares[shift] != PieceNameNone) {
-							if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
-								d |= 1UL << shift;
-						}
-						else if (board->fen->enPassant == sq.file - 1 && sq.rank == Rank4)
-							d |= 1UL << shift;
-					}
-					break;
-				default:
-					break;
+					else if (board->fen->enPassant == enPassantFile && sq.rank == pawnRanks[board->fen->sideToMove][1])
+						d |= 1UL << shift;
 				}
-			}
-			else if (pinnedBy.antiDiag == sq.antiDiag) {
-				switch (board->fen->sideToMove) {
-				case ColorWhite:
-					if (ii > FileA) {
-						shift = sq.name + 7;
-						if (board->piecesOnSquares[shift] != PieceNameNone) {
-							if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
-								d |= 1UL << shift;
-						}
-						else if (board->fen->enPassant == sq.file - 1 && sq.rank == Rank5)
+			} else if (pinnedBy.antiDiag == sq.antiDiag) {
+				shift = board->fen->sideToMove == ColorWhite ? sq.name + 7 : sq.name - 7;
+				int  enPassantFile = board->fen->sideToMove == ColorWhite ? sq.file - 1 : sq.file + 1;
+				if ((board->fen->sideToMove == ColorWhite && ii > FileA) || (board->fen->sideToMove == ColorBlack && ii < FileH)) {
+					if (board->piecesOnSquares[shift] != PieceNameNone) {
+						if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
 							d |= 1UL << shift;
 					}
-					break;
-				case ColorBlack:
-					if (ii < FileH) {
-						shift = sq.name - 7;
-						if (board->piecesOnSquares[shift] != PieceNameNone) {
-							if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
-								d |= 1UL << shift;
-						}
-						else if (board->fen->enPassant == sq.file + 1 && sq.rank == Rank4)
-							d |= 1UL << shift;
-					}
-					break;
-				default:
-					break;
+					else if (board->fen->enPassant == enPassantFile && sq.rank == pawnRanks[board->fen->sideToMove][1])
+						d |= 1UL << shift;
 				}
-			}
-			else if (pinnedBy.file == sq.file) {
+			} else if (pinnedBy.file == sq.file) {
 				shift = sq.name + pawnShifts[board->fen->sideToMove][0];
 				if (board->piecesOnSquares[shift] == PieceNameNone) {
 					d |= 1UL << shift;
 					if (jj == pawnRanks[board->fen->sideToMove][0]) {
-						shift = (shift + pawnShifts[board->fen->sideToMove][0]);
+						shift += pawnShifts[board->fen->sideToMove][0];
 						if (board->piecesOnSquares[shift] == PieceNameNone) d |= 1UL << shift;
 					}
 				}
 			}
-			else if (pinnedBy.rank == sq.rank) goto next;
+			else if (pinnedBy.rank == sq.rank) goto next; //not much can be done
 			board->movesFromSquares[sq.name] = d;
 		}
 		else {
@@ -1221,7 +1181,7 @@ next:
 		if (board->pinnedPieces & sq.bitSquare) {
  			d = board->pinningPieces;
  			while (d) {
- 				enum SquareName s = __builtin_ctzl(d);
+ 				int  s = __builtin_ctzl(d);
  				square(&p, s);
  				if ((p.file == sq.file && p.file == kingSquare.file) || (p.rank == sq.rank && p.rank == kingSquare.rank) || (p.diag == sq.diag && p.diag == kingSquare.diag) || (p.antiDiag == sq.antiDiag && p.antiDiag == kingSquare.antiDiag)) {
  				  square(&pinnedBy, p.name);
@@ -1260,6 +1220,8 @@ exit:
 }
 
 void makeMove(struct Move * move) {
+	int  dstKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
+	int  castlingSide = CastlingSideNone;
 	//null move
 	if ((move->type & MoveTypeNull) && (move->type & MoveTypeValid)) {
 		move->chessBoard->fen->sideToMove = move->chessBoard->fen->sideToMove == ColorWhite ? ColorBlack : ColorWhite;
@@ -1278,8 +1240,8 @@ void makeMove(struct Move * move) {
 	//rook moves
 	//need to find out if this is a castling rook to update FEN castling rights and rooks
 	if (move->chessBoard->movingPiece.type == Rook && (move->chessBoard->fen->castlingRights & (CastlingSideBoth << ((move->chessBoard->fen->sideToMove) << 1)))) {
-		enum Ranks rookRank[2] = { Rank1, Rank8 };
-		enum CastlingSide castlingSide = CastlingSideNone;
+		int  rookRank[2] = { Rank1, Rank8 };
+		int  castlingSide = CastlingSideNone;
 		if (move->chessBoard->movingPiece.square.rank == rookRank[move->chessBoard->fen->sideToMove]) {
 			if (move->chessBoard->movingPiece.square.file == move->chessBoard->fen->castlingRook[0][move->chessBoard->fen->sideToMove]) //short castling
 				castlingSide = CastlingSideKingside;
@@ -1295,7 +1257,7 @@ void makeMove(struct Move * move) {
 
 	//capture
 	if (move->type & MoveTypeCapture) {
-		enum PieceName capturedPiece = PieceNameNone;
+		int capturedPiece = PieceNameNone;
 		if (move->type & MoveTypeEnPassant) {
 			struct Square capturedPawnSquare;
 			signed char offset[2] = { -8, 8 };
@@ -1309,7 +1271,7 @@ void makeMove(struct Move * move) {
 			//if captured piece is a castling rook, then remove the castling rights of the opponent on that side
 			if ((capturedPiece & 7) == Rook) {
 				unsigned char whiteBlack[2] = { 0, 56 };
-				enum CastlingRightsEnum cr = CastlingRightsWhiteNoneBlackNone;
+				int cr = CastlingRightsWhiteNoneBlackNone;
 				if (move->destinationSquare.name == move->chessBoard->fen->castlingRook[0][move->chessBoard->opponentColor] + whiteBlack[move->chessBoard->opponentColor]) {
 					cr = CastlingSideKingside << (move->chessBoard->opponentColor << 1);
 					if (move->chessBoard->fen->castlingRights & cr) {
@@ -1330,15 +1292,13 @@ void makeMove(struct Move * move) {
 	}
 
 	//castling
-	enum SquareName dstKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
-	enum CastlingSide castlingSide = CastlingSideNone;
 	if (move->chessBoard->movingPiece.type == King) {
 		if (((move->type & MoveTypeCastlingQueenside) == MoveTypeCastlingQueenside) || ((move->type & MoveTypeCastlingKingside) == MoveTypeCastlingKingside)) {
 			castlingSide = (((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside))) >> 2);
 			unsigned char rookOffset[2] = { 0, 56 };
-			enum SquareName dstRookSquare[2][2] = { { SquareF1, SquareF8 }, { SquareD1, SquareD8 } };
-			enum SquareName srcRookSquare = move->chessBoard->fen->castlingRook[castlingSide - 1][move->chessBoard->fen->sideToMove] + rookOffset[move->chessBoard->fen->sideToMove];
-			enum PieceName rookName = (move->chessBoard->fen->sideToMove << 3) | Rook;
+			int  dstRookSquare[2][2] = { { SquareF1, SquareF8 }, { SquareD1, SquareD8 } };
+			int  srcRookSquare = move->chessBoard->fen->castlingRook[castlingSide - 1][move->chessBoard->fen->sideToMove] + rookOffset[move->chessBoard->fen->sideToMove];
+			int  rookName = (move->chessBoard->fen->sideToMove << 3) | Rook;
 			//remove castling rook from its source square taking care of
 			//Chess960 case of rook occupying king's destination square - make sure we are not removing (overwriting) the king with PieceNone!
 			if (srcRookSquare != dstKingSquare[castlingSide - 1][move->chessBoard->fen->sideToMove]) {
@@ -1437,7 +1397,7 @@ int fentoboard(struct Fen * fen, struct Board * board) {
 				char s = found - symbols;
 				if (s > 0 && s < 15) {
 					board->occupations[s] |= 1UL << idx;
-					board->piecesOnSquares[idx] = (enum PieceName)s;
+					board->piecesOnSquares[idx] = (int)s;
 				}
 			} else if (isdigit(fen->ranks[i][c])) {
 				for (unsigned char k = j; k < j + fen->ranks[i][c] - '0'; k++) {
@@ -1464,7 +1424,7 @@ int fentoboard(struct Fen * fen, struct Board * board) {
 }
 
 struct Board * cloneBoard(struct Board * src) {
-    struct Board * dst = malloc(sizeof(struct Board));
+    struct Board * dst = (struct Board *)malloc(sizeof(struct Board));
     if (!dst) {
         fprintf(stderr, "cloneBoard() error: malloc(Board) returned NULL: %s\n", strerror(errno));
         return NULL;
@@ -1474,7 +1434,7 @@ struct Board * cloneBoard(struct Board * src) {
     // Deep copy pointers
     //Fen
     if (src->fen) {
-        dst->fen = malloc(sizeof(struct Fen));
+        dst->fen = (struct Fen *)malloc(sizeof(struct Fen));
         if (!dst->fen) {
             free(dst);
             fprintf(stderr, "cloneBoard() error: malloc(Fen) returned NULL: %s\n", strerror(errno));
@@ -1484,7 +1444,7 @@ struct Board * cloneBoard(struct Board * src) {
     }
     // Zobrist Hash
     if (src->zh) {
-        dst->zh = malloc(sizeof(struct ZobristHash));
+        dst->zh = (struct ZobristHash * )malloc(sizeof(struct ZobristHash));
         if (!dst->zh) {
         	  free(dst->fen); 
             free(dst);
@@ -1503,3 +1463,6 @@ void freeBoard(struct Board * board) {
         free(board);
     }
 }
+#ifdef __cplusplus
+}
+#endif

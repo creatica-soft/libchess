@@ -8,13 +8,17 @@
 #include <stdlib.h>
 #include "libchess.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void zobristHash(struct ZobristHash * hash) {
 	hash->hash = STARTPOS_HASH;
 	hash->prevCastlingRights = STARTPOS_CASTLING_RIGHTS;
 	hash->prevEnPassant = 0;
 	int k = 0;
 	//empty square hashes
-	for (enum SquareName s = SquareA1; s <= SquareH8; s++) 
+	for (int s = SquareA1; s <= SquareH8; s++) 
 		hash->piecesAtSquares[0][s] = bitStrings[k++];
 	//occupied square hashes
 	for (unsigned char c = 1; c <= 2; c++) {
@@ -30,9 +34,9 @@ void zobristHash(struct ZobristHash * hash) {
 	//black move hash
 	hash->blackMove = bitStrings[k++];
 	//castling hashes
-	for (enum CastlingRightsEnum i = CastlingRightsWhiteNoneBlackNone; i <= CastlingRightsWhiteBothBlackBoth; i++) hash->castling[i] = bitStrings[k++];
+	for (int i = CastlingRightsWhiteNoneBlackNone; i <= CastlingRightsWhiteBothBlackBoth; i++) hash->castling[i] = bitStrings[k++];
 	//en passant hashes
-	for (enum Files i = FileA; i <= FileH; i++) hash->enPassant[i] = bitStrings[k++];
+	for (int i = FileA; i <= FileH; i++) hash->enPassant[i] = bitStrings[k++];
 }
 
 void getHash(struct ZobristHash * hash, struct Board * board) {	
@@ -46,7 +50,7 @@ void getHash(struct ZobristHash * hash, struct Board * board) {
 	}
 	hash->hash = 0; hash->prevEnPassant = 0;
 	//xor in empty squares
-	for (enum SquareName s = SquareA1; s <= SquareH8; s++)
+	for (int s = SquareA1; s <= SquareH8; s++)
 		if (board->piecesOnSquares[s] == PieceNameNone) 
 			hash->hash ^= hash->piecesAtSquares[0][s];
 	//xor in pieces
@@ -88,7 +92,7 @@ int updateHash(struct ZobristHash * hash, struct Board * board, struct Move * mo
 	int srcPieceType = (board->movingPiece.color + 1) * board->movingPiece.type;
 	//printf("srcPieceType %d, move type %d, src square %s, moving piece %s, captured piece %s, promo piece %s\n", srcPieceType,  move->type, squareName[move->sourceSquare.name], pieceName[board->movingPiece.name], pieceName[board->capturedPiece], pieceName[board->promoPiece]);
 	if ((move->type & (MoveTypeEnPassant | MoveTypeCapture)) == (MoveTypeEnPassant | MoveTypeCapture)) {
-		enum SquareName s;
+		int s;
 		if (board->movingPiece.color == ColorWhite) 
 			s = move->destinationSquare.name - 8;
 		else s = move->destinationSquare.name + 8;
@@ -119,11 +123,11 @@ int updateHash(struct ZobristHash * hash, struct Board * board, struct Move * mo
 		//printf("hash %lx\n", hash->hash);
 	}
 	else if (((move->type & MoveTypeCastlingKingside) == MoveTypeCastlingKingside) || ((move->type & MoveTypeCastlingQueenside) == MoveTypeCastlingQueenside)) {
-		enum SquareName castlingKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
-		enum SquareName castlingRookSquare[2][2] = { { SquareF1, SquareF8 }, { SquareD1, SquareD8 } };
+		int castlingKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
+		int castlingRookSquare[2][2] = { { SquareF1, SquareF8 }, { SquareD1, SquareD8 } };
 		unsigned char side = ((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside)) - 1) >> 2;
     //printf("side %d\n", side);
-		enum SquareName rookSquare = SquareNone;
+		int rookSquare = SquareNone;
 		unsigned char whiteBlack[2] = { 0, 56 };
 		//xor out the king in its src square
 		hash->hash ^= hash->piecesAtSquares[srcPieceType][move->sourceSquare.name];
@@ -191,3 +195,6 @@ int updateHash(struct ZobristHash * hash, struct Board * board, struct Move * mo
 	board->zh = hash;
 	return 0;
 }
+#ifdef __cplusplus
+}
+#endif
