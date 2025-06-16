@@ -417,7 +417,7 @@ extern "C" {
 }
 
 int main(int argc, char **argv) {
-    const std::string weights_file = "chessCNN6.pt";
+    const std::string weights_file = "chessCNN7_22.pt";
     struct Fen fen;
     struct Board board;
     struct ZobristHash zh;

@@ -13,8 +13,8 @@ struct MagicEntry{
 };
 
 // Global tables, defined in magic_bitboards.c
-extern struct MagicEntry rook_magics[SQUARE_COUNT];
-extern struct MagicEntry bishop_magics[SQUARE_COUNT];
+static struct MagicEntry rook_magics[SQUARE_COUNT];
+static struct MagicEntry bishop_magics[SQUARE_COUNT];
 
 // Precomputed rook magics (sourced from Stockfish/Wiki)
 static const unsigned long rook_magic_numbers[SQUARE_COUNT] = {

@@ -2,6 +2,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 unsigned int leftrotate(unsigned int F, unsigned int s) {
     return (F << s) | (F >> (32 - s));
 }
@@ -176,7 +180,7 @@ unsigned long md5(char * msg) {
     padding += 120 - padding;
   size_t total_len = len + padding + 8;
   size_t chunk_num = total_len / 64;
-  unsigned char * m = malloc(total_len);
+  unsigned char * m = (unsigned char *)malloc(total_len);
   memset(m, 0, total_len);
   memcpy(m, msg, len);
   
@@ -198,7 +202,7 @@ unsigned long md5(char * msg) {
   //append original length in bits mod 2^64 to message
   memcpy(m + len + padding, &lenBits, 8);
   
-  unsigned char * M = malloc(16 * 4);
+  unsigned char * M = (unsigned char *)malloc(16 * 4);
   unsigned int A, B, C, D, F, g, X;
   
   // Process the message in successive 64-byte chunks:
@@ -278,3 +282,7 @@ int main(int argc, char ** argv) {
   return 0;
 }
 */
+
+#ifdef __cplusplus
+}
+#endif

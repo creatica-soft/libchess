@@ -6,9 +6,17 @@
 #include <stdlib.h>
 #include "libchess.h"
 
-void piece(struct Square * sq, struct ChessPiece * pc, enum PieceName pcName) {
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void piece(struct Square * sq, struct ChessPiece * pc, int pcName) {
 	pc->name = pcName;
 	pc->type = pcName & 7;
 	pc->color = pcName >> 3;
 	memcpy(&(pc->square), sq, sizeof (struct Square));
 }
+
+#ifdef __cplusplus
+}
+#endif

@@ -15,6 +15,10 @@
 #include <math.h>
 #include "libchess.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int getOptions(struct Engine * engine) {
 	char name[MAX_UCI_OPTION_NAME_LEN], type[MAX_UCI_OPTION_TYPE_LEN],
 		defaultStringValue[MAX_UCI_OPTION_STRING_LEN];
@@ -22,7 +26,7 @@ int getOptions(struct Engine * engine) {
 
 	fprintf(engine->toEngine, "uci\n");
 	fflush(engine->toEngine);
-	dprintf(engine->logfile, "uci\n");
+	if (engine->logfile >= 0) dprintf(engine->logfile, "uci\n");
 	//fprintf(stderr, "uci\n");
 	char line[256];
 	engine->numberOfCheckOptions = 0;
@@ -32,7 +36,7 @@ int getOptions(struct Engine * engine) {
 	engine->numberOfButtonOptions = 0;
 	char * lineMod = NULL, * tmp = NULL;
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
-		dprintf(engine->logfile, "%s", line);
+		if (engine->logfile >= 0) dprintf(engine->logfile, "%s", line);
 		//fprintf(stderr, "%s", line);
 		if (strcmp(line, "uciok\n") == 0) break;
 		if (strstr(line, "option name ") - line == 0) {
@@ -152,7 +156,7 @@ int getOptions(struct Engine * engine) {
 	return 0;
 }
 
-int nametoindex(struct Engine * engine, char * name, enum OptionType type) {
+int nametoindex(struct Engine * engine, char * name, int type) {
 	int idx = -1;
 	switch (type) {
 	case 0: //button
@@ -202,7 +206,7 @@ int nametoindex(struct Engine * engine, char * name, enum OptionType type) {
 	return idx;
 }
 
-int setOption(struct Engine * engine, char * name, enum OptionType type, void * value) {
+int setOption(struct Engine * engine, char * name, int type, void * value) {
 	char line[256];
 	line[0] = '\0';
 	long v;
@@ -245,7 +249,7 @@ int setOption(struct Engine * engine, char * name, enum OptionType type, void * 
 	}
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
-	dprintf(engine->logfile, "%s\n", line);	
+	if (engine->logfile >= 0) dprintf(engine->logfile, "%s\n", line);	
 	//fprintf(stderr, "%s\n", line);
 	// without any output from the engine, fgets() will block
 	//while (fgets(line, sizeof(line), stdin)) {
@@ -299,10 +303,10 @@ bool isReady(struct Engine * engine) {
 	char line[256];
 	fprintf(engine->toEngine, "isready\n");
 	fflush(engine->toEngine);
-	dprintf(engine->logfile, "isready\n");
+	if (engine->logfile >= 0) dprintf(engine->logfile, "isready\n");
 	//fprintf(stderr, "isready\n");
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
-  	dprintf(engine->logfile, "%s", line);
+  	if (engine->logfile >= 0) dprintf(engine->logfile, "%s", line);
 		//fprintf(stderr, "%s", line);
 		if (strcmp(line, "readyok\n") == 0) {
 			ready = true;
@@ -315,7 +319,7 @@ bool isReady(struct Engine * engine) {
 bool newGame(struct Engine * engine) {
 	fprintf(engine->toEngine, "ucinewgame\n");
 	fflush(engine->toEngine);
-  dprintf(engine->logfile, "ucinewgame\n");	
+  if (engine->logfile >= 0) dprintf(engine->logfile, "ucinewgame\n");	
 	//fprintf(stderr, "ucinewgame\n");
 	return isReady(engine);
 }
@@ -323,14 +327,14 @@ bool newGame(struct Engine * engine) {
 void stop(struct Engine * engine) {
 	fprintf(engine->toEngine, "stop\n");
 	fflush(engine->toEngine);
-  dprintf(engine->logfile, "stop\n");	
+  if (engine->logfile >= 0) dprintf(engine->logfile, "stop\n");	
 	//fprintf(stderr, "stop\n");
 }
 
 void quit(struct Engine * engine) {
 	fprintf(engine->toEngine, "quit\n");
 	fflush(engine->toEngine);
-  dprintf(engine->logfile, "quit\n");	
+  if (engine->logfile >= 0) dprintf(engine->logfile, "quit\n");	
 	//fprintf(stderr, "quit\n");
 	fclose(engine->toEngine);
 	fclose(engine->fromEngine);
@@ -350,7 +354,7 @@ bool position(struct Engine * engine) {
 	}
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
-  dprintf(engine->logfile, "%s\n", line);
+  if (engine->logfile >= 0) dprintf(engine->logfile, "%s\n", line);
 	//fprintf(stderr, "%s\n", line);
 	return isReady(engine);
 }
@@ -381,8 +385,8 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 					for (int i = 0; i < multiPV; i++) {
 					  if (prevLine[i]) free(prevLine[i]);
 					}
-					dprintf(engine->logfile, "getPV() error: bestmove is either (none) or blank:\n");
-					dprintf(engine->logfile, "%s", line);
+					if (engine->logfile >= 0) dprintf(engine->logfile, "getPV() error: bestmove is either (none) or blank:\n");
+					if (engine->logfile >= 0) dprintf(engine->logfile, "%s", line);
 					fprintf(stderr, "getPV() error: bestmove is either (none) or blank\n");
 					return 1;
 				}
@@ -464,7 +468,7 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 								free(prevLine[pv]);
 								prevLine[pv] = NULL;
 							}
-							prevLine[pv] = malloc(strlen(line) + 1);
+							prevLine[pv] = (char *)malloc(strlen(line) + 1);
 							strcpy(prevLine[pv], line);
 						}
 					} //end of if pv
@@ -593,17 +597,40 @@ int go(struct Engine * engine, struct Evaluation ** eval) {
 
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
-  dprintf(engine->logfile, "%s\n", line);
+  if (engine->logfile >= 0) dprintf(engine->logfile, "%s\n", line);
 	//fprintf(stderr, "%s\n", line);
 
 	int multiPV = nametoindex(engine, "MultiPV", Spin);
 	if (multiPV < 0) {
-    dprintf(engine->logfile, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
+    if (engine->logfile >= 0) dprintf(engine->logfile, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
 		fprintf(stderr, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
 		return 1;
 	}
 	//fprintf(stderr, "multiPV %ld\n", engine->optionSpin[multiPV].value);
 	return getPV(engine, eval, engine->optionSpin[multiPV].value);
+}
+
+float getEval(struct Engine * engine) {
+	char line[2048];
+	char * tmpLine;
+	float score = 0;
+	while (fgets(line, sizeof(line), engine->fromEngine)) {
+		//fprintf(stderr, "%s", line);
+		if (strstr(line, "Final evaluation ") - line == 0) {
+			char * score_start = strpbrk(line, "+-");
+			score = strtof(score_start, NULL);
+			break;
+		} 
+	}
+	return score;
+}
+
+float eval(struct Engine * engine) {
+	fprintf(engine->toEngine, "eval\n");
+	fflush(engine->toEngine);
+  if (engine->logfile >= 0) dprintf(engine->logfile, "eval\n");	
+	//fprintf(stderr, "eval\n");
+	return getEval(engine);
 }
 
 int engine(struct Engine * engine, char * engineName) {
@@ -616,7 +643,7 @@ int engine(struct Engine * engine, char * engineName) {
 		return 1;			
 	}
 	strcpy(engine->engineName, engineName);
-	char symbols[62] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	char symbols[63] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 	char suffix[10];
 	do {
 		suffix[0] = '.';
@@ -682,12 +709,12 @@ int engine(struct Engine * engine, char * engineName) {
 	return 0;
 }
 
-struct Engine * initChessEngine(char * engineName, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV) {
+struct Engine * initChessEngine(char * engineName, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging) {
   struct timespec delay;
   delay.tv_sec = 1;
   delay.tv_nsec = 0;
   struct Engine * chessEngine;
-  chessEngine = malloc(sizeof(struct Engine));
+  chessEngine = (struct Engine *)malloc(sizeof(struct Engine));
   if (!chessEngine) {
     printf("initChessEngine() error: malloc(sizeof(struct Engine)) returned NULL\n");
     return NULL;  	
@@ -710,24 +737,25 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
   if (res) {
     printf("initChessEngine() error: engine(%s) returned %d\n", engineName, res);
     return NULL;
-  } 
-  char symbols[62] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-	char suffix[10];
-	struct stat * buf = malloc(sizeof(struct stat));
-  char logfile[255] = "";
-  do {
-		suffix[0] = '.';
-		for (int i = 1; i < 9; i++) {
-			suffix[i] = symbols[randomNumber(0, 61)];
-		}
-		suffix[9] = '\0';
-    strcpy(logfile, "engine_log");
-		strncat(logfile, suffix, 10);
-	} while(!stat(logfile, buf));
-	free(buf);
-  chessEngine->logfile = open(logfile, O_RDWR | O_APPEND | O_CREAT | O_TRUNC);
-  fchmod(chessEngine->logfile, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-
+  }
+  if (logging) {
+	  char symbols[63] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+		char suffix[10];
+		struct stat * buf = (struct stat *)malloc(sizeof(struct stat));
+	  char logfile[255] = "";
+	  do {
+			suffix[0] = '.';
+			for (int i = 1; i < 9; i++) {
+				suffix[i] = symbols[randomNumber(0, 61)];
+			}
+			suffix[9] = '\0';
+	    strcpy(logfile, "engine_log");
+			strncat(logfile, suffix, 10);
+		} while(!stat(logfile, buf));
+		free(buf);
+	  chessEngine->logfile = open(logfile, O_RDWR | O_APPEND | O_CREAT | O_TRUNC);
+	  fchmod(chessEngine->logfile, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+  } else chessEngine->logfile = -1;
   getOptions(chessEngine);
   int idx = nametoindex(chessEngine, "MultiPV", Spin);
   chessEngine->optionSpin[idx].value = multiPV;
@@ -757,13 +785,13 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
   setOptions(chessEngine);
   int timeout = 0;
   while (!isReady(chessEngine) && timeout < 3) {
-  	dprintf(chessEngine->logfile, "initChessEngine() warning: isReady() returned false\n");
+  	if (chessEngine->logfile >= 0) dprintf(chessEngine->logfile, "initChessEngine() warning: isReady() returned false\n");
     printf("initChessEngine() warning: isReady() returned false\n");
     nanosleep(&delay, NULL);
     timeout++;
   }
   if (!isReady(chessEngine)) {
-  	dprintf(chessEngine->logfile, "initChessEngine() error: isReady() returned false\n");
+  	if (chessEngine->logfile >= 0) dprintf(chessEngine->logfile, "initChessEngine() error: isReady() returned false\n");
   	free(chessEngine);
     printf("initChessEngine() error: isReady() returned false\n");
   	return NULL;
@@ -772,8 +800,12 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
 }
 
 void releaseChessEngine(struct Engine * chessEngine) {
-  dprintf(chessEngine->logfile, "releaseChessEngine(): closing logfile...\n");
+  if (chessEngine->logfile >= 0) dprintf(chessEngine->logfile, "releaseChessEngine(): closing logfile...\n");
   close(chessEngine->logfile);
   if (chessEngine) free(chessEngine);
   chessEngine = NULL;
 }
+
+#ifdef __cplusplus
+}
+#endif

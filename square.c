@@ -8,7 +8,11 @@
 #include <stdlib.h>
 #include "libchess.h"
 
-void square(struct Square * square, enum SquareName sqName) {
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void square(struct Square * square, int sqName) {
 	square->name = sqName;
 	if (sqName != SquareNone) {
 		square->bitSquare = 1UL << sqName;
@@ -34,3 +38,18 @@ void square(struct Square * square, enum SquareName sqName) {
 		square->antiDiag = AntidiagonalNone;
 	}
 }
+
+int squareColor(int sqName) {
+  if ((sqName & 7) % 2) {
+		if ((sqName >> 3) % 2) return ColorBlack;
+		else return ColorWhite;
+	} 
+	else {
+		if ((sqName >> 3) % 2) return ColorWhite;
+		else return ColorBlack;
+	}
+}
+
+#ifdef __cplusplus
+}
+#endif

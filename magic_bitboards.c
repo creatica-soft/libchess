@@ -2,8 +2,12 @@
 #include <stdio.h>
 #include "magic_bitboards.h"
 
-struct MagicEntry rook_magics[SQUARE_COUNT];
-struct MagicEntry bishop_magics[SQUARE_COUNT];
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+//struct MagicEntry rook_magics[SQUARE_COUNT];
+//struct MagicEntry bishop_magics[SQUARE_COUNT];
 
 // Generate attack mask for rook
 static unsigned long get_rook_attack_mask(int square) {
@@ -164,3 +168,7 @@ unsigned long get_bishop_moves(int square, unsigned long occupancy) {
   unsigned long index = ((occupancy & magic->attack_mask) * magic->magic_number) >> (64 - magic->relevant_bits);
   return magic->move_table[index];
 }
+
+#ifdef __cplusplus
+}
+#endif

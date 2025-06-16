@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include "libchess.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 //see https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation
 
@@ -24,20 +27,24 @@ int strtofen(struct Fen * fen, const char * fenstr) {
 		printf("strtofen() error: FEN string is too long (%zu), it must be shorter than %zu.\n", count, sizeof fen->fenString);
 		return 1;
 	}
+	char position[73];
+	char castling[5];
+	char * saveptr;
+	size_t sz;
+	char * token;
+	unsigned char i;
+
 	strncpy(fen->fenString, fenstr, count);
 	char * fenString = strdup(fenstr);
 	if (!fenString) {
 		printf("Error in strtofen(): strdup(%s) returned null - %s\n", fenstr, strerror(errno));
 		goto err;
+	} else {		
+		token = strtok_r(fenString, " ", &saveptr);
+		i = 0;
 	}
 	//fprintf(stderr, "strtofen(): fen %s\n", fenstr);
 
-	char position[73];
-	char castling[5];
-	char * saveptr;
-	char * token = strtok_r(fenString, " ", &saveptr);
-	unsigned char i = 0;
-	size_t sz;
 
 	while (token) {
 		switch (i) {
@@ -120,7 +127,7 @@ int strtofen(struct Fen * fen, const char * fenstr) {
 		char wf[] = "ABCDEFGH";
 		char bf[] = "abcdefgh";
 		char r[] = "KQkq";
-		enum Files f;
+		int f;
 		unsigned char white_king_file = 0;
 		unsigned char black_king_file = 0;
 
@@ -212,7 +219,7 @@ int fentostr(struct Fen * fen) {
 	}
 	else {
 		unsigned char i = 0;
-		for (enum Color color = ColorWhite; color <= ColorBlack; color++)
+		for (int color = ColorWhite; color <= ColorBlack; color++)
 		{
 			if (fen->isChess960)
 			{
@@ -248,4 +255,7 @@ int fentostr(struct Fen * fen) {
 
 	return sprintf(fen->fenString, "%s/%s/%s/%s/%s/%s/%s/%s %c %s %s %u %u", fen->ranks[7], fen->ranks[6], fen->ranks[5], fen->ranks[4], fen->ranks[3], fen->ranks[2], fen->ranks[1], fen->ranks[0], fen->sideToMove == ColorWhite ? 'w' : 'b', castling, en_passant, fen->halfmoveClock, fen->moveNumber);
 }
+#ifdef __cplusplus
+}
+#endif
 
