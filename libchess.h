@@ -1,19 +1,13 @@
 /// 
 /// c++ -std=c++17 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt/anaconda3/lib -I /opt/anaconda3/include -L/opt/anaconda3/lib -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves8.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
-///
-/// To compile on MacOS M1 using clang , run:
-/// cc -c -Wno-strncat-size -O3 -I /opt/anaconda3/include bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves8.c
-
-//to integrate with Lichess NNUE,  compile C++ files in nnue folder separately
-//c++ -Wno-writable-strings -c -std=c++17 -O3 nnue/network.cpp nnue/nnue_accumulator.cpp nnue/features/half_ka_v2_hm.cpp bitboard.cpp evaluate.cpp memory.cpp misc.cpp nnue.cpp position.cpp
-
-//finally, link all object files into libchess.so
-//c++ -shared -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt/anaconda3/lib -L/opt/anaconda3/lib -o libchess.so bitscanner.o board.o engine.o fen.o game.o game_omp.o move.o piece.o square.o tag.o zobrist-hash.o sqlite.o my_md5.o magic_bitboards.o boards_legal_moves8.o nnue/bitboard.o nnue/evaluate.o nnue/half_ka_v2_hm.o nnue/memory.o nnue/misc.o nnue/network.o nnue/nnue.o nnue/nnue_accumulator.o  nnue/position.o
 
 /// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
-/// use -g for debugging with lldb instead of -O3 (lldb ./test, then run, then bt)
+
+/// use -O0 -g for debugging with lldb or gdb instead of -O3 (lldb ./test, then run, and if crashes, bt)
+
 /// To compile on alpine linux, run:
-/// gcc -O3 -fopenmp -fPIC -I /usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include -shared -Wl,-rpath,/home/apoliakevitch/libchess -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves6.c -lgomp -lsqlite3
+/// g++ -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -std=c++17 -O3 -fopenmp -fPIC -I /usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include -shared -Wl,-rpath,/home/apoliakevitch/libchess -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves8.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -lgomp -lsqlite3
+
 /// To build python bindings, use:
 /// conda install cffi
 /// cc -E libchess.h > libchess.ph
