@@ -62,13 +62,13 @@ Value Eval::evaluate(const Eval::NNUE::Networks&    networks,
     auto [psqt, positional] = smallNet ? networks.small.evaluate(pos, accumulators, &caches.small)
                                        : networks.big.evaluate(pos, accumulators, &caches.big);
 
-    Value nnue = (125 * psqt + 131 * positional) / 128;
+    Value nnue = (125 * psqt + 131 * positional) / 128; //scaled nnue
 
     // Re-evaluate the position when higher eval accuracy is worth the time spent
     if (smallNet && (std::abs(nnue) < 236))
     {
         std::tie(psqt, positional) = networks.big.evaluate(pos, accumulators, &caches.big);
-        nnue                       = (125 * psqt + 131 * positional) / 128;
+        nnue                       = (125 * psqt + 131 * positional) / 128; //scaled nnue
         smallNet                   = false;
     }
 
@@ -147,15 +147,13 @@ std::string Eval::trace(Position& pos, const Eval::NNUE::Networks& networks) {
     ss << std::showpoint << std::showpos << std::fixed << std::setprecision(2) << std::setw(15);
 
     auto [psqt, positional] = networks.big.evaluate(pos, accumulators, &caches->big);
-    Value v                 = psqt + positional;
+    Value v                 = psqt + positional; //unscaled nnue
     v                       = pos.side_to_move() == WHITE ? v : -v;
-    ss << "NNUE evaluation        " << 0.01 * to_cp(v, pos) << " (white side)\n";
+    ss << "NNUE evaluation        " << 0.01 * to_cp(v, pos) << " (white side) [with unscaled NNUE]\n";
 
     v = evaluate(networks, pos, accumulators, *caches, VALUE_ZERO);
     v = pos.side_to_move() == WHITE ? v : -v;
-    ss << "Final evaluation       " << 0.01 * to_cp(v, pos) << " (white side)";
-    ss << " [with scaled NNUE, ...]";
-    ss << "\n";
+    ss << "Final evaluation       " << 0.01 * to_cp(v, pos) << " (white side) [with scaled NNUE]\n";
 
     return ss.str();
 }

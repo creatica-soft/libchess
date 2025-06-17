@@ -1052,7 +1052,8 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
       printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);
       return 2;
     }
-    score_nnue = eval(chessEngine);
+    if (!board.isCheck) score_nnue = eval(chessEngine);
+    else score_nnue = 0.0;
 
     //printf("playGameExt(%d): calling go first time...()\n", threadId);
     if (go(chessEngine, evaluations)) {
@@ -1086,8 +1087,9 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
   	  }
 	  }
 	  libchess_init_nnue_context(&nnueCtx);
-	  score = libchess_evaluate_nnue(&board, &nnueCtx);
-	  printf("playGameExt(%d): my startpos NNUE score %.2f, stockfish startpos NNUE score %.2f, engine score %.2f\n", threadId, score, score_nnue, (float)(evaluations[0]->scorecp) * 0.01);
+	  if (!board.isCheck) score = libchess_evaluate_nnue(&board, &nnueCtx);
+	  else score = 0.0;
+	  //printf("playGameExt(%d): my startpos NNUE score %.2f, stockfish startpos NNUE score %.2f, engine score %.2f\n", threadId, score, score_nnue, (float)(evaluations[0]->scorecp) * 0.01);
   } //chessEngine
   	
 	char * sanMoves = strndup(game->sanMoves, strlen(game->sanMoves));
@@ -1103,10 +1105,9 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 			free(sanMoves);
 			return 1;
 		}
-	  printf("playGameExt(%d): move uci %s, san %s, type %d, FEN %s\n", threadId, move.uciMove, move.sanMove, move.type, move.chessBoard->fen->fenString);
+	  //printf("playGameExt(%d): move uci %s, san %s, type %d, FEN %s\n", threadId, move.uciMove, move.sanMove, move.type, move.chessBoard->fen->fenString);
 		if (chessEngine) {
-		  if (!board.isCheck) score = libchess_evaluate_nnue_incremental(&board, &move, &nnueCtx);
-		  else score = 0;
+		  score = libchess_evaluate_nnue_incremental(&board, &move, &nnueCtx);
 		}
 		if (updateDb && !chessEngine) {
     	//store the hash and uciMove in the cache to correct gameResult in NextMoves.db
@@ -1228,17 +1229,14 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 	    	token = strtok_r(NULL, " ", &saveptr);
 	    	continue;
 	    }*/
-      if (!board.isCheck) {
-        strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
-        if (!position(chessEngine)) {
-          printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);
-          return 2;
-        }
-        score_nnue = eval(chessEngine);
+      strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
+      if (!position(chessEngine)) {
+        printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);
+        return 2;
       }
+      if (!board.isCheck) score_nnue = eval(chessEngine);
       else score_nnue = 0;
-  		printf("playGameExt(%d): my NNUE score %.2f, stockfish NNUE score %.2f, engine score %.2f\n", threadId, score, score_nnue, board.movingPiece.color == ColorWhite ? (float)(evaluations[0]->scorecp) * 0.01 : -(float)(evaluations[0]->scorecp) * 0.01);
-      
+  		//printf("playGameExt(%d): my NNUE score %.2f, stockfish NNUE score %.2f, engine score %.2f\n", threadId, score, score_nnue, board.movingPiece.color == ColorWhite ? (float)(evaluations[0]->scorecp) * 0.01 : -(float)(evaluations[0]->scorecp) * 0.01);      
       if (go(chessEngine, evaluations)) {
         printf("playGameExt(%d) error: go(chessEngine, evaluations) returned non-zero code\n", threadId);
         return 2;      
@@ -2010,8 +2008,8 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	  }  	
   } 
   
-  if (eval) libchess_init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue");
-
+  //if (eval) libchess_init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue"); //same weights as in stockfish binary
+  if (eval) libchess_init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue"); //use default weights 
   
 	struct InitGameFromPGNfilesContext * initGameCtx[gameThreads];
 	struct SqlContext * sqlCtx[sqlThreads];
