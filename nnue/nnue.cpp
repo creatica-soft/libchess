@@ -32,11 +32,11 @@ void libchess_free_nnue_context(struct NNUEContext * ctx);
 float libchess_evaluate_nnue(struct Board * board, struct NNUEContext * ctx);
 float libchess_evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
 
-void libchess_to_position(const struct Board * board, Stockfish::Position * pos, Stockfish::StateInfo * si) {
+void libchess_to_position(const struct Board * board, Stockfish::Position * pos, Stockfish::StateInfo * state) {
   if (board && board->fen) {
-      pos->set(board->fen->fenString, board->fen->isChess960, si);
+      pos->set(board->fen->fenString, board->fen->isChess960, state);
   } else {
-      pos->set(startPos, false, si);
+      pos->set(startPos, false, state);
   }
 }
 
@@ -109,15 +109,14 @@ float libchess_evaluate_nnue(struct Board * board, struct NNUEContext * ctx) {
 float libchess_evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx) {
     if (!board) return 0;
     libchess_to_position(board, ctx->pos, ctx->state);
-    if (!ctx->pos->square<Stockfish::KING>(Stockfish::WHITE) || !ctx->pos->square<Stockfish::KING>(Stockfish::BLACK)) {
-        return 0;
-    }
+    if (!ctx->pos->square<Stockfish::KING>(Stockfish::WHITE) || !ctx->pos->square<Stockfish::KING>(Stockfish::BLACK)) return 0;
     ctx->accumulator_stack->reset();
     Stockfish::Move sf_move = libchess_move_to_stockfish(move);
     Stockfish::StateInfo * new_state = new Stockfish::StateInfo();
     Stockfish::DirtyPiece dp = ctx->pos->do_move(sf_move, *new_state, ctx->pos->gives_check(sf_move));
     delete ctx->state; // Free previous state
     ctx->state = new_state; // Update state
+    if (ctx->pos->checkers()) return 0;
     ctx->accumulator_stack->push(dp);
     Stockfish::Value v = Stockfish::Eval::evaluate(*networks, *ctx->pos, *ctx->accumulator_stack, *ctx->caches, 0);
     ctx->accumulator_stack->pop();
