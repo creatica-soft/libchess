@@ -22,12 +22,6 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
 	int offset3; // used for legal moves source squares
 	int sampleXchannels = sample * channels * 64; //sample offset in boards_legal_moves array
 	int src, dst;
-	if (!boards_legal_moves) {
-	  printf("boardLegalMoves(%d) error: boards_legal_moves is NULL\n", omp_get_thread_num());
-	  return -1;	  
-	}
-  unsigned char sideToMove = board->fen->sideToMove << 3;
-  unsigned char oppositeSide = board->opponentColor << 3;
 
   //each channel is a chessboard 8 x 8 (64 squares)
   //Channels 0 - 5: 6 channels for opponents pawns, knights, bishops, rooks, queens and king
@@ -44,7 +38,6 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     unsigned char shiftedColor = color << 3;
     int pawn = shiftedColor | Pawn;
     int king = shiftedColor | King;
-    int i = 0;
     for (int pn = pawn; pn <= king; pn++) { //loop over different piece types of the same color
       bitBoard = board->occupations[pn];
       if (bitBoard) {

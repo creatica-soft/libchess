@@ -6,7 +6,7 @@
   This file should not need to much adaptation to add tablebase probing to
   a particular engine, provided the engine is written in C or C++.
 */
-
+#include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -376,7 +376,7 @@ static void init_tablebases(const char *path)
 //  printf("Found %d tablebases.\n", TBnum_piece + TBnum_pawn);
 }
 
-static const char offdiag[] = {
+static const int8_t offdiag[] = {
   0,-1,-1,-1,-1,-1,-1,-1,
   1, 0,-1,-1,-1,-1,-1,-1,
   1, 1, 0,-1,-1,-1,-1,-1,

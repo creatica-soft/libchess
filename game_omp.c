@@ -1,5 +1,16 @@
 //This file is used to experiment with data and data loading to train chess AI models from PGN and CSV files
 #pragma warning(disable:4996)
+#include "nnue/types.h"
+#include "nnue/position.h"
+#include "nnue/evaluate.h"
+#include "nnue/nnue/nnue_common.h"
+#include "nnue/nnue/network.h"
+#include "nnue/nnue/nnue_accumulator.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <omp.h>
 #include <assert.h>
 #include <errno.h>
@@ -14,9 +25,20 @@
 #include "magic_bitboards.h"
 #include "libchess.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+
+struct NNUEContext {
+    Stockfish::StateInfo * state;
+    Stockfish::Position * pos;
+    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
+    Stockfish::Eval::NNUE::AccumulatorCaches * caches;
+};
+
+void init_nnue(const char * nnue_file_big, const char * nnue_file_small);
+void cleanup_nnue();
+void init_nnue_context(struct NNUEContext * ctx);
+void free_nnue_context(struct NNUEContext * ctx);
+float evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
+float evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
 
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
@@ -117,11 +139,13 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 	  printf("bmprNew(%d) error: calloc() for boards_legal_moves returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
+	/*
 	bmpr->move_type = (long *)calloc(bmpr->samples, sizeof(long));
 	if (!bmpr->move_type) {
 	  printf("bmprNew(%d) error: calloc() for move_type returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
+	
 	bmpr->src_sq = (long *)calloc(bmpr->samples, sizeof(long));
 	if (!bmpr->src_sq) {
 	  printf("bmprNew(%d) error: calloc() for src_sq returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
@@ -132,6 +156,12 @@ struct BMPR * bmprNew(struct BMPR * bmpr, int channels, int numberOfSamples) {
 	  printf("bmprNew(%d) error: calloc() for dst_sq returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
 	  return NULL;
 	}
+	*/
+	bmpr->move = (long *)calloc(bmpr->samples, sizeof(long));
+	if (!bmpr->move) {
+	  printf("bmprNew(%d) error: calloc() for move returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
+	  return NULL;
+	}	
 	bmpr->result = (long *)calloc(bmpr->samples, sizeof(long));
 	if (!bmpr->result) {
 	  printf("bmprNew(%d) error: calloc() for result returned NULL. %s\n", omp_get_thread_num(), strerror(errno));
@@ -181,8 +211,10 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned 
 	struct Move move;
 	struct Board board;
 	struct Fen fen;
+	struct NNUEContext nnueCtx;
 	char * fenString;
   bool wrong_result = false;
+  float score = 0;
   
 	if (strcmp(game->tags[Result], "1/2-1/2") == 0) gameResult = 0;
 	else if (strcmp(game->tags[Result], "1-0") == 0) gameResult = 1;
@@ -209,6 +241,8 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned 
 		printf("playGameAI(%d) error: strndup() returned NULL: %s. sanMoves %s\n", omp_get_thread_num(), strerror(errno), game->sanMoves);
 		return -7;
 	}
+	init_nnue_context(&nnueCtx);
+	score = evaluate_nnue(&board, NULL, &nnueCtx);
 	char * saveptr;
 	char * token = strtok_r(sanMoves, " ", &saveptr);
 	while (token) {
@@ -259,6 +293,7 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned 
         if (initMove(&move, &board, token)) {
     			printf("playGameAI(%d) error: invalid move %u%s%s (%s); FEN %s\n", omp_get_thread_num(), move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
     			if (sanMoves) free(sanMoves);
+    			free_nnue_context(&nnueCtx);
     			return -2;
     		}
     		makeMove(&move);    
@@ -266,25 +301,34 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned 
   	    continue;
       } else {
         printf("boardLegalMoves() returned non-zero code\n");
+  			if (sanMoves) free(sanMoves);
+  			free_nnue_context(&nnueCtx);
         return -1;
       }
     }
 		if (initMove(&move, &board, token)) {
 			printf("playGameAI(%d) error: invalid move %u%s%s (%s); FEN %s\n", omp_get_thread_num(), move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
 			if (sanMoves) free(sanMoves);
+			free_nnue_context(&nnueCtx);
 			return -2;
 		}
     //board.channel[src_sqr] is an array of channels from 0 to 20 (16 channels for pieces and 5 for promotions)
     //channels 0 to 7 are for pawns on files a to h respectively.
     //channels 8 to 10 are for knights, 11-13 - bishops, 14-16 - rooks, 17-19 - queens, 20 - king
     //the array is filled in boardLegalMoves() defined in boards_legal_movesX.c
-    (*bmpr)->move_type[(*bmpr)->sample] = board.channel[move.sourceSquare.name];
+    //(*bmpr)->move_type[(*bmpr)->sample] = board.channel[move.sourceSquare.name];
     //printf("playGameAI(%d): board.channel[%s] %u\n", omp_get_thread_num(), squareName[move.sourceSquare.name], board.channel[move.sourceSquare.name]);
-    (*bmpr)->src_sq[(*bmpr)->sample] = move.sourceSquare.name;
-    (*bmpr)->dst_sq[(*bmpr)->sample] = move.destinationSquare.name;
+    //(*bmpr)->src_sq[(*bmpr)->sample] = move.sourceSquare.name;
+    //(*bmpr)->dst_sq[(*bmpr)->sample] = move.destinationSquare.name;
+    (*bmpr)->move[(*bmpr)->sample] = move.sourceSquare.name * 64 + move.destinationSquare.name;
+    score = evaluate_nnue_incremental(&board, &move, &nnueCtx);
+    if (score > 2.0) (*bmpr)->result[(*bmpr)->sample] = board.movingPiece.color == ColorWhite ? 2 : 0;
+    else if (score < -2.0) (*bmpr)->result[(*bmpr)->sample] = board.movingPiece.color == ColorWhite ? 0 : 2;
+    else (*bmpr)->result[(*bmpr)->sample] = 1;
 
 		makeMove(&move);
-		
+		/*
+		//we don't care about wrong move result as we use NNUE eval
 		if (board.isStaleMate && strcmp(game->tags[Result], "1/2-1/2") != 0) {
 			printf("playGameAI(%d): game tag Result '%s' did not match the actual one '1/2-1/2' - corrected\n[Event \"%s\"]\n[Site \"%s\"]\n[Date \"%s\"]\n[Round \"%s\"]\n[White \"%s\"]\n[Black \"%s\"]\n", omp_get_thread_num(), game->tags[Result], game->tags[Event], game->tags[Site], game->tags[Date], game->tags[Round], game->tags[White], game->tags[Black]);
 			strcpy(game->tags[Result], "1/2-1/2");
@@ -300,16 +344,18 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned 
 			strcpy(game->tags[Result], "0-1");
 			gameResult = -1;
 			wrong_result = true;
-		}
+		}*/
 		//we attempt to correct wrong result by using the end of move result in stripGameResult()
 		//but it also may be wrong
 		//result is from a point of view of the side to move - which I think confuses the model during training!
-		//so let's provide constant result regardless of the side to move!
+		//so let's provide constant result regardless of the side to move! Another words, from white point of view
 		//result class is used as a target in value loss calculation
-		if (board.fen->sideToMove == ColorBlack) //move is made, so sideToMove if White has already changed to Black
+		/*
+		if (board.movingPiece.color == ColorWhite)
       (*bmpr)->result[(*bmpr)->sample] = gameResult + 1; //(0 (white lost/black won), 1 (draw), 2 (white won/black lost))
     else 
       (*bmpr)->result[(*bmpr)->sample] = -gameResult + 1; //from black perspective (0 (loss), 1 (draw), 2 (win))
+    
     //we attempt to correct the wrong game result by rewinding backwards by the number of plies in a game
     //if the game started in previous batch, then those positions won't be updated, of course
     if (wrong_result) {
@@ -317,7 +363,7 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned 
         if ((*bmpr)->sample - i < 0) break;
         (*bmpr)->result[(*bmpr)->sample - i] = (*bmpr)->result[(*bmpr)->sample];
       }
-    }
+    }*/
     //printf("playGameAI(%d): sample %d, result %d, gameResult %d, sideToMove %d\n", omp_get_thread_num(), (*bmpr)->sample, (*bmpr)->result[(*bmpr)->sample], gameResult, board.fen->sideToMove);
     //material balance is used as scalar input in boath policy and value heads 
     //material balance seems to be irrelevant for a single position, which could just be in the middle
@@ -336,6 +382,7 @@ int playGameAI(struct Game * game, struct BMPR ** bmpr, int gameStage, unsigned 
 		token = strtok_r(NULL, " ", &saveptr);
 	}
 	if (sanMoves) free(sanMoves);
+	free_nnue_context(&nnueCtx);
 	return 0;
 }
 
@@ -344,6 +391,7 @@ void free_bmpr(struct BMPR * bmpr) {
   if (bmpr->boards_legal_moves) {
     free(bmpr->boards_legal_moves);
   }
+  /*
   if (bmpr->move_type) {
     free(bmpr->move_type);
   }
@@ -352,6 +400,9 @@ void free_bmpr(struct BMPR * bmpr) {
   }
   if (bmpr->dst_sq) {
     free(bmpr->dst_sq);
+  }*/
+  if (bmpr->move) {
+    free(bmpr->move);
   }
   if (bmpr->result) {
     free(bmpr->result);
@@ -517,6 +568,7 @@ void * getGame(void * context) {
     HASH_DEL(games, entry);
     free(entry);
   }
+  cleanup_nnue();
   cleanup_magic_bitboards();
   games = NULL;
   printf("Total games %lu: played %lu, skipped %lu, duplicate %lu. Number of plies in played games: %lu, step %lu\n", numberOfGames, numberOfGames - skipped - duplicate, skipped, duplicate, numberOfPlies, step);
@@ -652,9 +704,10 @@ void * getGameCsv(void * context) {
           			break;
           		}
               //calculate legal move index (move prediction class) - used as target in policy loss calculation
-              bmpr->move_type[bmpr->sample] = board.channel[move.sourceSquare.name];
-              bmpr->dst_sq[bmpr->sample] = move.destinationSquare.name;
-              bmpr->src_sq[bmpr->sample] = move.sourceSquare.name;
+              //bmpr->move_type[bmpr->sample] = board.channel[move.sourceSquare.name];
+              //bmpr->dst_sq[bmpr->sample] = move.destinationSquare.name;
+              //bmpr->src_sq[bmpr->sample] = move.sourceSquare.name;
+              bmpr->move[bmpr->sample] = move.sourceSquare.name * 64 + move.destinationSquare.name;
               //calculate promo index (promo prediction class) - used as target in promo loss calculation
               /*if (board.promoPiece != PieceNameNone)
               // promo classes: knight is 0, bishop is 1, rook is 2, queen is 3 
@@ -708,6 +761,7 @@ void * getGameCsv(void * context) {
       } //end of pragma omp taskgroup
     } //end of pragma omp single
   } //end of pragma omp parallel
+  cleanup_nnue();
   cleanup_magic_bitboards();
   printf("getGameCsv(): Number of plies in played games: %lu\n", numberOfPlies);
 	return NULL;
@@ -739,6 +793,9 @@ void getGame_detached(char ** fileNames, const int numberOfFiles, const int minE
   	exit(1);
   }
   init_magic_bitboards();
+  //init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue"); //same weights as in stockfish binary
+  init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue"); //use default weights 
+
   if (strstr(fileNames[0], ".csv")) {
     if (pthread_create(&thread, &attr, &getGameCsv, (void *)ctx) == 0) {
         if ((res = pthread_attr_destroy(&attr)) != 0) {

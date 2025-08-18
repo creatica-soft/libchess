@@ -354,7 +354,7 @@ int validateUciMove(struct Move * move) {
 	piece(&(move->sourceSquare), &cp, move->chessBoard->piecesOnSquares[move->sourceSquare.name]);
 	memcpy(&(move->chessBoard->movingPiece), &cp, sizeof(struct ChessPiece));
 	if (move->chessBoard->movingPiece.name == PieceNameNone) {
-		printf("The source square %s is empty in move from %s to %s in %u%s%s; FEN %s\n", squareName[move->chessBoard->movingPiece.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, move->chessBoard->fen->fenString);
+		printf("The source square %s is empty in move from %s to %s in %u%s%s; FEN %s\n", squareName[move->sourceSquare.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, move->chessBoard->fen->fenString);
 		return 1;
 	}
 	if ((move->chessBoard->movesFromSquares[move->sourceSquare.name] & move->destinationSquare.bitSquare) > 0)
@@ -499,31 +499,38 @@ void setUciMoveType(struct Move * move) {
 		if ((move->chessBoard->fen->enPassant < FileNone) && move->chessBoard->fen->enPassant + (move->chessBoard->fen->sideToMove == ColorWhite ? Rank6 << 3 : Rank3 << 3) == move->destinationSquare.name)
 			move->type |= (MoveTypeCapture | MoveTypeEnPassant);
 		//Is move en passant?
-		else if ((move->chessBoard->movingPiece.square.name ^ move->destinationSquare.name) == 16)
-		{
-			struct Square s;
+		else if (abs(move->sourceSquare.name - move->destinationSquare.name) == 16) {
+			//all opponent pawns
 			unsigned long pawns = move->chessBoard->occupations[(move->chessBoard->opponentColor << 3) | Pawn];
+			//opponent pawns on Rank 4 or 5 depending on the side to move
+			if (move->chessBoard->fen->sideToMove == ColorWhite)
+			  pawns &= RANK4;
+			else pawns &= RANK5;
+			//opponent pawns on adjacent files (adjacent to the moving pawn from its initial rank to rank 4 or 5)
+			if (move->sourceSquare.file < FileH) pawns &= files_bb[move->sourceSquare.file + 1]; 
+			if (move->sourceSquare.file > FileA) pawns &= files_bb[move->sourceSquare.file - 1];
+			//if there are such opponent pawns, then the move is en passant
+			if (pawns) move->type |= MoveTypeEnPassant;
+			/*
+			//this is a deprecated algorithm for finding if a move is en passant or not
+			//it is slower because it iterates over all opponent pawns and breaks when it finds the first one
+			struct Square s;
 			int ranks[2] = { Rank4, Rank5 };
 			square(&s, lsBit(pawns));
-			while (s.name < SquareNone)
-			{
-				if (s.rank == ranks[move->chessBoard->fen->sideToMove] && ((s.file == move->sourceSquare.file + 1 && move->sourceSquare.file < FileH) || (s.file == move->sourceSquare.file - 1 && move->sourceSquare.file > FileA)))
-				{
+			while (s.name < SquareNone) {
+				if (s.rank == ranks[move->chessBoard->fen->sideToMove] && ((move->sourceSquare.file < FileH && s.file == move->sourceSquare.file + 1) || (move->sourceSquare.file > FileA && s.file == move->sourceSquare.file - 1))) {
 					move->type |= MoveTypeEnPassant;
 					break;
 				}
 				pawns ^= s.bitSquare;
 				square(&s, lsBit(pawns));
-			}
+			}*/
 		}
 	}
-
-//Is move castling?
-	else if (move->chessBoard->movingPiece.type == King)
-	{
+  //Is move castling?
+	else if (move->chessBoard->movingPiece.type == King) {
 		//the king moves to the square occupied by its own rook in Chess960
-		if (move->chessBoard->fen->isChess960 && move->chessBoard->piecesOnSquares[move->destinationSquare.name] == ((move->chessBoard->fen->sideToMove << 3) | Rook))
-		{
+		if (move->chessBoard->fen->isChess960 && move->chessBoard->piecesOnSquares[move->destinationSquare.name] == ((move->chessBoard->fen->sideToMove << 3) | Rook)) {
 			if (move->destinationSquare.file == move->chessBoard->fen->castlingRook[1][move->chessBoard->fen->sideToMove])
 				move->type |= MoveTypeCastlingQueenside;
 			else if (move->destinationSquare.file == move->chessBoard->fen->castlingRook[0][move->chessBoard->fen->sideToMove])
@@ -532,9 +539,7 @@ void setUciMoveType(struct Move * move) {
 				printf("Illegal castling move in chess 960: the %s rook on %s is not a castling one\n", move->chessBoard->fen->sideToMove == ColorWhite ? "white" : "black", squareName[move->destinationSquare.name]);
 				return;
 			}
-		}
-		else
-		{
+		} else {
 			char diff = move->sourceSquare.name - move->destinationSquare.name;
 			if (abs(diff) == 2) {
 				int dstKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
@@ -559,9 +564,6 @@ int initMove(struct Move * move, struct Board * board, char * moveString) {
 	memset(move, 0, sizeof(struct Move));
 	board->capturedPiece = PieceNameNone;
 	board->promoPiece = PieceNameNone;
-	//board->isCheck = false;
-	//board->isMate = false;
-	//board->isStaleMate = false;
 	square(&(board->movingPiece.square), SquareNone);
 	piece(&(board->movingPiece.square), &(board->movingPiece), PieceNameNone);
 
@@ -570,7 +572,7 @@ int initMove(struct Move * move, struct Board * board, char * moveString) {
 
 	if (!parseUciMove(moveString)) {
 		strncpy(move->sanMove, moveString, sizeof move->sanMove);
-		move->uciMove[0] = '\0';
+		move->uciMove[0] = '\0'; //this is not needed because of memset() call above
 		if (validateSanMove(move)) {
 			printf("initMove() error: validateSanMove failed\n");
 			return 1;
@@ -579,7 +581,7 @@ int initMove(struct Move * move, struct Board * board, char * moveString) {
 			san2uci(move);
 	} else {
 		strncpy(move->uciMove, moveString, sizeof move->uciMove);
-		move->sanMove[0] = '\0';
+		move->sanMove[0] = '\0'; //this is not needed because of memset() call above
 		if (validateUciMove(move)) {
 			printf("initMove() error: validateUciMove failed\n");
 			return 1;
@@ -588,6 +590,82 @@ int initMove(struct Move * move, struct Board * board, char * moveString) {
 		uci2san(move);
 	}
 	return 0;
+}
+
+bool promoMove(struct Board * board, int src, int dst) {
+  if ((board->piecesOnSquares[src] & 7) == Pawn) {
+    int src_rank = src / 8;
+    int dst_rank = dst / 8;
+    int pre_promo_rank = board->fen->sideToMove == ColorWhite ? Rank7 : Rank2;
+    int promo_rank = board->fen->sideToMove == ColorWhite ? Rank8 : Rank1;
+    if (src_rank == pre_promo_rank && dst_rank == promo_rank) return true;
+  }
+  return false;
+}
+
+//because normally src and dst squares are taken from board's occupation and legal moves,
+//no validation is necessary here
+void init_move(struct Move * move, struct Board * board, int src, int dst) {
+	memset(move, 0, sizeof(struct Move));
+	move->type = MoveTypeValid;
+	square(&(move->sourceSquare), src);
+	square(&(move->destinationSquare), dst);
+	board->capturedPiece = PieceNameNone;
+	if (board->piecesOnSquares[dst] && ((board->piecesOnSquares[dst] >> 3) == board->opponentColor)) 
+	  move->type |= MoveTypeCapture;
+	board->promoPiece = promoMove(board, src, dst) ? (board->fen->sideToMove == ColorWhite ? WhiteQueen : BlackQueen) : PieceNameNone; //deficiency - always assume promotion to queen
+	if (board->promoPiece) move->type |= MoveTypePromotion;
+	struct Square src_sq;
+	square(&src_sq, src);
+	piece(&src_sq, &(board->movingPiece), board->piecesOnSquares[src]);
+	move->chessBoard = board;
+	move->castlingRook = FileNone;
+	strcat(move->uciMove, squareName[src]);
+	strcat(move->uciMove, squareName[dst]);
+	move->uciMove[4] = promoLetter[board->promoPiece & 7];
+	if (board->movingPiece.type == Pawn) {
+		//Is move en passant capture?
+		if ((board->fen->enPassant < FileNone) && board->fen->enPassant + (board->fen->sideToMove == ColorWhite ? Rank6 << 3 : Rank3 << 3) == dst)
+			move->type |= (MoveTypeCapture | MoveTypeEnPassant);
+		//Is move en passant?
+		else if (abs(move->sourceSquare.name - move->destinationSquare.name) == 16) {
+			//all opponent pawns
+			unsigned long pawns = move->chessBoard->occupations[(move->chessBoard->opponentColor << 3) | Pawn];
+			//opponent pawns on Rank 4 or 5 depending on the side to move
+			if (move->chessBoard->fen->sideToMove == ColorWhite)
+			  pawns &= RANK4;
+			else pawns &= RANK5;
+			//opponent pawns on adjacent files (adjacent to the moving pawn from its initial rank to rank 4 or 5)
+			if (move->sourceSquare.file < FileH) pawns &= files_bb[move->sourceSquare.file + 1]; 
+			if (move->sourceSquare.file > FileA) pawns &= files_bb[move->sourceSquare.file - 1];
+			//if there are such opponent pawns, then the move is en passant
+			if (pawns) move->type |= MoveTypeEnPassant;
+		}
+  }
+  //Is move castling?
+	else if (board->movingPiece.type == King) {
+		//the king moves to the square occupied by its own rook in Chess960
+		if (board->fen->isChess960 && board->piecesOnSquares[dst] == ((board->fen->sideToMove << 3) | Rook)) {
+			if (move->destinationSquare.file == board->fen->castlingRook[1][board->fen->sideToMove])
+				move->type |= MoveTypeCastlingQueenside;
+			else if (move->destinationSquare.file == board->fen->castlingRook[0][board->fen->sideToMove])
+				move->type |= MoveTypeCastlingKingside;
+			else {
+				printf("Illegal castling move in chess 960: the %s rook on %s is not a castling one\n", board->fen->sideToMove == ColorWhite ? "white" : "black", squareName[dst]);
+			}
+		} else {
+			if (abs(src - dst) == 2) {
+				int dstKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
+				if (dst == dstKingSquare[1][board->fen->sideToMove])
+					move->type |= MoveTypeCastlingQueenside;
+				else if (dst == dstKingSquare[0][board->fen->sideToMove])
+					move->type |= MoveTypeCastlingKingside;
+				else {
+					printf("Illegal %s king move from %s to %s; FEN %s\n", move->chessBoard->fen->sideToMove == ColorWhite ? "white" : "black", squareName[src], squareName[dst], board->fen->fenString);
+				}
+			}
+		}
+	}
 }
 
 #ifdef __cplusplus
