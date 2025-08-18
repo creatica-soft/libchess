@@ -32,16 +32,14 @@ struct NNUEContext {
     Stockfish::StateInfo * state;
     Stockfish::Position * pos;
     Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
-    Stockfish::Eval::NNUE::AccumulatorCaches * caches;
+    Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
 };
-
-void libchess_init_nnue(const char * nnue_file_big, const char * nnue_file_small);
-void libchess_cleanup_nnue();
-void libchess_init_nnue_context(struct NNUEContext * ctx);
-void libchess_free_nnue_context(struct NNUEContext * ctx);
-float libchess_evaluate_nnue(struct Board * board, struct NNUEContext * ctx);
-float libchess_evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
-
+void init_nnue(const char * nnue_file_big, const char * nnue_file_small);
+void cleanup_nnue();
+void init_nnue_context(struct NNUEContext * ctx);
+void free_nnue_context(struct NNUEContext * ctx);
+double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
+double evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
 
 sqlite3 * openDb(const char *, int);
 void closeDb(sqlite3 * db);
@@ -972,7 +970,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 	struct Move move;
 	struct Board board;
 	struct ZobristHash zh;//, zh2;
-  struct NNUEContext nnueCtx;
+	struct NNUEContext ctx;
 	char gameResult = 0;
 	int hashIndex = 0;
 	unsigned long hashCache[MAX_NUMBER_OF_GAME_MOVES];
@@ -1010,7 +1008,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 		zobristHash(&zh);
 //		zobristHash(&zh2);
 		getHash(&zh, &board);
-		board.hash = zh.hash;
+		//board.hash = zh.hash;
 		//bestMoves() returns sorted array of moves and their scores from the best to the worth
 		//from the point of view of the side to move
 		//struct MoveScores moves[MAX_NUMBER_OF_NEXT_MOVES];
@@ -1052,8 +1050,8 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
       printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);
       return 2;
     }
-    if (!board.isCheck) score_nnue = eval(chessEngine);
-    else score_nnue = 0.0;
+    if (board.isCheck) score_nnue = 0.0;
+    else score_nnue = eval(chessEngine);
 
     //printf("playGameExt(%d): calling go first time...()\n", threadId);
     if (go(chessEngine, evaluations)) {
@@ -1064,7 +1062,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
     else if (evaluations[0]->nag == 19 || evaluations[0]->nag == 21) gameResult = -1;
     else gameResult = 0;
     
-		if (generateZobristHash && updateDb) q = board.hash >> t;
+		if (generateZobristHash && updateDb) q = board.zh->hash >> t;
     //printf("playGameExt(): hash %lu >> %d = %u\n", board.hash, t, q);		
     for (int i = 0; i < multiPV; i++) {
       if (i > 0) {
@@ -1074,28 +1072,27 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
   	    if (move) {
 		    	if (updateDb) {
 	          pthread_mutex_lock(&(queueMoves_mutex[q]));
-	      	  enqueueMoves(nextMovesQueue[q], board.hash, move, gameResult, board.fen->sideToMove == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+	      	  enqueueMoves(nextMovesQueue[q], board.zh->hash, move, gameResult, board.fen->sideToMove == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
 	      	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
       	  }
     	  }
   	  } else {
 		    	if (updateDb) {
 	    	    pthread_mutex_lock(&(queueMoves_mutex[q]));
-	      	  enqueueMoves(nextMovesQueue[q], board.hash, evaluations[i]->bestmove, gameResult, board.fen->sideToMove == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+	      	  enqueueMoves(nextMovesQueue[q], board.zh->hash, evaluations[i]->bestmove, gameResult, board.fen->sideToMove == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
 	      	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
 	      	}
   	  }
 	  }
-	  libchess_init_nnue_context(&nnueCtx);
-	  if (!board.isCheck) score = libchess_evaluate_nnue(&board, &nnueCtx);
-	  else score = 0.0;
+    init_nnue_context(&ctx);
+	  score = evaluate_nnue(&board, NULL, &ctx);
 	  //printf("playGameExt(%d): my startpos NNUE score %.2f, stockfish startpos NNUE score %.2f, engine score %.2f\n", threadId, score, score_nnue, (float)(evaluations[0]->scorecp) * 0.01);
   } //chessEngine
   	
 	char * sanMoves = strndup(game->sanMoves, strlen(game->sanMoves));
 	if (!sanMoves) {
 		printf("playGameExt(%d) error: strndup() returned NULL: %s. sanMoves %s\n", threadId, strerror(errno), game->sanMoves);
-		return errno;
+  	return errno;
 	}
 	char * saveptr = NULL;
 	char * token = strtok_r(sanMoves, " ", &saveptr);
@@ -1107,7 +1104,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 		}
 	  //printf("playGameExt(%d): move uci %s, san %s, type %d, FEN %s\n", threadId, move.uciMove, move.sanMove, move.type, move.chessBoard->fen->fenString);
 		if (chessEngine) {
-		  score = libchess_evaluate_nnue_incremental(&board, &move, &nnueCtx);
+		  score = evaluate_nnue_incremental(&board, &move, &ctx);
 		}
 		if (updateDb && !chessEngine) {
     	//store the hash and uciMove in the cache to correct gameResult in NextMoves.db
@@ -1115,7 +1112,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 
     	if (hashIndex < MAX_NUMBER_OF_GAME_MOVES) {
     	  strncpy(uciMoveCache[hashIndex], move.uciMove, 6);
-    	  hashCache[hashIndex++] = board.hash;
+    	  hashCache[hashIndex++] = board.zh->hash;
     	} else {
     		printf("playGameExt(%d) error: number of moves %d exceeded MAX_NUMBER_OF_GAME_MOVES %d\n", threadId, hashIndex, MAX_NUMBER_OF_GAME_MOVES);
    			free(sanMoves);
@@ -1142,7 +1139,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 		makeMove(&move);
 		//reconcile(&board);
 		if (generateZobristHash && updateDb) {
-			if (updateHash(&zh, &board, &move)) {
+			if (updateHash(&board, &move)) {
 				printf("playGameExt(%d) error: updateHash() returned non-zero value\n", threadId);
 				free(sanMoves);
 				return 1;
@@ -1156,12 +1153,12 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 	    	exit(1);
 	    }
 */		    
-			board.hash = zh.hash;
+			//board.hash = zh.hash;
 			//struct MoveScores moves[MAX_NUMBER_OF_NEXT_MOVES];
 			//int bestMovesNumber = bestMoves(board.hash, board.fen->sideToMove, moves);
 			//for (int i = 0; i < bestMovesNumber; i++)
 			//	printf("%s %.8f %s\n", moves[i].move, moves[i].score, color[board.fen->sideToMove]);
-      q = board.hash >> t;
+      q = board.zh->hash >> t;
       //printf("playGameExt(): hash %lu >> %d = %u\n", board.hash, t, q);
 		}
 		if (board.isStaleMate) {
@@ -1173,7 +1170,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 			if (chessEngine) {
 		    if (updateDb) {
 	        pthread_mutex_lock(&(queueMoves_mutex[q]));
-	      	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, 0);
+	      	enqueueMoves(nextMovesQueue[q], board.zh->hash, move.uciMove, gameResult, 0);
 	      	pthread_mutex_unlock(&(queueMoves_mutex[q]));
       	} 
       	if (createDataset && dataset) {
@@ -1192,7 +1189,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 				if (chessEngine) {
 			    if (updateDb) {
 		        pthread_mutex_lock(&(queueMoves_mutex[q]));
-		      	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, MATE_SCORE);
+		      	enqueueMoves(nextMovesQueue[q], board.zh->hash, move.uciMove, gameResult, MATE_SCORE);
 		      	pthread_mutex_unlock(&(queueMoves_mutex[q]));
 		      }
 	      	if (createDataset && dataset) {
@@ -1210,7 +1207,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 				if (chessEngine) {
 			    if (updateDb) {
 		        pthread_mutex_lock(&(queueMoves_mutex[q]));
-		      	enqueueMoves(nextMovesQueue[q], board.hash, move.uciMove, gameResult, -MATE_SCORE);
+		      	enqueueMoves(nextMovesQueue[q], board.zh->hash, move.uciMove, gameResult, -MATE_SCORE);
 		      	pthread_mutex_unlock(&(queueMoves_mutex[q]));
 	      	}
 	      	if (createDataset && dataset) {
@@ -1232,13 +1229,15 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
       strncpy(chessEngine->position, board.fen->fenString, MAX_FEN_STRING_LEN);
       if (!position(chessEngine)) {
         printf("playGameExt(%d) error: position(chessEngine) returned false\n", threadId);
+   			free(sanMoves);
         return 2;
       }
-      if (!board.isCheck) score_nnue = eval(chessEngine);
-      else score_nnue = 0;
+      if (board.isCheck) score_nnue = 0;
+      else score_nnue = eval(chessEngine);
   		//printf("playGameExt(%d): my NNUE score %.2f, stockfish NNUE score %.2f, engine score %.2f\n", threadId, score, score_nnue, board.movingPiece.color == ColorWhite ? (float)(evaluations[0]->scorecp) * 0.01 : -(float)(evaluations[0]->scorecp) * 0.01);      
       if (go(chessEngine, evaluations)) {
         printf("playGameExt(%d) error: go(chessEngine, evaluations) returned non-zero code\n", threadId);
+  			free(sanMoves);
         return 2;      
       }
       if (evaluations[0]->nag == 18 || evaluations[0]->nag == 20) gameResult = 1;
@@ -1253,14 +1252,14 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
     	    if (move) {
 				    if (updateDb) {
 	            pthread_mutex_lock(&(queueMoves_mutex[q]));
-	        	  enqueueMoves(nextMovesQueue[q], board.hash, move, gameResult, board.movingPiece.color == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+	        	  enqueueMoves(nextMovesQueue[q], board.zh->hash, move, gameResult, board.movingPiece.color == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
 	        	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
 	        	}
       	  }
     	  } else {
 				    if (updateDb) {
 	      	    pthread_mutex_lock(&(queueMoves_mutex[q]));
-	        	  enqueueMoves(nextMovesQueue[q], board.hash, evaluations[i]->bestmove, gameResult, board.movingPiece.color == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
+	        	  enqueueMoves(nextMovesQueue[q], board.zh->hash, evaluations[i]->bestmove, gameResult, board.movingPiece.color == ColorWhite ? evaluations[i]->scorecp : -evaluations[i]->scorecp);
 	        	  pthread_mutex_unlock(&(queueMoves_mutex[q]));
 	        	}
     	  }
@@ -1319,7 +1318,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
 	    evaluation = NULL;
       evaluations[i] = NULL;
     }
-    libchess_free_nnue_context(&nnueCtx);
+    free_nnue_context(&ctx);
 	}
 	return 0;
 }
@@ -1487,7 +1486,7 @@ void * initGamesFromPGNfiles(void * context) {
 	FILE * dataset = NULL;
 	if (ctx->createDataset) {
 		char filename[255];
-		sprintf(filename, "%s%d.pgn", ctx->dataset, ctx->threadNumber);
+		sprintf(filename, "%s%d.csv", ctx->dataset, ctx->threadNumber);
 		dataset = fopen(filename, "a");
 		if (!dataset) {
 			printf("initGamesFromPGNfiles(%d) error: failed to open/create a file %s, %s\n", ctx->threadNumber, filename, strerror(errno));
@@ -2008,8 +2007,8 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	  }  	
   } 
   
-  //if (eval) libchess_init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue"); //same weights as in stockfish binary
-  if (eval) libchess_init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue"); //use default weights 
+  //if (eval) init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue"); //same weights as in stockfish binary
+  if (eval) init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue"); //use default weights 
   
 	struct InitGameFromPGNfilesContext * initGameCtx[gameThreads];
 	struct SqlContext * sqlCtx[sqlThreads];
@@ -2159,7 +2158,7 @@ unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int g
 	  }
 	  closeDb(db);
   }
-  if (eval) libchess_cleanup_nnue();
+  if (eval) cleanup_nnue();
 	cleanup_magic_bitboards();
 	if (res) return res;
 	return numberOfGamesPlayed;

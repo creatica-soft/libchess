@@ -200,9 +200,10 @@ int nametoindex(struct Engine * engine, char * name, int type) {
 		}
 		break;
 	}
+	/*
 	if (idx < 0) {
 		fprintf(stderr, "nametoindex() warning: engine %s does not know option %s of type %s\n", engine->id, name, optionTypes[type]);
-	}
+	}*/
 	return idx;
 }
 
@@ -497,7 +498,14 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
         }				
 		} //end of else (not bestmove)
 	} //end of while (fgets(line...))
-	return 0;
+	if (feof(engine->fromEngine)) {
+	  fprintf(stderr, "getPV(): fgets() reached EOF in engine->fromEngine pipe\n");
+	}
+	else if (ferror(engine->fromEngine)) {
+	  fprintf(stderr, "getPV() error: fgets() failed to read from engine->fromEngine pipe\n");
+	  return 1;
+	}
+	return 0;		
 }
 
 /*
@@ -561,7 +569,7 @@ int go(struct Engine * engine, struct Evaluation ** eval) {
 		strcat(line, tmp);
 	}
 	if (engine->nodes) {
-		sprintf(tmp, " nodes %d", engine->nodes);
+		sprintf(tmp, " nodes %lu", engine->nodes);
 		strcat(line, tmp);
 	}
 	if (engine->mate) {
@@ -633,106 +641,286 @@ float eval(struct Engine * engine) {
 	return getEval(engine);
 }
 
-int engine(struct Engine * engine, char * engineName) {
-  if (!engine) {
-		printf("engine() error: argument engine is NULL\n");
-  	return 1;
-  }
-	if (!engineName) {
-		printf("engine() error: argument engineName is NULL\n");
-		return 1;			
-	}
-	strcpy(engine->engineName, engineName);
-	char symbols[63] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-	char suffix[10];
-	do {
-		suffix[0] = '.';
-		for (int i = 1; i < 9; i++) {
-			suffix[i] = symbols[randomNumber(0, 61)];
-		}
-		suffix[9] = '\0';
-  	strcpy(engine->namedPipeTo, TO_ENGINE_NAMED_PIPE_PREFIX);
-		strncat(engine->namedPipeTo, suffix, 10);
-	} while(mkfifo(engine->namedPipeTo, S_IRUSR | S_IWUSR) == -1);
-  do {
-		suffix[0] = '.';
-		for (int i = 1; i < 9; i++) {
-			suffix[i] = symbols[randomNumber(0, 61)];
-		}
-		suffix[9] = '\0';
-  	strcpy(engine->namedPipeFrom, FROM_ENGINE_NAMED_PIPE_PREFIX);
-		strncat(engine->namedPipeFrom, suffix, 10);
-	} while(mkfifo(engine->namedPipeFrom, S_IRUSR | S_IWUSR) == -1);
+#ifdef _WIN32
+#include <windows.h>
 
-	pid_t enginePid;
-	enginePid = fork();
-	if (enginePid < 0) {
-		printf("engine() error: fork failed\n");
-		return 1;
-	}
-	if (enginePid == 0) { //child
-		int toEngine, fromEngine;
-		if ((toEngine = open(engine->namedPipeTo, O_RDONLY)) == -1) {
-			printf("engine() child error: open(%s, O_RDONLY) returned %s\n", engine->namedPipeTo, strerror(errno));
-			return 1;
-		}
-		//printf("engine() child: open(%s, O_RDONLY) ok\n", engine->namedPipeTo);
-		if ((fromEngine = open(engine->namedPipeFrom, O_WRONLY)) == -1) {
-			printf("engine() child error: open(%s, O_WRONLY) returned %s\n", engine->namedPipeFrom, strerror(errno));
-			close(toEngine);
-			remove(engine->namedPipeTo);
-			return 1;
-		}
-		//printf("engine() child: open(%s, O_WRONLY) ok\n", engine->namedPipeFrom);
-		dup2(toEngine, STDIN_FILENO);
-		close(toEngine);
-		dup2(fromEngine, STDOUT_FILENO);
-		close(fromEngine);
-		if (execlp((char *)engine->engineName, (char *)engine->engineName, (char *)NULL) < 0) {
-			printf("engine() child error: execlp failed with %d (%s)\n", errno, strerror(errno));
-			return 1;
-		}
-	}
-	else { //parent
-		if ((engine->toEngine = fopen(engine->namedPipeTo, "w")) == NULL) {
-			printf("engine() parent error: fopen(%s, w) returned %s\n", engine->namedPipeTo, strerror(errno));
-			return 1;
-		}
-		//printf("engine() parent: fopen(%s, w) ok\n", engine->namedPipeTo);
-		if ((engine->fromEngine = fopen(engine->namedPipeFrom, "r")) == NULL) {
-			printf("engine() parent error: fopen(%s, r) returned %s\n", engine->namedPipeFrom, strerror(errno));
-			fclose(engine->toEngine);
-			remove(engine->namedPipeTo);
-			return 1;
-		}
-	}
-	return 0;
+#define TO_ENGINE_NAMED_PIPE_PREFIX "\\\\.\\pipe\\to_engine_"
+#define FROM_ENGINE_NAMED_PIPE_PREFIX "\\\\.\\pipe\\from_engine_"
+
+int engine(struct Engine *engine, const char *engineName) {
+    if (!engine) {
+        fprintf(stderr, "engine() error: argument engine is NULL\n");
+        return 1;
+    }
+    if (!engineName || strlen(engineName) >= MAX_ENGINE_NAME_LEN) {
+        fprintf(stderr, "engine() error: invalid engineName\n");
+        return 1;
+    }
+    strncpy(engine->engineName, engineName, MAX_ENGINE_NAME_LEN - 1);
+    engine->engineName[MAX_ENGINE_NAME_LEN - 1] = '\0';
+
+    // Generate unique pipe names
+    char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    char suffix[10];
+
+    // Generate toEngine pipe name
+    suffix[0] = '.';
+    for (int i = 1; i < 9; i++) {
+        suffix[i] = symbols[randomNumber(0, 61)];
+    }
+    suffix[9] = '\0';
+    snprintf(engine->namedPipeTo, MAX_PIPE_NAME_LEN, "%s%s", TO_ENGINE_NAMED_PIPE_PREFIX, suffix);
+
+    // Generate fromEngine pipe name
+    suffix[0] = '.';
+    for (int i = 1; i < 9; i++) {
+        suffix[i] = symbols[randomNumber(0, 61)];
+    }
+    suffix[9] = '\0';
+    snprintf(engine->namedPipeFrom, MAX_PIPE_NAME_LEN, "%s%s", FROM_ENGINE_NAMED_PIPE_PREFIX, suffix);
+
+    // Create named pipes
+    HANDLE hPipeToEngine = CreateNamedPipeA(
+        engine->namedPipeTo,
+        PIPE_ACCESS_OUTBOUND, // Parent writes to this pipe
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, // Max instances
+        4096, // Out buffer size
+        4096, // In buffer size
+        0, // Default timeout
+        NULL // Security attributes
+    );
+    if (hPipeToEngine == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "engine() error: CreateNamedPipe(%s) failed: %lu\n", engine->namedPipeTo, GetLastError());
+        return 1;
+    }
+
+    HANDLE hPipeFromEngine = CreateNamedPipeA(
+        engine->namedPipeFrom,
+        PIPE_ACCESS_INBOUND, // Parent reads from this pipe
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1,
+        4096,
+        4096,
+        0,
+        NULL
+    );
+    if (hPipeFromEngine == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "engine() error: CreateNamedPipe(%s) failed: %lu\n", engine->namedPipeFrom, GetLastError());
+        CloseHandle(hPipeToEngine);
+        return 1;
+    }
+
+    // Create client-side handles for the child process
+    HANDLE hChildToEngine = CreateFileA(
+        engine->namedPipeTo,
+        GENERIC_READ,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hChildToEngine == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "engine() error: CreateFile(%s) failed: %lu\n", engine->namedPipeTo, GetLastError());
+        CloseHandle(hPipeToEngine);
+        CloseHandle(hPipeFromEngine);
+        return 1;
+    }
+
+    HANDLE hChildFromEngine = CreateFileA(
+        engine->namedPipeFrom,
+        GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hChildFromEngine == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "engine() error: CreateFile(%s) failed: %lu\n", engine->namedPipeFrom, GetLastError());
+        CloseHandle(hPipeToEngine);
+        CloseHandle(hPipeFromEngine);
+        CloseHandle(hChildToEngine);
+        return 1;
+    }
+
+    // Set up the child process
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hChildToEngine;
+    si.hStdOutput = hChildFromEngine;
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    // Launch the chess engine
+    char cmdLine[512];
+    snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", engine->engineName);
+    if (!CreateProcessA(
+        NULL,
+        cmdLine,
+        NULL,
+        NULL,
+        TRUE, // Inherit handles
+        0,
+        NULL,
+        NULL,
+        &si,
+        &pi
+    )) {
+        fprintf(stderr, "engine() error: CreateProcess failed: %lu\n", GetLastError());
+        CloseHandle(hPipeToEngine);
+        CloseHandle(hPipeFromEngine);
+        CloseHandle(hChildToEngine);
+        CloseHandle(hChildFromEngine);
+        return 1;
+    }
+
+    // Close child handles in parent
+    CloseHandle(hChildToEngine);
+    CloseHandle(hChildFromEngine);
+    CloseHandle(pi.hThread); // Don't need thread handle
+    // Note: Keep pi.hProcess to monitor child process if needed
+
+    // Convert parent pipe handles to FILE* for fgets/fputs compatibility
+    int fdToEngine = _open_osfhandle((intptr_t)hPipeToEngine, _O_WRONLY);
+    if (fdToEngine == -1) {
+        fprintf(stderr, "engine() error: _open_osfhandle(toEngine) failed\n");
+        CloseHandle(hPipeToEngine);
+        CloseHandle(hPipeFromEngine);
+        CloseHandle(pi.hProcess);
+        return 1;
+    }
+    engine->toEngine = _fdopen(fdToEngine, "w");
+    if (!engine->toEngine) {
+        fprintf(stderr, "engine() error: _fdopen(toEngine) failed\n");
+        _close(fdToEngine);
+        CloseHandle(hPipeFromEngine);
+        CloseHandle(pi.hProcess);
+        return 1;
+    }
+
+    int fdFromEngine = _open_osfhandle((intptr_t)hPipeFromEngine, _O_RDONLY);
+    if (fdFromEngine == -1) {
+        fprintf(stderr, "engine() error: _open_osfhandle(fromEngine) failed\n");
+        fclose(engine->toEngine);
+        CloseHandle(hPipeFromEngine);
+        CloseHandle(pi.hProcess);
+        return 1;
+    }
+    engine->fromEngine = _fdopen(fdFromEngine, "r");
+    if (!engine->fromEngine) {
+        fprintf(stderr, "engine() error: _fdopen(fromEngine) failed\n");
+        fclose(engine->toEngine);
+        _close(fdFromEngine);
+        CloseHandle(pi.hProcess);
+        return 1;
+    }
+
+    // Ensure text mode for fgets/fputs
+    setvbuf(engine->toEngine, NULL, _IONBF, 0); // Unbuffered for timely writes
+    setvbuf(engine->fromEngine, NULL, _IONBF, 0); // Unbuffered for timely reads
+
+    printf("Created pipes: toEngine=%s, fromEngine=%s\n", engine->namedPipeTo, engine->namedPipeFrom);
+    return 0;
 }
+#else
+int engine(struct Engine *engine, const char *engineName) {
+    if (!engine) {
+        fprintf(stderr, "engine() error: argument engine is NULL\n");
+        return 1;
+    }
+    if (!engineName || strlen(engineName) >= MAX_ENGINE_NAME_LEN) {
+        fprintf(stderr, "engine() error: invalid engineName\n");
+        return 1;
+    }
+    strncpy(engine->engineName, engineName, MAX_ENGINE_NAME_LEN - 1);
+    engine->engineName[MAX_ENGINE_NAME_LEN - 1] = '\0';
 
-struct Engine * initChessEngine(char * engineName, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging) {
+    char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    char suffix[10];
+    //srand(time(NULL)); // Ensure random seeding
+
+    // Create toEngine pipe
+    do {
+        suffix[0] = '.';
+        for (int i = 1; i < 9; i++) {
+            suffix[i] = symbols[randomNumber(0, 61)];
+        }
+        suffix[9] = '\0';
+        snprintf(engine->namedPipeTo, MAX_PIPE_NAME_LEN, "%s%s", TO_ENGINE_NAMED_PIPE_PREFIX, suffix);
+    } while (mkfifo(engine->namedPipeTo, S_IRUSR | S_IWUSR) == -1);
+
+    // Create fromEngine pipe
+    do {
+        suffix[0] = '.';
+        for (int i = 1; i < 9; i++) {
+            suffix[i] = symbols[randomNumber(0, 61)];
+        }
+        suffix[9] = '\0';
+        snprintf(engine->namedPipeFrom, MAX_PIPE_NAME_LEN, "%s%s", FROM_ENGINE_NAMED_PIPE_PREFIX, suffix);
+    } while (mkfifo(engine->namedPipeFrom, S_IRUSR | S_IWUSR) == -1);
+
+    pid_t enginePid = fork();
+    if (enginePid < 0) {
+        fprintf(stderr, "engine() error: fork failed: %s\n", strerror(errno));
+        remove(engine->namedPipeTo);
+        remove(engine->namedPipeFrom);
+        return 1;
+    }
+
+    if (enginePid == 0) { // Child
+        int toEngine = open(engine->namedPipeTo, O_RDONLY);
+        if (toEngine == -1) {
+            fprintf(stderr, "engine() child error: open(%s, O_RDONLY): %s\n", engine->namedPipeTo, strerror(errno));
+            exit(1);
+        }
+        int fromEngine = open(engine->namedPipeFrom, O_WRONLY);
+        if (fromEngine == -1) {
+            fprintf(stderr, "engine() child error: open(%s, O_WRONLY): %s\n", engine->namedPipeFrom, strerror(errno));
+            close(toEngine);
+            remove(engine->namedPipeTo);
+            exit(1);
+        }
+        dup2(toEngine, STDIN_FILENO);
+        close(toEngine);
+        dup2(fromEngine, STDOUT_FILENO);
+        close(fromEngine);
+        if (execlp(engine->engineName, engine->engineName, NULL) < 0) {
+            fprintf(stderr, "engine() child error: execlp failed: %s\n", strerror(errno));
+            exit(1);
+        }
+    } else { // Parent
+        if ((engine->toEngine = fopen(engine->namedPipeTo, "w")) == NULL) {
+            fprintf(stderr, "engine() parent error: fopen(%s, w): %s\n", engine->namedPipeTo, strerror(errno));
+            remove(engine->namedPipeTo);
+            remove(engine->namedPipeFrom);
+            return 1;
+        }
+        if ((engine->fromEngine = fopen(engine->namedPipeFrom, "r")) == NULL) {
+            fprintf(stderr, "engine() parent error: fopen(%s, r): %s\n", engine->namedPipeFrom, strerror(errno));
+            fclose(engine->toEngine);
+            remove(engine->namedPipeTo);
+            remove(engine->namedPipeFrom);
+            return 1;
+        }
+    }
+    //printf("Created pipes: toEngine=%s, fromEngine=%s\n", engine->namedPipeTo, engine->namedPipeFrom);
+    return 0;
+}
+#endif
+
+struct Engine * initChessEngine(char * engineName, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool limitStrength, int elo) {
   struct timespec delay;
   delay.tv_sec = 1;
   delay.tv_nsec = 0;
-  struct Engine * chessEngine;
-  chessEngine = (struct Engine *)malloc(sizeof(struct Engine));
+  struct Engine * chessEngine = (struct Engine *)calloc(1, sizeof(struct Engine));
   if (!chessEngine) {
-    printf("initChessEngine() error: malloc(sizeof(struct Engine)) returned NULL\n");
+    printf("initChessEngine() error: calloc(1, sizeof(struct Engine)) returned NULL\n");
     return NULL;  	
   }
-  chessEngine->position[0] = '\0';
-  chessEngine->moves[0] = '\0';
   chessEngine->movetime = movetime;
   chessEngine->depth = depth;
-  chessEngine->nodes = 0;
-  chessEngine->searchmoves = NULL;
-  chessEngine->infinite = false;
-  chessEngine->ponder = false;
-  chessEngine->mate = 0;
-  chessEngine->movestogo = 0;
-  chessEngine->wtime = 0;
-  chessEngine->btime = 0;
-  chessEngine->winc = 0;
-  chessEngine->binc = 0;
   int res = engine(chessEngine, engineName);
   if (res) {
     printf("initChessEngine() error: engine(%s) returned %d\n", engineName, res);
@@ -741,7 +929,7 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
   if (logging) {
 	  char symbols[63] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 		char suffix[10];
-		struct stat * buf = (struct stat *)malloc(sizeof(struct stat));
+		struct stat * buf = (struct stat *)calloc(1, sizeof(struct stat));
 	  char logfile[255] = "";
 	  do {
 			suffix[0] = '.';
@@ -758,13 +946,17 @@ struct Engine * initChessEngine(char * engineName, long movetime, int depth, int
   } else chessEngine->logfile = -1;
   getOptions(chessEngine);
   int idx = nametoindex(chessEngine, "MultiPV", Spin);
-  chessEngine->optionSpin[idx].value = multiPV;
+  if (idx >= 0) chessEngine->optionSpin[idx].value = multiPV;
   idx = nametoindex(chessEngine, "Hash", Spin);
-  chessEngine->optionSpin[idx].value = hashSize;
+  if (idx >= 0) chessEngine->optionSpin[idx].value = hashSize;
   idx = nametoindex(chessEngine, "Threads", Spin);
-  chessEngine->optionSpin[idx].value = threadNumber;
+  if (idx >= 0) chessEngine->optionSpin[idx].value = threadNumber;
   idx = nametoindex(chessEngine, "SyzygyPath", String);
-  strncpy(chessEngine->optionString[idx].value, syzygyPath, MAX_UCI_OPTION_STRING_LEN);
+  if (idx >= 0) strncpy(chessEngine->optionString[idx].value, syzygyPath, MAX_UCI_OPTION_STRING_LEN);
+  idx = nametoindex(chessEngine, "UCI_Elo", Spin);
+  if (idx >= 0) chessEngine->optionSpin[idx].value = elo;
+  idx = nametoindex(chessEngine, "UCI_LimitStrength", Check);
+  if (idx >= 0) chessEngine->optionCheck[idx].value = limitStrength;
   
   //enable stockfish debug logging
   /*

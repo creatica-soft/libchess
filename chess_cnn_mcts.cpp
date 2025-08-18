@@ -1,32 +1,47 @@
-//c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn7.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
-/*
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <ctype.h>
-#include <math.h>
-#include <time.h>
-*/
+//c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn9.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
+
+#include "nnue/types.h"
+#include "nnue/position.h"
+#include "nnue/evaluate.h"
+#include "nnue/nnue/nnue_common.h"
+#include "nnue/nnue/network.h"
+#include "nnue/nnue/nnue_accumulator.h"
+
 #include "uthash.h"
-#include "libchess.h"
-#include "chess_cnn7.h"
 #include <torch/torch.h>
 #include <vector>
 #include <random>
+//#include <time.h>
+#include <chrono>
+#include "libchess.h"
+#include "chess_cnn9.h"
 
-#define MAX_BATCH_SIZE 1024
-#define PATH_LEN 1000
-#define UCB_C 1.4 // Exploration constant
+#include <math.h>
+
+extern "C" {
+
+struct NNUEContext {
+    Stockfish::StateInfo * state;
+    Stockfish::Position * pos;
+    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
+    Stockfish::Eval::NNUE::AccumulatorCaches * caches;
+};
+float evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
+float evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
+
+#define MAX_BATCH_SIZE 100
+#define PATH_LEN 100000 //max depth
+#define EXPLORATION_CONSTANT 1.0 //smaller value favor exploitation, i.e. deeper tree vs wider tree
+#define BRANCHING 64 //smaller values increase depth
 
 // Global stop flag for MCTS interruption
-const int num_channels = 29;
+const int num_channels = 87;
 extern volatile int stopFlag;
 extern int logfile;
+extern struct Engine chessEngine;
 extern torch::Device device;
 extern ChessCNN model;
 
-extern "C" {
   // MCTS Node
   struct MCTSNode {
     uint64_t zobrist;  // Zobrist hash
@@ -34,31 +49,21 @@ extern "C" {
     float W;           // Total value W is a sum of loses (-1) and wins (1) for these N games
                        // Q = W / N
     float P;           // Prior probability - model move_probs for a given move in the node
-    //unsigned char promo; //promotion: 0 - none, 1 - knight, 2 - bishop, 3 - rook, 4 - queen
-    int move; //index from 0 to 4095, uci move srcsqr = move / 64, dstsqr = move % 64
+    int move; //index from 0 to 4095, uci move src_sq = move / 64, dst_sq = move % 64
     struct MCTSNode ** children; // Array of child pointers
     struct MCTSNode * parent; // Pointer to parent node
     int num_children;
+    int sideToMove;
     UT_hash_handle hh; // Hash handle
   };
   
   struct MCTSNode * tree = NULL;
-  
-  
+    
   //Predictor + Upper Confidence Bound applied to Trees - used in select_child()
-  
   float puct_score(struct MCTSNode * parent, struct MCTSNode * child) {
-    const float c = 1.0; // Exploration constant, smaller values favor exploitation
-    float Q = child->N ? child->W / child->N : 0.5;
-    return Q + c * child->P * sqrtf((float)parent->N) / (1.0 + child->N);
+    float Q = child->N ? child->W / child->N : 0.0;
+    return Q + EXPLORATION_CONSTANT * child->P * sqrtf((float)parent->N) / (1.0 + child->N);
   }
-  /*
-  float puct_score(struct MCTSNode * parent, struct MCTSNode * child) {
-      if (child->N == 0) return INFINITY; // Prioritize unvisited
-      float exploit = child->W / child->N;
-      float explore = UCB_C * sqrtf(logf(parent->N + 1) / child->N);
-      return exploit + explore * child->P;
-  }*/
   
   int legalMovesCount(struct Board * board) {
     unsigned long any = board->occupations[(board->fen->sideToMove << 3) | PieceTypeAny];
@@ -73,8 +78,11 @@ extern "C" {
   
   bool promoMove(struct Board * board, enum SquareName source_square, enum SquareName destination_square) {
     if ((board->piecesOnSquares[source_square] & 7) == Pawn) {
-      if ((source_square >= SquareA7 && source_square <= SquareH7 && destination_square >= SquareA8 && destination_square <= SquareH8) || (source_square >= SquareA2 && source_square <= SquareH2 && destination_square >= SquareA1 && destination_square <= SquareH1))
-      return true;
+      int src_rank = source_square / 8;
+      int dst_rank = destination_square / 8;
+      int pre_promo_rank = board->fen->sideToMove == ColorWhite ? Rank7 : Rank2;
+      int promo_rank = board->fen->sideToMove == ColorWhite ? Rank8 : Rank1;
+      if (src_rank == pre_promo_rank && dst_rank == promo_rank) return true;
     }
     return false;
   }
@@ -88,7 +96,6 @@ extern "C" {
     uci_move[0] = '\0';
     div_t move = div(move_idx, 64);
     enum SquareName source_square = (enum SquareName)move.quot;
-    //enum SquareName source_square = (enum SquareName)board->sourceSquare[move.quot];
     enum SquareName destination_square = (enum SquareName)move.rem;
     strncat(uci_move, squareName[source_square], 2);
     strncat(uci_move, squareName[destination_square], 2);
@@ -96,7 +103,6 @@ extern "C" {
       bool promo_move = promoMove(board, source_square, destination_square);
       if (promo_move) {
         uci_move[4] = 'q';
-        //if (promo) uci_move[4] = tolower(promoLetter[promo]); 
         uci_move[5] = '\0';
       }
     }
@@ -113,9 +119,6 @@ extern "C" {
           child->N = 0;
           child->W = 0.0;
           child->P = move_probs[i];
-          /*bool promo_move = promoMove(board, (enum SquareName)(moves[i] / 64), (enum SquareName)(moves[i] % 64));
-          if (promo_move) child->promo = promo;
-          else child->promo = 0;*/
           child->children = NULL;
           child->num_children = 0;
           child->parent = node;
@@ -130,7 +133,12 @@ extern "C" {
           idx_to_move(temp_board, child->move, uci_move);
           struct Move move;
           //fprintf(stderr, "expand_node(): calling initMove(%s)\n", uci_move);
-          initMove(&move, temp_board, uci_move);
+      		if (initMove(&move, temp_board, uci_move)) {
+      			dprintf(logfile, "expand_node() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+      			fprintf(stderr, "expand_node() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+      			exit(-1);
+      		}
+
           makeMove(&move);
     			if (updateHash(temp_board->zh, temp_board, &move)) {
     				dprintf(logfile, "expand_node() error: updateHash() returned non-zero value\n");
@@ -139,65 +147,19 @@ extern "C" {
     			}
           // Set child's zobrist hash before adding to tree
           child->zobrist = temp_board->hash;
+          child->sideToMove = temp_board->fen->sideToMove;
           
           // Add to tree
           HASH_ADD(hh, tree, zobrist, sizeof(uint64_t), child);
           node->children[i] = child;
-  
+  				//dprintf(logfile, "expand_node(): added hash for %s: move %s, parent %s\n", color[child->sideToMove], uci_move, color[child->parent->sideToMove]);
+  				//fprintf(stderr, "expand_node(): added hash for %s: move %s, parent %s\n", color[child->sideToMove], uci_move, color[child->parent->sideToMove]);
+            
           // Free temp_board for next child
           freeBoard(temp_board);
       }
   }
   
-  // Select child using UCB1 with randomization for ties
-  /*
-  void select_child(struct MCTSNode * parent, struct MCTSNode ** node) {
-    if (node->num_children == 0) {
-      *selected = NULL;
-      dprintf(logfile, "select_child(): parent %p has 0 children\n", node);
-      fprintf(stderr, "select_child(): parent %p has 0 children\n", node);
-      return 0;
-    }
-    float max_ucb = -INFINITY;
-    struct MCTSNode * best_child = NULL;
-    int ties = 0;
-    float ucb_values[parent->num_children];
-    
-    for (int i = 0; i < parent->num_children; i++) {
-      struct MCTSNode * child = &parent->children[i];
-      float ucb;
-      if (child->N == 0) {
-        ucb = INFINITY;
-      } else {
-        ucb = (child->W / child->N) + UCB_C * sqrtf(logf(parent->N + 1) / child->N);
-      }
-      ucb_values[i] = ucb;
-      if (ucb > max_ucb) {
-        max_ucb = ucb;
-        best_child = child;
-        ties = 1;
-      } else if (ucb == max_ucb) {
-        ties++;
-      }
-    }
-    
-    // Random tie-breaking
-    if (ties > 1) {
-      int choice = rand() % ties;
-      int count = 0;
-      for (int i = 0; i < parent->num_children; i++) {
-        if (ucb_values[i] == max_ucb) {
-          if (count == choice) {
-            best_child = &parent->children[i];
-            break;
-          }
-          count++;
-        }
-      }
-    }
-    *node = best_child;
-  }
-  */
   float select_child(struct MCTSNode * node, struct MCTSNode ** selected) {
       if (node->num_children == 0) {
           *selected = NULL;
@@ -213,12 +175,6 @@ extern "C" {
   
       // Compute scores
       for (int i = 0; i < node->num_children; i++) {
-          if (node->children[i]->zobrist == 0) { // Unexpanded child
-              *selected = NULL;
-              dprintf(logfile, "select_child(): found unexpanded child node %p, index %d\n", node, i);
-              fprintf(stderr, "select_child(): found unexpanded child node %p, index %d\n", node, i);
-              return 0;
-          }
           scores[i] = puct_score(node, node->children[i]);
           if (scores[i] > best_score) {
               best_score = scores[i];
@@ -231,6 +187,8 @@ extern "C" {
   
       // Randomly select among near-ties
       if (ties > 1) {
+          //dprintf(logfile, "select_child(): randomly selecting among %d near ties\n", ties);
+          //fprintf(stderr, "select_child(): randomly selecting among %d near ties\n", ties);
           int choice = rand() % ties;
           int count = 0;
           for (int i = 0; i < node->num_children; i++) {
@@ -248,7 +206,7 @@ extern "C" {
       *selected = node->children[best_idx];
       return best_score;
   }
-  //returns an array of legal moves - indeces from 0 to 4095 (srcsqr * 64 + dstsqr)
+  //returns an array of legal moves - indeces from 0 to 4095 (src_sq * 64 + dst_sq)
   int * legal_moves(struct Board * board, int * num_moves) {
     if (!board || !(board->fen)) {
       dprintf(logfile, "legal_moves() error: either arg board is NULL or board->fen is NULL\n");
@@ -262,7 +220,7 @@ extern "C" {
       fprintf(stderr, "legal_moves() error: calloc returned NULL: %s\n", strerror(errno));
       return NULL;
     }	
-  	*num_moves = 0;
+  	* num_moves = 0;
   	enum PieceName color = (enum PieceName)((board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
   	unsigned long any = board->occupations[color]; 
   	while (any) {
@@ -281,7 +239,7 @@ extern "C" {
 
 int run_inference(struct Board ** board, int samples, int * top_moves, float * top_probs, int * outcome, int branching) {
     float * board_moves = NULL;
-    size_t input_size = samples * num_channels * 8 * 8; // samples, num_channels, 8x8 bitboards
+    size_t input_size = samples * num_channels * 64; // samples, num_channels, 8x8 bitboards
     board_moves = (float *)calloc(input_size, sizeof(float));
     if (!board_moves) {
       dprintf(logfile, "run_inference() error: calloc failed to allocate board_moves: %s\n", strerror(errno));
@@ -297,56 +255,93 @@ int run_inference(struct Board ** board, int samples, int * top_moves, float * t
       }
     }
     auto boardMoves = torch::from_blob(board_moves, {samples, num_channels, 8, 8}, torch::kFloat32).to(device, false);
-    auto [channel_logits, source_logits, destination_logits, value_logits, x_legal] = model->forward(boardMoves);    
-    //channel_logits.shape [samples, 10]
-    //destination_logits.shape [samples, 64]
-    //x_legal.shape [samples, 10, 8, 8]
+    auto [policy_logits, value_logits, x_legal] = model->forward(boardMoves);    
+    //policy_logits.shape [samples, 4096]
     //value_logits.shape [samples, 3]
+    //x_legal.shape [samples, 10, 8, 8]
     
-    auto channel_mask = x_legal.sum({2, 3}).gt(0); // [samples, 10]
-    channel_logits.masked_fill_(channel_mask == 0, -1e6);
-    auto channel_probs = torch::softmax(channel_logits, 1); // [samples, 10]
-
-    auto source_mask = boardMoves.select(1, 18).flatten(1, 2); // [samples, 64]
-    source_logits.masked_fill_(source_mask == 0, -1e6);
-    auto source_probs = torch::softmax(source_logits, 1); // [samples, 64]
+    auto move_mask = x_legal.view({samples, -1}); // [samples, 4096]
+    policy_logits.masked_fill_(move_mask == 0, -std::numeric_limits<float>::infinity());
+    auto policy_probs = torch::softmax(policy_logits, 1); // [samples, 4096]
+    auto top_k = policy_probs.topk(branching, 1); //std::tuple<at::Tensor, at:Tensor>
+    auto top_prob = std::get<0>(top_k);
+    auto top_idx = std::get<1>(top_k);
 
     auto outcome_prob = torch::softmax(value_logits, 1); // [samples, 3]
     auto outcome_pred = torch::argmax(outcome_prob, 1); // [samples]
-
     for (int i = 0; i < samples; i++) {
-        std::vector<std::pair<int64_t, float>> moves;
-        for (int s = 0; s < 64; s++) {
-            if (source_mask[i][s].item<float>() == 0) continue;
-            for (int d = 0; d < 64; d++) {
-                if ((board[i]->sideToMoveMoves[s] & (1UL << d)) == 0) continue; // Skip illegal moves
-                float joint_prob = source_probs[i][s].item<float>() * destination_logits[i][d].item<float>(); // Use logits directly
-                int64_t move_index = s * 64 + d; // (src, dst)
-                moves.emplace_back(move_index, joint_prob);
-            }
+        int legal_moves_count = legalMovesCount(board[i]);
+        //std::cerr << "Legal moves count " << legal_moves_count << std::endl;
+        for (int j = 0; j < std::min(branching, legal_moves_count); j++) {
+            //std::cerr << "move idx for sample " << i << ": " << top_idx[i][j].item<int64_t>() << std::endl;
+            //std::cerr << "move prob for sample " << i << ": " << top_prob[i][j].item<float>() << std::endl;
+            top_moves[i * branching + j] = (int)top_idx[i][j].item<int64_t>();
+            top_probs[i * branching + j] = top_prob[i][j].item<float>();
         }
-        std::sort(moves.begin(), moves.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-        for (int j = 0; j < std::min(branching, (int)moves.size()); ++j) {
-            top_moves[i * branching + j] = moves[j].first;
-            top_probs[i * branching + j] = moves[j].second;
-        }
-        outcome[i] = outcome_pred[i].item<int>();
+        outcome[i] = (int)outcome_pred[i].item<int64_t>();
+        //std::cerr << "outcome prediction for sample " << i << ": " << outcome_pred[i].item<int64_t>() << std::endl;
     }
     free(board_moves);
     return 0;
 }
 
+std::vector<int> generateUniqueRandomNumbers(int n, int k) {
+    // Initialize array [0, n-1]
+    std::vector<int> nums(n);
+    for (int i = 0; i < n; ++i) nums[i] = i;
+
+    // Random number generator
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    // Shuffle the array
+    std::shuffle(nums.begin(), nums.end(), gen);
+
+    // Return first k elements
+    nums.resize(k);
+    return nums;
+}
+
+  
 extern "C" {
-  void mcts_search(struct Board * board, int num_simulations, int branching) {
+  
+  // Function to create a new Probability struct
+  void get_prob(float * results, size_t size) {  
+      // Find minimum value for shifting
+      float min_val = results[0];
+      float weights[size];
+      for (size_t i = 1; i < size; ++i) {
+          if (results[i] < min_val) {
+              min_val = results[i];
+          }
+      }
+  
+      // Calculate weights
+      float shift = (min_val < 0) ? -min_val : 0.0; // Shift by |min| if negative
+      float total_weight = 0.0;
+      for (size_t i = 0; i < size; ++i) {
+          weights[i] = results[i] + shift;
+          total_weight += weights[i];
+      }
+        
+      // Calculate probabilities
+      for (size_t i = 0; i < size; ++i) {
+          results[i] = weights[i] / total_weight;
+      }
+  }
+
+  void mcts_search(struct Board * board, int num_simulations, int branching, struct NNUEContext * ctx) {
     //int64_t total = 0;
     //int maxPathLen = 0;
     char uci_move[6];
     struct MCTSNode * path[PATH_LEN]; // used in backpropagation to update all the nodes 
     int path_len;
+    int min_depth = PATH_LEN;
     
     for (int i = 0; i < num_simulations; i++) {
-      //start from the same initial position given by board
+      //start from the same initial position given by board (at the root node, i.e. at the top of the tree)
       //clone the board to preserve it for subsequent iterations
+      //IMPORTANT: all evaluations should be done from the perspetive of this board->fen->sideToMove color
       struct Board * sim_board = cloneBoard(board);
       if (!sim_board) {
         dprintf(logfile, "mcts_search() error: cloneBoard() returned NULL\n");
@@ -359,7 +354,8 @@ extern "C" {
       struct MCTSNode * node = NULL;
       path_len = 0;
       HASH_FIND(hh, tree, &sim_board->hash, sizeof(uint64_t), node);
-      //create it if not found
+      //create it if not found, this likely happens at the beginning of a game, i.e. the hash table is empty
+      //so here we are creating the root node, i.e. the node at the top of the tree
       if (!node) {
         node = (struct MCTSNode *)malloc(sizeof(struct MCTSNode));
         if (!node) {
@@ -371,13 +367,18 @@ extern "C" {
         node->N = 0;
         node->W = 0.0;
         node->P = 0.0;
-        //node->promo = sim_board->promoPiece;
         node->children = NULL;
         node->num_children = 0;
         node->parent = NULL;
         node->move = 0;
+        node->sideToMove = sim_board->fen->sideToMove;
         HASH_ADD(hh, tree, zobrist, sizeof(uint64_t), node);
-        //add existing or new node to the path for backpropagation
+        //add new node to the path for backpropagation
+        if (path_len >= PATH_LEN) {
+          dprintf(logfile, "mcts_search() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+          fprintf(stderr, "mcts_search() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+          exit(1);
+        } 
         path[path_len++] = node;
       }
       //iterate down the tree
@@ -394,7 +395,11 @@ extern "C" {
           //init child's move
           struct Move move;
           //fprintf(stderr, "mcts_search(): calling initMove(%s)\n", uci_move);
-          initMove(&move, sim_board, uci_move);
+      		if (initMove(&move, sim_board, uci_move)) {
+      			dprintf(logfile, "mcts_search() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+      			fprintf(stderr, "mcts_search() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+      			exit(-1);
+      		}
           //make the move
           makeMove(&move);
           //update Zobrist hash (it is needed so that we can call updateHash later instead of getHash)
@@ -405,63 +410,85 @@ extern "C" {
     			}
           //add this child node to the path for backpropagation (i.e. to update the score and visit number)
           if (path_len >= PATH_LEN) {
-            dprintf(logfile, "mcts_search() error: path buffer is full, pathLen %d\n", PATH_LEN);
-            fprintf(stderr, "mcts_search() error: path buffer is full, pathLen %d\n", PATH_LEN);
+            dprintf(logfile, "mcts_search() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+            fprintf(stderr, "mcts_search() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
             exit(1);
           }
           path[path_len++] = node;
         } else {
-          //fprintf(stderr, "mcts_search() error in loop over childred: found unexpanded child node\n");
+          //fprintf(stderr, "mcts_search() error in loop over childred: found unexpanded child node, i.e. node without children\n");
           break;
         }
         //continue iterating down the tree until no more children or the end of the game is reached
       }
-      
-      // Expansion and Evaluation - add more children - increase the length of the tree down using the model's predictions
+      //Here we are at the bottom of the tree or at the terminal node
+      // Expansion and Evaluation - add more children - increase the length of the tree down using the model's predictions or randomly
       float result = 0;
-      int outcome = 0;
+      //int outcome = 0;
       if (!sim_board->isStaleMate && !sim_board->isMate) {
-        //int num_moves, *moves = legal_moves(sim_board, &num_moves);
+        int num_moves, * moves = legal_moves(sim_board, &num_moves);
   
         //allocate the memory for model's output
         int top_move_pred[branching];
         float top_move_probs[branching];
-        //int promo_pred = 0;
+        float results[branching];
+        int idxSet[branching];
+        memset((int *)idxSet, -1, branching);
         //run the model
-        run_inference(&sim_board, 1, top_move_pred, top_move_probs, &outcome, branching);
+        //run_inference(&sim_board, 1, top_move_pred, top_move_probs, &outcome, branching);
         //fprintf(stderr, "mcts_search(): top move prediction: %d(%.1f), promo_pred %c, predicted outcome %d\n", top_move_pred[0], top_move_probs[0], promoLetter[promo_pred + 1], outcome);
+
+        //instead of running the model, we try random moves from moves[] to see how good is the model vs random moves
+        if (branching > num_moves) branching = num_moves;
+        std::vector<int> idx = generateUniqueRandomNumbers(num_moves - 1, branching);
+        result = evaluate_nnue(sim_board, NULL, ctx); //to reset accumulators and get eval for this node
+        if (result > 2) result = board->fen->sideToMove == sim_board->fen->sideToMove ? 1 : -1;
+        else if (result < -2) result = board->fen->sideToMove == sim_board->fen->sideToMove ? -1 : 1;
+        else result = 0;
+        for (int i = 0; i < branching; i++) {
+          top_move_pred[i] = moves[idx[i]];
+          struct Move move;
+          char uci_move[6];
+          idx_to_move(sim_board, top_move_pred[i], uci_move);
+      		if (initMove(&move, sim_board, uci_move)) {
+      			dprintf(logfile, "mcts_search() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+      			fprintf(stderr, "mcts_search() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+      			exit(-1);
+      		}          
+          float res = evaluate_nnue(sim_board, &move, ctx); //hopefully, NNUE updates are incremental
+          results[i] = board->fen->sideToMove == sim_board->fen->sideToMove ? res : -res;
+        }
+        get_prob(results, branching); //scaled down to [0..1] and sum to 1
+
         //result = (float)outcome;
         //total += outcome;
-        //if (sim_board->fen->sideToMove == ColorBlack) {
-          //result = -result; // Flip for Black’s perspective
-        //}
           
         if (!node || node->num_children == 0) {
-          //if we found unexpanded child, i.e. select_child(parent, &node) returned NULL in node
+          //if we found unexpanded child, i.e. select_child(parent, &node) returned NULL in node, i.e. a node without children
+          //basically we reached the bottom of the tree, let's expand it further down
           if (!node) {
             node = (struct MCTSNode *)malloc(sizeof(struct MCTSNode));
             node->zobrist = sim_board->hash;
             node->N = 0;
             node->W = 0.0;
             node->P = 0.0; 
-            //node->promo = sim_board->promoPiece;
             node->move = 0;
             node->children = NULL;
             node->num_children = 0;
+            node->sideToMove = sim_board->fen->sideToMove;
             node->parent = path[path_len - 1]; // Set parent
             HASH_ADD(hh, tree, zobrist, sizeof(uint64_t), node);
             if (path_len >= PATH_LEN) {
-              dprintf(logfile, "mcts_search() error: path buffer is full, pathLen %d\n", PATH_LEN);
-              fprintf(stderr, "mcts_search() error: path buffer is full, pathLen %d\n", PATH_LEN);
+              dprintf(logfile, "mcts_search() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+              fprintf(stderr, "mcts_search() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
               exit(-1);
             }
             path[path_len++] = node;
           }
           //fprintf(stderr, "mcts_search() warning in tree expansion: added hash %llu because select_child(parent, &node) returned NULL\n", node->zobrist);
-          //instead of using all legal moves, we only take top 3 from the model prediction or less 
-          //if legal moves less than 3
-          int legal_moves_count = legalMovesCount(sim_board);
-          if (!legal_moves_count) {            
+          //int legal_moves_count = legalMovesCount(sim_board);
+          int legal_moves_count = num_moves;
+          if (!legal_moves_count) {
             dprintf(logfile, "mcts_search() error: legal_moves_count is 0 but not end game!\n");
             fprintf(stderr, "mcts_search() error: legal_moves_count is 0 but not end game!\n");
             exit(-1);
@@ -469,32 +496,37 @@ extern "C" {
           if (legal_moves_count > branching) legal_moves_count = branching;
           //add children to a new or empty node
           expand_node(node, sim_board, top_move_probs, top_move_pred, legal_moves_count > branching ? branching : legal_moves_count);
-          //fprintf(stderr, "Expansion: expanded node %p, zobrist %llu with %d children\n", node, node->zobrist, legal_moves_count > 3 ? 3 : legal_moves_count);
+          //fprintf(stderr, "Expansion: expanded node %p, zobrist %llu with %d children\n", node, node->zobrist, legal_moves_count > branching ? branching : legal_moves_count);
         }                 
       } else { //end of game
         result = 0.0;
-        if (sim_board->isMate)
-          result = 1.0; //Always win from the perspective of the player for which this is a child node!
+        if (sim_board->isMate) //sideToMove is mated
+          result = -1;
         //fprintf(stderr, "result %.1f\n", result);
         //total++;
       }
       // Backpropagation: update node visits and results
       //if (path_len > maxPathLen) maxPathLen = path_len;
-      for (int j = path_len - 1; j >= 0; j--) {
+      for (int j = path_len - 1; j >= 0; j--) { //starting from the current node moving back all the way to the root node
         path[j]->N++;
         //we need to alternate results because they are looked at from the node's perspective: 
         //positive - winning, negative - losing regardless of the color (white or black)
-        //and nodes alternate such as if parent node is white, then its children are black and vice versa
-        float node_result = (path_len - 1 - j) % 2 == 0 ? result : -result;
-        path[j]->W += node_result;
+        //and nodes alternate such as if parent node is white, then its children are black and vice versa        
+        //path[j]->W += path[j]->sideToMove == sim_board->fen->sideToMove ? result : -result;
+        path[j]->W += result; //we only look at evals from a single perspective of the board->fen->sideToMove
         //fprintf(stderr, "Backpropagation: updated node %p, zobrist %llu: visits %d, results %.1f\n", path[j], path[j]->zobrist, path[j]->N, path[j]->W);         
       }
       freeBoard(sim_board);
+      if (chessEngine.seldepth < path_len) chessEngine.seldepth = path_len;   
+      if (min_depth > path_len) min_depth = path_len;   
+    } //end of the iterations loop
+    if (chessEngine.depth && min_depth >= chessEngine.depth) {
+        stopFlag = 1;
     }
     //fprintf(stderr, "total terminal positions %lld, maxPathLen %d\n", total, maxPathLen);
   }
   
-  void mcts_search_batched(struct Board * board, int num_simulations, int branching) {
+  void mcts_search_batched(struct Board * board, int num_simulations, int branching, struct NNUEContext * ctx) {
       struct MCTSNode * path[MAX_BATCH_SIZE * PATH_LEN];
       char uci_move[6];
       int path_len;
@@ -532,12 +564,16 @@ extern "C" {
               node->N = 0;
               node->W = 0.0;
               node->P = 0.0;
-              //node->promo = sim_board->promoPiece;
               node->children = NULL;
               node->num_children = 0;
               node->parent = NULL;
               node->move = 0;
               HASH_ADD(hh, tree, zobrist, sizeof(uint64_t), node);
+              if (path_len >= PATH_LEN) {
+                dprintf(logfile, "mcts_search_batched() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+                fprintf(stderr, "mcts_search_batched() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+                exit(-1);
+              }
               path[path_len++] = node;
           }
   
@@ -549,7 +585,11 @@ extern "C" {
                   idx_to_move(sim_board, node->move, uci_move);
                   struct Move move;
                   //fprintf(stderr, "mcts_search_batched(): tree traversal, calling initMove(%s)\n", uci_move);
-                  initMove(&move, sim_board, uci_move);
+              		if (initMove(&move, sim_board, uci_move)) {
+              			dprintf(logfile, "mcts_search_batched() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+              			fprintf(stderr, "mcts_search_batched() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+              			exit(-1);
+              		}
                   makeMove(&move);
                   if (updateHash(sim_board->zh, sim_board, &move)) {
                       dprintf(logfile, "mcts_search_batched() error: updateHash() returned non-zero value\n");
@@ -557,8 +597,8 @@ extern "C" {
                       exit(-1);
                   }
                   if (path_len >= PATH_LEN) {
-                      dprintf(logfile, "mcts_search_batched() error: path buffer is full, PATH_LEN %d\n", PATH_LEN);
-                      fprintf(stderr, "mcts_search_batched() error: path buffer is full, PATH_LEN %d\n", PATH_LEN);
+                      dprintf(logfile, "mcts_search_batched() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+                      fprintf(stderr, "mcts_search_batched() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
                       exit(-1);
                   }
                   path[path_len++] = node;
@@ -628,13 +668,17 @@ extern "C" {
                           expand_node(node, sim_board, &top_move_probs[b * branching], &top_move_pred[b * branching], legal_moves_count > branching ? branching : legal_moves_count);
                           //fprintf(stderr, "Expansion: expanded node %p, zobrist %llu with %d children\n", node, node->zobrist, legal_moves_count > branching ? branching : legal_moves_count);
                       }
-                      /*
-                      float result = (float)outcomes[b] - 1.0;
+                      
+                      //float result = (float)outcomes[b] - 1.0;
+                      float result = evaluate_nnue(sim_board, NULL, ctx);
+                      if (result > 2) result = board->fen->sideToMove == sim_board->fen->sideToMove ? 1 : -1;
+                      else if (result < -2) result = board->fen->sideToMove == sim_board->fen->sideToMove ? -1 : 1;
+                      else result = 0;        
                       for (int j = path_len - 1; j >= 0; j--) {
                           path[j]->N++;
-                          float node_result = (path_len - 1 - j) % 2 == 0 ? result : -result;
-                          path[j]->W += node_result;
-                      }*/
+                          //path[j]->W += path[j]->sideToMove == sim_board->fen->sideToMove ? result : -result;
+                          path[j]->W += result;
+                      }
                       freeBoard(sim_board);
                   }
                   batch_positions = 0;
@@ -643,11 +687,11 @@ extern "C" {
           } else { //if !(!sim_board->isStaleMate && !sim_board->isMate && is_unique)
               // Terminal node or duplicate leaf
               if (sim_board->isStaleMate || sim_board->isMate) {
-                  float result = sim_board->isMate ? 1.0 : 0.0;
+                  float result = sim_board->isMate ? (board->fen->sideToMove == sim_board->fen->sideToMove ? -1 : 1) : 0;
                   for (int j = path_len - 1; j >= 0; j--) {
                       path[j]->N++;
-                      float node_result = (path_len - 1 - j) % 2 == 0 ? result : -result;
-                      path[j]->W += node_result;
+                      //path[j]->W += path[j]->sideToMove == sim_board->fen->sideToMove ? result : -result;
+                      path[j]->W += result;
                   }
               }
               freeBoard(sim_board);
@@ -662,7 +706,7 @@ extern "C" {
               fprintf(stderr, "mcts_search_batched() error: run_inference() failed\n");
               exit(-1);
           }
-          //fprintf(stderr, "mcts_search_batch(): top move prediction: %d(%.1f), promo %c, predicted outcome %d\n", top_move_pred[0], top_move_probs[0], promoLetter[promo_pred[0] + 1], outcomes[0]);
+          //fprintf(stderr, "mcts_search_batch(): top move prediction: %d(%.1f), predicted outcome %d\n", top_move_pred[0], top_move_probs[0], outcomes[0]);
  
           for (int b = 0; b < batch_positions; b++) {
               struct MCTSNode * node = batch_nodes[b];
@@ -683,6 +727,11 @@ extern "C" {
                       node->parent = path[path_len - 1];
                       node->move = -1;
                       HASH_ADD(hh, tree, zobrist, sizeof(uint64_t), node);
+                      if (path_len >= PATH_LEN) {
+                        dprintf(logfile, "mcts_search_batched() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+                        fprintf(stderr, "mcts_search_batched() error: path buffer is full, increase PATH_LEN (%d), branching (%d) or exploration constant (%.2f)\n", PATH_LEN, BRANCHING, EXPLORATION_CONSTANT);
+                        exit(-1);
+                      }
                       path[path_len++] = node;
                   }
                   int legal_moves_count = legalMovesCount(sim_board);
@@ -695,13 +744,18 @@ extern "C" {
                   expand_node(node, sim_board, &top_move_probs[b * branching], &top_move_pred[b * branching], legal_moves_count > branching ? branching : legal_moves_count);
                   //fprintf(stderr, "Expansion: expanded node %p, zobrist %llu with %d children\n", node, node->zobrist, legal_moves_count > branching ? branching : legal_moves_count);
              }
-              /*
-              float result = (float)outcomes[b] - 1.0;
+              
+              //float result = (float)outcomes[b] - 1.0;
+              float result = evaluate_nnue(sim_board, NULL, ctx);
+              if (result > 2) result = board->fen->sideToMove == sim_board->fen->sideToMove ? 1 : -1;
+              else if (result < -2) result = board->fen->sideToMove == sim_board->fen->sideToMove ? -1 : 1;
+              else result = 0;
+              
               for (int j = path_len - 1; j >= 0; j--) {
                   path[j]->N++;
-                  float node_result = (path_len - 1 - j) % 2 == 0 ? result : -result;
-                  path[j]->W += node_result;
-              }*/
+                  //path[j]->W += path[j]->sideToMove == sim_board->fen->sideToMove ? result : -result;
+                  path[j]->W += result;
+              }
               freeBoard(sim_board);
           }
       }
@@ -709,41 +763,6 @@ extern "C" {
   }
   
   float select_best_move(struct Board * board, char * uciMove) {
-    /*
-    int num_moves, * moves = legal_moves(board, &num_moves);
-    if (!moves || num_moves == 0) return NULL;
-    float best_score = -1.0;
-    float epsilon = 1.0; //exploration-exploitation constant; smaller value favor exploitation
-    
-    for (int i = 0; i < num_moves; i++) {
-      struct Board * next_board = cloneBoard(board);
-      if (!next_board) {
-        dprintf(logfile, "select_best_move() error: cloneBoard() returned NULL\n");
-        fprintf(stderr, "select_best_move() error: cloneBoard() returned NULL\n");
-        exit(-1);
-      }
-      struct Move move;
-      idx_to_move(next_board, moves[i], uciMove);
-      initMove(&move, next_board, uciMove);
-      makeMove(&move);
-  		if (!updateHash(next_board->zh, next_board, &move)) next_board->hash = next_board->zh->hash;
-  		else {
-  			dprintf(logfile, "select_best_move() error: updateHash() returned non-zero value\n");
-  			fprintf(stderr, "select_best_move() error: updateHash() returned non-zero value\n");
-        freeBoard(next_board);
-  			exit(-1);
-  		}    
-      struct MCTSNode * node = NULL;
-      HASH_FIND(hh, tree, &next_board->hash, sizeof(uint64_t), node);
-      if (node) {
-        float score = (float)(node->N); //Simply choose the node with the most number of visits
-        if (score > best_score) best_score = score;
-      }
-      freeBoard(next_board);
-    }
-    free(moves);
-    */
-    //it appears to be better to select best_move from the hash table using PUCT, i.e. select_child()  
     struct MCTSNode * node = NULL;
     HASH_FIND(hh, tree, &board->hash, sizeof(uint64_t), node);
     if (!node) {
@@ -752,17 +771,18 @@ extern "C" {
       exit(-1);
     } 
     struct MCTSNode * parent = node;
+    node = NULL;
     float best_score = select_child(parent, &node);
     if (!node) {
       //I think to avoid NULL node condition, the number of iterations in MCTSrun should be odd, not even
       dprintf(logfile, "select_best_move() warning: select_child() returned NULL\n");
       fprintf(stderr, "select_best_move() warning: select_child() returned NULL\n");
       //return NULL;
-      if (parent->parent) {
+      if (parent->parent->parent) { //parent->parent is the opponent's move
         dprintf(logfile, "select_best_move() notice: select_child() returned NULL but parent->parent is not NULL\n");
         fprintf(stderr, "select_best_move() notice: select_child() returned NULL but parent->parent is not NULL\n");
         parent = parent->parent;
-        idx_to_move(board, parent->move, uciMove);
+        idx_to_move(board, parent->parent->move, uciMove);
       } else {
         dprintf(logfile, "select_best_move() error: select_child() returned NULL and parent->parent is also NULL\n");
         fprintf(stderr, "select_best_move() error: select_child() returned NULL and parent->parent is also NULL\n");
@@ -772,21 +792,76 @@ extern "C" {
     return best_score;
   }
   
-  void free_hash_table(struct MCTSNode **table) {
-      struct MCTSNode * node, * tmp;
-      char uci_move[6];
-      HASH_ITER(hh, *table, node, tmp) {
-          if (node->move > 0) idx_to_move(NULL, node->move, uci_move);
-          else uci_move[0] = '\0';
-          dprintf(logfile, "hash %llu, visits %d, result %.1f, Q %.5f, probs %.5f, move %s\n", node->zobrist, node->N, node->W, node->N > 0 ? node->W / node->N : 0, node->P, uci_move);
-          if (node->children) free(node->children);
-          HASH_DEL(*table, node);
-          free(node);
-      }
-      *table = NULL;
+  void free_mcts_node(struct MCTSNode ** table, struct MCTSNode * node) {
+    if (!node) return;
+    char uci_move[6];
+
+    // Recursively free children
+    if (node->children) {
+        for (int i = 0; i < node->num_children; i++) {
+            if (node->children[i]) {
+                if (node->children[i]->move > 0) idx_to_move(NULL, node->children[i]->move, uci_move);
+                else uci_move[0] = '\0';
+                //dprintf(logfile, "hash %llu, visits %d, result %.1f, Q %.5f, probs %.5f, move %s, sideToMove %s\n", node->children[i]->zobrist, node->children[i]->N, node->children[i]->W, node->children[i]->N > 0 ? node->children[i]->W / node->children[i]->N : 0, node->children[i]->P, uci_move, color[node->sideToMove]);
+
+                free_mcts_node(table, node->children[i]);
+                node->children[i] = NULL;
+            }
+        }
+        free(node->children);
+        node->children = NULL;
+    }
+
+    // Remove from hash table and free node
+    HASH_DEL(*table, node);
+    free(node);
   }
   
-  int neuralEvaluate(struct Board * board, char * uciMove) {
+  void free_hash_table_top(struct MCTSNode ** table, struct Board * board) {
+    struct MCTSNode * node = NULL, * parent;
+
+    // Find the node corresponding to the board's Zobrist hash
+    HASH_FIND(hh, * table, &board->hash, sizeof(uint64_t), node);
+    if (!node || !node->parent) return; // No parent to free
+
+    parent = node->parent;
+
+    // Free all sibling nodes (children of parent except node)
+    if (parent->children) {
+        for (int i = 0; i < parent->num_children; i++) {
+            if (parent->children[i] && parent->children[i] != node) {
+                free_mcts_node(table, parent->children[i]);
+                parent->children[i] = NULL;
+            }
+        }
+    }
+
+    // Free the parent node
+    free_mcts_node(table, parent);
+    node->parent = NULL; // Make current node the root
+  }
+  
+  void free_hash_table(struct MCTSNode **table) {
+    struct MCTSNode *node = NULL, *tmp;
+    char uci_move[6];
+
+    // Iterate over all nodes
+    HASH_ITER(hh, *table, node, tmp) {
+        // Log node information
+        if (node->move > 0) idx_to_move(NULL, node->move, uci_move);
+        else uci_move[0] = '\0';
+        //dprintf(logfile, "hash %llu, visits %d, result %.1f, Q %.5f, probs %.5f, move %s, sideToMove %s\n", node->zobrist, node->N, node->W, node->N > 0 ? node->W / node->N : 0, node->P, uci_move, color[node->sideToMove]);
+
+        // Remove and free the node
+        tmp = (struct MCTSNode *)node->hh.next; // Save next node before deletion
+        free_mcts_node(table, node);
+        node = NULL;
+    }
+
+    *table = NULL;
+  }
+    
+  int neuralEvaluate(struct Board * board, char * uciMove, struct NNUEContext * ctx) {
     int res = 0;
     //number of moves to try at each node - the greater branching
     //the shorter tree or ply depth; the formular for number of simulation is depth ^ branching;
@@ -800,39 +875,18 @@ extern "C" {
       int result = 0;
       int top_move_pred[branching];
       float top_move_probs[branching];
-      //int promo_pred = 0;
       run_inference(&board, 1, top_move_pred, top_move_probs, &result, branching);
-      //fprintf(stderr, "Evaluation: top 3 move predictions: %lld(%.1f) %lld(%.1f) %lld(%.1f), predicted outcome %lld\n", top_move_pred[0], top_move_probs[0], top_move_pred[1], top_move_probs[1], top_move_pred[2], top_move_probs[2], result);
       idx_to_move(board, top_move_pred[0], uciMove);
     } else {
       // Main MCTS loop
       const int NUM_SIMULATIONS = 1001;
       //while (!board->isMate && !board->isStaleMate) {
         // Run MCTS simulations. Results are stored in uthash tree
-        mcts_search(board, NUM_SIMULATIONS, branching);
+        mcts_search(board, NUM_SIMULATIONS, branching, ctx);
         
         // Select best move from uthash tree
         select_best_move(board, uciMove);
-        //struct Move move;
-        //initMove(&move, board, best_move);
-        //makeMove(&move);
-  			//if (!updateHash(board->zh, board, &move)) board->hash = board->zh->hash;
-  			//else {
-  			//	fprintf(stderr, "neuralEvaluate() error: updateHash() returned non-zero value\n");
-  			//	exit(-1);
-  			//}
-        //fprintf(stderr, "Played move: %s\n", best_move);
-        
-        // Clear tree for next iteration (optional)
-        //free_hash_table(&tree);
-      //}
     }
-  exit:
-    /*
-    if (tree) {
-      free_hash_table(&tree);
-      tree = NULL;
-    }*/
     return res;
   }
   
@@ -844,49 +898,40 @@ extern "C" {
       run_inference(&board, 1, &top_move_pred, &top_move_probs, &result, 1);
       idx_to_move(board, top_move_pred, uciMove);
   }
-  
-  int runMCTS(struct Board * board, double maxTime, char * uciMove) {
-      int res = 0;
-      clock_t start = clock();
-      double elapsed = 0.0;
-      int iterations = 10 * MIN_ITERATIONS + 1;
-      int branching = 8;
-      
-      stopFlag = 0;
-      while (elapsed < maxTime && !stopFlag && iterations < MAX_ITERATIONS) {
-          clock_t iter_start = clock();
-          //fprintf(stderr, "runMCTS(): calling mcts_search_batched(board, %d, %d)...\n", iterations, branching);
-          mcts_search_batched(board, iterations, branching);
-          //mcts_search(board, iterations, branching);
-          //fprintf(stderr, "runMCTS(): calling mcts_search_batched(board, %d, %d)...done\n", iterations, branching);
-          //score must be from the engine point of view
-          //fprintf(stderr, "runMCTS(): calling select_best_move()...\n");
-          float score = select_best_move(board, uciMove); 
-          //fprintf(stderr, "runMCTS(): calling select_best_move()...done. Bestmove %s\n", uciMove);
-          double iter_elapsed_sec = (double)(clock() - iter_start) / CLOCKS_PER_SEC; //sec
-          elapsed = ((double)(clock() - start)) / CLOCKS_PER_SEC * 1000; //ms
-          dprintf(logfile, "info multipv 1 score cp %d depth %.0f nodes %d nps %.0f pv %s\n", (int)(score * 10000), round(sqrtf(iterations)), iterations, round((double)iterations / iter_elapsed_sec), uciMove);
-          printf("info multipv 1 score cp %d depth %.0f nodes %d nps %.0f pv %s\n", (int)(score * 10000), round(sqrtf(iterations)), iterations, round((double)iterations / iter_elapsed_sec), uciMove);
-          fflush(stdout);
-          int iter = (maxTime / elapsed - 1) * iterations;
-          if (iter % 2 == 0)
-            iterations += iter;
-          else iterations += iter + 1;
-      }
-      
-  exit:
-      /*
-      if (tree) {
-        free_hash_table(&tree);
-        tree = NULL;
-      }*/
-      return res;
-  }
-  
+
   void cleanup() {
       if (tree) {
         free_hash_table(&tree);
         tree = NULL;
       }
   }
+
+  int runMCTS(struct Board * board, double maxTime, char * uciMove, struct NNUEContext * ctx) {
+      int res = 0;
+      time_t start = time(NULL); //sec
+      double elapsed = 0.0;
+      int iterations = MIN_ITERATIONS;
+      int branching = BRANCHING;
+      
+      stopFlag = 0;
+      while (elapsed < maxTime * 0.001 && !stopFlag && iterations < MAX_ITERATIONS) {
+          auto iter_start = std::chrono::steady_clock::now();
+          //mcts_search_batched(board, iterations, branching, ctx);
+          mcts_search(board, iterations, branching, ctx);
+          float score = select_best_move(board, uciMove); 
+          elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+          dprintf(logfile, "info multipv 1 score cp %d depth %.0f seldepth %d nodes %d nps %.0f pv %s\n", (int)(score * 100), round(sqrtf(iterations)), chessEngine.seldepth, iterations, round((double)iterations / elapsed), uciMove);
+          printf("info multipv 1 score cp %d depth %.0f nodes %d nps %.0f pv %s\n", (int)(score * 100), round(sqrtf(iterations)), iterations, round((double)iterations / elapsed), uciMove);
+          fflush(stdout);
+          int iter = (maxTime * 0.001 / elapsed - 1) * iterations / 10;
+          if (iter % 2 == 0)
+            iterations += iter;
+          else iterations += iter + 1;
+      }
+      
+      free_hash_table_top(&tree, board);
+  
+      return res;
+  }
+  
 }

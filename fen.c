@@ -22,9 +22,13 @@ extern "C" {
 /// 0 for success, non-zero for failure
 /// </return>
 int strtofen(struct Fen * fen, const char * fenstr) {
+  if (!fen) {
+  	printf("strtofen() error: fen arg is NULL\n");
+  	return 1;
+  }
 	size_t count = strlen(fenstr) + 1;
-	if (count > sizeof fen->fenString) {
-		printf("strtofen() error: FEN string is too long (%zu), it must be shorter than %zu.\n", count, sizeof fen->fenString);
+	if (count > MAX_FEN_STRING_LEN) {
+		printf("strtofen() error: FEN string is too long (%zu), it must be shorter than %d\n", count, MAX_FEN_STRING_LEN);
 		return 1;
 	}
 	char position[73];
@@ -34,7 +38,7 @@ int strtofen(struct Fen * fen, const char * fenstr) {
 	char * token;
 	unsigned char i;
 
-	strncpy(fen->fenString, fenstr, count);
+	strncpy(fen->fenString, fenstr, MAX_FEN_STRING_LEN);
 	char * fenString = strdup(fenstr);
 	if (!fenString) {
 		printf("Error in strtofen(): strdup(%s) returned null - %s\n", fenstr, strerror(errno));

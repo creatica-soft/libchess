@@ -14,7 +14,8 @@ void piece(struct Square * sq, struct ChessPiece * pc, int pcName) {
 	pc->name = pcName;
 	pc->type = pcName & 7;
 	pc->color = pcName >> 3;
-	memcpy(&(pc->square), sq, sizeof (struct Square));
+	if (sq != &(pc->square))
+	  memcpy(&(pc->square), sq, sizeof (struct Square));
 }
 
 #ifdef __cplusplus
