@@ -1,3 +1,11 @@
+#pragma once
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #define CHESS_API __declspec(dllexport)
+#else
+  #define CHESS_API
+#endif
+
 #ifndef MAGIC_BITBOARDS_H
 #define MAGIC_BITBOARDS_H
 
@@ -6,10 +14,10 @@
 
 // Magic entry for a square
 struct MagicEntry{
-    unsigned long attack_mask;   // Relevant squares
-    unsigned long magic_number;  // Magic constant
+    unsigned long long attack_mask;   // Relevant squares
+    unsigned long long magic_number;  // Magic constant
     int relevant_bits;      // Number of bits in attack_mask
-    unsigned long * move_table;   // Pointer to move bitboards
+    unsigned long long * move_table;   // Pointer to move bitboards
 };
 
 // Global tables, defined in magic_bitboards.c
@@ -17,7 +25,7 @@ static struct MagicEntry rook_magics[SQUARE_COUNT];
 static struct MagicEntry bishop_magics[SQUARE_COUNT];
 
 // Precomputed rook magics (sourced from Stockfish/Wiki)
-static const unsigned long rook_magic_numbers[SQUARE_COUNT] = {
+static const unsigned long long rook_magic_numbers[SQUARE_COUNT] = {
   612498416294952992ULL,  2377936612260610304ULL,  36037730568766080ULL,
   72075188908654856ULL,   144119655536003584ULL,   5836666216720237568ULL,
   9403535813175676288ULL, 1765412295174865024ULL,  3476919663777054752ULL,
@@ -54,7 +62,7 @@ static const int rook_relevant_bits[SQUARE_COUNT] = {
 };
 
 // Precomputed bishop magics
-static const unsigned long bishop_magic_numbers[SQUARE_COUNT] = {
+static const unsigned long long bishop_magic_numbers[SQUARE_COUNT] = {
   9368648609924554880ULL, 9009475591934976ULL,     4504776450605056ULL,
   1130334595844096ULL,    1725202480235520ULL,     288516396277699584ULL,
   613618303369805920ULL,  10168455467108368ULL,    9046920051966080ULL,
@@ -92,24 +100,24 @@ static const int bishop_relevant_bits[SQUARE_COUNT] = {
 #ifdef __cplusplus
 extern "C" {
   // Initialize magic bitboards
-  void init_magic_bitboards(void);
+  CHESS_API void init_magic_bitboards(void);
   
   // Cleanup move tables
-  void cleanup_magic_bitboards(void);
+  CHESS_API void cleanup_magic_bitboards(void);
   
   // Get moves for sliding pieces
-  unsigned long get_rook_moves(int square, unsigned long occupancy);
-  unsigned long get_bishop_moves(int square, unsigned long occupancy);
+  unsigned long long get_rook_moves(int square, unsigned long long occupancy);
+  unsigned long long get_bishop_moves(int square, unsigned long long occupancy);
 }
 #else
 // Initialize magic bitboards
-void init_magic_bitboards(void);
+CHESS_API void init_magic_bitboards(void);
 
 // Cleanup move tables
-void cleanup_magic_bitboards(void);
+CHESS_API void cleanup_magic_bitboards(void);
 
 // Get moves for sliding pieces
-unsigned long get_rook_moves(int square, unsigned long occupancy);
-unsigned long get_bishop_moves(int square, unsigned long occupancy);
+unsigned long long get_rook_moves(int square, unsigned long long occupancy);
+unsigned long long get_bishop_moves(int square, unsigned long long occupancy);
 #endif
 #endif

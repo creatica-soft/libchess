@@ -847,7 +847,7 @@ int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dataset, char
 int nextMoves(unsigned long hash, struct MoveScoreGames ** moves, int sqlThreads) {
   unsigned char q;
   if (sqlThreads == 1 || sqlThreads == 2 || sqlThreads == 4 || sqlThreads == 8) {
-  	q = 64 - __builtin_ctzl(sqlThreads);
+  	q = 64 - lsBit(sqlThreads);
   	//printf("nextMoves(): MSB = %d\n", q);
     q = hash >> q;
   } else {
@@ -985,7 +985,7 @@ int playGameExt(struct Game * game, bool generateZobristHash, bool updateDb, boo
   struct Evaluation * evaluation = NULL;
   struct Evaluation * evaluations[8] = { NULL };
   if (updateDb) {
-  	t = 64 - __builtin_ctzl(sqlThreads);
+  	t = 64 - lsBit(sqlThreads);
   	//printf("playGameExt(): sqlThreads %d, t %d\n", sqlThreads, t);
   }
 	struct Fen fen;

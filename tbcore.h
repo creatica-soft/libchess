@@ -5,7 +5,7 @@
 #ifndef TBCORE_H
 #define TBCORE_H
 
-#ifndef __WIN32__
+#ifndef _WIN32
 #include <pthread.h>
 #define SEP_CHAR ':'
 #define FD int
@@ -18,7 +18,7 @@
 #endif
 
 #ifdef TB_HAVE_THREADS
-#ifndef __WIN32__
+#ifndef _WIN32
 #define LOCK_T pthread_mutex_t
 #define LOCK_INIT(x) pthread_mutex_init(&(x), NULL)
 #define LOCK(x) pthread_mutex_lock(&(x))
@@ -79,14 +79,18 @@ struct PairsData {
 };
 
 struct TBEntry {
-  char *data;
-  uint64 key;
-  uint64 mapping;
-  ubyte ready;
-  ubyte num;
-  ubyte symmetric;
-  ubyte has_pawns;
+    char* data;
+    uint64 key;
+    uint64 mapping;
+    ubyte ready;
+    ubyte num;
+    ubyte symmetric;
+    ubyte has_pawns;
+#ifndef _MSC_VER
 } __attribute__((__may_alias__));
+#else
+    };
+#endif
 
 struct TBEntry_piece {
   char *data;

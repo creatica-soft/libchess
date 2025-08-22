@@ -26,7 +26,7 @@ float moveValue(struct Board * board, enum SquareName src, enum SquareName dst) 
     for (enum PieceType p = Queen; p > pt; p--) {
       bitBoard = board->occupations[shiftedColor | p];
       while (bitBoard) { //for all opponent pieces that greater than pt
-        s = __builtin_ctzl(bitBoard);
+        s = lsBit(bitBoard);
         if (dst == s) return 1.0; //prioritise capture of major pieces
         bitBoard &= bitBoard - 1;
       }
@@ -34,7 +34,7 @@ float moveValue(struct Board * board, enum SquareName src, enum SquareName dst) 
     for (enum PieceType p = pt; p >= Pawn; p--) { 
       bitBoard = board->occupations[shiftedColor | p];
       while (bitBoard) { //for all opponent pieces that greater than pt
-        s = __builtin_ctzl(bitBoard);
+        s = lsBit(bitBoard);
         if (dst == s && !(board->defendedPieces & s))
           return 1.0; //prioritise capture of underfended pieces equal or lower than pt
         bitBoard &= bitBoard - 1;
@@ -43,7 +43,7 @@ float moveValue(struct Board * board, enum SquareName src, enum SquareName dst) 
     for (enum PieceType p = Pawn; p < pt; p++) { 
       bitBoard = board->occupations[shiftedColor | p];
       while (bitBoard) { //for all opponent pieces that smaller than pt
-        s = __builtin_ctzl(bitBoard);
+        s = lsBit(bitBoard);
         if ((board->movesFromSquares[s] & src) && !(board->movesFromSquares[s] & dst))
           return 1.0; //prioritise moves for pieces attacked by a minor piece (included pinned one)
         if (board->movesFromSquares[s] & dst)
@@ -80,7 +80,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     offset = sampleXchannels + channel * 64;
     bitBoard = board->occupations[pn];
     while (bitBoard) {
-      src = __builtin_ctzl(bitBoard);
+      src = lsBit(bitBoard);
       boards_legal_moves[offset + src] = 1.0;
       bitBoard &= bitBoard - 1;
     }
@@ -93,7 +93,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     offset = sampleXchannels + channel * 64;
     bitBoard = board->occupations[pn];
     while (bitBoard) {
-      src = __builtin_ctzl(bitBoard);
+      src = lsBit(bitBoard);
       boards_legal_moves[offset + src] = 1.0;
       bitBoard &= bitBoard - 1;      
     }
@@ -105,7 +105,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   offset = sampleXchannels + channel * 64;
   bitBoard = board->occupations[PieceNameWhite];
   while (bitBoard) {
-    src = __builtin_ctzl(bitBoard);
+    src = lsBit(bitBoard);
     boards_legal_moves[offset + src] = pieceValue[board->piecesOnSquares[src] & 7];
     bitBoard &= bitBoard - 1;    
   }
@@ -116,7 +116,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   offset = sampleXchannels + channel * 64;
   bitBoard = board->occupations[PieceNameBlack];
   while (bitBoard) {
-    src = __builtin_ctzl(bitBoard);
+    src = lsBit(bitBoard);
     boards_legal_moves[offset + src] = pieceValue[board->piecesOnSquares[src] & 7];
     bitBoard &= bitBoard - 1;    
   }
@@ -132,10 +132,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     if (bitBoard) offset = sampleXchannels + channel * 64;
     else unusedChannels[idx++] = channel;
     while (bitBoard) {
-      src = __builtin_ctzl(bitBoard);
+      src = lsBit(bitBoard);
       bitBoard2 = board->movesFromSquares[src];
       while (bitBoard2) {
-        dst = __builtin_ctzl(bitBoard2);
+        dst = lsBit(bitBoard2);
         boards_legal_moves[offset + dst] = 1.0;
         bitBoard2 &= bitBoard2 - 1;    
       }
@@ -155,11 +155,11 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
         channel++;
       }
       if (bitBoard) {
-        src = __builtin_ctzl(bitBoard);
+        src = lsBit(bitBoard);
         bitBoard &= bitBoard - 1;
         bitBoard2 = board->movesFromSquares[src];
         while (bitBoard2) {
-          dst = __builtin_ctzl(bitBoard2);
+          dst = lsBit(bitBoard2);
           boards_legal_moves[offset + dst] = 1.0;
           bitBoard2 &= bitBoard2 - 1;    
         }
@@ -172,10 +172,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     num = __builtin_popcountl(bitBoard);
     if (num < 2) offset = sampleXchannels + channel * 64;
     else offset = sampleXchannels + unusedChannels[--idx] * 64;
-    src = __builtin_ctzl(bitBoard);
+    src = lsBit(bitBoard);
     bitBoard2 = board->movesFromSquares[src];
     while (bitBoard2) {
-      dst = __builtin_ctzl(bitBoard2);
+      dst = lsBit(bitBoard2);
       boards_legal_moves[offset + dst] = 1.0;
       bitBoard2 &= bitBoard2 - 1;    
     }
@@ -186,10 +186,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   bitBoard = board->occupations[shiftedColor | King];
   offset = sampleXchannels + channel * 64;
   channel++;
-  src = __builtin_ctzl(bitBoard);
+  src = lsBit(bitBoard);
   bitBoard2 = board->movesFromSquares[src];
   while (bitBoard2) {
-    dst = __builtin_ctzl(bitBoard2);
+    dst = lsBit(bitBoard2);
     boards_legal_moves[offset + dst] = 1.0;
     bitBoard2 &= bitBoard2 - 1;    
   }
@@ -204,10 +204,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     if (bitBoard) offset = sampleXchannels + channel * 64;
     else unusedChannels[idx++] = channel;
     while (bitBoard) {
-      src = __builtin_ctzl(bitBoard);
+      src = lsBit(bitBoard);
       bitBoard2 = board->movesFromSquares[src];
       while (bitBoard2) {
-        dst = __builtin_ctzl(bitBoard2);
+        dst = lsBit(bitBoard2);
         boards_legal_moves[offset + dst] = moveValue(board, src, dst);
         bitBoard2 &= bitBoard2 - 1;    
       }
@@ -226,11 +226,11 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
         channel++;
       }
       if (bitBoard) {
-        src = __builtin_ctzl(bitBoard);
+        src = lsBit(bitBoard);
         bitBoard &= bitBoard - 1;
         bitBoard2 = board->movesFromSquares[src];
         while (bitBoard2) {
-          dst = __builtin_ctzl(bitBoard2);
+          dst = lsBit(bitBoard2);
           boards_legal_moves[offset + dst] = moveValue(board, src, dst);
           bitBoard2 &= bitBoard2 - 1;    
         }
@@ -243,10 +243,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     num = __builtin_popcountl(bitBoard);
     if (num < 2) offset = sampleXchannels + channel * 64;
     else offset = sampleXchannels + unusedChannels[--idx] * 64;
-    src = __builtin_ctzl(bitBoard);
+    src = lsBit(bitBoard);
     bitBoard2 = board->movesFromSquares[src];
     while (bitBoard2) {
-      dst = __builtin_ctzl(bitBoard2);
+      dst = lsBit(bitBoard2);
       boards_legal_moves[offset + dst] = moveValue(board, src, dst);
       bitBoard2 &= bitBoard2 - 1;    
     }
@@ -257,10 +257,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   bitBoard = board->occupations[shiftedColor | King];
   offset = sampleXchannels + channel * 64;
   channel++;
-  src = __builtin_ctzl(bitBoard);
+  src = lsBit(bitBoard);
   bitBoard2 = board->movesFromSquares[src];
   while (bitBoard2) {
-    dst = __builtin_ctzl(bitBoard2);
+    dst = lsBit(bitBoard2);
     boards_legal_moves[offset + dst] = moveValue(board, src, dst);
     bitBoard2 &= bitBoard2 - 1;    
   }
@@ -271,7 +271,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
 	  //printf("legal moves from square %s %lu\n", squareName[sq], board->sideToMoveMoves[sq]);    
     bitBoard = board->sideToMoveMoves[src];
     while (bitBoard) {
-      dst = __builtin_ctzl(bitBoard);
+      dst = lsBit(bitBoard);
       boards_legal_moves[offset + dst] = 1.0;
       bitBoard &= bitBoard - 1;    
     }

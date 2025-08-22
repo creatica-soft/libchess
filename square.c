@@ -15,7 +15,7 @@ extern "C" {
 void square(struct Square * square, int sqName) {
 	square->name = sqName;
 	if (sqName != SquareNone) {
-		square->bitSquare = 1UL << sqName;
+		square->bitSquare =1ULL << sqName;
 		square->file = sqName & 7; 
 		square->rank = sqName >> 3; 
 		/*

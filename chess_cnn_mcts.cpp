@@ -69,7 +69,7 @@ extern ChessCNN model;
     unsigned long any = board->occupations[(board->fen->sideToMove << 3) | PieceTypeAny];
     int legal_move_count = 0;
     while (any) {
-      enum SquareName sn = (enum SquareName)__builtin_ctzl(any);
+      enum SquareName sn = (enum SquareName)lsBit(any);
       legal_move_count += __builtin_popcountl(board->sideToMoveMoves[sn]);
       any &= any - 1;
     }
@@ -224,10 +224,10 @@ extern ChessCNN model;
   	enum PieceName color = (enum PieceName)((board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
   	unsigned long any = board->occupations[color]; 
   	while (any) {
-  	  enum SquareName src_sq = (enum SquareName)__builtin_ctzl(any);
+  	  enum SquareName src_sq = (enum SquareName)lsBit(any);
   	  unsigned long moves_from_sq = board->sideToMoveMoves[src_sq];
   	  while (moves_from_sq) {
-    	  enum SquareName dst_sq = (enum SquareName)__builtin_ctzl(moves_from_sq);
+    	  enum SquareName dst_sq = (enum SquareName)lsBit(moves_from_sq);
   		  moves[(*num_moves)++] = src_sq * 64 + dst_sq;
   		  moves_from_sq &= moves_from_sq - 1;
   		}

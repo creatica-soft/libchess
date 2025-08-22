@@ -75,7 +75,7 @@ void getHash(struct ZobristHash * hash, struct Board * board) {
   int sn, pt;
 	unsigned long long bitboard = board->occupations[PieceNameNone];
 	while (bitboard) {
-		sn = __builtin_ctzl(bitboard);
+		sn = lsBit(bitboard);
 		pt = (((board->piecesOnSquares[sn]) >> 3) * 6) + ((board->piecesOnSquares[sn]) & 7);
 		hash->hash ^= hash->piecesAtSquares[pt][sn];
 		hash->hash2 ^= hash->piecesAtSquares2[pt][sn];
@@ -84,7 +84,7 @@ void getHash(struct ZobristHash * hash, struct Board * board) {
 	//xor in pieces
 	bitboard = board->occupations[PieceNameAny];
 	while (bitboard) {
-		sn = __builtin_ctzl(bitboard);
+		sn = lsBit(bitboard);
 		pt = (((board->piecesOnSquares[sn]) >> 3) * 6) + ((board->piecesOnSquares[sn]) & 7);
 		hash->hash ^= hash->piecesAtSquares[pt][sn];
 		hash->hash2 ^= hash->piecesAtSquares2[pt][sn];

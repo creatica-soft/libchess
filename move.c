@@ -18,12 +18,12 @@ extern "C" {
 /// of a bit field move type given in a secondary argument
 ///</summary>
 void getMoveType(char * mvType, unsigned char type) {
-	//unsigned char N = bitCount((unsigned long)type);
+	//unsigned char N = bitCount((unsigned long long)type);
 	mvType[0] = '\0';
-	unsigned char i;
+	unsigned int i;
 	strcat(mvType, moveType[0]);
 	while (type) {
-		i = genLSBit(type);
+		i = lsBit(type);
 		strcat(mvType, " | ");
 		strcat(mvType, moveType[i + 1]);
 		type ^= 1 << i;
@@ -92,7 +92,7 @@ int validateSanMove(struct Move * move) {
 			if (sanMove[2] == '=') {
 				char * idx = strchr(pieces, sanMove[3]);
 				if (idx) {
-					move->chessBoard->promoPiece = (move->chessBoard->fen->sideToMove << 3) | (idx - pieces + 2);
+					move->chessBoard->promoPiece = (int)((move->chessBoard->fen->sideToMove << 3) | (idx - pieces + 2));
 					move->type |= MoveTypePromotion;
 					sanMove[2] = '\0';
 				}
@@ -110,7 +110,7 @@ int validateSanMove(struct Move * move) {
 						if (sanMove[4] == '=') {
 							char * idx = strchr(pieces, sanMove[5]);
 							if (idx) {
-								move->chessBoard->promoPiece = (move->chessBoard->fen->sideToMove << 3) | (idx - pieces + 2);
+								move->chessBoard->promoPiece = (int)((move->chessBoard->fen->sideToMove << 3) | (idx - pieces + 2));
 								move->type |= MoveTypePromotion | MoveTypeCapture;
 								sanMove[4] = '\0';
 							}
@@ -178,9 +178,9 @@ int validateSanMove(struct Move * move) {
 			char pieces[] = ".xNBRQK";
 			char * idx = strchr(pieces, sanMove[i]);
 			if (idx) {
-				long pieceIndex = idx - pieces;
+				long long pieceIndex = idx - pieces;
 				if (pieceIndex > 1)
-					piece(&(move->chessBoard->movingPiece.square), &(move->chessBoard->movingPiece), (move->chessBoard->fen->sideToMove << 3) | pieceIndex);
+					piece(&(move->chessBoard->movingPiece.square), &(move->chessBoard->movingPiece), (int)((move->chessBoard->fen->sideToMove << 3) | pieceIndex));
 				else if (pieceIndex == 1) {
 					move->type |= MoveTypeCapture;
 				}
@@ -210,7 +210,7 @@ int validateSanMove(struct Move * move) {
 			if (move->destinationSquare.rank == dstRanks[move->chessBoard->fen->sideToMove]) {
 				if ((move->chessBoard->movesFromSquares[srcSquare] & move->destinationSquare.bitSquare) > 0) {
 					struct Square oppositePawnSquare;
-					unsigned long oppositePawns = move->chessBoard->occupations[move->chessBoard->opponentColor << 3 | Pawn];
+					unsigned long long oppositePawns = move->chessBoard->occupations[move->chessBoard->opponentColor << 3 | Pawn];
 					//oppositePawns &= 0xFFFFFFFFFFFFFFFFUL;
 					assert(oppositePawns == (oppositePawns & 0xFFFFFFFFFFFFFFFFUL));
 					square(&oppositePawnSquare, lsBit(oppositePawns));
@@ -237,7 +237,7 @@ int validateSanMove(struct Move * move) {
 		//find move candidates
 		struct Square * moveCandidates[10];
 		//get a bitboard of squares where moving piece names (for example, white knights) are
-		unsigned long cp = move->chessBoard->occupations[move->chessBoard->movingPiece.name];
+		unsigned long long cp = move->chessBoard->occupations[move->chessBoard->movingPiece.name];
 		struct Square * s;
 		unsigned char n = 0; //number of candidates
 		s = (struct Square *)malloc(sizeof(struct Square));
@@ -375,7 +375,7 @@ void san2uci(struct Move * move) {
 	{
 		//need to move the king on the kingside rook
 		int r[2] = { Rank1, Rank8 };
-		unsigned long rooks = move->chessBoard->occupations[move->chessBoard->movingPiece.color << 3 | Rook];
+		unsigned long long rooks = move->chessBoard->occupations[move->chessBoard->movingPiece.color << 3 | Rook];
 		struct Square king;
 		square(&king, lsBit(move->chessBoard->occupations[move->chessBoard->movingPiece.color << 3 | King]));
 		square(&s, lsBit(rooks));
@@ -432,7 +432,7 @@ void uci2san(struct Move * move) {
 	if (move->chessBoard->movingPiece.type != Pawn && move->chessBoard->movingPiece.type != King) {
 		//find move candidates
 		struct Square * moveCandidates[10];
-		unsigned long cp = move->chessBoard->occupations[move->chessBoard->movingPiece.name];
+		unsigned long long cp = move->chessBoard->occupations[move->chessBoard->movingPiece.name];
 		struct Square * s;
 		s = (struct Square *)malloc(sizeof(struct Square));
 		square(s, lsBit(cp));
@@ -491,7 +491,7 @@ void setUciMoveType(struct Move * move) {
 		strncpy(promo, "..nbrq", 6);
 		char * idx = strchr(promo, move->uciMove[4]);
 		if (idx)
-			move->chessBoard->promoPiece = ((move->chessBoard->fen->sideToMove << 3) | (idx - promo));
+			move->chessBoard->promoPiece = (int)((move->chessBoard->fen->sideToMove << 3) | (idx - promo));
 		else
 			printf("Unknown promotion piece %u%s%s\n", move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move->uciMove);
 	} else if (move->chessBoard->movingPiece.type == Pawn) {
@@ -501,7 +501,7 @@ void setUciMoveType(struct Move * move) {
 		//Is move en passant?
 		else if (abs(move->sourceSquare.name - move->destinationSquare.name) == 16) {
 			//all opponent pawns
-			unsigned long pawns = move->chessBoard->occupations[(move->chessBoard->opponentColor << 3) | Pawn];
+			unsigned long long pawns = move->chessBoard->occupations[(move->chessBoard->opponentColor << 3) | Pawn];
 			//opponent pawns on Rank 4 or 5 depending on the side to move
 			if (move->chessBoard->fen->sideToMove == ColorWhite)
 			  pawns &= RANK4;
@@ -630,7 +630,7 @@ void init_move(struct Move * move, struct Board * board, int src, int dst) {
 		//Is move en passant?
 		else if (abs(move->sourceSquare.name - move->destinationSquare.name) == 16) {
 			//all opponent pawns
-			unsigned long pawns = move->chessBoard->occupations[(move->chessBoard->opponentColor << 3) | Pawn];
+			unsigned long long pawns = move->chessBoard->occupations[(move->chessBoard->opponentColor << 3) | Pawn];
 			//opponent pawns on Rank 4 or 5 depending on the side to move
 			if (move->chessBoard->fen->sideToMove == ColorWhite)
 			  pawns &= RANK4;

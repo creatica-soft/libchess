@@ -5,7 +5,7 @@
  *
  * (C) 2015 basil, all rights reserved,
  * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
+ * copy of this software and associated documentation files (the "So7ftware"),
  * to deal in the Software without restriction, including without limitation
  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
  * and/or sell copies of the Software, and to permit persons to whom the
@@ -26,12 +26,17 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "magic_bitboards.h"
-
-#include "tbprobe.h"
-#ifdef __x86_64__
+#include <stdint.h> // For uint8_t, uint64_t
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(__popcnt64)
+#pragma intrinsic(_BitScanForward64)
+#else
 #include <x86intrin.h>
 #endif
+#include "magic_bitboards.h"
+#include "tbprobe.h"
+
 #define WHITE_KING              (TB_WPAWN + 5)
 #define WHITE_QUEEN             (TB_WPAWN + 4)
 #define WHITE_ROOK              (TB_WPAWN + 3)
@@ -66,7 +71,7 @@
 
 #define BEST_NONE               0xFFFF
 #define SCORE_ILLEGAL           0x7FFF
-
+/*
 #ifndef TB_NO_HW_POP_COUNT
 // Add portable popcount definition
 #ifdef __x86_64__
@@ -74,8 +79,7 @@
 #define popcount(x) _mm_popcnt_u64(x)
 #define BITSCAN(x, idx) __asm__("bsfq %1, %0": "=r"(idx): "rm"(x))
 #else
-#define popcount(x) __builtin_popcountll(x)
-#define BITSCAN(x, idx) (idx = __builtin_ctzll(x))
+#define BITSCAN(x, idx) (idx = lsBitl(x))
 #endif
 #else
 static inline unsigned popcount(uint64_t x)
@@ -86,17 +90,39 @@ static inline unsigned popcount(uint64_t x)
     return (x * 0x0101010101010101ull) >> 56;
 }
 #endif
-
 #ifdef __x86_64__
 #define BITSCAN(x, idx) __asm__("bsfq %1, %0": "=r"(idx): "rm"(x))
 #else
-#define BITSCAN(x, idx) (idx = __builtin_ctzll(x))
+#define BITSCAN(x, idx) (idx = lsBit(x))
+#endif
+*/
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(__popcnt64)
+#define popcount(x) __popcnt64(x)
+#else
+#define popcount(x) __builtin_popcountll(x)
+#endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_BitScanForward64)
+#define BITSCAN(x, idx) _BitScanForward64(&(idx), (x))
+static inline unsigned lsBit(uint64_t value) {
+    unsigned long index;
+    return _BitScanForward64(&index, value) ? (unsigned)index : 64;
+}
+#else
+#define BITSCAN(x, idx) ((idx) = __builtin_ctzll(x))
+static inline unsigned lsBit(uint64_t value) {
+    return __builtin_ctzll(value);
+}
 #endif
 
 #define poplsb(x)               ((x) & ((x) - 1))
 static inline unsigned lsb(uint64_t b)
 {
-    size_t idx;
+    unsigned long idx;
     BITSCAN(b, idx);
     return (unsigned)idx;
 }
@@ -297,15 +323,15 @@ static const uint64_t anti2board_table[15] =
     0x0001020408102040ull,
 };
 
-static inline size_t diag2index(uint64_t b, unsigned d)
+static inline unsigned long diag2index(uint64_t b, unsigned d)
 {
     b *= 0x0101010101010101ull;
     b >>= 56;
     b >>= 1;
-    return (size_t)b;
+    return (unsigned long)b;
 }
 
-static inline size_t anti2index(uint64_t b, unsigned a)
+static inline unsigned long anti2index(uint64_t b, unsigned a)
 {
     return diag2index(b, a);
 }
@@ -701,7 +727,12 @@ static int probe_wdl_table(const struct pos *pos, int *success)
                 return 0;
             }
             // Memory barrier to ensure ptr->ready = 1 is not reordered.
-            __asm__ __volatile__ ("" ::: "memory");
+            #ifdef _MSC_VER
+            #include <intrin.h>
+            #define memory_barrier() _ReadWriteBarrier()
+            #else
+            #define memory_barrier() __asm__ __volatile__ ("" ::: "memory")
+            #endif
             ptr->ready = 1;
         }
         UNLOCK(TB_MUTEX);
@@ -1834,7 +1865,7 @@ extern unsigned tb_probe_wdl_impl(
         knights,
         pawns,
         0,
-        static_cast<uint8_t>(ep),
+        (uint8_t)(ep),
         turn
     };
     int success;
@@ -1868,8 +1899,8 @@ extern unsigned tb_probe_root_impl(
         bishops,
         knights,
         pawns,
-        static_cast<uint8_t>(rule50),
-        static_cast<uint8_t>(ep),
+        (uint8_t)(rule50),
+        (uint8_t)(ep),
         turn
     };
     int dtz;

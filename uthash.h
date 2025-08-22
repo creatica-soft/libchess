@@ -173,8 +173,8 @@ do {                                                                            
 } while (0)
 
 #ifdef HASH_BLOOM
-#define HASH_BLOOM_BITLEN (1UL << HASH_BLOOM)
-#define HASH_BLOOM_BYTELEN (HASH_BLOOM_BITLEN/8UL) + (((HASH_BLOOM_BITLEN%8UL)!=0UL) ? 1UL : 0UL)
+#define HASH_BLOOM_BITLEN (1ULL << HASH_BLOOM)
+#define HASH_BLOOM_BYTELEN (HASH_BLOOM_BITLEN/8UL) + (((HASH_BLOOM_BITLEN%8UL)!=0UL) ? 1ULL : 0UL)
 #define HASH_BLOOM_MAKE(tbl,oomed)                                               \
 do {                                                                             \
   (tbl)->bloom_nbits = HASH_BLOOM;                                               \
@@ -573,7 +573,7 @@ do {                                                                            
 do {                                                                             \
   unsigned _klen = fieldlen;                                                     \
   write(HASH_EMIT_KEYS, &_klen, sizeof(_klen));                                  \
-  write(HASH_EMIT_KEYS, keyptr, (unsigned long)fieldlen);                        \
+  write(HASH_EMIT_KEYS, keyptr, (unsigned long long)fieldlen);                        \
 } while (0)
 #else
 #define HASH_EMIT_KEY(hh,head,keyptr,fieldlen)

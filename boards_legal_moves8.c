@@ -46,11 +46,11 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
         else offset2 = offset + 64 * 12;
       }
       while (bitBoard) { //loop over occupations of the same piece types of the same color
-        src = __builtin_ctzl(bitBoard);
+        src = lsBit(bitBoard);
         boards_legal_moves[offset + src] = 1.0;
         bitBoard2 = board->movesFromSquares[src];
         while (bitBoard2) { //loop over all moves from src square
-          dst = __builtin_ctzl(bitBoard2);
+          dst = lsBit(bitBoard2);
           if (color == board->fen->sideToMove) {
             int move_type = (pn == pawn && dst / 8 == (color == ColorWhite ? 7 : 0)) ? 6 : (pn & 7) - 1; 
             if (move_type == 6) { //promo move

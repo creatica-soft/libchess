@@ -22,10 +22,10 @@ extern "C" {
 /// 0 for success, non-zero for failure
 /// </return>
 int strtofen(struct Fen * fen, const char * fenstr) {
-  if (!fen) {
-  	printf("strtofen() error: fen arg is NULL\n");
-  	return 1;
-  }
+	if (!fen) {
+		printf("strtofen() error: fen arg is NULL\n");
+		return 1;
+	}
 	size_t count = strlen(fenstr) + 1;
 	if (count > MAX_FEN_STRING_LEN) {
 		printf("strtofen() error: FEN string is too long (%zu), it must be shorter than %d\n", count, MAX_FEN_STRING_LEN);
@@ -142,22 +142,22 @@ int strtofen(struct Fen * fen, const char * fenstr) {
 				switch (castling[c]) {
 				case 'K':
 					fen->castlingRook[0][0] = FileH;
-					fen->castlingBits |= (1UL << FileH);
+					fen->castlingBits |= (1ULL << FileH);
 					fen->castlingRights |= CastlingSideKingside;
 					break;
 				case 'Q':
 					fen->castlingRook[1][0] = FileA;
-					fen->castlingBits |= (1UL << FileA);
+					fen->castlingBits |= (1ULL << FileA);
 					fen->castlingRights |= CastlingSideQueenside;
 					break;
 				case 'k':
 					fen->castlingRook[0][1] = FileH;
-					fen->castlingBits |= (1UL << (FileH + 56));
+					fen->castlingBits |= (1ULL << (FileH + 56));
 					fen->castlingRights |= (CastlingSideKingside << 2);
 					break;
 				case 'q':
 					fen->castlingRook[1][1] = FileA;
-					fen->castlingBits |= (1UL << (FileA + 56));
+					fen->castlingBits |= (1ULL << (FileA + 56));
 					fen->castlingRights |= (CastlingSideQueenside << 2);
 					break;
 				}
@@ -176,11 +176,11 @@ int strtofen(struct Fen * fen, const char * fenstr) {
 				f = (enum Files)(tolower(c) - 'a');
 				if ((unsigned char)f > white_king_file) {
 					fen->castlingRook[0][0] = f;
-					fen->castlingBits |= (1UL << f);
+					fen->castlingBits |= (1ULL << f);
 					fen->castlingRights |= CastlingSideKingside;
 				} else {
 					fen->castlingRook[1][0] = f;
-					fen->castlingBits |= (1UL << f);
+					fen->castlingBits |= (1ULL << f);
 					fen->castlingRights |= CastlingSideQueenside;
 				}
 			} else if (memchr(bf, castling[c], 8)) {
@@ -195,11 +195,11 @@ int strtofen(struct Fen * fen, const char * fenstr) {
 				f = c - 'a';
 				if ((unsigned char)f > black_king_file) {
 					fen->castlingRook[0][1] = f;
-					fen->castlingBits |= (1UL << (f + 56));
+					fen->castlingBits |= (1ULL << (f + 56));
 					fen->castlingRights |= (CastlingSideKingside << 2);
 				} else {
 					fen->castlingRook[1][1] = f;
-					fen->castlingBits |= (1UL << (f + 56));
+					fen->castlingBits |= (1ULL << (f + 56));
 					fen->castlingRights |= (CastlingSideQueenside << 2);
 				}
 			}

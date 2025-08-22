@@ -330,7 +330,7 @@ inline Square msb(Bitboard b) {
 
     #else  // MSVC, WIN32
 
-    unsigned long idx;
+    unsigned long long idx;
 
     if (b >> 32)
     {

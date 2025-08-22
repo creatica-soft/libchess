@@ -1,7 +1,6 @@
 # docker build -t alpine-chess:3.22 --rm .
 ARG ALPINE_VER="3.22"
-ARG ALPINE_ARCH="arm64v8"
-FROM $ALPINE_ARCH/alpine:$ALPINE_VER
+FROM alpine:$ALPINE_VER
 LABEL version="3.22"
 ARG TZ="Australia/Brisbane"
 RUN apk update && \

@@ -1,4 +1,13 @@
+//For MacOS using clang
 //c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp
+
+// For linux or Windows using mingw
+// add -mpopcnt for X86_64
+// might need to add -Wno-stringop-overflow to avoid some warnings in tbcore.h
+//g++ -std=c++17 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -Wno-stringop-overflow -O3 -I /home/ap/libchess -L /home/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp -lchess
+
+//or with clang in MSYS2 MINGW64 or CLANG64
+//clang++ -std=c++17 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -O3 -I /home/ap/libchess -L /home/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp -lchess
 
 #include "nnue/types.h"
 #include "nnue/position.h"
@@ -6,6 +15,10 @@
 #include "nnue/nnue/nnue_common.h"
 #include "nnue/nnue/network.h"
 #include "nnue/nnue/nnue_accumulator.h"
+
+#ifdef _MSC_VER
+#include <mutex>
+#endif
 
 #ifdef __GNUC__ // g++ on Alpine Linux
 #include <mutex>
@@ -22,6 +35,10 @@
 #include "tbprobe.h"
 #include "libchess.h"
 
+extern std::atomic<bool> stopFlag;
+extern double timeAllocated; //ms
+extern char best_move[6];
+
 extern "C" {
 
   struct NNUEContext {
@@ -37,13 +54,10 @@ extern "C" {
   void print(const char * message, ...);
   
   #define MAX_DEPTH 50
-  extern std::atomic<bool> stopFlag;
   extern bool quitFlag;
   extern bool searchFlag;
   extern int logfile;
-  extern double timeAllocated; //ms
   extern struct Engine chessEngine;
-  extern char best_move[6];
   std::mutex probe_mutex;
   
   struct Edge {
@@ -262,10 +276,10 @@ extern "C" {
   	enum PieceName side = (enum PieceName)((temp_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
   	unsigned long long any = temp_board->occupations[side]; 
   	while (any) {
-  	  int src = __builtin_ctzl(any);
+  	  int src = lsBit(any);
   	  unsigned long long moves = temp_board->sideToMoveMoves[src];
   	  while (moves) {
-    	  int dst = __builtin_ctzl(moves);
+    	  int dst = lsBit(moves);
         init_move(move, temp_board, src, dst);
         double res = evaluate_nnue(temp_board, move, ctx);
         if (res > best_value) best_value = res;
@@ -303,7 +317,7 @@ MCTS implementation follows the four core phases:
   };
 
   void mcts_search(ThreadParams * params, struct NNUEContext * ctx) {
-    char uci_move[6], temp_move[6];
+    char uci_move[6];
     struct Move move;
     params->currentNodes = 0;
     std::vector<struct MCTSNode *> path;  // Track the path from root to leaf
@@ -355,7 +369,7 @@ MCTS implementation follows the four core phases:
       double result = 0, res;
       int src, dst, effective_branching = 1;
       std::vector<std::pair<double, int>> move_evals;
-      if (__builtin_popcountl(sim_board->occupations[PieceNameAny]) > TB_LARGEST) {
+      if (bitCount(sim_board->occupations[PieceNameAny]) > TB_LARGEST) {
         if (sim_board->isCheck) {
             result = NNUE_CHECK; //NNUE cannot evaluate when in check - it will be resolved in expansion
         } else if (sim_board->isMate) { //sim_board->fen->sideToMove is mated
@@ -372,24 +386,22 @@ MCTS implementation follows the four core phases:
         }
         // Expansion - add more children - increase the depth of the tree down using the model's predictions, NNUE evals or randomly
         if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && !repetition3x) {
-          int num_moves = 0;
         	enum PieceName side = (enum PieceName)((sim_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
         	unsigned long long any = sim_board->occupations[side]; 
         	while (any) {
-        	  src = __builtin_ctzl(any);
+        	  src = lsBit(any);
         	  unsigned long long moves = sim_board->sideToMoveMoves[src];
         	  while (moves) {
-          	  dst = __builtin_ctzl(moves);
-              init_move(&move, sim_board, src, dst);
-              //evaluate_nnue() returns result in pawns (not centipawns!)
-              //stockfish makes the move, so the res is from the perspective of sim_board->opponentColor
-              res = evaluate_nnue(sim_board, &move, ctx);
-              if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
-                res = process_check(sim_board, &move, ctx);
-              move_evals.push_back({res, src * 64 + dst});
-        		  moves &= moves - 1;
-        		  num_moves++;
-        		}
+          	    dst = lsBit(moves);
+                init_move(&move, sim_board, src, dst);
+                //evaluate_nnue() returns result in pawns (not centipawns!)
+                //stockfish makes the move, so the res is from the perspective of sim_board->opponentColor
+                res = evaluate_nnue(sim_board, &move, ctx);
+                if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
+                  res = process_check(sim_board, &move, ctx);
+                move_evals.push_back({res, src * 64 + dst});
+        		moves &= moves - 1;
+        	  }
             any &= any - 1;
           }
           std::sort(move_evals.begin(), move_evals.end(), std::greater<>()); //sorted in descending order
@@ -405,7 +417,7 @@ MCTS implementation follows the four core phases:
         } //end of if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate) 
       } else {
         if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && !repetition3x) {
-          unsigned int ep = __builtin_ctzl(sim_board->fen->enPassantLegalBit);
+          unsigned int ep = lsBit(sim_board->fen->enPassantLegalBit);
           unsigned int res = 0;
           {
             std::lock_guard<std::mutex> lock(probe_mutex);
@@ -415,7 +427,7 @@ MCTS implementation follows the four core phases:
               sim_board->fen->halfmoveClock, 0, ep == 64 ? 0 : ep, sim_board->opponentColor == ColorBlack ? 1 : 0, NULL);
           }
           if (res == TB_RESULT_FAILED) {
-            log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, __builtin_popcountl(sim_board->occupations[PieceNameAny]), sim_board->fen->fenString, ep, sim_board->fen->halfmoveClock, sim_board->opponentColor == ColorBlack ? 1 : 0, sim_board->occupations[PieceNameWhite], sim_board->occupations[PieceNameBlack], sim_board->occupations[WhiteKing] | sim_board->occupations[BlackKing],
+            log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, bitCount(sim_board->occupations[PieceNameAny]), sim_board->fen->fenString, ep, sim_board->fen->halfmoveClock, sim_board->opponentColor == ColorBlack ? 1 : 0, sim_board->occupations[PieceNameWhite], sim_board->occupations[PieceNameBlack], sim_board->occupations[WhiteKing] | sim_board->occupations[BlackKing],
               sim_board->occupations[WhiteQueen] | sim_board->occupations[BlackQueen], sim_board->occupations[WhiteRook] | sim_board->occupations[BlackRook], sim_board->occupations[WhiteBishop] | sim_board->occupations[BlackBishop], sim_board->occupations[WhiteKnight] | sim_board->occupations[BlackKnight], sim_board->occupations[WhitePawn] | sim_board->occupations[BlackPawn], strerror(errno));
             exit(-1);
           }
@@ -481,59 +493,92 @@ MCTS implementation follows the four core phases:
 
   void runMCTS(struct Board * board) {
     double elapsed = 0.0;
-    unsigned long iterations = MIN_ITERATIONS;
-    std::vector<ThreadParams> thread_params(chessEngine.optionSpin[Threads].value);
-    
-    for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
-        thread_params[i].thread_id = i;
-        thread_params[i].num_sims = iterations;  // Or time-based loop inside thread
-        thread_params[i].board = board;  // Read-only
-    }
-    
-    auto iter_start = std::chrono::steady_clock::now();
-    
-    if (!chessEngine.depth) chessEngine.depth = MAX_DEPTH;
-    std::vector<std::thread> threads;
-    for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
-      thread_params[i].stats.clear();
-      threads.emplace_back(thread_search, &thread_params[i]);
-    }
-    for (auto& t : threads) t.join();
-    
-    //chessEngine.currentNodes = 0;
-    chessEngine.currentDepth = 0;
-    chessEngine.seldepth = 0;
-    for (const auto& tp : thread_params) {
-      //chessEngine.currentNodes += tp.currentNodes;
-      if (tp.currentDepth > chessEngine.currentDepth) chessEngine.currentDepth = tp.currentDepth;
-      if (tp.seldepth > chessEngine.seldepth) chessEngine.seldepth = tp.seldepth;
-    }
-    
+    int move_idx = 0;
+    unsigned long long total_nodes = 1;
     std::vector<EdgeStats> merged_stats; //aggregated stats
-    std::unordered_map<int, EdgeStats> accum_map;
-    unsigned long long total_nodes = 0;
-    for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
-      for (const auto& edge : thread_params[i].stats) {
-        auto& acc = accum_map[edge.move];  // Creates if missing
-        if (acc.move == 0) acc.move = edge.move;  // Set once
-        acc.N += edge.N;
-        acc.W += edge.W;
-      }
-      total_nodes += thread_params[i].search.tree.size();
-      cleanup(&thread_params[i].search);
-    }
-    // Transfer to merged_stats (optionally sort by N descending for easier selection)
-    merged_stats.reserve(accum_map.size());
-    for (const auto& [move, stats] : accum_map) {
-      merged_stats.push_back(stats);
-    }
-    std::sort(merged_stats.begin(), merged_stats.end(), [](const EdgeStats& a, const EdgeStats& b) {
-      return a.N > b.N;
-    });  
+    auto iter_start = std::chrono::steady_clock::now();
+    int move_number = bitCount(board->moves);
+    if (move_number > 1) {
+        unsigned long iterations = MIN_ITERATIONS;
+        std::vector<ThreadParams> thread_params(chessEngine.optionSpin[Threads].value);
+        for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
+            thread_params[i].thread_id = i;
+            thread_params[i].num_sims = iterations;  // Or time-based loop inside thread
+            thread_params[i].board = board;  // Read-only
+        }
 
-    idx_to_move(board, merged_stats[0].move, best_move);
+        if (!chessEngine.depth) chessEngine.depth = MAX_DEPTH;
+        std::vector<std::thread> threads;
+        for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
+            thread_params[i].stats.clear();
+            threads.emplace_back(thread_search, &thread_params[i]);
+        }
+        for (auto& t : threads) t.join();
+
+        //chessEngine.currentNodes = 0;
+        chessEngine.currentDepth = 0;
+        chessEngine.seldepth = 0;
+        for (const auto& tp : thread_params) {
+            //chessEngine.currentNodes += tp.currentNodes;
+            if (tp.currentDepth > chessEngine.currentDepth) chessEngine.currentDepth = tp.currentDepth;
+            if (tp.seldepth > chessEngine.seldepth) chessEngine.seldepth = tp.seldepth;
+        }
+
+        std::unordered_map<int, EdgeStats> accum_map;
+        for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
+            for (const auto& edge : thread_params[i].stats) {
+                auto& acc = accum_map[edge.move];  // Creates if missing
+                if (acc.move == 0) acc.move = edge.move;  // Set once
+                acc.N += edge.N;
+                acc.W += edge.W;
+            }
+            total_nodes += thread_params[i].search.tree.size();
+            cleanup(&thread_params[i].search);
+        }
+        // Transfer to merged_stats (optionally sort by N descending for easier selection)
+        merged_stats.reserve(accum_map.size());
+        for (const auto& [move, stats] : accum_map) {
+            merged_stats.push_back(stats);
+        }
+        std::sort(merged_stats.begin(), merged_stats.end(), [](const EdgeStats& a, const EdgeStats& b) {
+            return a.N > b.N;
+            });
+        move_idx = merged_stats[0].move;
+    }
+    else if (move_number == 1) {
+        enum PieceName side = (enum PieceName)((board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
+        unsigned long long any = board->occupations[side];
+        int src = 0, dst = 0;
+        while (any) {
+            src = lsBit(any);
+            unsigned long long moves = board->sideToMoveMoves[src];
+            if (moves) {
+                dst = lsBit(moves);
+                break;
+            }
+            any &= any - 1;
+        }
+        move_idx = src * 64 + dst;
+    }
+    else {
+        if (board->isMate) {
+            log_file("info depth 0 score mate 0\n");
+            log_file("bestmove (none)\n");
+            print("info depth 0 score mate 0\n");
+            print("bestmove (none)\n");
+        }
+        else if (board->isStaleMate) {
+            log_file("info depth 0 score cp 0\n");
+            log_file("bestmove (none)\n");
+            print("info depth 0 score cp 0\n");
+            print("bestmove (none)\n");
+        }
+        return;
+    }
+
+    idx_to_move(board, move_idx, best_move);
     struct Move move;
-    init_move(&move, board, merged_stats[0].move / 64, merged_stats[0].move % 64);
+    init_move(&move, board, move_idx / 64, move_idx % 64);
     struct NNUEContext ctx;
     init_nnue_context(&ctx);
     double res = evaluate_nnue(board, &move, &ctx);
@@ -542,7 +587,7 @@ MCTS implementation follows the four core phases:
     free_nnue_context(&ctx);
     
     elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
-    unsigned long long nodes = 0;
+    unsigned long long nodes = 1;
     for (const auto& stats : merged_stats) nodes += stats.N;
     double nps = nodes / elapsed;
 
