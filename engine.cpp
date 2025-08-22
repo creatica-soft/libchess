@@ -1,5 +1,7 @@
 #include <fcntl.h>
-//#include <unistd.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 //#include <sys/wait.h>
@@ -155,7 +157,7 @@ int getOptions(struct Engine * engine) {
 	return 0;
 }
 
-int nametoindex(struct Engine * engine, char * name, int type) {
+int nametoindex(struct Engine * engine, const char * name, int type) {
 	int idx = -1;
 	switch (type) {
 	case 0: //button
@@ -206,7 +208,7 @@ int nametoindex(struct Engine * engine, char * name, int type) {
 	return idx;
 }
 
-int setOption(struct Engine * engine, char * name, int type, void * value) {
+int setOption(struct Engine * engine, const char * name, int type, void * value) {
 	char line[256];
 	line[0] = '\0';
 	long long v;
@@ -657,7 +659,7 @@ int engine(struct Engine *engine, const char *engineName) {
     engine->engineName[MAX_ENGINE_NAME_LEN - 1] = '\0';
 
     // Generate unique pipe names
-    char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     char suffix[10];
 
     // Generate toEngine pipe name
@@ -835,7 +837,7 @@ int engine(struct Engine *engine, const char *engineName) {
     strncpy(engine->engineName, engineName, MAX_ENGINE_NAME_LEN - 1);
     engine->engineName[MAX_ENGINE_NAME_LEN - 1] = '\0';
 
-    char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     char suffix[10];
     //srand(time(NULL)); // Ensure random seeding
 
@@ -925,7 +927,7 @@ struct Engine * initChessEngine(char * engineName, long long movetime, int depth
     return NULL;
   }
   if (logging) {
-	  char symbols[63] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	  const char symbols[63] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 	  char suffix[10];
 	  char logfile[255] = "";
 	  bool fileExists = false;
