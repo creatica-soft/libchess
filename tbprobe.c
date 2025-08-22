@@ -32,7 +32,9 @@
 #pragma intrinsic(__popcnt64)
 #pragma intrinsic(_BitScanForward64)
 #else
+#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
 #include <x86intrin.h>
+#endif
 #endif
 #include "magic_bitboards.h"
 #include "tbprobe.h"

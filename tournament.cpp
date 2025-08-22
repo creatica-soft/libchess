@@ -171,7 +171,7 @@ int main(int argc, char ** argv) {
   if (!white) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for white\n", WHITE_PATH);
   //else fprintf(stderr, "initilized chess engine %s for white\n", white->id);
   
-  black = initChessEngine(BLACK_PATH, MOVETIME, DEPTH, 128, 1, SYZYGY_PATH, 1, false, true, ELO_BLACK);
+  black = initChessEngine(BLACK_PATH, MOVETIME, DEPTH, 128, 1, SYZYGY_PATH, 1, true, true, ELO_BLACK);
   if (!black) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for black\n", BLACK_PATH);
   //else fprintf(stderr, "initilized chess engine %s for black\n", black->id);
 
@@ -199,7 +199,7 @@ int main(int argc, char ** argv) {
   		fprintf(stderr, "error: failed to open/create a file %s: %s\n", filename, strerror(errno));
   		exit(1);
   	}
-  	fprintf(file, "Test chess engine options:\nDirichletEpsilon %.2f\nDirichletAlpha %.2f\nExplorationConstant %.1f\nProbabilityMass %ld%%\n\n", (float)white->optionSpin[DirichletEpsilon].value / 100.0, (float)white->optionSpin[DirichletAlpha].value / 100.0, (float)white->optionSpin[ExplorationConstant].value / 100.0, white->optionSpin[ProbabilityMass].value);
+  	fprintf(file, "Test chess engine options:\nDirichletEpsilon %.2f\nDirichletAlpha %.2f\nExplorationConstant %.1f\nProbabilityMass %lld%%\n\n", (float)white->optionSpin[DirichletEpsilon].value / 100.0, (float)white->optionSpin[DirichletAlpha].value / 100.0, (float)white->optionSpin[ExplorationConstant].value / 100.0, white->optionSpin[ProbabilityMass].value);
     e_white = 1 / (1 + pow(10, (double)(ELO_BLACK - ELO_WHITE) / 400.0)); //expected white score
     e_black = 1.0 - e_white; //expected black score
     score_white = 0;

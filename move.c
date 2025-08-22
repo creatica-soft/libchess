@@ -17,7 +17,7 @@ extern "C" {
 /// returns string representation in the first argument
 /// of a bit field move type given in a secondary argument
 ///</summary>
-void getMoveType(char * mvType, unsigned char type) {
+void getMoveType(char * mvType, unsigned int type) {
 	//unsigned char N = bitCount((unsigned long long)type);
 	mvType[0] = '\0';
 	unsigned int i;
@@ -42,7 +42,7 @@ unsigned char moveCandidateScore(struct Square * sq, int srcFile, int srcRank)
 	return score;
 }
 
-bool parseUciMove(char * move) {
+bool parseUciMove(const char * move) {
 	// regex "^[a-h][1-8][a-h][1-8][bnqr]?$"
 	char promo[] = "bnqr";
 	size_t len = strlen(move);
@@ -86,7 +86,7 @@ int validateSanMove(struct Move * move) {
 	else if (strcmp(sanMove, "O-O") == 0)
 		castlingSide = CastlingSideKingside;
 	//promo regex "[a-h](?:x[a-h])?[18]\=[BNQR]"
-	char pieces[] = "NBRQ";
+	const char pieces[] = "NBRQ";
 	if (sanMove[0] >= 'a' && sanMove[0] <= 'h') {
 		if (sanMove[1] == '1' || sanMove[1] == '8') {
 			if (sanMove[2] == '=') {
@@ -175,7 +175,7 @@ int validateSanMove(struct Move * move) {
 			if (dstFile == FileNone) dstFile = x;
 			else srcFile = x;
 		} else {
-			char pieces[] = ".xNBRQK";
+			const char pieces[] = ".xNBRQK";
 			char * idx = strchr(pieces, sanMove[i]);
 			if (idx) {
 				long long pieceIndex = idx - pieces;
@@ -239,7 +239,7 @@ int validateSanMove(struct Move * move) {
 		//get a bitboard of squares where moving piece names (for example, white knights) are
 		unsigned long long cp = move->chessBoard->occupations[move->chessBoard->movingPiece.name];
 		struct Square * s;
-		unsigned char n = 0; //number of candidates
+		int n = 0; //number of candidates
 		s = (struct Square *)malloc(sizeof(struct Square));
 		//iterate over all squares where movingPiece.name are located
 		square(s, lsBit(cp));
@@ -255,7 +255,7 @@ int validateSanMove(struct Move * move) {
 				} else { //otherwise add this square to moveCandidates squares
 					if (n >= 10) {
 				    printf("validateSanMove() error: too many move candidates for %s\n", sanMove);
-				    for (unsigned char i = 0; i < n; i++) free(moveCandidates[i]);
+				    for (int i = 0; i < n; i++) free(moveCandidates[i]);
 				    writeDebug(move->chessBoard, false);
 				    return 1;
 					}				
@@ -286,7 +286,7 @@ int validateSanMove(struct Move * move) {
 		if (n == 0) free(s); //free square s if there are no candidates
 		//if moving piece source square is still unknown (i.e. its not a pawn or a king)
 		if (move->chessBoard->movingPiece.square.name == SquareNone) {
-			unsigned char t, maxT = 0;
+			int t, maxT = 0;
 			//score move candidates such as 
 			//if both src rank and src file are the same as square s ones, rate them as the most probable (4)
 			//if only src rank is the same, rate them below (3)
@@ -298,7 +298,7 @@ int validateSanMove(struct Move * move) {
 			//for example, maxTcandidates[4] = 1 means that there is one candidate with rating 4
 			//it should be only one candidate with the highest rating, otherwise, the move is ambigious
 			int maxTcandidates[5] = {0, 0, 0, 0, 0}; 
-			for (unsigned char i = 0; i < n; i++) {
+			for (int i = 0; i < n; i++) {
 				t = moveCandidateScore(moveCandidates[i], srcFile, srcRank);
 				maxTcandidates[t]++;
 				if (t > maxT) {
@@ -308,13 +308,13 @@ int validateSanMove(struct Move * move) {
 			}
 			if (maxTcandidates[maxT] == 1) {
   			square(&(move->chessBoard->movingPiece.square), moveCandidates[maxI]->name);
-  			for (unsigned char i = 0; i < n; i++) free(moveCandidates[i]);
+  			for (int i = 0; i < n; i++) free(moveCandidates[i]);
   		}
 			else {
 				getMoveType(mvType, move->type);
 				printf("validateSanMove() error: ambiguous move %s, moveType %s, srcRank %c, srcFile %c, max candidate rating %d, max candidates %d\n", move->sanMove, mvType, enumRanks[srcRank], enumFiles[srcFile], maxT, n);
 				writeDebug(move->chessBoard, true);
-  			for (unsigned char i = 0; i < n; i++) free(moveCandidates[i]);
+  			for (int i = 0; i < n; i++) free(moveCandidates[i]);
 				return 1;
 			}
 		}
@@ -423,7 +423,7 @@ void uci2san(struct Move * move) {
 		strcpy(move->sanMove, "O-O");
 		return;
 	}
-	unsigned char i = 0;
+	int i = 0;
 	if (move->chessBoard->movingPiece.type != Pawn)
 		move->sanMove[i++] = pieceLetter[move->chessBoard->movingPiece.type];
 	else if ((move->type & MoveTypeCapture) == MoveTypeCapture)
@@ -436,7 +436,7 @@ void uci2san(struct Move * move) {
 		struct Square * s;
 		s = (struct Square *)malloc(sizeof(struct Square));
 		square(s, lsBit(cp));
-		unsigned char idx = 0;
+		int idx = 0;
 		while (s->name < SquareNone) {
 			if ((move->chessBoard->movesFromSquares[s->name] & move->destinationSquare.bitSquare) > 0) {
 				moveCandidates[idx++] = s;
@@ -456,7 +456,7 @@ void uci2san(struct Move * move) {
 			square(s, lsBit(cp));
 		}
 		if (idx == 0) free(s);
-		for (unsigned char j = 0; j < idx; j++) {
+		for (int j = 0; j < idx; j++) {
 			if (move->chessBoard->movingPiece.square.name == moveCandidates[j]->name) continue;
 			if (move->chessBoard->movingPiece.square.rank == moveCandidates[j]->rank)
 				move->sanMove[i++] = move->chessBoard->movingPiece.square.file + 'a';
@@ -487,8 +487,8 @@ void setUciMoveType(struct Move * move) {
 	//Is move a promotion?
 	if (strlen(move->uciMove) == 5) {
 		move->type |= MoveTypePromotion;
-		char promo[7];
-		strncpy(promo, "..nbrq", 6);
+		const char promo[7] = "..nbrq";
+		//strncpy(promo, "..nbrq", 6);
 		char * idx = strchr(promo, move->uciMove[4]);
 		if (idx)
 			move->chessBoard->promoPiece = (int)((move->chessBoard->fen->sideToMove << 3) | (idx - promo));
@@ -540,7 +540,7 @@ void setUciMoveType(struct Move * move) {
 				return;
 			}
 		} else {
-			char diff = move->sourceSquare.name - move->destinationSquare.name;
+			int diff = move->sourceSquare.name - move->destinationSquare.name;
 			if (abs(diff) == 2) {
 				int dstKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
 				if (move->destinationSquare.name == dstKingSquare[1][move->chessBoard->fen->sideToMove])
@@ -556,7 +556,7 @@ void setUciMoveType(struct Move * move) {
 	}
 }
 
-int initMove(struct Move * move, struct Board * board, char * moveString) {
+int initMove(struct Move * move, struct Board * board, const char * moveString) {
 	if (!move || !board || !moveString) {
 		printf("initMove() error: argument(s) must not be NULL\n");
 		return 1;

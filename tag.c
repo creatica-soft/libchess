@@ -15,7 +15,7 @@ extern "C" {
 /// <summary>
 /// Parses the tag line into tag array indexed by enum Tags
 /// </summary>
-int strtotag(Tag tag, char * tagString) {
+int strtotag(Tag tag, const char * tagString) {
 	char name[MAX_TAG_NAME_LEN], value[MAX_TAG_VALUE_LEN];
 	int res = sscanf(tagString, "[%31s \"%89[^]\"]", name, value);
 	if (res != 2) {
@@ -38,7 +38,7 @@ int strtotag(Tag tag, char * tagString) {
 	return 0;
 }
 
-int strtoecotag(EcoTag tag, char * tagString) {
+int strtoecotag(EcoTag tag, const char * tagString) {
 	char name[MAX_ECO_TAG_NAME_LEN], value[MAX_TAG_VALUE_LEN];
 	int res = sscanf(tagString, "[%9s \"%89[^]\"]", name, value);
 	if (res != 2) {

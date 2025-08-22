@@ -178,18 +178,18 @@ enum CastlingRightsEnum {
 /// </summary>
 enum Color { ColorWhite, ColorBlack, ColorNone };
 
-static char * color[] = { "white", "black", "none" };
+static const char * color[] = { "white", "black", "none" };
 
 /// <summary>
 /// File enumeration from a to h
 /// </summary>
 enum Files {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone};
-static char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
+static const char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
 /// <summary>
 /// Rank enumeration from 1 to 8
 /// </summary>
 enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
-static char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
+static const char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
 static unsigned long long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
 static unsigned long long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
@@ -209,7 +209,7 @@ enum SquareName {
 	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone
 };
 
-static char * squareName[] = {
+static const char * squareName[] = {
 	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
 	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
 	"a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
@@ -244,7 +244,7 @@ enum Antidiagonals {
 /// Piece type enumeration
 /// </summary>
 enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
-static char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
+static const char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
 
 static float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
 static float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
@@ -260,13 +260,13 @@ enum PieceName {
 	BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, PieceNameBlack
 };
 
-static char * pieceName[] = {
+static const char * pieceName[] = {
 	"none", 
 	"white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "whites", "any",
 	"black pawn", "black knight", "black bishop", "black rook", "black queen", "black king", "blacks"
 };
 
-static unsigned char pieceLetter[] = {' ', 'P', 'N', 'B', 'R', 'Q', 'K', 'C', '*', 'p', 'n', 'b', 'r', 'q', 'k', 'c'};
+static const char pieceLetter[] = {' ', 'P', 'N', 'B', 'R', 'Q', 'K', 'C', '*', 'p', 'n', 'b', 'r', 'q', 'k', 'c'};
 
 enum PieceLetter { 
 	PieceLetter_e, PieceLetter_P, PieceLetter_N, PieceLetter_B, PieceLetter_R, 
@@ -279,8 +279,8 @@ enum PieceLetter {
 /// </summary>
 enum PromoLetter { PromoLetter_n = 2, PromoLetter_b, PromoLetter_r, PromoLetter_q};
 
-static unsigned char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q' };
-static unsigned char uciPromoLetter[] = { '\0', '\0', 'n', 'b', 'r', 'q', '\0' };
+static const char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q' };
+static const char uciPromoLetter[] = { '\0', '\0', 'n', 'b', 'r', 'q', '\0' };
 
 enum MoveType {
 	MoveTypeNormal, MoveTypeValid, MoveTypeCapture, MoveTypeCastlingKingside = 4, 
@@ -328,11 +328,11 @@ struct Fen {
 	/// 5th field in FEN - number of plies since last pawn advance or capture
 	/// Used in 50-move draw rule
 	/// </summary>
-	unsigned short halfmoveClock;
+	int halfmoveClock;
 	/// <summary>
 	/// 6th field in FEN - full move number
 	/// </summary>
-	unsigned short moveNumber;
+	int moveNumber;
 	/// <summary>
 	/// True if castling rights are indicated by the castling rook file instead of letters for kingside or queenside
 	/// </summary>
@@ -550,7 +550,7 @@ struct BMPR {
   //int * stage; // [batch_size]
 };
 
-static char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 static const unsigned long long STARTPOS_HASH = 0x958ee7dbd87b2d0aUL;
 static const unsigned long long STARTPOS_HASH2 = 0x4ed9a976a0f95be5UL;
 static const unsigned long long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995UL;
@@ -602,12 +602,12 @@ enum EcoTags {
 	eECO, eOpening, eVariation
 };
 
-static char * tags[] = {
+static const char * tags[] = {
 	"Unknown", "Event", "Site", "Date", "Round", "White", "Black", "Result",
 	"Annotator", "PlyCount", "TimeControl", "Time", "Termination", "Mode", "FEN", "SetUp", "Opening", "Variation", "Variant", "WhiteElo", "BlackElo", "ECO"
 };
 
-static char * ecotags[] = {
+static const char * ecotags[] = {
 	"ECO", "Opening", "Variation"
 };
 
@@ -615,21 +615,10 @@ enum Variant {
 	Standard, Chess960
 };
 
-static char * variant[] = {
+static const char * variant[] = {
 	"Standard", "chess 960"
 };
 
-/*struct Tag {
-	/// <summary>
-	/// Tag name
-	/// </summary>
-	enum Tags name;
-	/// <summary>
-	/// Tag value
-	/// </summary>
-	char value[80];
-};
-*/
 typedef char Tag[MAX_NUMBER_OF_TAGS][MAX_TAG_VALUE_LEN];
 
 typedef char EcoTag[MAX_NUMBER_OF_ECO_TAGS][MAX_TAG_VALUE_LEN];
@@ -743,7 +732,7 @@ CHESS_API int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dat
 /// validates a UCI or SAN move given by the last argument
 /// and initializes the Move struct on a given board
 ///</summary>
-CHESS_API int initMove(struct Move *, struct Board *, char *);
+CHESS_API int initMove(struct Move * move, struct Board * board, const char * moveString);
 CHESS_API void init_move(struct Move * move, struct Board * board, int src, int dst);
 CHESS_API bool promoMove(struct Board * board, int src, int dst);
 
@@ -757,20 +746,20 @@ CHESS_API void makeMove(struct Move * move);
 /// Parses the line into tag name and tag value
 /// and fills the given Tag array
 /// </summary>
-CHESS_API int strtotag(Tag tag, char *);
+CHESS_API int strtotag(Tag tag, const char * tagString);
 
 /// <summary>
 /// Parses the line into tag name and tag value
 /// and fills the given EcoTag array
 /// </summary>
-CHESS_API int strtoecotag(EcoTag, char *);
+CHESS_API int strtoecotag(EcoTag, const char * tagString);
 
 ///<summary>
 /// Count number of games, which begin with a string specified by the second argument
 /// from a FILE stream and index them by a game start position in the array long long[].
 /// The last argument is the number of games
 ///</summary>
-CHESS_API unsigned long long countGames(FILE *, char *, unsigned long long[], unsigned long long);
+CHESS_API unsigned long long countGames(FILE *, const char *, unsigned long long gameStartPositions[], unsigned long long maxNumberOfGames);
 
 ///<summary>
 /// Reads PGN game tags for a first game pointed by a file stream
@@ -803,13 +792,13 @@ CHESS_API int eTags(EcoTag, FILE *);
 
 //functions for fast data loading in AI model training
 //int initGamesFromPGNs(char * fileNames[], int numberOfFiles, int minElo, int maxEloDiff);
-CHESS_API struct BMPR * dequeueBMPR();
-CHESS_API void * getGame(void * context);
-CHESS_API void * getGameCsv(void * context);
-CHESS_API void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const int gameStage, const unsigned long long steps);
-CHESS_API void free_bmpr(struct BMPR * bmpr);
-CHESS_API int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
-CHESS_API int getStage(struct Board * board);
+//CHESS_API struct BMPR * dequeueBMPR();
+//CHESS_API void * getGame(void * context);
+//CHESS_API void * getGameCsv(void * context);
+//CHESS_API void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const int gameStage, const unsigned long long steps);
+//CHESS_API void free_bmpr(struct BMPR * bmpr);
+//CHESS_API int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
+//CHESS_API int getStage(struct Board * board);
 //float materialBalance(struct Board * board); //from the view of side to move
 CHESS_API void cleanup_magic_bitboards(void);
 CHESS_API void init_magic_bitboards(void);
@@ -851,9 +840,9 @@ CHESS_API int reconcile(struct Board *);
 
 ///<summary>
 /// returns string representation in the first argument
-/// of a bit field move type given in a secondary argument
+/// of a bit field move type given in the second argument
 ///</summary>
-CHESS_API void getMoveType(char *, unsigned char);
+CHESS_API void getMoveType(char *, unsigned int);
 
 ///<summary>
 /// ECO classificator for a chess game (first argument)
@@ -875,7 +864,7 @@ CHESS_API void releaseChessEngine(struct Engine * chessEngine);
 ///<summary>
 /// returns chess engine option index for a given name and type
 ///</summary>
-CHESS_API int nametoindex(struct Engine *, char *, int optionType);
+CHESS_API int nametoindex(struct Engine *, const char *, int optionType);
 
 ///<summary>
 /// gets chess engine options
@@ -883,7 +872,7 @@ CHESS_API int nametoindex(struct Engine *, char *, int optionType);
 //int getOptions(char *, struct Engine *);
 CHESS_API int getOptions(struct Engine *);
 
-CHESS_API int setOption(struct Engine *, char *, int optionType, void *);
+CHESS_API int setOption(struct Engine *, const char *, int optionType, void *);
 CHESS_API void setOptions(struct Engine *);
 
 CHESS_API bool isReady(struct Engine *);
@@ -895,7 +884,7 @@ CHESS_API bool position(struct Engine *);
 CHESS_API int go(struct Engine *, struct Evaluation **);
 CHESS_API float eval(struct Engine *);
 
-CHESS_API unsigned long long md5(char *);
+//CHESS_API unsigned long long md5(char *);
 
 ///<summary>
 /// This function returns the number of moves for a given Zobrist hash and 
@@ -905,7 +894,7 @@ CHESS_API unsigned long long md5(char *);
 /// can be 1, 2, 4 or 8. Therefore, X ranges from 0 to 7, i.e. 0 for 1 thread, 0 to 1 for 2 threads,
 /// 0 to 3 for 4 threads and 0 to 7 for 8 threads
 ///</summary>
-CHESS_API int nextMoves(unsigned long long, struct MoveScoreGames **, int);
+//CHESS_API int nextMoves(unsigned long long, struct MoveScoreGames **, int);
 
 ///<summary>
 /// This function is similar to nextMoves except it returns the sorted array of moveScores
@@ -913,7 +902,7 @@ CHESS_API int nextMoves(unsigned long long, struct MoveScoreGames **, int);
 /// where score = score / totalNumberOfGames for a given position
 /// The last arg is the number of sql threads, which should be 1, 2, 4 or 8 depending on how many db files you have
 ///</summary>
-CHESS_API int bestMoves(unsigned long long, int color, struct MoveScores *, int);
+//CHESS_API int bestMoves(unsigned long long, int color, struct MoveScores *, int);
 
 /*
 void libchess_init_nnue(const char * nnue_file);
