@@ -235,10 +235,10 @@ extern "C" {
   	enum PieceName side = (enum PieceName)((temp_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
   	unsigned long long any = temp_board->occupations[side]; 
   	while (any) {
-  	  int src = __builtin_ctzl(any);
+  	  int src = lsBit(any);
   	  unsigned long long moves = temp_board->sideToMoveMoves[src];
   	  while (moves) {
-    	  int dst = __builtin_ctzl(moves);
+    	  int dst = lsBit(moves);
         init_move(move, temp_board, src, dst);
         double res = evaluate_nnue(temp_board, move, ctx);
         if (res > best_value) best_value = res;
@@ -352,10 +352,10 @@ The tree is stored using UTHash with a composite key (zobrist, move), where zobr
       	enum PieceName side = (enum PieceName)((sim_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
       	unsigned long long any = sim_board->occupations[side]; 
       	while (any) {
-      	  int src = __builtin_ctzl(any);
+      	  int src = lsBit(any);
       	  unsigned long long moves = sim_board->sideToMoveMoves[src];
       	  while (moves) {
-        	  int dst = __builtin_ctzl(moves);
+        	  int dst = lsBit(moves);
             init_move(&move, sim_board, src, dst);
             //evaluate_nnue() returns result in pawns (not centipawns!)
             //stockfish makes the move, so the res is from the perspective of sim_board->opponentColor

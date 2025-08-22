@@ -49,7 +49,7 @@ int dbinit(sqlite3 * pDb, int cacheSizeKB, int mmapSizeB, bool journalMode) {
 	return 0;
 }
 
-int dbsearch(sqlite3 * pDb, unsigned long hash, enum Color sideToMove, int multiPV, double rareMoveThreshold, char ** best_move) {
+int dbsearch(sqlite3 * pDb, unsigned long long hash, enum Color sideToMove, int multiPV, double rareMoveThreshold, char ** best_move) {
   int res, num;
   sqlite3_stmt *pStmt;
   char stmt[128];
@@ -159,7 +159,7 @@ int dbcommit(sqlite3 * pDb) {
   return 0;
 }
 
-int dbsearchGame(sqlite3 * pDb, unsigned long gameHash) {
+int dbsearchGame(sqlite3 * pDb, unsigned long long gameHash) {
   int res, num;
   sqlite3_stmt *pStmt;
   char stmt[128];
@@ -180,7 +180,7 @@ int dbsearchGame(sqlite3 * pDb, unsigned long gameHash) {
   }
   int res2 = sqlite3_step(pStmt);
   //if (res2 == SQLITE_ROW)
-  //  printf("%lx %s\n", (unsigned long)sqlite3_column_int64(pStmt, 0), sqlite3_column_text(pStmt, 1));
+  //  printf("%lx %s\n", (unsigned long long)sqlite3_column_int64(pStmt, 0), sqlite3_column_text(pStmt, 1));
   res = sqlite3_finalize(pStmt);
   if (res != SQLITE_OK) {
     printf("dbsearchGame: sqlite3_finalize(pStmt) returned %d (%s)\n", res, sqlite3_errstr(res));
@@ -214,7 +214,7 @@ int dbsearchGame(sqlite3 * pDb, unsigned long gameHash) {
   return 1;
 }  
 
-int dbupdate(sqlite3 * pDb, unsigned long hash, char * next_move, int score, unsigned long gameHash) {
+int dbupdate(sqlite3 * pDb, unsigned long long hash, char * next_move, int score, unsigned long long gameHash) {
   int res, _score, games, num;
   sqlite3_stmt *pStmt;
   char stmt[128];

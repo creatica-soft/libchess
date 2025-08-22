@@ -11,7 +11,7 @@ unsigned int leftrotate(unsigned int F, unsigned int s) {
 }
 
 //For chess I just need 64-bit unsigned int as the output
-unsigned long md5(char * msg) {
+unsigned long long md5(char * msg) {
   //All variables are unsigned 32 bit and wrap modulo 2^32 when calculating 
   unsigned int s[64], K[64];
   // s specifies the per-round shift amounts
@@ -263,9 +263,9 @@ unsigned long md5(char * msg) {
   b0 = (b0 << 24) & 0xff000000 | (b0 << 8) & 0xff0000 | (b0 >> 8) & 0xff00 | (b0 >> 24);
   a0 = (a0 << 24) & 0xff000000 | (a0 << 8) & 0xff0000 | (a0 >> 8) & 0xff00 | (a0 >> 24);
 
-  unsigned long digestH, digestL;
-  digestH = (unsigned long)a0 << 32 | (unsigned long)b0;
-  digestL = (unsigned long)c0 << 32 | (unsigned long)d0; 
+  unsigned long long digestH, digestL;
+  digestH = (unsigned long long)a0 << 32 | (unsigned long long)b0;
+  digestL = (unsigned long long)c0 << 32 | (unsigned long long)d0; 
   
   //The below is the original output of MD5
   //sprintf(res, "%lx%lx", digestH, digestL);

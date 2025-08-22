@@ -10,10 +10,11 @@
 #include <atomic>
 #include <cstdarg>
 #endif
-#include <fcntl.h>
-#include <unistd.h>
+//#include <fcntl.h>
+//#include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <stdarg.h>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -37,7 +38,7 @@ std::condition_variable cv;
 bool searchFlag = false;
 std::atomic<bool> stopFlag = false;
 bool quitFlag = false;
-int logfile;
+FILE * logfile;
 double timeAllocated = 0.0; //ms
 struct Board * board = nullptr;
 char best_move[6] = "";
@@ -65,8 +66,9 @@ void log_file(const char * message, ...) {
   std::lock_guard<std::mutex> lock(log_mtx);
   va_list args;
   va_start(args, message);
-  vdprintf(logfile, message, args);
+  vfprintf(logfile, message, args);
   va_end(args);
+  fflush(logfile);
 }
 
 void print(const char * message, ...) {
@@ -270,8 +272,14 @@ void search_thread_func() {
                   exit(-1);
               }
           }
-          strtofen(board->fen, tempFen);
-          fentoboard(board->fen, board);
+          if (strtofen(board->fen, tempFen)) {
+            log_file("handlePosition() error: strtofen() returned non-zero code, fen %s\n", tempFen);
+            exit(-1);
+          }
+          if (fentoboard(board->fen, board)) {
+            log_file("handlePosition() error: fentoboard() returned non-zero code, fen %s\n", board->fen->fenString);
+            exit(-1);
+          }
           getHash(board->zh, board);
           if (token != NULL && strcmp(token, "moves") == 0) {
               while ((token = strtok(NULL, " ")) != NULL) {
@@ -367,20 +375,20 @@ void search_thread_func() {
           }
       }
   
-      if (__builtin_popcountl(board->occupations[PieceNameAny]) > TB_LARGEST) {
+      if (bitCount(board->occupations[PieceNameAny]) > TB_LARGEST) {
           std::lock_guard<std::mutex> lock(mtx);
           searchFlag = true;
           stopFlag = false;
           cv.notify_one(); // Start search
       } else {
         best_move[0] = '\0';
-        unsigned int ep = __builtin_ctzl(board->fen->enPassantLegalBit);
+        unsigned int ep = lsBit(board->fen->enPassantLegalBit);
         unsigned int result = tb_probe_root(board->occupations[PieceNameWhite], board->occupations[PieceNameBlack], 
-        board->occupations[WhiteKing] | board->occupations[BlackKing],
+            board->occupations[WhiteKing] | board->occupations[BlackKing],
             board->occupations[WhiteQueen] | board->occupations[BlackQueen], board->occupations[WhiteRook] | board->occupations[BlackRook], board->occupations[WhiteBishop] | board->occupations[BlackBishop], board->occupations[WhiteKnight] | board->occupations[BlackKnight], board->occupations[WhitePawn] | board->occupations[BlackPawn],
             board->fen->halfmoveClock, 0, ep == 64 ? 0 : ep, board->opponentColor == ColorBlack ? 1 : 0, NULL);
         if (result == TB_RESULT_FAILED) {
-            log_file("handleGo() error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s\n", TB_LARGEST, __builtin_popcountl(board->occupations[PieceNameAny]), board->fen->fenString);
+            log_file("handleGo() error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s\n", TB_LARGEST, bitCount(board->occupations[PieceNameAny]), board->fen->fenString);
             exit(-1);
         }
         unsigned int wdl      = TB_GET_WDL(result); //0 - loss, 4 - win, 1..3 - draw
@@ -473,19 +481,22 @@ void setEngineOptions() {
 }
 
 int main(int argc, char **argv) {
+    TB_LARGEST = 0;
     struct Fen fen;
+    memset(&fen, 0, sizeof(struct Fen));
     struct ZobristHash zh;
+    memset(&zh, 0, sizeof(struct ZobristHash));
     struct Board chess_board;
+    memset(&chess_board, 0, sizeof(struct Board));
     chess_board.fen = &fen;
     zobristHash(&zh);
     chess_board.zh = &zh;
     board = &chess_board;
-    logfile = open("uci.log", O_RDWR | O_APPEND | O_CREAT | O_TRUNC);
-    fchmod(logfile, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    logfile = fopen("uci.log", "w");
     srand(time(NULL)); 
     init_magic_bitboards();
     init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
-    
+    memset(&chessEngine, 0, sizeof(struct Engine));
     setEngineOptions();
 
     // Start the search thread
@@ -495,6 +506,6 @@ int main(int argc, char **argv) {
     
     cleanup_nnue();
     cleanup_magic_bitboards();
-    close(logfile);
+    fclose(logfile);
     return 0;
 }

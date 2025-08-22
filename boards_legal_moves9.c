@@ -33,7 +33,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
       bitBoard = board->occupations[pn];
       if (bitBoard) offset = sampleXchannels + channel * 64;
       while (bitBoard) { //loop over occupations of the same piece types of the same color
-        sq = __builtin_ctzl(bitBoard);
+        sq = lsBit(bitBoard);
         boards_legal_moves[offset + sq] = 1.0;
         bitBoard &= bitBoard - 1;
       } //end of while bitBoard loop over occupations of the same piece types for a given color
@@ -66,7 +66,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     else if (i == 10) bitBoard = board->fen->castlingBits;
     offset = sampleXchannels + channel * 64;
     while (bitBoard) { //loop over occupations of the same piece types of the same color
-      sq = __builtin_ctzl(bitBoard);
+      sq = lsBit(bitBoard);
       boards_legal_moves[offset + sq] = 1.0;
       bitBoard &= bitBoard - 1;
     } //end of while bitBoard loop over occupations of the same piece types for a given color
@@ -78,7 +78,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     bitBoard = board->sideToMoveMoves[sn];
     if (bitBoard) offset = sampleXchannels + channel * 64;
     while (bitBoard) {
-      sq = __builtin_ctzl(bitBoard);
+      sq = lsBit(bitBoard);
       boards_legal_moves[offset + sq] = 1.0;
       bitBoard &= bitBoard - 1;      
     }

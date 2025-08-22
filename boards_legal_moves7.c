@@ -37,7 +37,7 @@ float moveValue(struct Board * board, enum SquareName src, enum SquareName dst) 
   for (enum PieceType p = Pawn; p < pt; p++) { 
     bitBoard = board->occupations[shiftedColor | p];
     while (bitBoard) { //for all opponent pieces that inferior than pt
-      s = __builtin_ctzl(bitBoard);
+      s = lsBit(bitBoard);
       if ((board->movesFromSquares[s] & (1UL << src)) && !(board->movesFromSquares[s] & (1UL << dst)))
         return 1.0; //try to prioritise moves for pieces attacked by an inferior piece (included pinned one)
       if (board->movesFromSquares[s] & (1UL << dst))
@@ -103,7 +103,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
       if (bitBoard) {
         offset = sampleXchannels + channel * 64; 
         offset2 = offset + 64 * 42; //move control squares and moves channels to the end
-        src = __builtin_ctzl(bitBoard); //src square for a pawn
+        src = lsBit(bitBoard); //src square for a pawn
         boards_legal_moves[offset + src] = 1.0;
         //printf("boardLegalMoves(%d): %s board->channel[%s] = %d\n", omp_get_thread_num(), pieceName[pawn], squareName[src], channel - 21);
         board->channel[src] = channel - 21; // 0 to 7 - pawn channels for moves (channel is incremented from 0 to 41)
@@ -118,7 +118,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
         }
 */
         while (bitBoard2) { //loop over pawn moves (for opponent these are just diagonal pawn moves)
-          dst = __builtin_ctzl(bitBoard2);
+          dst = lsBit(bitBoard2);
           /*
           if (board->fen->sideToMove == color) {
             unsigned char diff = src > dst ? src - dst : dst - src;
@@ -143,7 +143,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
         if (bitBoard) {
           offset = sampleXchannels + channel * 64;
           offset2 = offset + 64 * 42;
-          src = __builtin_ctzl(bitBoard);
+          src = lsBit(bitBoard);
           //printf("boardLegalMoves(%d): %s board->channel[%s] = %d\n", omp_get_thread_num(), pieceName[pn], squareName[src], channel - 21);
           board->channel[src] = channel - 21; // 8-10 (knight move channels), 11-13 (bishop), 14-16 (rook), 17-19 (queen)
           board->sourceSquare[channel - 21] = src;
@@ -168,7 +168,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
           }
 */
           while (bitBoard2) {
-            dst = __builtin_ctzl(bitBoard2);
+            dst = lsBit(bitBoard2);
             //pnCount[pn][dst]++;
             boards_legal_moves[offset2 + dst] = 1.0; 
             bitBoard2 &= bitBoard2 - 1;    
@@ -189,7 +189,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     bitBoard = board->occupations[king];
     offset = sampleXchannels + channel * 64;
     offset2 = offset + 64 * 42;
-    src = __builtin_ctzl(bitBoard);
+    src = lsBit(bitBoard);
     //printf("boardLegalMoves(%d): %s board->channel[%s] = %d\n", omp_get_thread_num(), pieceName[king], squareName[src], channel - 21);
     board->channel[src] = channel - 21; // channel 20 is king moves
     board->sourceSquare[channel - 21] = src;
@@ -197,7 +197,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
     bitBoard2 = board->movesFromSquares[src];
     //if (board->fen->sideToMove == color) attackedUndefended |= bitBoard2 & oUndefended;
     while (bitBoard2) {
-      dst = __builtin_ctzl(bitBoard2);
+      dst = lsBit(bitBoard2);
       //pnCount[king][dst]++;
       boards_legal_moves[offset2 + dst] = 1.0;
       bitBoard2 &= bitBoard2 - 1;    
@@ -211,7 +211,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   //this does not work
   if (attackedSuperior) offset = sampleXchannels + channel * 64;
   while (attackedSuperior) {
-    dst = __builtin_ctzl(attackedSuperior);
+    dst = lsBit(attackedSuperior);
     boards_legal_moves[offset + dst] = 1.0; //take a superior piece from this square
     attackedSuperior &= attackedSuperior - 1;
   }
@@ -220,7 +220,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   //this does not work
   if (attackedUndefended) offset = sampleXchannels + channel * 64;
   while (attackedUndefended) {
-    dst = __builtin_ctzl(attackedUndefended);
+    dst = lsBit(attackedUndefended);
     boards_legal_moves[offset + dst] = 1.0; //take a piece from this undefended square
     attackedUndefended &= attackedUndefended - 1;
   }
@@ -230,7 +230,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   //this does not work
   if (attackedByInferior) offset = sampleXchannels + channel * 64;
   while (attackedByInferior) {
-    src = __builtin_ctzl(attackedByInferior);
+    src = lsBit(attackedByInferior);
     boards_legal_moves[offset + src] = 1.0; //move away from this square attacked by inferior piece
     attackedByInferior &= attackedByInferior - 1;
   }
@@ -241,7 +241,7 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   //so this should be multiple per piece channels!
   if (controlledByInferior) offset = sampleXchannels + channel * 64;
   while (controlledByInferior) {
-    dst = __builtin_ctzl(controlledByInferior);
+    dst = lsBit(controlledByInferior);
     boards_legal_moves[offset + dst] = 1.0; //avoid moves to these controlled by inferior pieces squares
     controlledByInferior &= controlledByInferior - 1;
   }
@@ -277,10 +277,10 @@ int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct
   bitBoard = all; //all sideToMove occupations
   //for (src = SquareA1; src <= SquareH8; src++) { //not sure which loop is faster, probably depends on the number of pieces
   while (bitBoard) { //loop over all sideToMove pieces
-    src = __builtin_ctzl(bitBoard); //sideToMove piece src square
+    src = lsBit(bitBoard); //sideToMove piece src square
     bitBoard2 = board->sideToMoveMoves[src]; //all moves from src square
     while (bitBoard2) { //loop over moves from src square
-      dst = __builtin_ctzl(bitBoard2); // destination square for a move
+      dst = lsBit(bitBoard2); // destination square for a move
       float value = pieceValue[board->piecesOnSquares[dst] & 7] - pieceValue[board->piecesOnSquares[src] & 7];
       enum PieceName last = board->piecesOnSquares[src];
       while (true) {

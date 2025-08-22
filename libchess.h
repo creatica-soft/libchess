@@ -6,7 +6,16 @@
 /// use -O0 -g for debugging with lldb or gdb instead of -O3 (lldb ./test, then run, and if crashes, bt)
 
 /// To compile on alpine linux, run:
-/// g++ -std=c++17 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -Wno-strncat-size -fPIC -O0 -g -o libchess.so bitscanner.c board.c engine.c fen.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -lsqlite3
+/// g++ -std=c++17 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -Wno-strncat-size -fPIC -O3 -o libchess.so bitscanner.c board.c engine.c fen.c move.c piece.c square.c tag.c zobrist-hash.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
+/// 
+
+
+/// To build for Windows using mingw
+/// g++ -std=c++17 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -fPIC -O3 -o libchess.dll bitscanner.c board.c engine.cpp fen.c move.c piece.c square.c tag.c zobrist-hash.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
+/// 
+/// or in MSYS2 MINGW with clang
+/// clang++ -std=c++17 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -o libchess.dll bitscanner.c board.c engine.c fen.c move.c piece.c square.c tag.c zobrist-hash.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
+/// 
 
 /// To build python bindings, use:
 /// conda install cffi
@@ -15,6 +24,18 @@
 /// python3.12 tasks.py (it should produce chess.cpython-312-darwin.so from libchess.so and libchess.ph)
 /// python3.12 test.py (to test chess module stored in chess.cpython-312-darwin.so)
 ///
+#pragma once
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #define CHESS_API __declspec(dllexport)
+#else
+  #define CHESS_API
+#endif
+
+#ifdef _WIN32
+#define strtok_r strtok_s
+#endif
+
 
 #include <stdbool.h>
 //#include <wchar.h>
@@ -32,8 +53,15 @@ extern "C" {
 
 #define MAX_PIPE_NAME_LEN 256
 #define MAX_ENGINE_NAME_LEN 128
+
+#ifdef _WIN32
+#define TO_ENGINE_NAMED_PIPE_PREFIX "\\\\.\\pipe\\to_engine_"
+#define FROM_ENGINE_NAMED_PIPE_PREFIX "\\\\.\\pipe\\from_engine_"
+#else
 #define TO_ENGINE_NAMED_PIPE_PREFIX "/tmp/to_chess_engine_pipe"
 #define FROM_ENGINE_NAMED_PIPE_PREFIX "/tmp/from_chess_engine_pipe"
+#endif
+
 #define MAX_NUMBER_OF_GAME_THREADS 16 //these threads just process pgn files
 #define MAX_NUMBER_OF_SQL_THREADS 8 //these threads just update NextMovesX.db, where X is thread number. 
                                     //Use power of 2, i.e. 1, 2, 4, 8. 8 is max!
@@ -107,14 +135,14 @@ static unsigned long long ranks_bb[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6
 // B-tree minimum degree (adjust based on performance needs)
 #define T 32
 typedef struct BTreeNode {
-    unsigned long keys[2 * T - 1];    // Array of keys
+    unsigned long long keys[2 * T - 1];    // Array of keys
     struct BTreeNode *children[2 * T]; // Array of child pointers
     int num_keys;                 // Current number of keys
     bool is_leaf;                 // Leaf node flag
 } BTreeNode;
 
-bool BTreeSearch(BTreeNode *, unsigned long);
-BTreeNode* BTreeInsert(BTreeNode*, unsigned long);
+bool BTreeSearch(BTreeNode *, unsigned long long);
+BTreeNode* BTreeInsert(BTreeNode*, unsigned long long);
 void BTreeCleanUp(BTreeNode * root, void * db);
 */
 
@@ -163,8 +191,8 @@ static char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
 enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
 static char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
-static unsigned long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
-static unsigned long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
+static unsigned long long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
+static unsigned long long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
 
 /// <summary>
 /// Square enumeration
@@ -218,8 +246,8 @@ enum Antidiagonals {
 enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
 static char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
 
-static float pieceValue[] = { 0.0, 0.1, 0.30, 0.32, 0.50, 0.90, 1.0 }; //scaled down by kings value of 10
-static float pieceMobility[] = { 0.0, 4.0, 8.0, 11.0, 14.0, 25.0, 8.0 }; //max value - used for norm
+static float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
+static float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
 
 /// <summary>
 /// Piece enumeration: first three bits are used to encode the type, fourth bit defines the color.
@@ -295,7 +323,7 @@ struct Fen {
 	/// In X-FEN it is only setup when the opposite side can actually capture, although illegal captures (when pinned, for example) may not be checked
 	/// </summary>
 	int enPassant;
-	unsigned long enPassantLegalBit;
+	unsigned long long enPassantLegalBit;
 	/// <summary>
 	/// 5th field in FEN - number of plies since last pawn advance or capture
 	/// Used in 50-move draw rule
@@ -310,10 +338,10 @@ struct Fen {
 	/// </summary>
 	bool isChess960;
 	/// <summary>
-	/// Castling rook files for chess 960 position indexed by side: 0 - kingside castling (short), 1 - queenside castling (long) and by color: 0 - white, 1 - black
+	/// Castling rook files for chess 960 position indexed by side: 0 - kingside castling (short), 1 - queenside castling (long long) and by color: 0 - white, 1 - black
 	/// </summary>
 	int castlingRook[2][2];
-	unsigned long castlingBits; //rook squares if casling with that rook is allowed by FEN
+	unsigned long long castlingBits; //rook squares if casling with that rook is allowed by FEN
 };
 
 enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationConstant, DirichletAlpha, DirichletEpsilon};
@@ -335,10 +363,10 @@ static const char * optionTypes[] = {
 ///</summary>
 struct OptionSpin {
 	char name[MAX_UCI_OPTION_NAME_LEN];
-	long defaultValue;
-	long value;
-	long min;
-	long max;
+	long long defaultValue;
+	long long value;
+	long long min;
+	long long max;
 };
 
 ///<summary>
@@ -392,21 +420,21 @@ struct Engine {
 	char namedPipeFrom[255];
 	char position[MAX_FEN_STRING_LEN]; //FEN string
 	char moves[MAX_UCI_MOVES_LEN]; //UCI moves
-	int logfile;
+	FILE * logfile;
 	//go() arguments
-	long movetime;
+	long long movetime;
 	int depth;
 	int seldepth;
 	int currentDepth;
-	unsigned long nodes;
-	unsigned long currentNodes;
+	unsigned long long nodes;
+	unsigned long long currentNodes;
 	int mate;
 	bool ponder;
 	bool infinite;
-	long wtime;
-	long btime;
-	long winc;
-	long binc;
+	long long wtime;
+	long long btime;
+	long long winc;
+	long long binc;
 	int movestogo;
 	char * searchmoves;
 	FILE * toEngine;
@@ -420,11 +448,11 @@ struct Evaluation {
 	unsigned char multipv;
 	int scorecp;
 	int matein; //mate in <moves>, not <plies>
-	unsigned long nodes;
-	unsigned long nps;
+	unsigned long long nodes;
+	unsigned long long nps;
 	unsigned short hashful;//permill (per thousand)
 	unsigned char tbhits;
-	unsigned long time; //ms
+	unsigned long long time; //ms
 	char pv[1024];
 	char bestmove[6];
 	char ponder[6];
@@ -434,7 +462,7 @@ struct Evaluation {
 /// <summary>
 ///  Converts FEN string to struct fen
 /// </summary>
-int strtofen(struct Fen *, const char *);
+CHESS_API int strtofen(struct Fen *, const char *);
 
 /// <summary>
 ///  Updates fenString in Fen struct
@@ -477,13 +505,13 @@ struct Board {
 	//unsigned long long oPawnMoves, oKnightMoves, oBishopMoves, oRookMoves, oQueenMoves, oKingMoves, pawnMoves, knightMoves, bishopMoves, rookMoves, queenMoves, kingMoves;
 	unsigned long long occupations[16];
 	int piecesOnSquares[64]; //array of enum PieceName
+	unsigned long long moves; //all sideToMoveMoves
 	unsigned long long movesFromSquares[64]; //these include opponents moves as well
 	unsigned long long sideToMoveMoves[64]; //these are just the moves of sideToMove
 	//unsigned long long channel[64]; //AI model input 21 channels (16 for each piece + 5 for promotions)
 	//unsigned long long sourceSquare[10]; //source square for AI channel[64] 
 	int opponentColor; //enum Color
 	int plyNumber;
-	//int numberOfMoves;
 	int capturedPiece; //enum PieceName
 	int promoPiece; //enum PieceName
 	struct ChessPiece movingPiece;
@@ -510,23 +538,23 @@ struct Move {
 };
 
 struct BMPR {
-  long samples;
-  long sample;
-  long channels;
+  long long samples;
+  long long sample;
+  long long channels;
   float * boards_legal_moves; // [batch_size, number_of_channels, 8, 8]
-  //long * move_type; // piece channel [0, 10] [batch_size]
-  //long * src_sq;
-  //long * dst_sq;
-  long * move; // encoded as src_sq * 64 + dst_sq
-  long * result; // [batch_size]
+  //long long * move_type; // piece channel [0, 10] [batch_size]
+  //long long * src_sq;
+  //long long * dst_sq;
+  long long * move; // encoded as src_sq * 64 + dst_sq
+  long long * result; // [batch_size]
   //int * stage; // [batch_size]
 };
 
 static char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-static const unsigned long STARTPOS_HASH = 0x958ee7dbd87b2d0aUL;
-static const unsigned long STARTPOS_HASH2 = 0x4ed9a976a0f95be5UL;
-static const unsigned long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995UL;
-static const unsigned long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8UL;
+static const unsigned long long STARTPOS_HASH = 0x958ee7dbd87b2d0aUL;
+static const unsigned long long STARTPOS_HASH2 = 0x4ed9a976a0f95be5UL;
+static const unsigned long long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995UL;
+static const unsigned long long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8UL;
 
 struct ZobristHash {
 	/// <summary>
@@ -549,7 +577,7 @@ struct ZobristHash {
 	/// <summary>
 	/// Hash of the standard chess starting position
 	/// </summary>
-//	unsigned long startPosHash;
+//	unsigned long long startPosHash;
 };
 
 struct MoveScoreGames {
@@ -566,7 +594,7 @@ struct MoveScores {
 };
 
 enum Tags {
-	Unknown, Event, Site, Date, Round, White, Black, Result,
+	UnknownTag, Event, Site, Date, Round, White, Black, Result,
 	Annotator, PlyCount, TimeControl, Time, Termination, Mode, FEN, SetUp, Opening, Variation, Variant, WhiteElo, BlackElo, ECO
 };
 
@@ -632,138 +660,136 @@ struct EcoLine {
 	EcoTag tags;
 };
 
-struct Board * cloneBoard(struct Board * src);
-void freeBoard(struct Board * board);
+CHESS_API struct Board * cloneBoard(struct Board * src);
+CHESS_API void freeBoard(struct Board * board);
 ///<summary>
 /// Generates unbiased random random number from inclusive range [min, max]
 /// The first argument is min, the second is max
 ///</summary>
-int randomNumber(const int, const int);
+CHESS_API int randomNumber(const int, const int);
 
 ///<summary>
 /// initializes a ZobristHash struct
 ///</summary>
-void zobristHash(struct ZobristHash *);
+CHESS_API void zobristHash(struct ZobristHash *);
 
 ///<summary>
 /// calculates Zobrist hash from a Board struct and updates
 /// ZobristHash struct, which should be initialized first
 ///<summary>
-void getHash(struct ZobristHash *, struct Board *);
+CHESS_API void getHash(struct ZobristHash *, struct Board *);
 
 ///<summary>
 /// resets ZobristHash struct to initial game position
 ///</summary>
-void resetHash(struct ZobristHash *);
+CHESS_API void resetHash(struct ZobristHash *);
 
 ///<summary>
 /// updates ZobristHash of a given Board after a given move
 ///</summary>
-int updateHash(struct Board *, struct Move *);
+CHESS_API int updateHash(struct Board *, struct Move *);
 
 ///<summary>
 /// fills Square struct from SquareName enum
 ///</summary>
-void square(struct Square *, int squareName);
+CHESS_API void square(struct Square *, int squareName);
 
 ///<summary>
 /// fills ChessPiece struct from a given Square and a PieceName
 ///</summary>
-void piece(struct Square *, struct ChessPiece *, int pieceName);
+CHESS_API void piece(struct Square *, struct ChessPiece *, int pieceName);
 
 ///<summary>
 /// makes a Board struct from a Fen one including legal moves generation stored in Board->movesFromSquares
 ///</summary>
-int fentoboard(struct Fen *, struct Board *);
+CHESS_API int fentoboard(struct Fen *, struct Board *);
 
 // four standard bit manupulation functions
-unsigned char bitCount(unsigned long);
-unsigned char lsBit(unsigned long);
-unsigned char genLSBit(unsigned long);
-unsigned char msBit(unsigned long);
-void unpack_bits(unsigned long number, float * bit_array);
+CHESS_API unsigned long long bitCount(unsigned long long);
+CHESS_API unsigned long lsBit(unsigned long long);
+//CHESS_API void unpack_bits(unsigned long long number, float * bit_array);
 
 ///<summary>
 /// This function strips game result from SAN moves string
 ///</summary>
-void stripGameResult(struct Game *);
+CHESS_API void stripGameResult(struct Game *);
 
 ///<summary>
 /// This function strips comments, variations and NAGs from SAN moves string
 ///</summary>
-int normalizeMoves(char *);
+CHESS_API int normalizeMoves(char *);
 
 ///<summary>
 /// This function removes move numbers from normalized SAN moves string
 ///</summary>
-int movesOnly(char *);
+CHESS_API int movesOnly(char *);
 
 ///<summary>
 /// generates all legal moves on a given board
 /// stored in movesFromSquares array of the Board struct
 ///</summary>
-void generateMoves(struct Board *);
+CHESS_API void generateMoves(struct Board *);
 
 ///<summary>
 /// This function generates board position given an array of enum PieceName[] and its size (the second argument)
 /// as well as sideToMove (third argument), castlingRights (fourth argument) and enPassant (fifth argument)
 /// The board should be passed by reference in the last argument
 ///<summary>
-void generateEndGame(int * pieceName, int numberOfPieces, int sideToMove, int castlingRights, int enPassant, struct Board *);
+CHESS_API void generateEndGame(int * pieceName, int numberOfPieces, int sideToMove, int castlingRights, int enPassant, struct Board *);
 
-int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dataset, char * engine, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool writedebug, int threads);
+CHESS_API int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dataset, char * engine, long long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool writedebug, int threads);
 
 ///<summary>
 /// validates a UCI or SAN move given by the last argument
 /// and initializes the Move struct on a given board
 ///</summary>
-int initMove(struct Move *, struct Board *, char *);
-void init_move(struct Move * move, struct Board * board, int src, int dst);
-bool promoMove(struct Board * board, int src, int dst);
+CHESS_API int initMove(struct Move *, struct Board *, char *);
+CHESS_API void init_move(struct Move * move, struct Board * board, int src, int dst);
+CHESS_API bool promoMove(struct Board * board, int src, int dst);
 
 ///<summary>
 /// makes a given Move on board and updates Board and Fen struct
 ///</summary>
-void makeMove(struct Move * move);
+CHESS_API void makeMove(struct Move * move);
 //void undoMove(struct Move * move);
 
 /// <summary>
 /// Parses the line into tag name and tag value
 /// and fills the given Tag array
 /// </summary>
-int strtotag(Tag tag, char *);
+CHESS_API int strtotag(Tag tag, char *);
 
 /// <summary>
 /// Parses the line into tag name and tag value
 /// and fills the given EcoTag array
 /// </summary>
-int strtoecotag(EcoTag, char *);
+CHESS_API int strtoecotag(EcoTag, char *);
 
 ///<summary>
 /// Count number of games, which begin with a string specified by the second argument
-/// from a FILE stream and index them by a game start position in the array long[].
+/// from a FILE stream and index them by a game start position in the array long long[].
 /// The last argument is the number of games
 ///</summary>
-unsigned long countGames(FILE *, char *, unsigned long[], unsigned long);
+CHESS_API unsigned long long countGames(FILE *, char *, unsigned long long[], unsigned long long);
 
 ///<summary>
 /// Reads PGN game tags for a first game pointed by a file stream
 /// and fills the provided array of typedef Tag
 /// returns 0 on success, non-zero on error
 ///</summary>
-int gTags(Tag, FILE *);
+CHESS_API int gTags(Tag, FILE *);
 
 ///<summary>
 /// Reads eco file tags for a first eco line pointed by a file stream
 /// and fills the provided array of typedef EcoTag
 /// returns 0 on success, non-zero on error
 ///</summary>
-int eTags(EcoTag, FILE *);
+CHESS_API int eTags(EcoTag, FILE *);
 
 ///<summary>
 /// Plays multiple pgn games from a given pgn file
 ///</summary>
-//unsigned long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV, bool logging);
+//unsigned long long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV, bool logging);
 
 ///<summary>
 /// This function is similar to playGames() with a difference that it takes a list of PGN
@@ -773,26 +799,26 @@ int eTags(EcoTag, FILE *);
 /// The first arg is an array of file names, the second arg is the number of of files in this array
 /// The rest are the same as in pgnGames()
 ///</summary>
-//unsigned long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int numberOfGames, int maxEloDiff, int minMoves, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV, bool logging);
+//unsigned long long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int numberOfGames, int maxEloDiff, int minMoves, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV, bool logging);
 
 //functions for fast data loading in AI model training
 //int initGamesFromPGNs(char * fileNames[], int numberOfFiles, int minElo, int maxEloDiff);
-struct BMPR * dequeueBMPR();
-void * getGame(void * context);
-void * getGameCsv(void * context);
-void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const int gameStage, const unsigned long steps);
-void free_bmpr(struct BMPR * bmpr);
-int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
-int getStage(struct Board * board);
+CHESS_API struct BMPR * dequeueBMPR();
+CHESS_API void * getGame(void * context);
+CHESS_API void * getGameCsv(void * context);
+CHESS_API void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const int gameStage, const unsigned long long steps);
+CHESS_API void free_bmpr(struct BMPR * bmpr);
+CHESS_API int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
+CHESS_API int getStage(struct Board * board);
 //float materialBalance(struct Board * board); //from the view of side to move
-void cleanup_magic_bitboards(void);
-void init_magic_bitboards(void);
+CHESS_API void cleanup_magic_bitboards(void);
+CHESS_API void init_magic_bitboards(void);
 
 ///<summary>
 /// This function initializes Game struct from a stream position given by FILE
 /// It returns 0 on success and 1 on the EOF
 ///</summary>
-int initGame(struct Game *, FILE *);
+CHESS_API int initGame(struct Game *, FILE *);
 
 ///<summary>
 /// Plays a game given its struct
@@ -803,7 +829,7 @@ int initGame(struct Game *, FILE *);
 /// draws a chessboard
 /// if the second argument is true, then also all legal moves for each piece 
 /// </summary>
-void writeDebug(struct Board *, bool);
+CHESS_API void writeDebug(struct Board *, bool);
 
 ///<summary>
 /// draws a board with just a specified piece name such as white pawns, for example
@@ -821,55 +847,55 @@ void writeDebug(struct Board *, bool);
 /// returns 0 if occupations reconcile with piecesOnSquares,
 /// otherwise, non-zero error code
 ///</summary>
-int reconcile(struct Board *);
+CHESS_API int reconcile(struct Board *);
 
 ///<summary>
 /// returns string representation in the first argument
 /// of a bit field move type given in a secondary argument
 ///</summary>
-void getMoveType(char *, unsigned char);
+CHESS_API void getMoveType(char *, unsigned char);
 
 ///<summary>
 /// ECO classificator for a chess game (first argument)
 /// second argument - array of ecoLines
 /// third argument - the number of ecoLines
 ///</summary>
-void ecoClassify(struct Game *, struct EcoLine **, int);
+CHESS_API void ecoClassify(struct Game *, struct EcoLine **, int);
 
 ///<summary>
 /// runs a chess engine in a child process
 /// The second arg is engine binary path
 ///</summary>
-int engine(struct Engine *, const char *);
+CHESS_API int engine(struct Engine *, const char *);
 
-struct Engine * initChessEngine(char * engineName, long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool limitStrength, int elo);
+CHESS_API struct Engine * initChessEngine(char * engineName, long long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool limitStrength, int elo);
 
-void releaseChessEngine(struct Engine * chessEngine);
+CHESS_API void releaseChessEngine(struct Engine * chessEngine);
 
 ///<summary>
 /// returns chess engine option index for a given name and type
 ///</summary>
-int nametoindex(struct Engine *, char *, int optionType);
+CHESS_API int nametoindex(struct Engine *, char *, int optionType);
 
 ///<summary>
 /// gets chess engine options
 ///</summary>
 //int getOptions(char *, struct Engine *);
-int getOptions(struct Engine *);
+CHESS_API int getOptions(struct Engine *);
 
-int setOption(struct Engine *, char *, int optionType, void *);
-void setOptions(struct Engine *);
+CHESS_API int setOption(struct Engine *, char *, int optionType, void *);
+CHESS_API void setOptions(struct Engine *);
 
-bool isReady(struct Engine *);
-bool newGame(struct Engine *);
-void stop(struct Engine *);
-void quit(struct Engine *);
-bool position(struct Engine *);
-//void go(long, int, int, int, char *, bool, bool, long, long, long, long, int, struct Engine *, struct Evaluation **);
-int go(struct Engine *, struct Evaluation **);
-float eval(struct Engine *);
+CHESS_API bool isReady(struct Engine *);
+CHESS_API bool newGame(struct Engine *);
+CHESS_API void stop(struct Engine *);
+CHESS_API void quit(struct Engine *);
+CHESS_API bool position(struct Engine *);
+//void go(long long, int, int, int, char *, bool, bool, long long, long long, long long, long long, int, struct Engine *, struct Evaluation **);
+CHESS_API int go(struct Engine *, struct Evaluation **);
+CHESS_API float eval(struct Engine *);
 
-unsigned long md5(char *);
+CHESS_API unsigned long long md5(char *);
 
 ///<summary>
 /// This function returns the number of moves for a given Zobrist hash and 
@@ -879,7 +905,7 @@ unsigned long md5(char *);
 /// can be 1, 2, 4 or 8. Therefore, X ranges from 0 to 7, i.e. 0 for 1 thread, 0 to 1 for 2 threads,
 /// 0 to 3 for 4 threads and 0 to 7 for 8 threads
 ///</summary>
-int nextMoves(unsigned long, struct MoveScoreGames **, int);
+CHESS_API int nextMoves(unsigned long long, struct MoveScoreGames **, int);
 
 ///<summary>
 /// This function is similar to nextMoves except it returns the sorted array of moveScores
@@ -887,7 +913,7 @@ int nextMoves(unsigned long, struct MoveScoreGames **, int);
 /// where score = score / totalNumberOfGames for a given position
 /// The last arg is the number of sql threads, which should be 1, 2, 4 or 8 depending on how many db files you have
 ///</summary>
-int bestMoves(unsigned long, int color, struct MoveScores *, int);
+CHESS_API int bestMoves(unsigned long long, int color, struct MoveScores *, int);
 
 /*
 void libchess_init_nnue(const char * nnue_file);
@@ -909,10 +935,10 @@ int updateNextMove(sqlite3 *, sqlite3_int64, const char *, int);
 ///<summary>
 /// naive chess piece (except pawns) move generator
 /// moves are limited by board boundary only
-/// may be used at the start to populate move arrays[64] of unsigned long
+/// may be used at the start to populate move arrays[64] of unsigned long long
 ///<summary>
-//unsigned long moveGenerator(int pieceType, struct Square *);
-//unsigned long moveGenerator(int pieceType, int squareName);
+//unsigned long long moveGenerator(int pieceType, struct Square *);
+//unsigned long long moveGenerator(int pieceType, int squareName);
 #ifdef __cplusplus
 }
 #endif

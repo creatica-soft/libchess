@@ -1,4 +1,11 @@
 // nnue.cpp
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #define CHESS_API __declspec(dllexport)
+#else
+  #define CHESS_API
+#endif
+
 #include "types.h"
 #include "position.h"
 #include "evaluate.h"
@@ -8,7 +15,7 @@
 #include "nnue/nnue_architecture.h"
 #include "nnue/features/half_ka_v2_hm.h"
 #include <cstdlib>
-#include <pthread.h>
+//#include <pthread.h>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -25,12 +32,12 @@ struct NNUEContext {
     Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
 };
 
-void init_nnue(const char * nnue_file_big = EvalFileDefaultNameBig, const char * nnue_file_small = EvalFileDefaultNameSmall);
-void cleanup_nnue();
-void init_nnue_context(struct NNUEContext * ctx);
-void free_nnue_context(struct NNUEContext * ctx);
-double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
-double evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
+CHESS_API void init_nnue(const char * nnue_file_big = EvalFileDefaultNameBig, const char * nnue_file_small = EvalFileDefaultNameSmall);
+CHESS_API void cleanup_nnue();
+CHESS_API void init_nnue_context(struct NNUEContext * ctx);
+CHESS_API void free_nnue_context(struct NNUEContext * ctx);
+CHESS_API double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
+//CHESS_API double evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
 
 void boardtopos(const struct Board * board, Stockfish::Position * pos, Stockfish::StateInfo * state) {
   if (board && board->fen) {
@@ -140,6 +147,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
     //v = ctx->pos->side_to_move() == Stockfish::WHITE ? v : -v; //keep it from the perspective of the side to move
     return 0.01 * Stockfish::to_cp(v, *ctx->pos);
 }
+/*
 double evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx) {
     if (!board) return 0;
     Stockfish::Move sf_move = movetomove(move);
@@ -153,7 +161,7 @@ double evaluate_nnue_incremental(struct Board * board, struct Move * move, struc
     //v = ctx->pos->side_to_move() == Stockfish::WHITE ? v : -v; //keep it from the perspective of the side to move
     return 0.01 * Stockfish::to_cp(v, *ctx->pos);
 }
-
+*/
 #ifdef __cplusplus
 }
 #endif

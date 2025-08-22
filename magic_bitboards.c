@@ -8,10 +8,11 @@ extern "C" {
 
 //struct MagicEntry rook_magics[SQUARE_COUNT];
 //struct MagicEntry bishop_magics[SQUARE_COUNT];
+unsigned long long bitCount(unsigned long long value);
 
 // Generate attack mask for rook
-static unsigned long get_rook_attack_mask(int square) {
-  unsigned long mask = 0;
+static unsigned long long get_rook_attack_mask(int square) {
+  unsigned long long mask = 0;
   int rank = square / 8;
   int file = square % 8;
   // d-file (except square and edges)
@@ -26,8 +27,8 @@ static unsigned long get_rook_attack_mask(int square) {
 }
 
 // Generate attack mask for bishop
-static unsigned long get_bishop_attack_mask(int square) {
-  unsigned long mask = 0;
+static unsigned long long get_bishop_attack_mask(int square) {
+  unsigned long long mask = 0;
   int rank = square / 8;
   int file = square % 8;
   // Diagonals (excluding edges)
@@ -42,8 +43,8 @@ static unsigned long get_bishop_attack_mask(int square) {
 }
 
 // Reference function for rook moves (linear approach)
-static unsigned long get_rook_moves_reference(int square, unsigned long occupancy) {
-  unsigned long moves = 0;
+static unsigned long long get_rook_moves_reference(int square, unsigned long long occupancy) {
+  unsigned long long moves = 0;
   int directions[4] = {8, -8, 1, -1}; // North, South, East, West
   int rank = square / 8;
   int file = square % 8;
@@ -65,8 +66,8 @@ static unsigned long get_rook_moves_reference(int square, unsigned long occupanc
 }
 
 // Reference function for bishop moves
-static unsigned long get_bishop_moves_reference(int square, unsigned long occupancy) {
-  unsigned long moves = 0;
+static unsigned long long get_bishop_moves_reference(int square, unsigned long long occupancy) {
+  unsigned long long moves = 0;
   int directions[4] = {9, -9, 7, -7}; // Diagonals
   int rank = square / 8;
   int file = square % 8;
@@ -87,15 +88,15 @@ static unsigned long get_bishop_moves_reference(int square, unsigned long occupa
 }
 
 // Generate occupancy variations
-static void generate_occupancy_variations(unsigned long mask, unsigned long *variations, int *count) {
-  *count = 1 << __builtin_popcountl(mask);
-  unsigned long bits[64];
+static void generate_occupancy_variations(unsigned long long mask, unsigned long long *variations, int *count) {
+  *count = 1 << bitCount(mask);
+  unsigned long long bits[64];
   int bit_count = 0;
   for (int i = 0; i < 64; i++) {
     if (mask & (1ULL << i)) bits[bit_count++] = i;
   }
   for (int i = 0; i < *count; i++) {
-    unsigned long variation = 0;
+    unsigned long long variation = 0;
     for (int j = 0; j < bit_count; j++) {
       if (i & (1 << j)) variation |= (1ULL << bits[j]);
     }
@@ -110,22 +111,22 @@ void init_magic_bitboards(void) {
     rook_magics[square].magic_number = rook_magic_numbers[square];
     rook_magics[square].relevant_bits = rook_relevant_bits[square];
     int table_size = 1 << rook_magics[square].relevant_bits;
-    rook_magics[square].move_table = (unsigned long *)malloc(table_size * sizeof(unsigned long));
+    rook_magics[square].move_table = (unsigned long long *)malloc(table_size * sizeof(unsigned long long));
     if (!rook_magics[square].move_table) {
       fprintf(stderr, "Failed to allocate rook move table for square %d\n", square);
       exit(1);
     }
     
     // Generate occupancy variations
-    unsigned long variations[1 << MAX_OCCUPANCY_BITS];
+    unsigned long long variations[1 << MAX_OCCUPANCY_BITS];
     int variation_count;
     generate_occupancy_variations(rook_magics[square].attack_mask, variations, &variation_count);
     
     // Fill move table
     for (int i = 0; i < variation_count; i++) {
-      unsigned long occupancy = variations[i];
-      unsigned long moves = get_rook_moves_reference(square, occupancy);
-      unsigned long index = ((occupancy & rook_magics[square].attack_mask) * rook_magics[square].magic_number) >> (64 - rook_magics[square].relevant_bits);
+      unsigned long long occupancy = variations[i];
+      unsigned long long moves = get_rook_moves_reference(square, occupancy);
+      unsigned long long index = ((occupancy & rook_magics[square].attack_mask) * rook_magics[square].magic_number) >> (64 - rook_magics[square].relevant_bits);
       rook_magics[square].move_table[index] = moves;
     }
     
@@ -134,7 +135,7 @@ void init_magic_bitboards(void) {
     bishop_magics[square].magic_number = bishop_magic_numbers[square];
     bishop_magics[square].relevant_bits = bishop_relevant_bits[square];
     table_size = 1 << bishop_magics[square].relevant_bits;
-    bishop_magics[square].move_table = (unsigned long *)malloc(table_size * sizeof(unsigned long));
+    bishop_magics[square].move_table = (unsigned long long *)malloc(table_size * sizeof(unsigned long long));
     if (!bishop_magics[square].move_table) {
       fprintf(stderr, "Failed to allocate bishop move table for square %d\n", square);
       exit(1);
@@ -142,9 +143,9 @@ void init_magic_bitboards(void) {
     
     generate_occupancy_variations(bishop_magics[square].attack_mask, variations, &variation_count);
     for (int i = 0; i < variation_count; i++) {
-      unsigned long occupancy = variations[i];
-      unsigned long moves = get_bishop_moves_reference(square, occupancy);
-      unsigned long index = ((occupancy & bishop_magics[square].attack_mask) * bishop_magics[square].magic_number) >> (64 - bishop_magics[square].relevant_bits);
+      unsigned long long occupancy = variations[i];
+      unsigned long long moves = get_bishop_moves_reference(square, occupancy);
+      unsigned long long index = ((occupancy & bishop_magics[square].attack_mask) * bishop_magics[square].magic_number) >> (64 - bishop_magics[square].relevant_bits);
       bishop_magics[square].move_table[index] = moves;
     }
   }
@@ -157,15 +158,15 @@ void cleanup_magic_bitboards(void) {
   }
 }
 
-unsigned long get_rook_moves(int square, unsigned long occupancy) {
+unsigned long long get_rook_moves(int square, unsigned long long occupancy) {
   struct MagicEntry * magic = &rook_magics[square];
-  unsigned long index = ((occupancy & magic->attack_mask) * magic->magic_number) >> (64 - magic->relevant_bits);
+  unsigned long long index = ((occupancy & magic->attack_mask) * magic->magic_number) >> (64 - magic->relevant_bits);
   return magic->move_table[index];
 }
 
-unsigned long get_bishop_moves(int square, unsigned long occupancy) {
+unsigned long long get_bishop_moves(int square, unsigned long long occupancy) {
   struct MagicEntry * magic = &bishop_magics[square];
-  unsigned long index = ((occupancy & magic->attack_mask) * magic->magic_number) >> (64 - magic->relevant_bits);
+  unsigned long long index = ((occupancy & magic->attack_mask) * magic->magic_number) >> (64 - magic->relevant_bits);
   return magic->move_table[index];
 }
 
