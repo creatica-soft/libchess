@@ -29,7 +29,7 @@
 #define THREADS 8
 #define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH "/Users/ap/syzygy"
+#define SYZYGY_PATH ""
 #define HASH 1024 //this is just for hashfull stats - no memory restriction is in place for tree growth
 #define EXPLORATION_CONSTANT 80 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
 #define PROBABILITY_MASS 60 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
