@@ -392,11 +392,7 @@ struct Engine {
 	//go() arguments
 	long long movetime = 0;
 	int depth = 0;
-  int currentDepth{0};
-  //std::atomic<unsigned long long> currentNodes{0}; //not needed because in MCTS it is root's N
-  int seldepth{0};
 	unsigned long long nodes = 0;
-	int tbhits = 0;
 	int mate = 0;
 	bool ponder = false;
 	bool infinite = false;
@@ -408,6 +404,8 @@ struct Engine {
 	char * searchmoves = nullptr;
 	FILE * toEngine = nullptr;
 	FILE * fromEngine = nullptr;
+  //int seldepth = 0;
+	//int tbhits = 0;
 };
 
 struct Evaluation {

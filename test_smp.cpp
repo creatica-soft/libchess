@@ -31,6 +31,10 @@ std::mutex mtx, log_mtx, print_mtx;
 std::atomic<bool> stopFlag;
 char best_move[6] = "";
 std::atomic<bool> search_done{false}; // Signals search completion
+std::atomic<unsigned long long> total_children{0};
+std::atomic<int> hash_full{0};
+std::atomic<unsigned long long> tbhits{0};
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -97,7 +101,6 @@ extern "C" {
       struct MCTSNode * root = nullptr;
       double exploration_constant = 1.0;
       double probability_mass = 0.9;
-      //double dirichlet_alpha = 0.1;
       double noise = 0.1;
       double virtual_loss;  // Tune: UCI option, e.g., 1.0-3.0
   };
@@ -111,7 +114,6 @@ extern "C" {
       unsigned long long currentNodes;
       int currentDepth;
       int seldepth;
-      int tbhits;
       std::mt19937 rng;
   };
   
@@ -181,37 +183,18 @@ extern "C" {
   }
   
   void expand_node(struct MCTSNode * parent, struct Board * chess_board, const std::vector<std::pair<double, int>>& top_moves, std::mt19937 rng) {
-    if (parent->num_children.load() > 0) return;  // Already expanded      
+    if (parent->num_children.load() > 0) return;  // Already expanded
     int num_moves = top_moves.size();
+    total_children.fetch_add(num_moves, std::memory_order_relaxed);
     std::vector<double> priors(num_moves);
-    //for (int i = 0; i < num_moves; i++) 
-    //  priors[i] = top_moves[i].first;  // Copy probs
-    // Dirichlet noise if root
-    //print("expand_node() gen Dirichlet noise...\n");
-    //if (parent == search.root && search.dirichlet_alpha > 0.0) {
-    //if (search.noise > 0.0) { //noise min is 0.01
-        //std::gamma_distribution<double> gamma(search.dirichlet_alpha, 1.0);
-        /*
-        std::vector<double> noise(num_moves);
-        double noise_sum = 0.0;
-        for (auto& n : noise) {
-            n = uniform(rng);
-            noise_sum += n;
-        }
-        for (auto& n : noise) n /= noise_sum;  // Normalize
-        */
-      std::uniform_real_distribution<> uniform(-search.noise, search.noise);
-      for (int i = 0; i < num_moves; ++i) {
-        priors[i] = top_moves[i].first + uniform(rng);
-          //priors[i] = (1.0 - (double)(chessEngine.optionSpin[DirichletEpsilon].value)) / 100.0 * priors[i] + (double)(chessEngine.optionSpin[DirichletEpsilon].value) / 100.0 * noise[i];
-      }
-    //}
-    //print("expand_node() gen Dirichlet noise...done\n");
+    std::uniform_real_distribution<> uniform(-search.noise, search.noise);
+    for (int i = 0; i < num_moves; ++i) {
+      priors[i] = top_moves[i].first + uniform(rng);
+    }
     struct Edge * children = (struct Edge *)calloc(num_moves, sizeof(struct Edge));
     for (int i = 0; i < num_moves; ++i) {
         struct Board * temp_board = cloneBoard(chess_board);
         struct Move move;
-        //int move_idx = top_moves[i].second;
         init_move(&move, temp_board, top_moves[i].second / 64, top_moves[i].second % 64);
         makeMove(&move);
   			if (updateHash(temp_board, &move)) {
@@ -556,7 +539,7 @@ MCTS implementation follows the four core phases:
         result = tanh(result / 4.0);
       }
       // Expansion - add more children - increase the depth of the tree down using the model's predictions, NNUE evals or randomly
-      if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && !repetition3x && node->mutex.try_lock()) {
+      if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && !repetition3x && node->mutex.try_lock() && hash_full < 1000) {
         int src, dst, effective_branching = 1;
         double res;
         std::vector<std::pair<double, int>> move_evals;
@@ -592,7 +575,7 @@ MCTS implementation follows the four core phases:
                 if (wdl == 4) res = -MATE_SCORE * 0.001;
                 else if (wdl == 0) res = MATE_SCORE * 0.001;
                 else res = 0.0;
-                params->tbhits++;
+                tbhits.fetch_add(1, std::memory_order_relaxed);
               }
             } //end of else (pieceCount <= TB_LARGEST)
             move_evals.push_back({res, src * 64 + dst});
@@ -683,6 +666,15 @@ MCTS implementation follows the four core phases:
       init_nnue_context(&ctx);
       int depth = engineDepth.currentDepth.load(std::memory_order_relaxed);
       int seldepth = engineDepth.seldepth.load(std::memory_order_relaxed);
+      std::shared_lock lock(map_mutex);
+      size_t unique_nodes = search.tree.size();
+      lock.unlock();
+      size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+      size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
+      int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
+      if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
+      hash_full.store(hashfull, std::memory_order_relaxed);
+
       for (int i = 0; i < multiPV && move_idx && pv; i++) {
         struct Move move;
         struct Board * temp_board = cloneBoard(board);
@@ -691,7 +683,7 @@ MCTS implementation follows the four core phases:
         if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
           res = process_check(temp_board, &move, &ctx); 
         freeBoard(temp_board); 
-        print("info depth %d seldepth %d multipv %d score cp %ld nodes %llu nps %.0f hashfull 0 tbhits 0 time %.0f pv %s\n", depth, seldepth, i + 1, (long)(res * 100), nodes, nps, elapsed * 1000, pv[i]);
+        print("info depth %d seldepth %d multipv %d score cp %ld nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", depth, seldepth, i + 1, (long)(res * 100), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, pv[i]);
       }
       free_nnue_context(&ctx);
       if (pv) {
@@ -713,6 +705,8 @@ MCTS implementation follows the four core phases:
     int multiPV = 1;
     
     if (move_number > 1) {
+      total_children.store(0, std::memory_order_relaxed);
+      tbhits.store(0, std::memory_order_relaxed);
       search.exploration_constant = (double)chessEngine.optionSpin[ExplorationConstant].value / 100.0;
       search.probability_mass = (double)chessEngine.optionSpin[ProbabilityMass].value / 100.0;
       //search.dirichlet_alpha = (double)chessEngine.optionSpin[DirichletAlpha].value / 100.0;
@@ -726,7 +720,6 @@ MCTS implementation follows the four core phases:
         thread_params[i].currentNodes = 0;
         thread_params[i].currentDepth = 0;
         thread_params[i].seldepth = 0;
-        thread_params[i].tbhits = 0;
         thread_params[i].rng.seed(static_cast<unsigned int>(std::random_device{}() ^ std::hash<int>{}(i)));
       }
       
@@ -750,10 +743,6 @@ MCTS implementation follows the four core phases:
       output_thread.join();
       stopFlag.store(false, std::memory_order_relaxed); // Reset for next search
         
-      chessEngine.tbhits = 0;
-      for (const auto& tp : thread_params) {
-        chessEngine.tbhits += tp.tbhits;
-      }
       multiPV = select_best_moves(&pv, &move_idx);
       if (multiPV > 0) {
         unsigned long long max_visits = 0;
@@ -771,10 +760,9 @@ MCTS implementation follows the four core phases:
       nodes = search.root->N.load(std::memory_order_relaxed);
       unique_nodes = search.tree.size();
       cleanup();
-      // Estimate hashfull (in per-mille)
+      // Calculate hashfull (in per-mille)
       // hashfull using unique_nodes
-      size_t bytes_per_node = sizeof(MCTSNode) + 4 * sizeof(Edge) + 24;  // Avg 4 children? - depends on probability mass, 24B map overhead
-      size_t total_memory = unique_nodes * bytes_per_node;
+      size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
       size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
       hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
       if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
@@ -835,7 +823,7 @@ MCTS implementation follows the four core phases:
       if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
         res = process_check(temp_board, &move, &ctx);
       freeBoard(temp_board);
-      print("info depth %d seldepth %d multipv %d score cp %ld nodes %llu nps %.0f hashfull %d tbhits %d time %.0f pv %s\n", depth, seldepth, i + 1, (long)(res * 100), nodes, nps, hashfull, chessEngine.tbhits, elapsed * 1000, pv[i]);
+      print("info depth %d seldepth %d multipv %d score cp %ld nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", depth, seldepth, i + 1, (long)(res * 100), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, pv[i]);
     }
     free_nnue_context(&ctx);
     print("bestmove %s\n", best_move);    
@@ -906,8 +894,6 @@ MCTS implementation follows the four core phases:
 	  chessEngine.optionSpin[PVPlies].value = chessEngine.optionSpin[PVPlies].defaultValue;
 	  chessEngine.optionSpin[PVPlies].min = 1;
 	  chessEngine.optionSpin[PVPlies].max = 32;
-	  chessEngine.seldepth = 0;
-	  chessEngine.currentDepth = 0;
     chessEngine.wtime = 1e9;
     chessEngine.btime = 1e9;
     chessEngine.winc = 0;
