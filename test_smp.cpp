@@ -1,4 +1,4 @@
-//c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess test_smp.cpp -o test_smp
+//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess tbcore.c tbprobe.c test_smp.cpp -o test_smp
 
 #include "nnue/types.h"
 #include "nnue/position.h"
@@ -8,18 +8,33 @@
 #include "nnue/nnue/nnue_accumulator.h"
 
 #include <vector>
+#include <mutex>
+#include <shared_mutex>
+#include <atomic>
 #include <thread>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <iostream>
+#include <fstream>
+#include <string>
 #include <unordered_map>
 #include <functional>
 #include <random>
 #include <chrono>
 #include <math.h>
+#include "tbprobe.h"
 #include "libchess.h"
+
+std::mutex mtx, log_mtx, print_mtx;
+std::atomic<bool> stopFlag;
+char best_move[6] = "";
+std::atomic<bool> search_done{false}; // Signals search completion
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-  struct Engine chessEngine;
 
   struct NNUEContext {
       Stockfish::StateInfo * state;
@@ -33,86 +48,121 @@ extern "C" {
   void free_nnue_context(struct NNUEContext * ctx);
   double evaluate_nnue(struct Board * chess_board, struct Move * move, struct NNUEContext * ctx);
   
-  #define EXPLORATION_CONSTANT 0.7 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
-  #define PROBABILITY_MASS 0.4 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-  #define MAX_DEPTH 50
-  #define DIRICHLET_ALPHA 0.03  // Tune: higher for more noise, i.e. noise is often will be close to 1
-  #define DIRICHLET_EPSILON 0.10  // Blend factor: (1 - epsilon) * P + epsilon * noise
-  
+  #define THREADS 8
+  #define MULTI_PV 5
+  #define SYZYGY_PATH_DEFAULT "<empty>"
+  #define SYZYGY_PATH "/Users/ap/syzygy"
+  #define HASH 1024 //this is just for hashfull stats - no memory restriction is in place for tree growth
+  #define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
+  #define PROBABILITY_MASS 75 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
+  //#define DIRICHLET_ALPHA 3  // Tune: higher for more often noise
+  //#define DIRICHLET_EPSILON 25  // Blend factor: (1 - epsilon) * P + epsilon * noise -- magnitude of noise
+  #define NOISE 5 //Default noise added to move priors to reduce contention between search threads and increase diversity 
+  #define VIRTUAL_LOSS 2
+  #define PV_PLIES 16
+  #define MAX_DEPTH 100
   #define timeAllocated 1000 //ms
-  char best_move[6];
-  std::atomic<bool> stopFlag = false;
+
+  bool tb_init_done = false;
+  FILE * logfile = nullptr;
+  struct Board * board = nullptr;
+  struct Engine chessEngine;
+  std::mutex probe_mutex;
+  std::shared_mutex map_mutex;
   
+  struct EngineDepth {
+    std::atomic<int> currentDepth{0};
+    std::atomic<int> seldepth{0};
+  };
+  
+  struct EngineDepth engineDepth;
+
   struct Edge {
-      int move;             // The move that leads to the child position
-      double P;            // Prior probability - model move_probs for a given move in the node
-      struct MCTSNode * child; // Pointer to the child node
+      int move = 0;             // The move that leads to the child position
+      double P = 0.0;            // Prior probability - model move_probs for a given move in the node
+      struct MCTSNode * child = nullptr; // Pointer to the child node
   };
 
   struct MCTSNode {
-    unsigned long long hash;
-    unsigned long long N;        // Visit count - number of games that have reached this node
-    double W;           // Total value W is a sum of loses (-1) and wins (1) for these N games
-                        // Q = W / N
-    struct Edge * children; //array of Edges to child nodes
-    int num_children;
+      unsigned long long hash = 0;
+      std::atomic<unsigned long long> N{0};  // Atomic for lock-free updates
+      std::atomic<double> W{0};
+      struct Edge * children = nullptr;
+      std::atomic<int> num_children = 0;
+      std::shared_mutex mutex;  // For protecting children expansion
   };
   
-  struct EdgeStats {
-    int move;
-    unsigned long long N;
-    double W;
-  };
-
   struct MCTSSearch {
-    std::unordered_map<unsigned long long, MCTSNode> tree;
-    struct MCTSNode * root = nullptr;
-    double exploration_constant;
-    double probability_mass;
-    double dirichlet_alpha;
-    std::mt19937 rng{std::random_device{}()};
+      std::unordered_map<unsigned long long, MCTSNode> tree;
+      struct MCTSNode * root = nullptr;
+      double exploration_constant = 1.0;
+      double probability_mass = 0.9;
+      //double dirichlet_alpha = 0.1;
+      double noise = 0.1;
+      double virtual_loss;  // Tune: UCI option, e.g., 1.0-3.0
   };
 
+  static MCTSSearch search;
+  
+  // Remove MCTSSearch from ThreadParams (shared now)
   struct ThreadParams {
-      MCTSSearch search;
       int thread_id;
-      int num_sims;  // Or time slice
-      struct Board * board;  // Shared read-only
-      std::vector<EdgeStats> stats; //per thread stats
-      unsigned long long currentNodes = 0;  // Per-thread
-      int currentDepth = 0;                 // Per-thread max depth reached
-      int seldepth = 0;                     // Per-thread selective depth
+      int num_sims;
+      unsigned long long currentNodes;
+      int currentDepth;
+      int seldepth;
+      int tbhits;
+      std::mt19937 rng;
   };
   
-  void cleanup(MCTSSearch * search) {
-    for (auto& [h, node] : search->tree) {
+  void log_file(const char * message, ...) {
+    std::lock_guard<std::mutex> lock(log_mtx);
+    va_list args;
+    va_start(args, message);
+    vfprintf(logfile, message, args);
+    va_end(args);
+    fflush(logfile);
+  }
+  
+  void print(const char * message, ...) {
+    std::lock_guard<std::mutex> lock(print_mtx);
+    va_list args;
+    va_start(args, message);
+    vprintf(message, args);
+    va_end(args);
+    fflush(stdout);
+  }
+
+  void cleanup() {
+    for (auto& [h, node] : search.tree) {
         free(node.children);
     }
-    search->tree.clear();
-    search->root = nullptr;
+    search.tree.clear();
+    search.root = nullptr;
   }
-    
-  void set_root(MCTSSearch * search, struct Board * board) {
+      
+  void set_root() {
     unsigned long long hash = board->zh->hash ^ board->zh->hash2;
-    auto& node = search->tree[hash];  // Inserts if missing
+    auto& node = search.tree[hash];
     node.hash = hash;
-    node.N = 0;
-    node.W = 0;
-    node.children = nullptr;
-    node.num_children = 0;
-    search->root = &node;
+    search.root = &node;
   }
-    
+  
   //Predictor + Upper Confidence Bound applied to Trees - used in select_best_child()
   double puct_score(struct MCTSNode * parent, int idx, double exploration_constant) {
-    double Q = parent->children[idx].child->N ? parent->children[idx].child->W / parent->children[idx].child->N : 0.0;
-    return -Q + exploration_constant * parent->children[idx].P * sqrt((double)parent->N) / (1.0 + parent->children[idx].child->N);
+      parent->mutex.lock_shared();
+      double P = parent->children[idx].P;
+      unsigned long long n = parent->children[idx].child->N.load(std::memory_order_relaxed);
+      double w = parent->children[idx].child->W.load(std::memory_order_relaxed);
+      parent->mutex.unlock_shared();
+      double Q = n ? w / n : 0.0;
+      return -Q + exploration_constant * P * sqrt((double)parent->N.load(std::memory_order_relaxed)) / (1.0 + n);
   }
-
+  
   char * idx_to_move(struct Board * chess_board, int move_idx, char * uci_move) {
     uci_move[0] = '\0';
     if (!uci_move) {
-      fprintf(stderr, "idx_to_move() error: invalid arg - uci_move is NULL\n");
+      print("idx_to_move() error: invalid arg - uci_move is NULL\n");
       return NULL;
     }
     div_t move = div(move_idx, 64);
@@ -130,95 +180,224 @@ extern "C" {
     return uci_move;
   }
   
-  void expand_node(MCTSSearch * search, struct MCTSNode * parent, struct Board * chess_board, const std::vector<std::pair<double, int>>& top_moves) {
+  void expand_node(struct MCTSNode * parent, struct Board * chess_board, const std::vector<std::pair<double, int>>& top_moves, std::mt19937 rng) {
+    if (parent->num_children.load() > 0) return;  // Already expanded      
     int num_moves = top_moves.size();
-    parent->children = (struct Edge *)calloc(num_moves, sizeof(struct Edge));
-    parent->num_children = num_moves;
-
-    // Dirichlet noise if root
     std::vector<double> priors(num_moves);
-    for (int i = 0; i < num_moves; ++i) priors[i] = top_moves[i].first;  // Copy probs
-
-    if (parent == search->root && search->dirichlet_alpha > 0.0) {
-        std::gamma_distribution<double> gamma(search->dirichlet_alpha, 1.0);
-        //fprintf(stderr, "gamma min %f, max %f\n", gamma.min(), gamma.max());
+    //for (int i = 0; i < num_moves; i++) 
+    //  priors[i] = top_moves[i].first;  // Copy probs
+    // Dirichlet noise if root
+    //print("expand_node() gen Dirichlet noise...\n");
+    //if (parent == search.root && search.dirichlet_alpha > 0.0) {
+    //if (search.noise > 0.0) { //noise min is 0.01
+        //std::gamma_distribution<double> gamma(search.dirichlet_alpha, 1.0);
+        /*
         std::vector<double> noise(num_moves);
         double noise_sum = 0.0;
         for (auto& n : noise) {
-            n = gamma(search->rng);
+            n = uniform(rng);
             noise_sum += n;
         }
-        for (auto& n : noise) {
-          n /= noise_sum;  // Normalize
-          fprintf(stderr, "noise %f\n", n);
-        }
-        for (int i = 0; i < num_moves; ++i) {
-            priors[i] = (1.0 - DIRICHLET_EPSILON) * priors[i] + DIRICHLET_EPSILON * noise[i];
-            fprintf(stderr, "%s%s %f\n", squareName[top_moves[i].second / 64], squareName[top_moves[i].second % 64], priors[i]);
-        }
-        fprintf(stderr, "\n");
-    }
+        for (auto& n : noise) n /= noise_sum;  // Normalize
+        */
+      std::uniform_real_distribution<> uniform(-search.noise, search.noise);
+      for (int i = 0; i < num_moves; ++i) {
+        priors[i] = top_moves[i].first + uniform(rng);
+          //priors[i] = (1.0 - (double)(chessEngine.optionSpin[DirichletEpsilon].value)) / 100.0 * priors[i] + (double)(chessEngine.optionSpin[DirichletEpsilon].value) / 100.0 * noise[i];
+      }
+    //}
+    //print("expand_node() gen Dirichlet noise...done\n");
+    struct Edge * children = (struct Edge *)calloc(num_moves, sizeof(struct Edge));
     for (int i = 0; i < num_moves; ++i) {
         struct Board * temp_board = cloneBoard(chess_board);
-        if (!temp_board) {
-          fprintf(stderr, "expand_node() error: cloneBoard() returned NULL\n");
-  				exit(-1);
-        }
         struct Move move;
-        int move_idx = top_moves[i].second;
-        init_move(&move, temp_board, move_idx / 64, move_idx % 64);
+        //int move_idx = top_moves[i].second;
+        init_move(&move, temp_board, top_moves[i].second / 64, top_moves[i].second % 64);
         makeMove(&move);
   			if (updateHash(temp_board, &move)) {
-  				fprintf(stderr, "expand_node() error: updateHash() returned non-zero value\n");
+  				print("expand_node() error: updateHash() returned non-zero value\n");
   				exit(-1);
   			}
         unsigned long long hash = temp_board->zh->hash ^ temp_board->zh->hash2;
-        auto it = search->tree.find(hash);
-        struct MCTSNode * child = (it != search->tree.end()) ? &it->second : nullptr;
-        if (!child) {
-            auto& new_node = search->tree[hash];
-            new_node.hash = hash;
-            new_node.N = 0;
-            new_node.W = 0;
-            new_node.children = nullptr;
-            new_node.num_children = 0;
-            child = &new_node;
-        }
-        parent->children[i].P = priors[i];  // Use noised priors
-        parent->children[i].move = move_idx;
-        parent->children[i].child = child;
         freeBoard(temp_board);
+        std::shared_lock search_lock(map_mutex);
+        auto it = search.tree.find(hash);
+        struct MCTSNode * child = (it != search.tree.end()) ? &it->second : nullptr;
+        search_lock.unlock();
+        if (!child) {
+          std::unique_lock insert_lock(map_mutex);
+          child = &search.tree[hash];
+          insert_lock.unlock();
+          child->mutex.lock();        
+          child->hash = hash;
+          child->mutex.unlock();
+        }
+        children[i].child = child;
+        children[i].P = priors[i];  // Use noised priors for root
+        children[i].move = top_moves[i].second;
     }
+    parent->children = children;
+    parent->num_children.store(num_moves, std::memory_order_relaxed);
   }
   
-  double most_visited_child(struct MCTSNode * parent, int * selected, unsigned long long * N) {
-    double W = 0;
-    for (int i = 0; i < parent->num_children; i++) {
-      if (parent->children[i].child->N > *N) {
-          *N = parent->children[i].child->N;
-          *selected = i;
-          W = parent->children[i].child->W;
+  //no locking, call only when search threads finished
+  int most_visited_child(struct MCTSNode * parent) {
+    unsigned long long N = 0;
+    int idx = -1;
+    std::vector<std::pair<double, int>> children;
+    int num_children = parent->num_children.load();
+    for (int i = 0; i < num_children; i++) {
+      unsigned long long n = parent->children[i].child->N.load(std::memory_order_relaxed);
+      children.push_back({parent->children[i].P, i});
+      if (n > N) {
+        N = n;
+        idx = i;
       } 
     }
-    return W;
+    //in case of unexpanded child, return idx of best prior
+    if (idx == -1 && num_children > 0) {
+      std::sort(children.begin(), children.end(), std::greater<>());
+      idx = children[0].second;
+    }
+    return idx;
   }
   
-  void select_best_child(struct MCTSNode * parent, int * selected, struct Board * chess_board, double exploration_constant) {
-      double best_score = -INFINITY;
-      double score;
-      for (int i = 0; i < parent->num_children; i++) {
-        //debug - comment out later
-        //char uci_move[6];
-        //idx_to_move(chess_board, parent->children[i].move, uci_move);
-        //fprintf(stderr, "select_best_child() debug: move %s, %.2f / %lld + sqrt(%lld) / %lld * %.4f * %.1f = %.5f + %.5f = %.5f\n", uci_move, -parent->children[i].child->W, parent->children[i].child->N, parent->N, parent->children[i].child->N + 1, parent->children[i].P, EXPLORATION_CONSTANT, parent->children[i].child->N ? -parent->children[i].child->W / parent->children[i].child->N : 0.0, sqrt(parent->N) / (parent->children[i].child->N + 1) * parent->children[i].P * EXPLORATION_CONSTANT, parent->children[i].child->N ? -parent->children[i].child->W / parent->children[i].child->N + sqrt(parent->N) / (parent->children[i].child->N + 1) * parent->children[i].P * EXPLORATION_CONSTANT : sqrt(parent->N) / (parent->children[i].child->N + 1) * parent->children[i].P * EXPLORATION_CONSTANT);
-        
-        score = puct_score(parent, i, exploration_constant);
-        if (score > best_score) {
-            best_score = score;
-            *selected = i;
-        } 
-     }
+  int select_best_move(char *** pv, int ** move_idx) {
+    std::vector<std::pair<unsigned long long, int>> children;
+    //std::lock_guard<std::mutex> lock(search.root->mutex); //perhaps, it is not needed here as root is only expanded once
+    int num_children = 0;
+    num_children = search.root->num_children.load();
+    
+    for (int i = 0; i < num_children; i++) {
+      search.root->mutex.lock_shared();
+      children.push_back({search.root->children[i].child->N.load(), i});
+      search.root->mutex.unlock_shared();
+    }      
+    std::sort(children.begin(), children.end(), std::greater<>());
+    int multiPV = std::min<int>(num_children, (int)chessEngine.optionSpin[MultiPV].value);
+    if (multiPV > 0) {
+      *pv = (char **)calloc(multiPV, sizeof(char *));
+      if (!*pv) {
+        print("select_best_move() error: calloc() failed for pv\n");
+        exit(-1);
+      }
+      for (int i = 0; i < multiPV; i++) {
+        (*pv)[i] = (char *)calloc(1, sizeof(best_move));
+        if (!(*pv)[i]) {
+          print("select_best_move() error: calloc() failed for pv[%d], pv length %d\n", i, sizeof(best_move));
+          exit(-1);
+        }
+      }
+      *move_idx = (int *)calloc(multiPV, sizeof(int));
+      if (!*move_idx) {
+        print("select_best_move() error: calloc() failed for move_idx\n");
+        exit(-1);
+      }      
+    } else {
+      print("select_best_move() error: root node has 0 children\n");
+      exit(-1);      
+    }
+    for (int i = 0; i < multiPV; i++) {
+      (*move_idx)[i] = search.root->children[children[i].second].move;
+      idx_to_move(board, (*move_idx)[i], (*pv)[i]);
+      //print("move_idx[%d] %d, pv[%d] %s\n", i, (*move_idx)[i], i, (*pv)[i]);
+    }
+    children.clear();
+    return multiPV;
   }
+
+  //no locking, call only when search threads finished
+  int select_best_moves(char *** pv, int ** move_idx) {
+    char uci_move[6];
+    std::vector<std::pair<unsigned long long, int>> children;
+    int num_children = search.root->num_children.load();
+    int multiPV = std::min<int>(num_children, (int)chessEngine.optionSpin[MultiPV].value);
+    if (num_children > 0) {
+      for (int i = 0; i < num_children; i++) {
+        children.push_back({search.root->children[i].child->N.load(), i});
+      }
+      std::sort(children.begin(), children.end(), std::greater<>());
+    } else {
+      print("select_best_moves() error: root node has 0 children\n");
+      exit(-1);      
+    }
+    int pvLength = chessEngine.optionSpin[PVPlies].value * sizeof(uci_move);
+    *pv = (char **)calloc(multiPV, sizeof(char *));
+    if (!*pv) {
+      print("select_best_moves() error: calloc() failed for pv\n");
+      exit(-1);
+    }
+    for (int i = 0; i < multiPV; i++) {
+      (*pv)[i] = (char *)calloc(1, pvLength);
+      if (!(*pv)[i]) {
+        print("select_best_moves() error: calloc() failed for pv[%d], pvLength %d\n", i, pvLength);
+        exit(-1);
+      }
+    }
+    *move_idx = (int *)calloc(multiPV, sizeof(int));
+    if (!*move_idx) {
+      print("select_best_moves() error: calloc() failed for move_idx, multiPV %d\n", multiPV);
+      exit(-1);
+    }
+
+    int maxLen = pvLength - sizeof(uci_move);
+    struct Move move;
+    for (int i = 0; i < multiPV; i++) {
+      int child_index = children[i].second;
+      struct MCTSNode * current_node = search.root;
+      struct Board * temp_board = cloneBoard(board);
+      (*move_idx)[i] = search.root->children[child_index].move;
+      idx_to_move(temp_board, (*move_idx)[i], uci_move);
+      strcat((*pv)[i], uci_move);
+      init_move(&move, temp_board, (*move_idx)[i] / 64, (*move_idx)[i] % 64);
+      makeMove(&move);
+      current_node = search.root->children[child_index].child;      
+      // Build PV by following most visited children
+      int num_child = current_node->num_children.load();
+      while (current_node && num_child > 0 && strlen((*pv)[i]) < maxLen) {
+        int next_idx = most_visited_child(current_node);
+        if (next_idx < 0) break;
+        idx_to_move(temp_board, current_node->children[next_idx].move, uci_move);
+        strcat((*pv)[i], " ");
+        strcat((*pv)[i], uci_move);
+        init_move(&move, temp_board, current_node->children[next_idx].move / 64, current_node->children[next_idx].move % 64);
+        makeMove(&move);
+        current_node = current_node->children[next_idx].child;
+        num_child = current_node->num_children.load();
+      }
+      freeBoard(temp_board);
+    }
+    children.clear();
+    return multiPV;
+  }
+  
+  int select_best_child(struct MCTSNode * parent, struct Board * chess_board, double exploration_constant) {
+    double best_score = -INFINITY;
+    double score;
+    int selected = -1;
+    //parent->mutex.lock();  // Lock parent for read consistency (optional, but safe)
+    int num_children = parent->num_children.load();
+    //parent->mutex.unlock();
+    for (int i = 0; i < num_children; i++) {
+      //debug - comment out later
+      //char uci_move[6];
+      //idx_to_move(chess_board, parent->children[i].move, uci_move);
+      //print("select_best_child() debug: move %s, %.2f / %lld + sqrt(%lld) / %lld * %.4f * %.1f = %.5f + %.5f = %.5f\n", uci_move, -parent->children[i].child->W, parent->children[i].child->N, parent->N, parent->children[i].child->N + 1, parent->children[i].P, (double)(chessEngine.optionSpin[ExplorationConstant].value) / 100.0, parent->children[i].child->N ? -parent->children[i].child->W / parent->children[i].child->N : 0.0, sqrt(parent->N) / (parent->children[i].child->N + 1) * parent->children[i].P * (double)(chessEngine.optionSpin[ExplorationConstant].value) / 100.0, parent->children[i].child->N ? -parent->children[i].child->W / parent->children[i].child->N + sqrt(parent->N) / (parent->children[i].child->N + 1) * parent->children[i].P * (double)(chessEngine.optionSpin[ExplorationConstant].value) / 100.0 : sqrt(parent->N) / (parent->children[i].child->N + 1) * parent->children[i].P * (double)(chessEngine.optionSpin[ExplorationConstant].value) / 100.0);      
+      score = puct_score(parent, i, exploration_constant);
+      if (score > best_score) {
+        best_score = score;
+        selected = i;
+      }
+    }
+
+    // Apply virtual loss to selected child
+    parent->mutex.lock_shared();
+    parent->children[selected].child->N.fetch_add(1, std::memory_order_relaxed);
+    parent->children[selected].child->W.fetch_sub(search.virtual_loss, std::memory_order_relaxed);
+    parent->mutex.unlock_shared();
+    return selected;
+  }
+
 
   int get_prob(std::vector<std::pair<double, int>>& move_evals, double probability_mass) {
     if (move_evals.empty()) return 0;
@@ -249,26 +428,34 @@ extern "C" {
   }
   
   double process_check(struct Board * chess_board, struct Move * move, struct NNUEContext * ctx) {
-    struct Board * temp_board = cloneBoard(chess_board);
-    move->chessBoard = temp_board;
-    makeMove(move);
-    double best_value = temp_board->isMate ? -0.01 * MATE_SCORE : -INFINITY;
-  	enum PieceName side = (enum PieceName)((temp_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
-  	unsigned long long any = temp_board->occupations[side]; 
-  	while (any) {
-  	  int src = __builtin_ctzl(any);
-  	  unsigned long long moves = temp_board->sideToMoveMoves[src];
-  	  while (moves) {
-    	  int dst = __builtin_ctzl(moves);
-        init_move(move, temp_board, src, dst);
-        double res = evaluate_nnue(temp_board, move, ctx);
-        if (res > best_value) best_value = res;
-  		  moves &= moves - 1;
-  		}
-      any &= any - 1;
+    struct Board * temp_board = chess_board;
+    if (move) {
+      temp_board = cloneBoard(chess_board);
+      move->chessBoard = temp_board;
+      makeMove(move);
     }
-    move->chessBoard = chess_board;
-    freeBoard(temp_board);
+    double best_value = -INFINITY;
+    if (!temp_board->isMate) {
+    	enum PieceName side = (enum PieceName)((temp_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
+    	unsigned long long any = temp_board->occupations[side]; 
+    	struct Move m;
+    	while (any) {
+    	  int src = lsBit(any);
+    	  unsigned long long moves = temp_board->sideToMoveMoves[src];
+    	  while (moves) {
+      	  int dst = lsBit(moves);
+          init_move(&m, temp_board, src, dst);
+          double res = evaluate_nnue(temp_board, &m, ctx);
+          if (res > best_value) best_value = res;
+    		  moves &= moves - 1;
+    		}
+        any &= any - 1;
+      }
+    } else best_value = -0.01 * MATE_SCORE;
+    if (move) {
+      move->chessBoard = chess_board;
+      freeBoard(temp_board);
+    }
     return -best_value;
   }
   
@@ -296,27 +483,24 @@ MCTS implementation follows the four core phases:
       }
   };
 
-  void mcts_search(ThreadParams * params, int num_simulations, struct Board * board, struct NNUEContext * ctx) {
-    char uci_move[6], temp_move[6];
+  void mcts_search(ThreadParams * params, struct NNUEContext * ctx) {
+    //print("mcts_search(%d) entered...\n", params->thread_id);
+    char uci_move[6];
     struct Move move;
     params->currentNodes = 0;
     std::vector<struct MCTSNode *> path;  // Track the path from root to leaf
-    path.reserve(MAX_DEPTH);
-    for (int i = 0; i < num_simulations; i++) {
+    path.reserve(chessEngine.depth);
+    for (int i = 0; i < params->num_sims && !stopFlag.load(); i++) {
       bool repetition3x = false;
       params->currentDepth = 0;
-      struct MCTSNode * node = params->search.root;
+      struct MCTSNode * node = search.root;
       //start from the same initial position given by board (at the root node, i.e. at the top of the tree)
       //clone the board to preserve it for subsequent iterations
       struct Board * sim_board = cloneBoard(board);
-      if (!sim_board) {
-        fprintf(stderr, "mcts_search() error: cloneBoard() returned NULL\n");
-        exit(-1);
-      }
       // Selection
       //iterate down the tree updating sim_board by initiating and making moves
       std::unordered_map<std::pair<uint64_t, uint64_t>, int, PairHash> position_history;
-      while (node && node->num_children > 0 && !sim_board->isStaleMate && !sim_board->isMate) { //traversal stops at a leaf or terminal node or at 3x repetition
+      while (node && node->num_children.load() > 0 && !sim_board->isStaleMate && !sim_board->isMate) { //traversal stops at a leaf or terminal node or at 3x repetition
         std::pair<uint64_t, uint64_t> pos_key(sim_board->zh->hash, sim_board->zh->hash2);
         if (position_history[pos_key] >= 2) { // 3rd occurrence
             repetition3x = true;
@@ -324,25 +508,36 @@ MCTS implementation follows the four core phases:
         }
         position_history[pos_key]++;
         //return child node with the best score using PUCT (Predictor + Upper Confidence Bound)
-        int idx = -1;
-        select_best_child(node, &idx, sim_board, params->search.exploration_constant);
-        //fprintf(stderr, "select_best_child() debug: selected move is %s%s, fen %s\n", squareName[node->children[idx].move / 64], squareName[node->children[idx].move % 64], sim_board->fen->fenString);
+        //print("mcts_search(%d) calling select_best_child()...\n", params->thread_id);
+        int idx = select_best_child(node, sim_board, search.exploration_constant);
+        //print("mcts_search(%d) returned from select_best_child()...\n", params->thread_id);
+        if (idx < 0) {
+          print("mcts_search() error: select_best_child() returned negative index\n");
+          exit(-1);
+        }
+        //print("select_best_child() debug: selected move is %s%s, fen %s\n", squareName[node->children[idx].move / 64], squareName[node->children[idx].move % 64], sim_board->fen->fenString);
         //init edge's move that leads to the child node
-    		init_move(&move, sim_board, node->children[idx].move / 64, node->children[idx].move % 64);
+        node->mutex.lock_shared();
+        int move_idx = node->children[idx].move;
+        node->mutex.unlock_shared();
+    		init_move(&move, sim_board, move_idx / 64, move_idx % 64);
         //make the move
         makeMove(&move); //this updates sim_board
         //update Zobrist hash (it is needed so that we can call updateHash later instead of getHash)
   			if (updateHash(sim_board, &move)) {
-  				fprintf(stderr, "mcts_search() error: updateHash() returned non-zero value\n");
+  				print("mcts_search() error: updateHash() returned non-zero value\n");
   				exit(-1);
   			}
         //continue iterating down the tree until no more children or the end of the game is reached
         path.push_back(node);  // Add node to path
+        std::shared_lock lock(node->mutex);
         node = node->children[idx].child;
+        lock.unlock();
         params->currentDepth++;
       } //end of while(node && node->num_children > 0 && !sim_board->isStaleMate && !sim_board->isMate) loop
       position_history.clear();
       path.push_back(node);  // Add leaf to path - sim_board and result correspond to this node!
+
       //Here we are at the bottom of the tree, i.e. at a leaf or at the terminal node (mate, stalemate)
       // Evaluation - evaluate a leaf, i.e. a node without children, then we expand it - add children, which will be evaluated at the subsequent iterations
       double result = 0;
@@ -350,180 +545,390 @@ MCTS implementation follows the four core phases:
           result = NNUE_CHECK; //NNUE cannot evaluate when in check - it will be resolved in expansion
       } else if (sim_board->isMate) { //sim_board->fen->sideToMove is mated
         result = -1.0;
-				//fprintf(stderr, "mcts_search() debug: checkmate for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
+				//print("mcts_search() debug: checkmate for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
       } else if (sim_board->isStaleMate || repetition3x) {
         result = 0.0;        
-				//fprintf(stderr, "mcts_search() debug: stalemate or 3x repetition for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
+				//print("mcts_search() debug: stalemate or 3x repetition for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
       } else {
         //evaluate_nnue() returns result in pawns (not centipawns!) from sim_board->fen->sideToMove perspective
         result = evaluate_nnue(sim_board, NULL, ctx);
-  			//fprintf(stderr, "mcts_search() debug: evaluate_nnue result %f, fen %s\n", result, sim_board->fen->fenString);
+  			//print("mcts_search() debug: evaluate_nnue result %f, fen %s\n", result, sim_board->fen->fenString);
         result = tanh(result / 4.0);
       }
       // Expansion - add more children - increase the depth of the tree down using the model's predictions, NNUE evals or randomly
-      if (params->currentDepth < MAX_DEPTH && !sim_board->isMate && !sim_board->isStaleMate && !repetition3x) {
-        int num_moves = 0;
+      if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && !repetition3x && node->mutex.try_lock()) {
+        int src, dst, effective_branching = 1;
+        double res;
         std::vector<std::pair<double, int>> move_evals;
       	enum PieceName side = (enum PieceName)((sim_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
       	unsigned long long any = sim_board->occupations[side]; 
       	while (any) {
-      	  int src = __builtin_ctzl(any);
+      	  src = lsBit(any);
       	  unsigned long long moves = sim_board->sideToMoveMoves[src];
       	  while (moves) {
-        	  int dst = __builtin_ctzl(moves);
-            init_move(&move, sim_board, src, dst);
-            //evaluate_nnue() returns result in pawns (not centipawns!)
-            //stockfish makes the move, so the res is from the perspective of sim_board->opponentColor
-            double res = evaluate_nnue(sim_board, &move, ctx);
-            if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
-              res = process_check(sim_board, &move, ctx);
+      	    dst = lsBit(moves);
+          	struct Board * tmp_board = cloneBoard(sim_board);
+            init_move(&move, tmp_board, src, dst);
+            makeMove(&move);
+          	int pieceCount = bitCount(tmp_board->occupations[PieceNameAny]);
+            if (pieceCount > TB_LARGEST || tmp_board->fen->halfmoveClock || tmp_board->fen->castlingRights) {
+              //evaluate_nnue() returns result in pawns (not centipawns!)
+              //stockfish makes the move, so the res is from the perspective of sim_board->opponentColor
+              if (tmp_board->isMate) res = MATE_SCORE * 0.01;
+              else if (tmp_board->isCheck) res = process_check(tmp_board, NULL, ctx);
+              else res = -evaluate_nnue(tmp_board, NULL, ctx);
+            } else { //pieceCount <= TB_LARGEST, etc
+              unsigned int ep = lsBit(tmp_board->fen->enPassantLegalBit);
+              unsigned int wdl = tb_probe_wdl(tmp_board->occupations[PieceNameWhite], tmp_board->occupations[PieceNameBlack], tmp_board->occupations[WhiteKing] | tmp_board->occupations[BlackKing],
+                tmp_board->occupations[WhiteQueen] | tmp_board->occupations[BlackQueen], tmp_board->occupations[WhiteRook] | tmp_board->occupations[BlackRook], tmp_board->occupations[WhiteBishop] | tmp_board->occupations[BlackBishop], tmp_board->occupations[WhiteKnight] | tmp_board->occupations[BlackKnight], tmp_board->occupations[WhitePawn] | tmp_board->occupations[BlackPawn],
+                0, 0, ep == 64 ? 0 : ep, tmp_board->opponentColor == ColorBlack ? 1 : 0);
+              if (res == TB_RESULT_FAILED) {
+                print("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, pieceCount, tmp_board->fen->fenString, ep, tmp_board->fen->halfmoveClock, tmp_board->opponentColor == ColorBlack ? 1 : 0, tmp_board->occupations[PieceNameWhite], tmp_board->occupations[PieceNameBlack], tmp_board->occupations[WhiteKing] | tmp_board->occupations[BlackKing], tmp_board->occupations[WhiteQueen] | tmp_board->occupations[BlackQueen], tmp_board->occupations[WhiteRook] | tmp_board->occupations[BlackRook], tmp_board->occupations[WhiteBishop] | tmp_board->occupations[BlackBishop], tmp_board->occupations[WhiteKnight] | tmp_board->occupations[BlackKnight], tmp_board->occupations[WhitePawn] | tmp_board->occupations[BlackPawn], strerror(errno));
+                if (tmp_board->isMate) res = MATE_SCORE * 0.01;
+                else if (tmp_board->isCheck) res = process_check(tmp_board, NULL, ctx);
+                else res = -evaluate_nnue(tmp_board, NULL, ctx);
+              } else { //tb_probe_wdl() succeeded
+                //0 - loss, 4 - win, 1..3 - draw
+                if (wdl == 4) res = -MATE_SCORE * 0.001;
+                else if (wdl == 0) res = MATE_SCORE * 0.001;
+                else res = 0.0;
+                params->tbhits++;
+              }
+            } //end of else (pieceCount <= TB_LARGEST)
             move_evals.push_back({res, src * 64 + dst});
       		  moves &= moves - 1;
-      		  num_moves++;
-      		}
+            freeBoard(tmp_board);
+      	  } //end of while(moves)
           any &= any - 1;
-        }
+        } //end of while(any)
         std::sort(move_evals.begin(), move_evals.end(), std::greater<>()); //sorted in descending order
         if (result == NNUE_CHECK) {
-  			  //fprintf(stderr, "mcts_search() debug: check resolution result %f for move %s%s, fen %s\n", move_evals[0].first, squareName[move_evals[0].second / 64], squareName[move_evals[0].second % 64], sim_board->fen->fenString);
+  			  //print("mcts_search() debug: check resolution result %f for move %s%s, fen %s\n", move_evals[0].first, squareName[move_evals[0].second / 64], squareName[move_evals[0].second % 64], sim_board->fen->fenString);
           result = tanh(move_evals[0].first / 4.0);
         }
-        int effective_branching = get_prob(move_evals, params->search.probability_mass);
+        effective_branching = get_prob(move_evals, search.probability_mass);
         // Slice to top effective
         move_evals.resize(effective_branching);
-        expand_node(&params->search, node, sim_board, move_evals);
+        //print("mcts_search(%d) calling expand_node()...\n", params->thread_id);
+        expand_node(node, sim_board, move_evals, params->rng);
+        node->mutex.unlock();
+        //print("mcts_search(%d) returned from expand_node()...\n", params->thread_id);          
         move_evals.clear();
-      } //end of if (path_len < MAX_DEPTH && !sim_board->isMate && !sim_board->isStaleMate)
+      } //end of if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && node->mutex.try_lock()) 
       // Backpropagation: update node visits and results
-      for (auto n = path.rbegin(); n != path.rend(); n++) {
+      for (auto n = path.rbegin(); n != path.rend(); ++n) {
         node = *n;
-        node->N++;
-        node->W += result;
-        result = -result; 
+        node->N.fetch_add(1, std::memory_order_relaxed);
+        node->W.fetch_add(result, std::memory_order_relaxed);
+        result = -result;
       }
+      // Revert virtual loss for the selected path (skip root, as no loss was applied to it)
+      for (size_t j = 1; j < path.size(); ++j) {  // From first child to leaf
+        struct MCTSNode * nd = path[j];
+        nd->N.fetch_sub(1, std::memory_order_relaxed);
+        nd->W.fetch_add(search.virtual_loss, std::memory_order_relaxed);
+      }      
+      params->currentNodes++;      
       path.clear();
-      params->currentNodes++;
       freeBoard(sim_board);
       if (params->currentDepth > params->seldepth) params->seldepth = params->currentDepth;   
+      if ((chessEngine.depth && params->currentDepth >= chessEngine.depth) || (chessEngine.nodes && params->currentNodes >= chessEngine.nodes)) break;
     } //end of the iterations loop
-    if ((chessEngine.depth && params->currentDepth >= chessEngine.depth) || (chessEngine.nodes && params->currentNodes >= chessEngine.nodes)) stopFlag = 1;
+    //print("mcts_search(%d) exiting...\n", params->thread_id);
   }
     
   void thread_search(ThreadParams * params) {
-      double elapsed = 0.0;
-      unsigned long iterations = MIN_ITERATIONS;
-
-      cleanup(&params->search);
-      // Set params based on thread_id for diversity
-      //params->search.exploration_constant = EXPLORATION_CONSTANT + 0.1 * (params->thread_id);
-      params->search.probability_mass = PROBABILITY_MASS + 0.07 * (params->thread_id);
-      params->search.exploration_constant = EXPLORATION_CONSTANT + 0.2 * (params->thread_id % 3 - 1);
-      //params->search.probability_mass = PROBABILITY_MASS + 0.1 * (params->thread_id % 2);
-      params->search.dirichlet_alpha = DIRICHLET_ALPHA;
-      
-      set_root(&params->search, params->board);
-  
-      struct NNUEContext ctx;
-      auto iter_start = std::chrono::steady_clock::now();
-      init_nnue_context(&ctx);
-      while (elapsed < (timeAllocated * 0.001) && !stopFlag && iterations < MAX_ITERATIONS) {
-        mcts_search(params, params->num_sims, params->board, &ctx);
-        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
-      }
-      free_nnue_context(&ctx);
-      if (params->search.root && params->search.root->num_children) {
-        params->stats.reserve(params->search.root->num_children);
-        for (int i = 0; i < params->search.root->num_children; i++) {
-            params->stats.push_back({params->search.root->children[i].move, params->search.root->children[i].child->N, params->search.root->children[i].child->W});
-        }        
-      }
-  }
-
-  void runMCTS(struct Board * board) {
-    double elapsed = 0.0;
-    unsigned long iterations = MIN_ITERATIONS;
-    std::vector<ThreadParams> thread_params(chessEngine.optionSpin[1].value);
-    
-    for (int i = 0; i < chessEngine.optionSpin[1].value; ++i) {
-        thread_params[i].thread_id = i;
-        thread_params[i].num_sims = iterations;  // Or time-based loop inside thread
-        thread_params[i].board = board;  // Read-only
-    }
-    
-    auto iter_start = std::chrono::steady_clock::now();
-    
-    std::vector<std::thread> threads;
-    for (int i = 0; i < chessEngine.optionSpin[1].value; ++i) {
-      thread_params[i].stats.clear();
-      threads.emplace_back(thread_search, &thread_params[i]);
-    }
-    for (auto& t : threads) t.join();
-    
-    //chessEngine.currentNodes = 0;
-    chessEngine.currentDepth = 0;
-    chessEngine.seldepth = 0;
-    for (const auto& tp : thread_params) {
-      //chessEngine.currentNodes += tp.currentNodes;
-      if (tp.currentDepth > chessEngine.currentDepth) chessEngine.currentDepth = tp.currentDepth;
-      if (tp.seldepth > chessEngine.seldepth) chessEngine.seldepth = tp.seldepth;
-    }
-    
-    std::vector<EdgeStats> merged_stats; //aggregated stats
-    std::unordered_map<int, EdgeStats> accum_map;
-    unsigned long long total_nodes = 0;
-    for (int i = 0; i < chessEngine.optionSpin[1].value; ++i) {
-      for (const auto& edge : thread_params[i].stats) {
-        auto& acc = accum_map[edge.move];  // Creates if missing
-        if (acc.move == 0) acc.move = edge.move;  // Set once
-        acc.N += edge.N;
-        acc.W += edge.W;
-      }
-      total_nodes += thread_params[i].search.tree.size();
-    }
-    
-    // Transfer to merged_stats (optionally sort by N descending for easier selection)
-    merged_stats.reserve(accum_map.size());
-    for (const auto& [move, stats] : accum_map) {
-      merged_stats.push_back(stats);
-    }
-    std::sort(merged_stats.begin(), merged_stats.end(), [](const EdgeStats& a, const EdgeStats& b) {
-      return a.N > b.N;
-    });  
-
-    idx_to_move(board, merged_stats[0].move, best_move);
-    struct Move move;
-    init_move(&move, board, merged_stats[0].move / 64, merged_stats[0].move % 64);
     struct NNUEContext ctx;
     init_nnue_context(&ctx);
-    double res = evaluate_nnue(board, &move, &ctx);
-    if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
-      res = process_check(board, &move, &ctx);
+    auto iter_start = std::chrono::steady_clock::now();
+    double elapsed = 0.0;
+    while (elapsed < (timeAllocated * 0.001) && !stopFlag.load()) {
+        mcts_search(params, &ctx);
+        
+        // Update max depth
+        int expected = engineDepth.currentDepth.load(std::memory_order_relaxed);
+        while (params->currentDepth > expected && !engineDepth.currentDepth.compare_exchange_strong(expected, params->currentDepth, std::memory_order_relaxed)) {
+            expected = engineDepth.currentDepth.load(std::memory_order_relaxed);
+        }
+        // Update max seldepth
+        expected = engineDepth.seldepth.load(std::memory_order_relaxed);
+        while (params->seldepth > expected && !engineDepth.seldepth.compare_exchange_strong(expected, params->seldepth, std::memory_order_relaxed)) {
+            expected = engineDepth.seldepth.load(std::memory_order_relaxed);
+        }
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+    }
     free_nnue_context(&ctx);
-    
-    elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+  }
+  
+  void uci_output_thread() {
+    auto iter_start = std::chrono::steady_clock::now();
+
+    while (!stopFlag.load(std::memory_order_relaxed) && !search_done.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      
+      // Calculate nodes (total simulations)
+      unsigned long long nodes = search.root->N.load(std::memory_order_relaxed);
+            
+      // Get elapsed time
+      double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+
+      // Compute NPS
+      double nps = elapsed > 0 ? nodes / elapsed : 0;
+      
+      int * move_idx = nullptr;
+      char ** pv = nullptr;
+      int multiPV = select_best_move(&pv, &move_idx);
+      //Get NNUE eval for the best_move (move_idx)
+      struct NNUEContext ctx;
+      init_nnue_context(&ctx);
+      int depth = engineDepth.currentDepth.load(std::memory_order_relaxed);
+      int seldepth = engineDepth.seldepth.load(std::memory_order_relaxed);
+      for (int i = 0; i < multiPV && move_idx && pv; i++) {
+        struct Move move;
+        struct Board * temp_board = cloneBoard(board);
+        init_move(&move, temp_board, move_idx[i] / 64, move_idx[i] % 64);
+        double res = evaluate_nnue(temp_board, &move, &ctx);
+        if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
+          res = process_check(temp_board, &move, &ctx); 
+        freeBoard(temp_board); 
+        print("info depth %d seldepth %d multipv %d score cp %ld nodes %llu nps %.0f hashfull 0 tbhits 0 time %.0f pv %s\n", depth, seldepth, i + 1, (long)(res * 100), nodes, nps, elapsed * 1000, pv[i]);
+      }
+      free_nnue_context(&ctx);
+      if (pv) {
+        for (int i = 0; i < multiPV; i++) free(pv[i]);
+        free(pv);
+      }
+      if (move_idx) free(move_idx);
+    }
+  }
+  
+  void runMCTS() {
+    double elapsed = 0.0;
+    int * move_idx = nullptr;
+    size_t unique_nodes = 0;
     unsigned long long nodes = 0;
-    for (const auto& stats : merged_stats) nodes += stats.N;
+    int hashfull = 0;
+    int move_number = bitCount(board->moves);
+    char ** pv = nullptr;
+    int multiPV = 1;
+    
+    if (move_number > 1) {
+      search.exploration_constant = (double)chessEngine.optionSpin[ExplorationConstant].value / 100.0;
+      search.probability_mass = (double)chessEngine.optionSpin[ProbabilityMass].value / 100.0;
+      //search.dirichlet_alpha = (double)chessEngine.optionSpin[DirichletAlpha].value / 100.0;
+      search.noise = (double)chessEngine.optionSpin[Noise].value / 100.0;
+      search.virtual_loss = chessEngine.optionSpin[VirtualLoss].value;
+      unsigned long iterations = MIN_ITERATIONS;
+      std::vector<ThreadParams> thread_params(chessEngine.optionSpin[Threads].value);
+      for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
+        thread_params[i].thread_id = i;
+        thread_params[i].num_sims = iterations;  // Or time-based loop inside thread
+        thread_params[i].currentNodes = 0;
+        thread_params[i].currentDepth = 0;
+        thread_params[i].seldepth = 0;
+        thread_params[i].tbhits = 0;
+        thread_params[i].rng.seed(static_cast<unsigned int>(std::random_device{}() ^ std::hash<int>{}(i)));
+      }
+      
+      set_root();
+
+      if (!chessEngine.depth) chessEngine.depth = MAX_DEPTH;
+      engineDepth.currentDepth.store(0);
+      engineDepth.seldepth.store(0);
+      std::vector<std::thread> threads;
+      auto iter_start = std::chrono::steady_clock::now();
+      for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
+        threads.emplace_back(thread_search, &thread_params[i]);
+      }
+      search_done.store(false, std::memory_order_relaxed); // Reset
+      std::thread output_thread(uci_output_thread);
+      
+      for (auto& t : threads) t.join();
+      elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+
+      search_done.store(true, std::memory_order_relaxed); // Signal search complete
+      output_thread.join();
+      stopFlag.store(false, std::memory_order_relaxed); // Reset for next search
+        
+      chessEngine.tbhits = 0;
+      for (const auto& tp : thread_params) {
+        chessEngine.tbhits += tp.tbhits;
+      }
+      multiPV = select_best_moves(&pv, &move_idx);
+      if (multiPV > 0) {
+        unsigned long long max_visits = 0;
+        int best_index = 0;
+        int num_children = search.root->num_children.load();
+        for (int i = 0; i < num_children; i++) {
+          unsigned long long visits = search.root->children[i].child->N.load();
+          if (visits > max_visits) {
+            max_visits = visits;
+            best_index = i;
+          }
+        }
+        idx_to_move(board, search.root->children[best_index].move, best_move);
+      }      
+      nodes = search.root->N.load(std::memory_order_relaxed);
+      unique_nodes = search.tree.size();
+      cleanup();
+      // Estimate hashfull (in per-mille)
+      // hashfull using unique_nodes
+      size_t bytes_per_node = sizeof(MCTSNode) + 4 * sizeof(Edge) + 24;  // Avg 4 children? - depends on probability mass, 24B map overhead
+      size_t total_memory = unique_nodes * bytes_per_node;
+      size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
+      hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
+      if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
+    }
+    else if (move_number == 1) {
+        auto iter_start = std::chrono::steady_clock::now();
+        enum PieceName side = (enum PieceName)((board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
+        unsigned long long any = board->occupations[side];
+        int src = 0, dst = 0;
+        while (any) {
+            src = lsBit(any);
+            unsigned long long moves = board->sideToMoveMoves[src];
+            if (moves) {
+                dst = lsBit(moves);
+                break;
+            }
+            any &= any - 1;
+        }
+        move_idx = (int *)calloc(1, sizeof(int));
+        if (!move_idx) {
+          print("runMCTS() error: calloc() failed for move_idx\n");
+          exit(-1);
+        }
+        move_idx[0] = src * 64 + dst;
+        idx_to_move(board, move_idx[0], best_move);
+        pv = (char **)calloc(1, sizeof(char *));
+        pv[0] = (char *)calloc(1, 6);
+        strcpy(pv[0], best_move);
+        multiPV = 1;
+        nodes = 1;
+        engineDepth.currentDepth.store(1);
+        engineDepth.seldepth.store(1);
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+    }
+    else {
+        if (board->isMate) {
+            print("info depth 0 score mate 0\n");
+            print("bestmove (none)\n");
+        }
+        else if (board->isStaleMate) {
+            print("info depth 0 score cp 0\n");
+            print("bestmove (none)\n");
+        }
+        return;
+    }
+    
     double nps = nodes / elapsed;
+    int depth = engineDepth.currentDepth.load(std::memory_order_relaxed);
+    int seldepth = engineDepth.seldepth.load(std::memory_order_relaxed);
+    struct Move move;
+    struct NNUEContext ctx;
+    init_nnue_context(&ctx);
+    for (int i = 0; i < multiPV && move_idx && pv; i++) {
+      struct Board * temp_board = cloneBoard(board);
+      //Get NNUE eval for the best_move (move_idx)
+      init_move(&move, temp_board, move_idx[i] / 64, move_idx[i] % 64);
+      double res = evaluate_nnue(temp_board, &move, &ctx);
+      if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
+        res = process_check(temp_board, &move, &ctx);
+      freeBoard(temp_board);
+      print("info depth %d seldepth %d multipv %d score cp %ld nodes %llu nps %.0f hashfull %d tbhits %d time %.0f pv %s\n", depth, seldepth, i + 1, (long)(res * 100), nodes, nps, hashfull, chessEngine.tbhits, elapsed * 1000, pv[i]);
+    }
+    free_nnue_context(&ctx);
+    print("bestmove %s\n", best_move);    
+    if (pv) {
+      for (int i = 0; i < multiPV; i++) free(pv[i]);
+      free(pv);
+    }
+    if (move_idx) free(move_idx);
+  }
 
-    // Calculate hashfull (in per-mille)
-    size_t bytes_per_node = sizeof(MCTSNode) + 4 * sizeof(Edge) + 24;  // Avg 4 children?, 24B map overhead
-    size_t total_memory = total_nodes * bytes_per_node;
-    size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
-    int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
-    if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
-
-    fprintf(stderr, "info depth %d seldepth %d multipv 1 score cp %ld nodes %llu nps %.0f hashfull %d tbhits 0 time %.0f pv %s timeAllocated %.2f\n", chessEngine.currentDepth, chessEngine.seldepth, (long)(res * 100), nodes, nps, hashfull, elapsed * 1000, best_move, timeAllocated * 0.001);
-  }  
+  void setEngineOptions() {
+    strcpy(chessEngine.id, "Creatica Chess Engine 1.0");
+    strcpy(chessEngine.authors, "Creatica");
+    chessEngine.numberOfCheckOptions = 0;
+	  chessEngine.numberOfComboOptions = 0;
+	  chessEngine.numberOfSpinOptions = 8;
+		chessEngine.numberOfStringOptions = 1;
+		chessEngine.numberOfButtonOptions = 0;
+	  strcpy(chessEngine.optionString[SyzygyPath].name, "SyzygyPath");
+	  strcpy(chessEngine.optionString[SyzygyPath].defaultValue, SYZYGY_PATH_DEFAULT);
+	  strcpy(chessEngine.optionString[SyzygyPath].value, SYZYGY_PATH);
+	  if (chessEngine.optionString[SyzygyPath].value[0]) {
+      tb_init(chessEngine.optionString[SyzygyPath].value);
+      if (TB_LARGEST == 0) {
+          print("info string error unable to initialize tablebase; no tablebase files found in %s\n", chessEngine.optionString[SyzygyPath].value);
+      } else {
+        tb_init_done = true;
+        print("info string successfully initialized tablebases in %s. Max number of pieces %d\n", chessEngine.optionString[SyzygyPath].value, TB_LARGEST);
+      }
+	  } else print("setEngineOptions() error: syzygy path is 0\n");
+	  strcpy(chessEngine.optionSpin[Hash].name, "Hash");
+	  chessEngine.optionSpin[Hash].defaultValue = HASH;
+	  chessEngine.optionSpin[Hash].value = chessEngine.optionSpin[Hash].defaultValue;
+	  chessEngine.optionSpin[Hash].min = 128;
+	  chessEngine.optionSpin[Hash].max = 4096;
+	  strcpy(chessEngine.optionSpin[Threads].name, "Threads");
+	  chessEngine.optionSpin[Threads].defaultValue = THREADS;
+	  chessEngine.optionSpin[Threads].value = chessEngine.optionSpin[Threads].defaultValue;
+	  chessEngine.optionSpin[Threads].min = 1;
+	  chessEngine.optionSpin[Threads].max = 8;
+	  strcpy(chessEngine.optionSpin[MultiPV].name, "MultiPV");
+	  chessEngine.optionSpin[MultiPV].defaultValue = MULTI_PV;
+	  chessEngine.optionSpin[MultiPV].value = chessEngine.optionSpin[MultiPV].defaultValue;
+	  chessEngine.optionSpin[MultiPV].min = 1;
+	  chessEngine.optionSpin[MultiPV].max = 8;
+	  strcpy(chessEngine.optionSpin[ProbabilityMass].name, "ProbabilityMass");
+	  chessEngine.optionSpin[ProbabilityMass].defaultValue = PROBABILITY_MASS;
+	  chessEngine.optionSpin[ProbabilityMass].value = chessEngine.optionSpin[ProbabilityMass].defaultValue;
+	  chessEngine.optionSpin[ProbabilityMass].min = 1;
+	  chessEngine.optionSpin[ProbabilityMass].max = 100;
+	  strcpy(chessEngine.optionSpin[ExplorationConstant].name, "ExplorationConstant");
+	  chessEngine.optionSpin[ExplorationConstant].defaultValue = EXPLORATION_CONSTANT;
+	  chessEngine.optionSpin[ExplorationConstant].value = chessEngine.optionSpin[ExplorationConstant].defaultValue;
+	  chessEngine.optionSpin[ExplorationConstant].min = 0;
+	  chessEngine.optionSpin[ExplorationConstant].max = 200;
+	  strcpy(chessEngine.optionSpin[Noise].name, "Noise");
+	  chessEngine.optionSpin[Noise].defaultValue = NOISE;
+	  chessEngine.optionSpin[Noise].value = chessEngine.optionSpin[Noise].defaultValue;
+	  chessEngine.optionSpin[Noise].min = 1;
+	  chessEngine.optionSpin[Noise].max = 30;
+	  strcpy(chessEngine.optionSpin[VirtualLoss].name, "VirtualLoss");
+	  chessEngine.optionSpin[VirtualLoss].defaultValue = VIRTUAL_LOSS;
+	  chessEngine.optionSpin[VirtualLoss].value = chessEngine.optionSpin[VirtualLoss].defaultValue;
+	  chessEngine.optionSpin[VirtualLoss].min = 0;
+	  chessEngine.optionSpin[VirtualLoss].max = 10;
+	  strcpy(chessEngine.optionSpin[PVPlies].name, "PVPlies");
+	  chessEngine.optionSpin[PVPlies].defaultValue = PV_PLIES;
+	  chessEngine.optionSpin[PVPlies].value = chessEngine.optionSpin[PVPlies].defaultValue;
+	  chessEngine.optionSpin[PVPlies].min = 1;
+	  chessEngine.optionSpin[PVPlies].max = 32;
+	  chessEngine.seldepth = 0;
+	  chessEngine.currentDepth = 0;
+    chessEngine.wtime = 1e9;
+    chessEngine.btime = 1e9;
+    chessEngine.winc = 0;
+    chessEngine.binc = 0;
+    chessEngine.movestogo = 0;
+    chessEngine.movetime = 0;
+    chessEngine.depth = 0;
+    chessEngine.nodes = 0;
+    chessEngine.infinite = false;
+  }
 
 #ifdef __cplusplus
 }
 #endif
 
+
 int main(int argc, char ** argv) {
-  struct Board board;
+  TB_LARGEST = 0;
   struct Fen fen;
   struct ZobristHash zh;
-  zobristHash(&zh);
+  struct Board chess_board;
   struct NNUEContext ctx;
   char fenString[MAX_FEN_STRING_LEN] = "";
   char uciMove[6] = "";
@@ -539,53 +944,18 @@ int main(int argc, char ** argv) {
 		printf("test_nnue error: strtofen() failed; FEN %s\n", fenString);
 		return 1;
 	}
-	if (fentoboard(&fen, &board)) {
+	if (fentoboard(&fen, &chess_board)) {
 		printf("test_nnue error: fentoboard() failed; FEN %s\n", fen.fenString);
 		return 1;
 	}
-	board.zh = &zh;
+  zobristHash(&zh);
+  chess_board.zh = &zh;
+  board = &chess_board;
   //init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue");
   init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
 	init_nnue_context(&ctx);
-    strcpy(chessEngine.id, "Creatica Chess Engine 1.0");
-    strcpy(chessEngine.authors, "Creatica");
-    chessEngine.numberOfCheckOptions = 0;
-	  chessEngine.numberOfComboOptions = 0;
-	  chessEngine.numberOfSpinOptions = 3;
-		chessEngine.numberOfStringOptions = 1;
-		chessEngine.numberOfButtonOptions = 0;
-	  strcpy(chessEngine.optionString[0].name, "SyzygyPath");
-	  strcpy(chessEngine.optionString[0].defaultValue, "/Users/ap/syzygy");
-	  strcpy(chessEngine.optionString[0].value, "/Users/ap/syzygy");	  
-	  strcpy(chessEngine.optionSpin[0].name, "Hash");
-	  chessEngine.optionSpin[0].defaultValue = 1024;
-	  chessEngine.optionSpin[0].value = chessEngine.optionSpin[0].defaultValue;
-	  chessEngine.optionSpin[0].min = 1024;
-	  chessEngine.optionSpin[0].max = 4096;
-	  strcpy(chessEngine.optionSpin[1].name, "Threads");
-	  chessEngine.optionSpin[1].defaultValue = 8;
-	  chessEngine.optionSpin[1].value = chessEngine.optionSpin[1].defaultValue;
-	  chessEngine.optionSpin[1].min = 1;
-	  chessEngine.optionSpin[1].max = 8;
-	  strcpy(chessEngine.optionSpin[2].name, "MultiPV");
-	  chessEngine.optionSpin[2].defaultValue = 1;
-	  chessEngine.optionSpin[2].value = chessEngine.optionSpin[2].defaultValue;
-	  chessEngine.optionSpin[2].min = 1;
-	  chessEngine.optionSpin[2].max = 8;
-	  chessEngine.seldepth = 0;
-	  chessEngine.currentDepth = 0;
-    chessEngine.wtime = 1e9;
-    chessEngine.btime = 1e9;
-    chessEngine.winc = 0;
-    chessEngine.binc = 0;
-    chessEngine.movestogo = 0;
-    chessEngine.movetime = 0;
-    chessEngine.depth = 0;
-    chessEngine.nodes = 0;
-    //chessEngine.currentNodes = 0;
-    chessEngine.infinite = false;
-
-	runMCTS(&board);
+  setEngineOptions();
+	runMCTS();
   cleanup_nnue();
   cleanup_magic_bitboards();
   return 0;

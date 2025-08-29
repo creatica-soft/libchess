@@ -403,7 +403,7 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 	enum Color sideToMove;
 	sideToMove = strchr(engine->position, 'w') ? ColorWhite : ColorBlack;
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
-		//fprintf(stderr, "%s", line);
+		//if (engine->logfile) fprintf(engine->logfile, "%s", line);
 		if (strstr(line, "bestmove ") - line == 0) {
 			if ((sscanf(line, "bestmove %5s ponder %5s\n", eval[0]->bestmove, eval[0]->ponder) == 2) || (sscanf(line, "bestmove %5s\n", eval[0]->bestmove) == 1)) {
 				if (strncmp(eval[0]->bestmove, "(none", 5) == 0 || eval[0]->bestmove[0] == '\0') {
@@ -423,9 +423,7 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 						}		  
 						break;
 					}
-					//printf("scanning prevLine[%d] %s with score cp\n", i, prevLine[i]);
 					if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
-  					//printf("scanning prevLine[%d] %s with score mate\n", i, prevLine[i]);
 					  if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score mate %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->matein), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) == 10)
 					    eval[i]->scorecp = MATE_SCORE * (eval[i]->matein/abs(eval[i]->matein));
 					}
@@ -439,9 +437,6 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
             }
             ++tmpLine; // Increment result, otherwise we'll find target at the same location
           }
-					//tmpLine = strstr(prevLine[i], " mate ");
-					//if (tmpLine) sscanf(tmpLine + 6, "%d", &(eval[0]->matein));
-					//printf("freeing prevLine[%d]\n", i);
 					free(prevLine[i]);
 					prevLine[i] = NULL;
 				} //end of for multiPV

@@ -29,10 +29,10 @@
 #define THREADS 8
 #define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH ""
+#define SYZYGY_PATH "/Users/ap/syzygy"
 #define HASH 1024 //this is just for hashfull stats - no memory restriction is in place for tree growth
-#define EXPLORATION_CONSTANT 80 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
-#define PROBABILITY_MASS 60 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
+#define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
+#define PROBABILITY_MASS 75 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
 //#define DIRICHLET_ALPHA 3  // Tune: higher for more often noise
 //#define DIRICHLET_EPSILON 25  // Blend factor: (1 - epsilon) * P + epsilon * noise -- magnitude of noise
 #define NOISE 5 //Default noise added to move priors to reduce contention between search threads and increase diversity 
@@ -45,7 +45,7 @@ std::condition_variable cv;
 bool searchFlag = false;
 std::atomic<bool> stopFlag = false;
 bool quitFlag = false;
-FILE * logfile;
+FILE * logfile = nullptr;;
 double timeAllocated = 0.0; //ms
 struct Board * board = nullptr;
 char best_move[6] = "";
