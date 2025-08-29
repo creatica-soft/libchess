@@ -20,6 +20,29 @@
 extern "C" {
 #endif
 
+#ifndef __APPLE__ // macOS
+unsigned int arc4random_uniform(unsigned int upper_bound) {
+    if (upper_bound == 0) return 0;
+    unsigned int min = -upper_bound % upper_bound; // Compute rejection threshold
+    unsigned int r;
+    do {
+        r = rand();
+    } while (r < min); // Reject to ensure uniformity
+    return r % upper_bound;
+}
+#endif
+
+int randomNumber(const int min, const int max) {
+    const int range = max - min + 1;
+    const unsigned int max_random = 0xFFFFFFFFU; // Maximum value of random()
+    const unsigned int threshold = (max_random / range) * range;
+    unsigned int num;
+    do {
+        num = arc4random_uniform(max + 1);
+    } while (num >= threshold); // Reject numbers causing bias
+    return (num % range) + min; // Adjust to desired range
+}
+
 int getOptions(struct Engine * engine) {
 	char name[MAX_UCI_OPTION_NAME_LEN], type[MAX_UCI_OPTION_TYPE_LEN],
 		defaultStringValue[MAX_UCI_OPTION_STRING_LEN];
@@ -401,9 +424,9 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 						break;
 					}
 					//printf("scanning prevLine[%d] %s with score cp\n", i, prevLine[i]);
-					if (sscanf(prevLine[i], "info depth %hhu seldepth %hhu multipv %hhu score cp %d nodes %llu nps %llu hashfull %hu tbhits %hhu time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
+					if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
   					//printf("scanning prevLine[%d] %s with score mate\n", i, prevLine[i]);
-					  if (sscanf(prevLine[i], "info depth %hhu seldepth %hhu multipv %hhu score mate %d nodes %llu nps %llu hashfull %hu tbhits %hhu time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->matein), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) == 10)
+					  if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score mate %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->matein), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) == 10)
 					    eval[i]->scorecp = MATE_SCORE * (eval[i]->matein/abs(eval[i]->matein));
 					}
 					//truncate pv string to maxPlies

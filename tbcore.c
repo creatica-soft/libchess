@@ -6,22 +6,22 @@
   This file should not need to much adaptation to add tablebase probing to
   a particular engine, provided the engine is written in C or C++.
 */
-#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdio.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include "tbcore.h"
-#ifdef _WIN32
-#include <stdlib.h>
-#define bswap32(x) _byteswap_ulong(x)
-#else
+#ifndef _WIN32
 #include <sys/mman.h>
-#include <unistd.h>
-#define bswap32(x) __builtin_bswap32(x)
 #endif
+#include "tbcore.h"
 
 #define TBMAX_PIECE 254
 #define TBMAX_PAWN 256
@@ -46,9 +46,6 @@
 static LOCK_T TB_MUTEX;
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 extern unsigned TB_LARGEST;
 static int initialized = 0;
 static int num_paths = 0;
@@ -69,7 +66,6 @@ static void init_indices(void);
 extern uint64_t calc_key_from_pcs(int *pcs, int mirror);
 static void free_wdl_entry(struct TBEntry *entry);
 static void free_dtz_entry(struct TBEntry *entry);
-
 
 static FD open_tb(const char *str, const char *suffix)
 {
@@ -380,7 +376,7 @@ static void init_tablebases(const char *path)
 //  printf("Found %d tablebases.\n", TBnum_piece + TBnum_pawn);
 }
 
-static const int8_t offdiag[] = {
+static const char offdiag[] = {
   0,-1,-1,-1,-1,-1,-1,-1,
   1, 0,-1,-1,-1,-1,-1,-1,
   1, 1, 0,-1,-1,-1,-1,-1,
@@ -1189,7 +1185,11 @@ static void calc_symlen(struct PairsData *d, int s, char *tmp)
 {
   int s1, s2;
 
-  int w = *(int *)(d->sympat + 3 * s);
+  //int w = *(int *)(d->sympat + 3 * s); //causes misaligned pointer use error
+  // Read the integer byte-by-byte to avoid misaligned access
+  int w;
+  memcpy(&w, d->sympat + 3 * s, sizeof(w));
+    
   s2 = (w >> 12) & 0x0fff;
   if (s2 == 0x0fff)
     d->symlen[s] = 0;
@@ -1204,6 +1204,7 @@ static void calc_symlen(struct PairsData *d, int s, char *tmp)
 
 static struct PairsData *setup_pairs(unsigned char *data, uint64 tb_size, uint64 *size, unsigned char **next, ubyte *flags, int wdl)
 {
+  //assert(((uintptr_t)data % 4) == 0 && "data pointer is not 4-byte aligned");
   struct PairsData *d;
   int i;
 
@@ -1222,7 +1223,9 @@ static struct PairsData *setup_pairs(unsigned char *data, uint64 tb_size, uint64
 
   int blocksize = data[1];
   int idxbits = data[2];
-  int real_num_blocks = *(uint32 *)(&data[4]);
+  //int real_num_blocks = *(uint32 *)(&data[4]); //causes misaligned pointer use error
+  int real_num_blocks;
+  memcpy(&real_num_blocks, &data[4], sizeof(uint32));
   int num_blocks = real_num_blocks + *(ubyte *)(&data[3]);
   int max_len = data[8];
   int min_len = data[9];
@@ -1482,7 +1485,9 @@ static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
 
   uint32 mainidx = idx >> d->idxbits;
   int litidx = (idx & ((1 << d->idxbits) - 1)) - (1 << (d->idxbits - 1));
-  uint32 block = *(uint32 *)(d->indextable + 6 * mainidx);
+  //uint32 block = *(uint32 *)(d->indextable + 6 * mainidx); //causes misaligned pointer use error
+  uint32 block;
+  memcpy(&block, d->indextable + 6 * mainidx, sizeof(block));
   litidx += *(ushort *)(d->indextable + 6 * mainidx + 4);
   if (litidx < 0) {
     do {
@@ -1520,7 +1525,7 @@ static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
   }
 #else
   uint32 next = 0;
-  uint32 code = bswap32(*ptr++);
+  uint32 code = __builtin_bswap32(*ptr++);
   bitcnt = 0; // number of bits in next
   for (;;) {
     int l = m;
@@ -1534,7 +1539,7 @@ static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
 	code |= (next >> (32 - l));
 	l -= bitcnt;
       }
-      next = bswap32(*ptr++);
+      next = __builtin_bswap32(*ptr++);
       bitcnt = 32;
     }
     code |= (next >> (32 - l));
@@ -1545,7 +1550,9 @@ static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
 
   ubyte *sympat = d->sympat;
   while (symlen[sym] != 0) {
-    int w = *(int *)(sympat + 3 * sym);
+    //int w = *(int *)(sympat + 3 * sym); //causes misaligned pointer use error
+    int w;
+    memcpy(&w, sympat + 3 * sym, sizeof(w));
     int s1 = w & 0x0fff;
     if (litidx < (int)symlen[s1] + 1)
       sym = s1;
@@ -1558,7 +1565,7 @@ static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
   return *(sympat + 3 * sym);
 }
 
-static void load_dtz_table(char *str, uint64_t key1, uint64_t key2)
+static void load_dtz_table(char *str, uint64 key1, uint64 key2)
 {
   int i;
   struct TBEntry *ptr, *ptr3;
@@ -1638,4 +1645,3 @@ static ubyte pa_flags[5] = { 8, 0, 0, 0, 4 };
 #ifdef __cplusplus
 }
 #endif
-

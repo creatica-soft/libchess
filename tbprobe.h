@@ -24,12 +24,12 @@
 #ifndef TBPROBE_H
 #define TBPROBE_H
 
-#include "tbconfig.h"
-
 #ifdef __cplusplus
 extern "C"
 {
 #endif
+
+#include "tbconfig.h"
 
 #ifndef TB_NO_STDINT
 #include <stdint.h>

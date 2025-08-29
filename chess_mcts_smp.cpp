@@ -1,13 +1,13 @@
 //For MacOS using clang
-//c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp
+//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp
 
 // For linux or Windows using mingw
 // add -mpopcnt for X86_64
 // might need to add -Wno-stringop-overflow to avoid some warnings in tbcore.h
-//g++ -std=c++17 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -Wno-stringop-overflow -O3 -I /home/ap/libchess -L /home/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp -lchess
+//g++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -Wno-stringop-overflow -O3 -I /home/ap/libchess -L /home/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp -lchess
 
 //or with clang in MSYS2 MINGW64 or CLANG64
-//clang++ -std=c++17 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -O3 -I /home/ap/libchess -L /home/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp -lchess
+//clang++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -O3 -I /home/ap/libchess -L /home/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp -lchess
 
 #include "nnue/types.h"
 #include "nnue/position.h"
@@ -58,6 +58,7 @@ extern "C" {
   extern bool searchFlag;
   extern int logfile;
   extern struct Engine chessEngine;
+  extern struct Board * board;
   std::mutex probe_mutex;
   
   struct Edge {
@@ -94,7 +95,7 @@ extern "C" {
       MCTSSearch search;
       int thread_id;
       int num_sims;  // Or time slice
-      struct Board * board;  // Shared read-only
+      //struct Board * board;  // Shared read-only
       std::vector<EdgeStats> stats; //per thread stats
       unsigned long long currentNodes = 0;  // Per-thread
       int currentDepth = 0;                 // Per-thread max depth reached
@@ -109,7 +110,7 @@ extern "C" {
     search->root = nullptr;
   }
     
-  void set_root(MCTSSearch * search, struct Board * board) {
+  void set_root(MCTSSearch * search) {
     unsigned long long hash = board->zh->hash ^ board->zh->hash2;
     auto& node = search->tree[hash];
     node.hash = hash;
@@ -328,7 +329,7 @@ MCTS implementation follows the four core phases:
       struct MCTSNode * node = params->search.root;
       //start from the same initial position given by board (at the root node, i.e. at the top of the tree)
       //clone the board to preserve it for subsequent iterations
-      struct Board * sim_board = cloneBoard(params->board);
+      struct Board * sim_board = cloneBoard(board);
       if (!sim_board) {
         log_file("mcts_search() error: cloneBoard() returned NULL\n");
         exit(-1);
@@ -458,7 +459,6 @@ MCTS implementation follows the four core phases:
       if (params->currentDepth > params->seldepth) params->seldepth = params->currentDepth;   
       if ((chessEngine.depth && params->currentDepth >= chessEngine.depth) || (chessEngine.nodes && params->currentNodes >= chessEngine.nodes)) break;
     } //end of the iterations loop
-    //if ((chessEngine.depth && params->currentDepth >= chessEngine.depth) || (chessEngine.nodes && params->currentNodes >= chessEngine.nodes)) stopFlag = true;
   }
     
   void thread_search(ThreadParams * params) {
@@ -473,7 +473,7 @@ MCTS implementation follows the four core phases:
       //params->search.probability_mass = (double)(chessEngine.optionSpin[ProbabilityMass].value) / 100.0 + 0.1 * (params->thread_id % 2);
       params->search.dirichlet_alpha = (double)(chessEngine.optionSpin[DirichletAlpha].value) / 100.0;
       
-      set_root(&params->search, params->board);
+      set_root(&params->search);
   
       struct NNUEContext ctx;
       auto iter_start = std::chrono::steady_clock::now();
@@ -491,12 +491,12 @@ MCTS implementation follows the four core phases:
       }
   }
 
-  void runMCTS(struct Board * board) {
+  void runMCTS() {
     double elapsed = 0.0;
     int move_idx = 0;
-    unsigned long long total_nodes = 1;
+    unsigned long long unique_nodes = 0;
+    unsigned long long nodes = 0;
     std::vector<EdgeStats> merged_stats; //aggregated stats
-    auto iter_start = std::chrono::steady_clock::now();
     int move_number = bitCount(board->moves);
     if (move_number > 1) {
         unsigned long iterations = MIN_ITERATIONS;
@@ -504,16 +504,18 @@ MCTS implementation follows the four core phases:
         for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
             thread_params[i].thread_id = i;
             thread_params[i].num_sims = iterations;  // Or time-based loop inside thread
-            thread_params[i].board = board;  // Read-only
+            //thread_params[i].board = board;  // Read-only
         }
 
         if (!chessEngine.depth) chessEngine.depth = MAX_DEPTH;
         std::vector<std::thread> threads;
+        auto iter_start = std::chrono::steady_clock::now();
         for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
             thread_params[i].stats.clear();
             threads.emplace_back(thread_search, &thread_params[i]);
         }
         for (auto& t : threads) t.join();
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
 
         //chessEngine.currentNodes = 0;
         chessEngine.currentDepth = 0;
@@ -532,20 +534,21 @@ MCTS implementation follows the four core phases:
                 acc.N += edge.N;
                 acc.W += edge.W;
             }
-            total_nodes += thread_params[i].search.tree.size();
+            unique_nodes += thread_params[i].search.tree.size();
             cleanup(&thread_params[i].search);
         }
         // Transfer to merged_stats (optionally sort by N descending for easier selection)
         merged_stats.reserve(accum_map.size());
         for (const auto& [move, stats] : accum_map) {
             merged_stats.push_back(stats);
+            nodes += stats.N;
         }
-        std::sort(merged_stats.begin(), merged_stats.end(), [](const EdgeStats& a, const EdgeStats& b) {
-            return a.N > b.N;
-            });
+        std::sort(merged_stats.begin(), merged_stats.end(), [](const EdgeStats& a, const EdgeStats& b) {return a.N > b.N;});
         move_idx = merged_stats[0].move;
+        merged_stats.clear();
     }
     else if (move_number == 1) {
+        auto iter_start = std::chrono::steady_clock::now();
         enum PieceName side = (enum PieceName)((board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
         unsigned long long any = board->occupations[side];
         int src = 0, dst = 0;
@@ -559,6 +562,11 @@ MCTS implementation follows the four core phases:
             any &= any - 1;
         }
         move_idx = src * 64 + dst;
+        nodes = 1;
+        unique_nodes = 1;
+        chessEngine.currentDepth = 1;
+        chessEngine.seldepth = 1;
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
     }
     else {
         if (board->isMate) {
@@ -586,14 +594,11 @@ MCTS implementation follows the four core phases:
       res = process_check(board, &move, &ctx);
     free_nnue_context(&ctx);
     
-    elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
-    unsigned long long nodes = 1;
-    for (const auto& stats : merged_stats) nodes += stats.N;
     double nps = nodes / elapsed;
 
     // Calculate hashfull (in per-mille)
     size_t bytes_per_node = sizeof(MCTSNode) + 4 * sizeof(Edge) + 24;  // Avg 4 children?, 24B map overhead
-    size_t total_memory = total_nodes * bytes_per_node;
+    size_t total_memory = unique_nodes * bytes_per_node;
     size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
     int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
     if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec

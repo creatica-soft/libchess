@@ -5,7 +5,7 @@
  *
  * (C) 2015 basil, all rights reserved,
  * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "So7ftware"),
+ * copy of this software and associated documentation files (the "Software"),
  * to deal in the Software without restriction, including without limitation
  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
  * and/or sell copies of the Software, and to permit persons to whom the
@@ -23,22 +23,18 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h> // For uint8_t, uint64_t
-#ifdef _MSC_VER
-#include <intrin.h>
-#pragma intrinsic(__popcnt64)
-#pragma intrinsic(_BitScanForward64)
-#else
-#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
+
+#include "tbprobe.h"
+#ifdef __x86_64__
 #include <x86intrin.h>
 #endif
-#endif
-#include "magic_bitboards.h"
-#include "tbprobe.h"
-
 #define WHITE_KING              (TB_WPAWN + 5)
 #define WHITE_QUEEN             (TB_WPAWN + 4)
 #define WHITE_ROOK              (TB_WPAWN + 3)
@@ -73,7 +69,7 @@
 
 #define BEST_NONE               0xFFFF
 #define SCORE_ILLEGAL           0x7FFF
-/*
+
 #ifndef TB_NO_HW_POP_COUNT
 // Add portable popcount definition
 #ifdef __x86_64__
@@ -81,7 +77,8 @@
 #define popcount(x) _mm_popcnt_u64(x)
 #define BITSCAN(x, idx) __asm__("bsfq %1, %0": "=r"(idx): "rm"(x))
 #else
-#define BITSCAN(x, idx) (idx = lsBitl(x))
+#define popcount(x) __builtin_popcountll(x)
+#define BITSCAN(x, idx) (idx = __builtin_ctzll(x))
 #endif
 #else
 static inline unsigned popcount(uint64_t x)
@@ -92,39 +89,17 @@ static inline unsigned popcount(uint64_t x)
     return (x * 0x0101010101010101ull) >> 56;
 }
 #endif
+
 #ifdef __x86_64__
 #define BITSCAN(x, idx) __asm__("bsfq %1, %0": "=r"(idx): "rm"(x))
 #else
-#define BITSCAN(x, idx) (idx = lsBit(x))
-#endif
-*/
-
-#ifdef _MSC_VER
-#include <intrin.h>
-#pragma intrinsic(__popcnt64)
-#define popcount(x) __popcnt64(x)
-#else
-#define popcount(x) __builtin_popcountll(x)
-#endif
-#ifdef _MSC_VER
-#include <intrin.h>
-#pragma intrinsic(_BitScanForward64)
-#define BITSCAN(x, idx) _BitScanForward64(&(idx), (x))
-static inline unsigned lsBit(uint64_t value) {
-    unsigned long index;
-    return _BitScanForward64(&index, value) ? (unsigned)index : 64;
-}
-#else
-#define BITSCAN(x, idx) ((idx) = __builtin_ctzll(x))
-static inline unsigned lsBit(uint64_t value) {
-    return __builtin_ctzll(value);
-}
+#define BITSCAN(x, idx) (idx = __builtin_ctzll(x))
 #endif
 
 #define poplsb(x)               ((x) & ((x) - 1))
 static inline unsigned lsb(uint64_t b)
 {
-    unsigned long idx;
+    size_t idx;
     BITSCAN(b, idx);
     return (unsigned)idx;
 }
@@ -141,10 +116,6 @@ static inline unsigned lsb(uint64_t b)
 #define MOVE_STALEMATE          0xFFFF
 #define MOVE_CHECKMATE          0xFFFE
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 struct pos
 {
     uint64_t white;
@@ -155,8 +126,8 @@ struct pos
     uint64_t bishops;
     uint64_t knights;
     uint64_t pawns;
-    uint8_t rule50;
-    uint8_t ep;
+    unsigned rule50;
+    unsigned ep;
     bool turn;
 };
 
@@ -325,15 +296,15 @@ static const uint64_t anti2board_table[15] =
     0x0001020408102040ull,
 };
 
-static inline unsigned long diag2index(uint64_t b, unsigned d)
+static inline size_t diag2index(uint64_t b, unsigned d)
 {
     b *= 0x0101010101010101ull;
     b >>= 56;
     b >>= 1;
-    return (unsigned long)b;
+    return (size_t)b;
 }
 
-static inline unsigned long anti2index(uint64_t b, unsigned a)
+static inline size_t anti2index(uint64_t b, unsigned a)
 {
     return diag2index(b, a);
 }
@@ -729,12 +700,7 @@ static int probe_wdl_table(const struct pos *pos, int *success)
                 return 0;
             }
             // Memory barrier to ensure ptr->ready = 1 is not reordered.
-            #ifdef _MSC_VER
-            #include <intrin.h>
-            #define memory_barrier() _ReadWriteBarrier()
-            #else
-            #define memory_barrier() __asm__ __volatile__ ("" ::: "memory")
-            #endif
+            __asm__ __volatile__ ("" ::: "memory");
             ptr->ready = 1;
         }
         UNLOCK(TB_MUTEX);
@@ -1867,7 +1833,7 @@ extern unsigned tb_probe_wdl_impl(
         knights,
         pawns,
         0,
-        (uint8_t)(ep),
+        ep,
         turn
     };
     int success;
@@ -1901,8 +1867,8 @@ extern unsigned tb_probe_root_impl(
         bishops,
         knights,
         pawns,
-        (uint8_t)(rule50),
-        (uint8_t)(ep),
+        rule50,
+        ep,
         turn
     };
     int dtz;
