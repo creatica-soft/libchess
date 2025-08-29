@@ -61,9 +61,9 @@ int normalizeMoves(char * moves) {
 	bool moreThanOne = false, skipCur = false, skipPar = false, dollar = false;
 	int count = 0;
 	int n = 0, numberOfPlies = 0;
-	char * s = strndup(moves, strlen(moves));
+	char * s = strdup(moves);
 	if (!s) {
-	  printf("normalizeMoves() error: strndup returned NULL: %s moves: %s\n", strerror(errno), moves);
+	  printf("normalizeMoves() error: strdup returned NULL: %s moves: %s\n", strerror(errno), moves);
 	  return errno;
 	}
 	size_t len = strlen(s);
@@ -123,10 +123,10 @@ int normalizeMoves(char * moves) {
 //returns number of plies
 int movesOnly(char * moves) {
 	bool wroteSpace = false;
-	int n = 0, numberOfPlies = 0;;
-	char * s = strndup(moves, strlen(moves));
+	int n = 0, numberOfPlies = 0;
+	char * s = strdup(moves);
 	if (!s) {
-	  printf("movesOnly() error: strndup() returned NULL: %s. moves %s\n", strerror(errno), moves);
+	  printf("movesOnly() error: strdup() returned NULL: %s. moves %s\n", strerror(errno), moves);
 	  return errno;
 	}
 	size_t len = strlen(s);
@@ -378,9 +378,9 @@ int playGame(struct Game * game) {
 		printf("playGame() error: fentoboard() failed; FEN %s\n", fen.fenString);
 		return 1;
 	}	
-	char * sanMoves = strndup(game->sanMoves, strlen(game->sanMoves));
+	char * sanMoves = strdup(game->sanMoves);
 	if (!sanMoves) {
-		printf("playGame() error: strndup() returned NULL: %s. sanMoves %s\n", strerror(errno), game->sanMoves);
+		printf("playGame() error: strdup() returned NULL: %s. sanMoves %s\n", strerror(errno), game->sanMoves);
 		return errno;
 	}
 	char * saveptr;

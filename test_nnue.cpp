@@ -104,6 +104,9 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
     freeBoard(temp_board);
     return -best_value;
   }
+#ifdef __cplusplus
+}
+#endif
 
 int main(int argc, char ** argv) {
   struct Board board;
@@ -183,10 +186,6 @@ int main(int argc, char ** argv) {
   cleanup_magic_bitboards();
   return 0;
 }
-
-#ifdef __cplusplus
-}
-#endif
 
 
 

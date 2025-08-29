@@ -10,7 +10,7 @@
 #include "libchess.h"
 
 #define SYZYGY_PATH "/Users/ap/syzygy"
-extern "C" {
+
   int main(int argc, char ** argv) {
     struct Board board;
     struct Fen fen;
@@ -61,4 +61,3 @@ extern "C" {
     printf("result %.0f, uci_move %s%s%c\n", result, squareName[src], squareName[dst], uciPromoLetter[6 - promotes]);
     cleanup_magic_bitboards();
   }
-}

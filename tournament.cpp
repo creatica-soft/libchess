@@ -161,6 +161,10 @@ void playGame(int n) {
   fprintf(file, "%s\n\n", result);
 }
 
+#ifdef __cplusplus
+}
+#endif
+
 int main(int argc, char ** argv) {
   int n = 0; //number of simulations of NUMBER_OF_GAMES each
   init_magic_bitboards();
@@ -210,13 +214,13 @@ int main(int argc, char ** argv) {
       elo_whites[n] = elo_white;
       score_whites[n] = score_white;
     }
-    else fprintf(file, "n (%d) > sizeof(elo_whites) (%lu)\n", n, sizeof(elo_whites));
+    else fprintf(file, "n (%d) > sizeof(elo_whites) (%llu)\n", n, sizeof(elo_whites));
     elo_black = round(ELO_BLACK + K_FACTOR * (score_black - e_black * NUMBER_OF_GAMES));
     if (n < sizeof(elo_blacks)) {
       elo_blacks[n] = elo_black;
       score_blacks[n] = score_black;
     }  
-    else fprintf(file, "n (%d) > sizeof(elo_blacks) (%lu)\n", n, sizeof(elo_blacks));
+    else fprintf(file, "n (%d) > sizeof(elo_blacks) (%llu)\n", n, sizeof(elo_blacks));
     fprintf(file, "Elo white %.0f, elo black %.0f after %d games (%.1f : %.1f)\n", elo_white, elo_black, NUMBER_OF_GAMES, score_white, score_black);
     fclose(file);
   }
@@ -246,7 +250,3 @@ int main(int argc, char ** argv) {
   
   return 0;
 }
-
-#ifdef __cplusplus
-}
-#endif
