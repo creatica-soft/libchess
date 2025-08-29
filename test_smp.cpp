@@ -515,6 +515,9 @@ MCTS implementation follows the four core phases:
     fprintf(stderr, "info depth %d seldepth %d multipv 1 score cp %ld nodes %llu nps %.0f hashfull %d tbhits 0 time %.0f pv %s timeAllocated %.2f\n", chessEngine.currentDepth, chessEngine.seldepth, (long)(res * 100), nodes, nps, hashfull, elapsed * 1000, best_move, timeAllocated * 0.001);
   }  
 
+#ifdef __cplusplus
+}
+#endif
 
 int main(int argc, char ** argv) {
   struct Board board;
@@ -579,7 +582,7 @@ int main(int argc, char ** argv) {
     chessEngine.movetime = 0;
     chessEngine.depth = 0;
     chessEngine.nodes = 0;
-    chessEngine.currentNodes = 0;
+    //chessEngine.currentNodes = 0;
     chessEngine.infinite = false;
 
 	runMCTS(&board);
@@ -587,10 +590,6 @@ int main(int argc, char ** argv) {
   cleanup_magic_bitboards();
   return 0;
 }
-
-#ifdef __cplusplus
-}
-#endif
 
 
 
