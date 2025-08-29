@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Define the library (libchess.dll or chess.lib)
-add_library(chess SHARED bitscanner.c board.c engine.cpp fen.c move.c piece.c pgn.c square.c tag.c zobrist-hash.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp)
+add_library(chess SHARED bitscanner.cpp board.cpp engine.cpp fen.cpp move.cpp piece.cpp pgn.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp)
 
 # Define the executable
 add_executable(chess_mcts_smp chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c)

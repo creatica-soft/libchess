@@ -5,6 +5,10 @@
 #ifndef TBCORE_H
 #define TBCORE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef _WIN32
 #include <pthread.h>
 #define SEP_CHAR ':'
@@ -47,11 +51,6 @@
 
 #define TBHASHBITS 10
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 typedef unsigned long long uint64;
 typedef unsigned int uint32;
 typedef unsigned char ubyte;
@@ -79,17 +78,17 @@ struct PairsData {
 };
 
 struct TBEntry {
-    char* data;
-    uint64 key;
-    uint64 mapping;
-    ubyte ready;
-    ubyte num;
-    ubyte symmetric;
-    ubyte has_pawns;
+  char *data;
+  uint64 key;
+  uint64 mapping;
+  ubyte ready;
+  ubyte num;
+  ubyte symmetric;
+  ubyte has_pawns;
 #ifndef _MSC_VER
 } __attribute__((__may_alias__));
 #else
-    };
+};
 #endif
 
 struct TBEntry_piece {
@@ -172,9 +171,8 @@ struct DTZTableEntry {
   uint64 key2;
   struct TBEntry *entry;
 };
-
-#endif
-
 #ifdef __cplusplus
 }
 #endif
+#endif
+

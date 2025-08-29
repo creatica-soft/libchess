@@ -1,4 +1,4 @@
-// compile with c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -Wl,-lchess -L /Users/ap/libchess -o tournament tournament.cpp
+// compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o tournament tournament.cpp
 
 #include <errno.h>
 #include <ctype.h>
@@ -10,18 +10,18 @@
 #include <unordered_map>
 #include "libchess.h"
 
-#define WHITE_PATH "/Users/ap/libchess/chess_mcts_smp"
+#define WHITE_PATH "/Users/ap/libchess/chess_mcts"
 #define BLACK_PATH "/Users/ap/libchess/stockfish-macos-m1-apple-silicon"
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define PGN_FILE "creatica-stockfish"
-#define ELO_WHITE 1000
-#define ELO_BLACK 1320
+#define ELO_WHITE 1500
+#define ELO_BLACK 1500
 #define K_FACTOR 32 // 40 for new players (under 30 games), 20 for established players under 2400, 10 for masters (2400+) 
 #define MOVETIME 1000
 #define DEPTH 0
 #define HASH 1024
 #define THREADS 8
-#define NUMBER_OF_GAMES 10
+#define NUMBER_OF_GAMES 50
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,15 +30,15 @@ extern "C" {
 //Globals
 double e_white, e_black, score_white, score_black;
 float elo_white, elo_black;
-struct Engine * white = NULL, * black = NULL;
+struct Engine * white = nullptr, * black = nullptr;
 struct Board board;
 struct Fen fen;
 struct ZobristHash zh;
 struct Move move;
 struct Evaluation evaluation;
-struct Evaluation * evaluations[1] = { NULL };
+struct Evaluation * evaluations[1] = { nullptr };
 char sanMoves[4096] = "";
-FILE * file = NULL;
+FILE * file = nullptr;
 char filename[255];
 
 struct PairHash {
@@ -175,19 +175,17 @@ int main(int argc, char ** argv) {
   if (!black) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for black\n", BLACK_PATH);
   //else fprintf(stderr, "initilized chess engine %s for black\n", black->id);
 
-  float elo_whites[5 * 5 * 7 * 6];
-  float elo_blacks[5 * 5 * 7 * 6];
-  float score_whites[5 * 5 * 7 * 6];
-  float score_blacks[5 * 5 * 7 * 6];
+  float elo_whites[3 * 3 * 3];
+  float elo_blacks[3 * 3 * 3];
+  float score_whites[3 * 3 * 3];
+  float score_blacks[3 * 3 * 3];
 
-	for (int m = 0; m < 5; m++) {
-	  white->optionSpin[DirichletEpsilon].value = 15 + m * 5; //0..50; for testing 15..35 with step 5; default 25
-	for (int l = 0; l < 5; l++) { // 1..9 with step 2; default 3
-	  white->optionSpin[DirichletAlpha].value = 1 + l * 2;
-	for (int k = 0; k < 7; k++) { //0..200; default 80. For testing 60..120 with step 10
-	  white->optionSpin[ExplorationConstant].value = 60 + k * 10;
-	for (int j = 0; j < 6; j++) { //0..100; default 80. For testing 50..100 with step 10
-	  white->optionSpin[ProbabilityMass].value = 50 + j * 10;
+//	for (int l = 0; l < 3; l++) { // 5..15 with step 5; default 10
+//	  white->optionSpin[Noise].value = 5 + l * 5;
+	for (int k = 0; k < 3; k++) { //80..120 with step 20
+	  white->optionSpin[ExplorationConstant].value = 80 + k * 20;
+	for (int j = 0; j < 3; j++) { //60..90 with step 15
+	  white->optionSpin[ProbabilityMass].value = 60 + j * 15;
 	  n++;
 	  char suffix[13];
 	  sprintf(suffix, "-%d.pgn", n);
@@ -199,7 +197,7 @@ int main(int argc, char ** argv) {
   		fprintf(stderr, "error: failed to open/create a file %s: %s\n", filename, strerror(errno));
   		exit(1);
   	}
-  	fprintf(file, "Test chess engine options:\nDirichletEpsilon %.2f\nDirichletAlpha %.2f\nExplorationConstant %.1f\nProbabilityMass %lld%%\n\n", (float)white->optionSpin[DirichletEpsilon].value / 100.0, (float)white->optionSpin[DirichletAlpha].value / 100.0, (float)white->optionSpin[ExplorationConstant].value / 100.0, white->optionSpin[ProbabilityMass].value);
+  	fprintf(file, "Test chess engine options:\nNoise %lld%%\nExplorationConstant %.1f\nProbabilityMass %lld%%\n\n", white->optionSpin[Noise].value, (float)white->optionSpin[ExplorationConstant].value / 100.0, white->optionSpin[ProbabilityMass].value);
     e_white = 1 / (1 + pow(10, (double)(ELO_BLACK - ELO_WHITE) / 400.0)); //expected white score
     e_black = 1.0 - e_white; //expected black score
     score_white = 0;
@@ -223,8 +221,7 @@ int main(int argc, char ** argv) {
     fclose(file);
   }
   }
-  }
-  }
+//  }
   quit(white);
   quit(black);
   releaseChessEngine(white);

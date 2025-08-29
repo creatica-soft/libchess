@@ -82,13 +82,13 @@
  * Define TB_ROOK_ATTACKS(square, occ) to return the rook attacks bitboard
  * for a rook at `square' assuming the given `occ' occupancy bitboard.
  */
- //#define TB_ROOK_ATTACKS(square, occ)     get_rook_moves(square, occ)
+ //#define TB_ROOK_ATTACKS(square, occ)     get_rook_moves(square, occ) */
 
 /*
  * Define TB_BISHOP_ATTACKS(square, occ) to return the bishop attacks bitboard
  * for a bishop at `square' assuming the given `occ' occupancy bitboard.
  */
- //#define TB_BISHOP_ATTACKS(square, occ)   get_bishop_moves(square, occ)
+ //#define TB_BISHOP_ATTACKS(square, occ)   get_bishop_moves(square, occ) */
 
 /*
  * Define TB_QUEEN_ATTACKS(square, occ) to return the queen attacks bitboard
@@ -96,7 +96,7 @@
  * NOTE: If no definition is provided then tbprobe will use:
  *       TB_ROOK_ATTACKS(square, occ) | TB_BISHOP_ATTACKS(square, occ)
  */
- //#define TB_QUEEN_ATTACKS(square, occ)    get_bishop_moves(square, occ) | get_rook_moves(square, occ)
+ //#define TB_QUEEN_ATTACKS(square, occ)    get_bishop_moves(square, occ) | get_rook_moves(square, occ) */
 
 /*
  * Define TB_PAWN_ATTACKS(square, color) to return the pawn attacks bitboard

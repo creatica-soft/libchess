@@ -1,4 +1,4 @@
-// compile with c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -Wl,-lchess -L /Users/ap/libchess -o test_nnue test_nnue.c
+// compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o test_nnue test_nnue.cpp
 #include "nnue/types.h"
 #include "nnue/position.h"
 #include "nnue/evaluate.h"
@@ -61,7 +61,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
   }
   
   char * idx_to_move(struct Board * chess_board, int move_idx, char * uci_move) {
-    uci_move[0] = '\0';
+    uci_move[0] = 0;
     if (!uci_move) {
       fprintf(stderr, "idx_to_move() error: invalid arg - uci_move is NULL\n");
       return NULL;
@@ -75,7 +75,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
       bool promo_move = promoMove(chess_board, source_square, destination_square);
       if (promo_move) {
         uci_move[4] = 'q';
-        uci_move[5] = '\0';
+        uci_move[5] = 0;
       }
     }
     return uci_move;
@@ -108,6 +108,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
 int main(int argc, char ** argv) {
   struct Board board;
   struct Fen fen;
+	struct Move move;
   struct NNUEContext ctx;
   char fenString[MAX_FEN_STRING_LEN] = "";
   char uciMove[6] = "";
@@ -127,7 +128,6 @@ int main(int argc, char ** argv) {
 		printf("test_nnue error: fentoboard() failed; FEN %s\n", fen.fenString);
 		return 1;
 	}
-	struct Move move;
   //init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue");
   init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
 	init_nnue_context(&ctx);
