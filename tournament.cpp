@@ -10,13 +10,13 @@
 #include <unordered_map>
 #include "libchess.h"
 
-#define WHITE_PATH "/Users/ap/libchess/chess_mcts"
-#define BLACK_PATH "/Users/ap/libchess/stockfish-macos-m1-apple-silicon"
+#define CREATICA_PATH "/Users/ap/libchess/creatica"
+#define STOCKFISH_PATH "/Users/ap/libchess/stockfish-macos-m1-apple-silicon"
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define PGN_FILE "creatica-stockfish"
-#define ELO_WHITE 1500
-#define ELO_BLACK 1500
-#define K_FACTOR 32 // 40 for new players (under 30 games), 20 for established players under 2400, 10 for masters (2400+) 
+#define ELO_CREATICA 2000
+#define ELO_STOCKFISH 2000
+#define K_FACTOR 20 // 40 for new players (under 30 games), 20 for established players under 2400, 10 for masters (2400+) 
 #define MOVETIME 1000
 #define DEPTH 0
 #define HASH 1024
@@ -28,9 +28,9 @@ extern "C" {
 #endif
 
 //Globals
-double e_white, e_black, score_white, score_black;
-float elo_white, elo_black;
-struct Engine * white = nullptr, * black = nullptr;
+double e_creatica, e_stockfish, score_creatica, score_stockfish;
+float elo_creatica, elo_stockfish;
+struct Engine * creatica = nullptr, * stockfish = nullptr;
 struct Board board;
 struct Fen fen;
 struct ZobristHash zh;
@@ -43,15 +43,12 @@ char filename[255];
 
 struct PairHash {
     std::size_t operator()(const std::pair<uint64_t, uint64_t>& p) const {
-        // Combine the two 64-bit hashes using XOR
-        // You can also use other mixing functions for better distribution
-        //return std::hash<uint64_t>{}(p.first) ^ std::hash<uint64_t>{}(p.second);
         return p.first ^ p.second;
     }
 };
   
-void playGame(int n) {
-  fprintf(stdout, "game %d, score %.1f : %.1f\n", n, score_white, score_black);
+void playGame(struct Engine * white, struct Engine * black, int n) {
+  fprintf(stdout, "game %d, score creatica : stockfish %.1f : %.1f\n", n, score_creatica, score_stockfish);
   newGame(white);
   newGame(black);
   strtofen(&fen, startPos);
@@ -79,7 +76,7 @@ void playGame(int n) {
     strcat(sanMoves, move.sanMove);
     strcat(sanMoves, " ");
     makeMove(&move);
-    fprintf(stdout, "game %d, score %.1f : %.1f, white score cp %d\n", n, score_white, score_black, evaluations[0]->scorecp);
+    fprintf(stdout, "game %d, score creatica : stockfish %.1f : %.1f, white score cp %d\n", n, score_creatica, score_stockfish, evaluations[0]->scorecp);
     writeDebug(&board, false);
     if (updateHash(&board, &move)) {
         fprintf(stderr, "playGame() error: updateHash() returned non-zero value\n");
@@ -111,7 +108,7 @@ void playGame(int n) {
     strcat(sanMoves, move.sanMove);
     strcat(sanMoves, " ");
     makeMove(&move);
-    fprintf(stdout, "game %d, score %.1f : %.1f, white score cp %d\n", n, score_white, score_black, -evaluations[0]->scorecp);
+    fprintf(stdout, "game %d, score creatica : stockfish %.1f : %.1f, white score cp %d\n", n, score_creatica, score_stockfish, -evaluations[0]->scorecp);
     writeDebug(&board, false);
     if (updateHash(&board, &move)) {
         fprintf(stderr, "playGame() error: updateHash() returned non-zero value\n");
@@ -130,17 +127,21 @@ void playGame(int n) {
   if (board.isMate) {
     if (board.fen->sideToMove == ColorWhite) {
       strcpy(result, "0-1");
-      score_black += 1;
+      if (strstr(black->id, "Stockfish")) 
+        score_stockfish += 1;
+      else score_creatica += 1.0;
     }
     else {
       strcpy(result, "1-0");        
-      score_white += 1.0;
+      if (strstr(white->id, "Creatica")) 
+        score_creatica += 1.0;
+      else score_stockfish += 1;
     }
   } 
   else if (board.isStaleMate || board.fen->halfmoveClock == 50 || (__builtin_popcountl(board.occupations[PieceNameAny]) <= 5 && evaluations[0]->scorecp == 0) || repetition3x) {
     strcpy(result, "1/2-1/2");    
-    score_white += 0.5;
-    score_black += 0.5;
+    score_creatica += 0.5;
+    score_stockfish += 0.5;
   }
   fprintf(file, "[Event \"Match of Champions\"]\n[Site \"sv Beruta\"]\n[Date \"2025.06.27\"]\n[Round \"%d\"]\n[White \"%s\"]\n[Black \"%s\"]\n[Result \"%s\"]\n\n", n, white->id, black->id, result);
 
@@ -171,25 +172,26 @@ int main(int argc, char ** argv) {
   evaluations[0] = &evaluation;
   evaluations[0]->maxPlies = 1; //we just need the next move  
 
-  white = initChessEngine(WHITE_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, 1, false, false, ELO_WHITE);
-  if (!white) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for white\n", WHITE_PATH);
-  //else fprintf(stderr, "initilized chess engine %s for white\n", white->id);
+  creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, 1, false, false, ELO_CREATICA);
+  if (!creatica) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for creatica\n", CREATICA_PATH);
+  //else fprintf(stderr, "initilized chess engine %s for creatica\n", creatica->id);
   
-  black = initChessEngine(BLACK_PATH, MOVETIME, DEPTH, 128, 1, SYZYGY_PATH, 1, true, true, ELO_BLACK);
-  if (!black) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for black\n", BLACK_PATH);
-  //else fprintf(stderr, "initilized chess engine %s for black\n", black->id);
+  stockfish = initChessEngine(STOCKFISH_PATH, MOVETIME, DEPTH, 128, 1, SYZYGY_PATH, 1, true, true, ELO_STOCKFISH);
+  if (!stockfish) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for black\n", STOCKFISH_PATH);
+  //else fprintf(stderr, "initilized chess engine %s for stockfish\n", stockfish->id);
 
-  float elo_whites[3 * 3 * 3];
-  float elo_blacks[3 * 3 * 3];
-  float score_whites[3 * 3 * 3];
-  float score_blacks[3 * 3 * 3];
+  float elos_creatica[3 * 5];
+  float elos_stockfish[3 * 5];
+  float scores_creatica[3 * 5];
+  float scores_stockfish[3 * 5];
 
-//	for (int l = 0; l < 3; l++) { // 5..15 with step 5; default 10
-//	  white->optionSpin[Noise].value = 5 + l * 5;
-	for (int k = 0; k < 3; k++) { //80..120 with step 20
-	  white->optionSpin[ExplorationConstant].value = 80 + k * 20;
-	for (int j = 0; j < 3; j++) { //60..90 with step 15
-	  white->optionSpin[ProbabilityMass].value = 60 + j * 15;
+	for (int l = 0; l < 5; l++) { // 3..7 with step 1; default 5
+	  creatica->optionSpin[Noise].value = 3 + l;
+//	for (int k = 0; k < 3; k++) { //80..120 with step 20
+	  //creatica->optionSpin[ExplorationConstant].value = 80 + k * 20;
+	  creatica->optionSpin[ExplorationConstant].value = 100;
+	for (int j = 0; j < 3; j++) { //70..80 with step 5
+	  creatica->optionSpin[ProbabilityMass].value = 70 + j * 5;
 	  n++;
 	  char suffix[13];
 	  sprintf(suffix, "-%d.pgn", n);
@@ -201,52 +203,55 @@ int main(int argc, char ** argv) {
   		fprintf(stderr, "error: failed to open/create a file %s: %s\n", filename, strerror(errno));
   		exit(1);
   	}
-  	fprintf(file, "Test chess engine options:\nNoise %lld%%\nExplorationConstant %.1f\nProbabilityMass %lld%%\n\n", white->optionSpin[Noise].value, (float)white->optionSpin[ExplorationConstant].value / 100.0, white->optionSpin[ProbabilityMass].value);
-    e_white = 1 / (1 + pow(10, (double)(ELO_BLACK - ELO_WHITE) / 400.0)); //expected white score
-    e_black = 1.0 - e_white; //expected black score
-    score_white = 0;
-    score_black = 0;
+  	fprintf(file, "Test chess engine options:\nNoise %lld%%\nExplorationConstant %.1f\nProbabilityMass %lld%%\n\n", creatica->optionSpin[Noise].value, (float)creatica->optionSpin[ExplorationConstant].value / 100.0, creatica->optionSpin[ProbabilityMass].value);
+    e_creatica = 1 / (1 + pow(10, (double)(ELO_STOCKFISH - ELO_CREATICA) / 400.0)); //expected creatica score
+    e_stockfish = 1.0 - e_creatica; //expected stockfish score
+    score_creatica = 0;
+    score_stockfish = 0;
     for (int i = 0; i < NUMBER_OF_GAMES; i++) {
-      playGame((n - 1) * NUMBER_OF_GAMES + i + 1);
+      if (i % 2)
+        playGame(stockfish, creatica, (n - 1) * NUMBER_OF_GAMES + i + 1);
+      else
+        playGame(creatica, stockfish, (n - 1) * NUMBER_OF_GAMES + i + 1);
     }
-    elo_white = round(ELO_WHITE + K_FACTOR * (score_white - e_white * NUMBER_OF_GAMES));
-    if (n < sizeof(elo_whites)) {
-      elo_whites[n] = elo_white;
-      score_whites[n] = score_white;
+    elo_creatica = round(ELO_CREATICA + K_FACTOR * (score_creatica - e_creatica * NUMBER_OF_GAMES));
+    if (n < sizeof(elos_creatica)) {
+      elos_creatica[n] = elo_creatica;
+      scores_creatica[n] = score_creatica;
     }
-    else fprintf(file, "n (%d) > sizeof(elo_whites) (%llu)\n", n, sizeof(elo_whites));
-    elo_black = round(ELO_BLACK + K_FACTOR * (score_black - e_black * NUMBER_OF_GAMES));
-    if (n < sizeof(elo_blacks)) {
-      elo_blacks[n] = elo_black;
-      score_blacks[n] = score_black;
+    else fprintf(file, "n (%d) > sizeof(elos_creatica) (%llu)\n", n, sizeof(elos_creatica));
+    elo_stockfish = round(ELO_STOCKFISH + K_FACTOR * (score_stockfish - e_stockfish * NUMBER_OF_GAMES));
+    if (n < sizeof(elos_stockfish)) {
+      elos_stockfish[n] = elo_stockfish;
+      scores_stockfish[n] = score_stockfish;
     }  
-    else fprintf(file, "n (%d) > sizeof(elo_blacks) (%llu)\n", n, sizeof(elo_blacks));
-    fprintf(file, "Elo white %.0f, elo black %.0f after %d games (%.1f : %.1f)\n", elo_white, elo_black, NUMBER_OF_GAMES, score_white, score_black);
+    else fprintf(file, "n (%d) > sizeof(elos_stockfish) (%llu)\n", n, sizeof(elos_stockfish));
+    fprintf(file, "Elo creatica %.0f, elo stockfish %.0f after %d games (%.1f : %.1f)\n", elo_creatica, elo_stockfish, NUMBER_OF_GAMES, score_creatica, score_stockfish);
     fclose(file);
   }
-  }
 //  }
-  quit(white);
-  quit(black);
-  releaseChessEngine(white);
-  releaseChessEngine(black);
+  }
+  quit(creatica);
+  quit(stockfish);
+  releaseChessEngine(creatica);
+  releaseChessEngine(stockfish);
   cleanup_magic_bitboards();
-  float best_elo_white = 0;
-  float best_elo_black = 0;
-  int best_n_white = -1;
-  int best_n_black = -1;
+  float best_elo_creatica = 0;
+  float best_elo_stockfish = 0;
+  int best_n_creatica = -1;
+  int best_n_stockfish = -1;
   for (int i = 0; i < n; i++) {
-    if (elo_whites[i] > best_elo_white) {
-      best_elo_white = elo_whites[i];
-      best_n_white = i;
+    if (elos_creatica[i] > best_elo_creatica) {
+      best_elo_creatica = elos_creatica[i];
+      best_n_creatica = i;
     }
-    if (elo_blacks[i] > best_elo_black) {
-      best_elo_black = elo_blacks[i];
-      best_n_black = i;
+    if (elos_stockfish[i] > best_elo_stockfish) {
+      best_elo_stockfish = elos_stockfish[i];
+      best_n_stockfish = i;
     }
   }
-  fprintf(stdout, "Best options for white are in %s-%d.pgn. Score %.1f : %.1f\n", PGN_FILE, best_n_white, score_whites[best_n_white], score_blacks[best_n_white]);
-  fprintf(stdout, "Best options for black are in %s-%d.pgn. Score %.1f : %.1f\n", PGN_FILE, best_n_black, score_blacks[best_n_black], score_blacks[best_n_black]);
+  fprintf(stdout, "Best options for creatica are in %s-%d.pgn. Score %.1f : %.1f\n", PGN_FILE, best_n_creatica, scores_creatica[best_n_creatica], scores_stockfish[best_n_creatica]);
+  fprintf(stdout, "Best options for stockfish are in %s-%d.pgn. Score %.1f : %.1f\n", PGN_FILE, best_n_stockfish, scores_stockfish[best_n_stockfish], scores_creatica[best_n_stockfish]);
   
   return 0;
 }

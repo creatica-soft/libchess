@@ -1,13 +1,13 @@
 //For MacOS using clang
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess chess_mcts.cpp uci.cpp tbcore.c tbprobe.c -o chess_mcts
+//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica
 
 // For linux or Windows using mingw
 // add -mpopcnt for X86_64
 // might need to add -Wno-stringop-overflow to avoid some warnings in tbcore.h
-//g++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -Wno-stringop-overflow -O3 -I /home/ap/libchess -L /home/ap/libchess chess_mcts.cpp uci.cpp tbcore.c tbprobe.c -o chess_mcts -lchess
+//g++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -Wno-stringop-overflow -O3 -I /home/ap/libchess -L /home/ap/libchess creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica -lchess
 
 //or with clang in MSYS2 MINGW64 or CLANG64
-//clang++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -O3 -flto -I /home/ap/libchess -L /home/ap/libchess chess_mcts.cpp uci.cpp tbcore.c tbprobe.c -o chess_mcts -lchess
+//clang++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -O3 -flto -I /home/ap/libchess -L /home/ap/libchess creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica -lchess
 
 #include "nnue/types.h"
 #include "nnue/position.h"

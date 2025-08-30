@@ -32,9 +32,7 @@
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define HASH 1024 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
-#define PROBABILITY_MASS 75 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-//#define DIRICHLET_ALPHA 3  // Tune: higher for more often noise
-//#define DIRICHLET_EPSILON 25  // Blend factor: (1 - epsilon) * P + epsilon * noise -- magnitude of noise
+#define PROBABILITY_MASS 90 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
 #define NOISE 5 //Default noise added to move priors to reduce contention between search threads and increase diversity 
 #define VIRTUAL_LOSS 2
 #define PV_PLIES 16
@@ -482,18 +480,6 @@ void setEngineOptions() {
 	  chessEngine.optionSpin[ExplorationConstant].value = chessEngine.optionSpin[ExplorationConstant].defaultValue;
 	  chessEngine.optionSpin[ExplorationConstant].min = 0;
 	  chessEngine.optionSpin[ExplorationConstant].max = 200;
-	  /*
-	  strcpy(chessEngine.optionSpin[DirichletAlpha].name, "DirichletAlpha");
-	  chessEngine.optionSpin[DirichletAlpha].defaultValue = DIRICHLET_ALPHA;
-	  chessEngine.optionSpin[DirichletAlpha].value = chessEngine.optionSpin[DirichletAlpha].defaultValue;
-	  chessEngine.optionSpin[DirichletAlpha].min = 0;
-	  chessEngine.optionSpin[DirichletAlpha].max = 10;
-	  strcpy(chessEngine.optionSpin[DirichletEpsilon].name, "DirichletEpsilon");
-	  chessEngine.optionSpin[DirichletEpsilon].defaultValue = DIRICHLET_EPSILON;
-	  chessEngine.optionSpin[DirichletEpsilon].value = chessEngine.optionSpin[DirichletEpsilon].defaultValue;
-	  chessEngine.optionSpin[DirichletEpsilon].min = 0;
-	  chessEngine.optionSpin[DirichletEpsilon].max = 50;
-	  */
 	  strcpy(chessEngine.optionSpin[Noise].name, "Noise");
 	  chessEngine.optionSpin[Noise].defaultValue = NOISE;
 	  chessEngine.optionSpin[Noise].value = chessEngine.optionSpin[Noise].defaultValue;
