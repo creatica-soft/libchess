@@ -20,7 +20,7 @@ add_library(chess SHARED bitscanner.cpp board.cpp engine.cpp fen.cpp move.cpp pi
 add_executable(creatica creatica.cpp uci.cpp tbcore.c tbprobe.c)
 add_executable(test_nnue test_nnue.cpp)
 add_executable(test_tb tbcore.c tbprobe.c test_tb.cpp)
-add_executable(test_smp test_smp.cpp)
+add_executable(test_smp tbcore.c tbprobe.c test_smp.cpp)
 add_executable(tournament tournament.cpp)
 
 # Now set compiler options after targets are defined
