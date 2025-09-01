@@ -32,17 +32,17 @@
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define HASH 1024 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
-#define PROBABILITY_MASS 90 //cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-#define NOISE 5 //Default noise added to move priors to reduce contention between search threads and increase diversity 
-#define VIRTUAL_LOSS 2
+#define PROBABILITY_MASS 90 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
+#define NOISE 10 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise * 0.01
+#define VIRTUAL_LOSS 3
 #define PV_PLIES 16
 
 // Shared variables
 std::mutex mtx, log_mtx, print_mtx;
 std::condition_variable cv;
-bool searchFlag = false;
-std::atomic<bool> stopFlag = false;
-bool quitFlag = false;
+std::atomic<bool> searchFlag {false};
+std::atomic<bool> stopFlag {false};
+std::atomic<bool> quitFlag {false};
 FILE * logfile = nullptr;;
 double timeAllocated = 0.0; //ms
 struct Board * board = nullptr;
@@ -55,7 +55,8 @@ extern "C" {
   void init_nnue(const char * nnue_file_big, const char * nnue_file_small);
   void cleanup_nnue();
   extern void runMCTS();
-
+  extern void cleanup(); //free Hash tree
+  
   //UCI protocol in uci.c
   void uciLoop();
   void handleUCI(void);
@@ -87,16 +88,19 @@ void print(const char * message, ...) {
   
 // Search thread function
 void search_thread_func() {
-    while (!quitFlag) {
+    while (!quitFlag.load()) {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [] { return searchFlag || quitFlag; }); // Wait for "go"
+        cv.wait(lock, [] { return searchFlag.load() || quitFlag.load(); }); // Wait for "go"
         lock.unlock();
-        if (quitFlag) break;
-        if (searchFlag) runMCTS();
+        if (quitFlag.load()) {
+          cleanup();
+          break;
+        }
+        if (searchFlag.load()) runMCTS();
         else continue;
         lock.lock();
-        searchFlag = false;
-        stopFlag = false;
+        searchFlag.store(false);
+        stopFlag.store(false);
         cv.notify_one(); // Signal search is done
     }
 }
@@ -105,7 +109,7 @@ void search_thread_func() {
       char line[2048];
       print("id name %s\n", chessEngine.id);
       log_file("id name %s\n", chessEngine.id);
-      while (!quitFlag) {
+      while (!quitFlag.load()) {
           if (fgets(line, sizeof(line), stdin) == NULL) {
               log_file("uciloop() error: fgets() returned NULL\n");
               exit(-1);
@@ -314,9 +318,9 @@ void search_thread_func() {
   
   void handleGo(char * command) {
       char * token;
-      if (searchFlag) {
+      if (searchFlag.load()) {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [] { return !searchFlag; }); // Wait for previous search to stop
+        cv.wait(lock, [] { return !searchFlag.load(); }); // Wait for previous search to stop
       }
       token = strtok(command, " ");
       while ((token = strtok(NULL, " ")) != NULL) {
@@ -389,8 +393,8 @@ void search_thread_func() {
   
       if (bitCount(board->occupations[PieceNameAny]) > TB_LARGEST) {
           std::lock_guard<std::mutex> lock(mtx);
-          searchFlag = true;
-          stopFlag = false;
+          searchFlag.store(true);
+          stopFlag.store(false);
           cv.notify_one(); // Start search
       } else {
         best_move[0] = '\0';
@@ -421,14 +425,14 @@ void search_thread_func() {
   
   void handleStop() {
     std::unique_lock<std::mutex> lock(mtx);
-    stopFlag = true;
-    cv.wait(lock, [] { return !searchFlag; }); // Wait for search to stop
+    stopFlag.store(true);
+    cv.wait(lock, [] { return !searchFlag.load(); }); // Wait for search to stop
   }
   
   void handleQuit(void) {
     log_file("quit\n");    
     std::lock_guard<std::mutex> lock(mtx);
-    quitFlag = true;
+    quitFlag.store(true);
     cv.notify_one();
   }
 }
