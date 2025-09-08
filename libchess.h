@@ -34,6 +34,7 @@
 
 #ifdef _WIN32
 #define strtok_r strtok_s
+#include "windows.h"
 #endif
 
 
@@ -386,6 +387,11 @@ struct Engine {
 	char engineName[255] = {};
 	char namedPipeTo[255] = {};
 	char namedPipeFrom[255] = {};
+#ifdef _WIN32
+	HANDLE hPipeToEngine = INVALID_HANDLE_VALUE;   // Add these to store pipe handles
+	HANDLE hPipeFromEngine = INVALID_HANDLE_VALUE;
+	HANDLE hProcess = INVALID_HANDLE_VALUE;
+#endif
 	char position[MAX_FEN_STRING_LEN] = {}; //FEN string
 	char moves[MAX_UCI_MOVES_LEN] = {}; //UCI moves
 	FILE * logfile = nullptr;
