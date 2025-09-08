@@ -23,17 +23,20 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <curl/curl.h>
+#include "json.hpp"
 #include "tbprobe.h"
 #include "libchess.h"
 
 #define THREADS 8
-#define MULTI_PV 5
+#define MULTI_PV 1
 #define SYZYGY_PATH_DEFAULT "<empty>"
 #define SYZYGY_PATH "/Users/ap/syzygy"
-#define HASH 1024 //default, GUI may set it via Hash option (once full, expansion won't happen!)
+#define HASH 2048 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
 #define PROBABILITY_MASS 90 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-#define NOISE 10 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise * 0.01
+#define MAX_NOISE 15 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
+                     // where noise is sampled randomly from a uniform distribution [-0.2..0.2]
 #define VIRTUAL_LOSS 3
 #define PV_PLIES 16
 
@@ -43,12 +46,13 @@ std::condition_variable cv;
 std::atomic<bool> searchFlag {false};
 std::atomic<bool> stopFlag {false};
 std::atomic<bool> quitFlag {false};
-FILE * logfile = nullptr;;
+FILE * logfile = nullptr;
 double timeAllocated = 0.0; //ms
-struct Board * board = nullptr;
 char best_move[6] = "";
+using json = nlohmann::json;
 
 extern "C" {  
+  struct Board * board = nullptr;
   struct Engine chessEngine;
   bool tb_init_done = false;
 
@@ -85,6 +89,71 @@ void print(const char * message, ...) {
   va_end(args);
   fflush(stdout);
 }
+
+// WriteCallback to append data to the response string
+size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    std::string* response = static_cast<std::string*>(userp);
+    size_t total_size = size * nmemb;
+    response->append(static_cast<char*>(contents), total_size); // Append, don't overwrite
+    return total_size;
+}
+
+// Function to perform a GET request and log response/code
+//it appears that lichess allows no more than 10 requests per minute or so, then it will reply with 429 code - too many requests
+//therefore, it can't be used during search
+bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::string response = "";
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // 10-second timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L); // 5-second connect timeout
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    log_file("sendGetRequest() debug: GET %s, HTTP code %ld, Response: %s\n", url.c_str(),  http_code, response.c_str());
+ 
+    bool success = (res == CURLE_OK && http_code == 200);
+    if (success && !response.empty()) {
+        try {
+            json data = json::parse(response);
+            if (data.contains("category")) {
+                std::string category = data["category"];
+                if (category == "win" || category == "syzygy-win" || category == "maybe-win") {
+                    scorecp = MATE_SCORE;
+                } else if (category == "loss" || category == "syzygy-loss" || category == "maybe-loss") {
+                    scorecp = -MATE_SCORE;
+                } else {
+                    scorecp = 0;
+                }
+            }
+            if (data.contains("moves") && data["moves"].is_array() && !data["moves"].empty()) {
+                if (data["moves"][0].contains("uci")) {
+                    uci_move = data["moves"][0].value("uci", "");
+                }
+            }
+        } catch (const json::parse_error& e) {
+            log_file("sendGetRequest() error: JSON parse error: %s for response %s\n", e.what(), response.c_str());
+            success = false;
+        }
+    } else {
+        log_file("sendGetRequest() error: curl error: %s or HTTP code %ld or empty response \"%s\"\n", curl_easy_strerror(res), http_code, response.c_str());
+    }
+         
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        log_file("sendGetRequest() error: curl error: %s\n", curl_easy_strerror(res));
+        return false;
+    }
+    return success;
+}
   
 // Search thread function
 void search_thread_func() {
@@ -106,7 +175,7 @@ void search_thread_func() {
 }
   
   void uciLoop() {
-      char line[2048];
+      char line[4096];
       print("id name %s\n", chessEngine.id);
       log_file("id name %s\n", chessEngine.id);
       while (!quitFlag.load()) {
@@ -232,8 +301,10 @@ void search_thread_func() {
   }
   
   void handleIsReady(void) {
+    if (!searchFlag.load()) {
       print("readyok\n");
       log_file("readyok\n");
+    }
   }
   
   void handleNewGame() {
@@ -390,12 +461,36 @@ void search_thread_func() {
               timeAllocated = 100;
           }
       }
-  
-      if (bitCount(board->occupations[PieceNameAny]) > TB_LARGEST) {
+      int numberOfPieces = bitCount(board->occupations[PieceNameAny]);
+      if (numberOfPieces > 7) {
           std::lock_guard<std::mutex> lock(mtx);
           searchFlag.store(true);
           stopFlag.store(false);
           cv.notify_one(); // Start search
+      } else if (numberOfPieces > TB_LARGEST) {
+          std::string fen(board->fen->fenString);
+          if (fen.back() == ' ')
+            fen.erase(fen.end() - 1);
+          size_t pos = fen.rfind(" ");
+          while (pos != std::string::npos) {
+            fen.replace(pos, 1, "_");
+            pos = fen.rfind(" ");
+          }
+          std::string syzygy_tb_url = "http://tablebase.lichess.ovh/standard?fen=" + fen;
+          int score_cp = 0;
+          std::string uci_move = "";
+          if (sendGetRequest(syzygy_tb_url, score_cp, uci_move)) {
+              strncpy(best_move, uci_move.c_str(), 6);
+              //log_file("HandleGo() debug: Syzygy TB request sent successfully");
+              print("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", score_cp, best_move, best_move);
+              log_file("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", score_cp, best_move, best_move);
+          } else {
+              log_file("HandleGo() error: failed to send Syzygy TB request to lichess\n");
+              std::lock_guard<std::mutex> lock(mtx);
+              searchFlag.store(true);
+              stopFlag.store(false);
+              cv.notify_one(); // Start search
+          }        
       } else {
         best_move[0] = '\0';
         unsigned int ep = lsBit(board->fen->enPassantLegalBit);
@@ -485,7 +580,7 @@ void setEngineOptions() {
 	  chessEngine.optionSpin[ExplorationConstant].min = 0;
 	  chessEngine.optionSpin[ExplorationConstant].max = 200;
 	  strcpy(chessEngine.optionSpin[Noise].name, "Noise");
-	  chessEngine.optionSpin[Noise].defaultValue = NOISE;
+	  chessEngine.optionSpin[Noise].defaultValue = MAX_NOISE;
 	  chessEngine.optionSpin[Noise].value = chessEngine.optionSpin[Noise].defaultValue;
 	  chessEngine.optionSpin[Noise].min = 1;
 	  chessEngine.optionSpin[Noise].max = 30;
@@ -519,17 +614,18 @@ int main(int argc, char **argv) {
     zobristHash(&zh);
     chess_board.zh = &zh;
     board = &chess_board;
-    logfile = fopen("uci.log", "w");
+    logfile = fopen("uci2.log", "w");
     srand(time(NULL)); 
     init_magic_bitboards();
     init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
     setEngineOptions();
-
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     // Start the search thread
     std::thread search_thread(search_thread_func);
     uciLoop();
     search_thread.join();
     
+    curl_global_cleanup();
     cleanup_nnue();
     cleanup_magic_bitboards();
     fclose(logfile);

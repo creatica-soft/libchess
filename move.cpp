@@ -136,7 +136,7 @@ int validateSanMove(struct Move * move) {
 		memcpy(&(move->chessBoard->movingPiece), &king, sizeof(struct ChessPiece));
 
 		if (!move->chessBoard->fen->isChess960) {
-			if ((move->chessBoard->movesFromSquares[king.square.name] & (1UL << kingCastlingSquare[castlingSide - 1][move->chessBoard->fen->sideToMove])) > 0) {
+			if ((move->chessBoard->movesFromSquares[king.square.name] & (1ULL << kingCastlingSquare[castlingSide - 1][move->chessBoard->fen->sideToMove])) > 0) {
 				square(&kingDstSq, kingCastlingSquare[castlingSide - 1][move->chessBoard->fen->sideToMove]);
 				move->type |= MoveTypeValid;
 			} else {
@@ -147,7 +147,7 @@ int validateSanMove(struct Move * move) {
 			}
 		} else {
 			unsigned char whiteBlack[2] = { 0, 56 };
-			if ((move->chessBoard->movesFromSquares[king.square.name] & (1UL << (move->chessBoard->fen->castlingRook[castlingSide - 1][move->chessBoard->fen->sideToMove] + whiteBlack[move->chessBoard->fen->sideToMove]))) > 0) {
+			if ((move->chessBoard->movesFromSquares[king.square.name] & (1ULL << (move->chessBoard->fen->castlingRook[castlingSide - 1][move->chessBoard->fen->sideToMove] + whiteBlack[move->chessBoard->fen->sideToMove]))) > 0) {
 				square(&kingDstSq, move->chessBoard->fen->castlingRook[castlingSide - 1][move->chessBoard->fen->sideToMove] + whiteBlack[move->chessBoard->fen->sideToMove]);
 				move->type |= MoveTypeValid;
 			}
@@ -207,8 +207,8 @@ int validateSanMove(struct Move * move) {
 				if ((move->chessBoard->movesFromSquares[srcSquare] & move->destinationSquare.bitSquare) > 0) {
 					struct Square oppositePawnSquare;
 					unsigned long long oppositePawns = move->chessBoard->occupations[move->chessBoard->opponentColor << 3 | Pawn];
-					//oppositePawns &= 0xFFFFFFFFFFFFFFFFUL;
-					assert(oppositePawns == (oppositePawns & 0xFFFFFFFFFFFFFFFFUL));
+					//oppositePawns &= 0xFFFFFFFFFFFFFFFFULL;
+					assert(oppositePawns == (oppositePawns & 0xFFFFFFFFFFFFFFFFULL));
 					square(&oppositePawnSquare, lsBit(oppositePawns));
 					while (oppositePawnSquare.name < SquareNone) {
 						if (oppositePawnSquare.rank == dstRanks[move->chessBoard->fen->sideToMove] && ((oppositePawnSquare.file == srcFile + 1 && srcFile < FileH) || (oppositePawnSquare.file == srcFile - 1 && srcFile > FileA))) {
@@ -259,7 +259,7 @@ int validateSanMove(struct Move * move) {
         }
 			}
 			//continue with other pieces (or squares where these pieces are)
-			cp ^= (1UL << s->name);
+			cp ^= (1ULL << s->name);
 			//if no more pieces left
 			if (!cp) {
 				//if there are candidates
@@ -337,26 +337,26 @@ int validateSanMove(struct Move * move) {
 }
 
 int validateUciMove(struct Move * move) {
-	//char src[3] = { move->uciMove[0], move->uciMove[1], '\0' };
-	//char dst[3] = { move->uciMove[2], move->uciMove[3], '\0' };
-	struct Square srcSq, dstSq;
-	//square(&srcSq, string2square(src));
-	square(&srcSq, (move->uciMove[1] - '1') << 3 | move->uciMove[0] - 'a');
-	//square(&dstSq, string2square(dst));
-	square(&dstSq, (move->uciMove[3] - '1') << 3 | move->uciMove[2] - 'a');
-	memcpy(&(move->sourceSquare), &srcSq, sizeof(struct Square));
-	memcpy(&(move->destinationSquare), &dstSq, sizeof(struct Square));
-	struct ChessPiece cp;
-	piece(&(move->sourceSquare), &cp, move->chessBoard->piecesOnSquares[move->sourceSquare.name]);
-	memcpy(&(move->chessBoard->movingPiece), &cp, sizeof(struct ChessPiece));
+	//struct Square srcSq, dstSq;
+	//square(&srcSq, (move->uciMove[1] - '1') << 3 | move->uciMove[0] - 'a');
+	//square(&dstSq, (move->uciMove[3] - '1') << 3 | move->uciMove[2] - 'a');
+	//memcpy(&(move->sourceSquare), &srcSq, sizeof(struct Square));
+	//memcpy(&(move->destinationSquare), &dstSq, sizeof(struct Square));
+	//3 lower bits for letter and 3 higher bits for number in uci move src and dst: 0..63 range
+	square(&(move->sourceSquare), (move->uciMove[1] - '1') << 3 | move->uciMove[0] - 'a');
+	square(&(move->destinationSquare), (move->uciMove[3] - '1') << 3 | move->uciMove[2] - 'a');
+	//struct ChessPiece cp;
+	//piece(&(move->sourceSquare), &cp, move->chessBoard->piecesOnSquares[move->sourceSquare.name]);
+	//memcpy(&(move->chessBoard->movingPiece), &cp, sizeof(struct ChessPiece));
+	piece(&(move->sourceSquare), &(move->chessBoard->movingPiece), move->chessBoard->piecesOnSquares[move->sourceSquare.name]);
 	if (move->chessBoard->movingPiece.name == PieceNameNone) {
-		printf("validateUciMove() error: the source square %s is empty in move from %s to %s in %u%s%s; FEN %s\n", squareName[move->sourceSquare.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, move->chessBoard->fen->fenString);
+		fprintf(stderr, "validateUciMove() error: the source square %s is empty in move from %s to %s in %u%s%s; FEN %s\n", squareName[move->sourceSquare.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, move->chessBoard->fen->fenString);
 		return 1;
 	}
 	if ((move->chessBoard->movesFromSquares[move->sourceSquare.name] & move->destinationSquare.bitSquare) > 0)
 		move->type |= MoveTypeValid;
 	else {
-		printf("validateUciMove() error: %s move from %s to %s is illegal in %u%s%s; legal moves %llu\n", pieceName[move->chessBoard->movingPiece.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, move->chessBoard->movesFromSquares[move->sourceSquare.name]);
+		fprintf(stderr, "validateUciMove() error: %s move from %s to %s is illegal in %u%s%s; legal moves from %s are %llu\n", pieceName[move->chessBoard->movingPiece.name], squareName[move->sourceSquare.name], squareName[move->destinationSquare.name], move->chessBoard->fen->moveNumber, move->chessBoard->fen->sideToMove == ColorWhite ? "." : "...", move->sanMove, squareName[move->sourceSquare.name], move->chessBoard->movesFromSquares[move->sourceSquare.name]);
 		writeDebug(move->chessBoard, true);
 		reconcile(move->chessBoard);
 		return 1;
@@ -393,7 +393,7 @@ void san2uci(struct Move * move) {
 					break;
 				}
 			}
-			rooks ^= (1UL << s.name);
+			rooks ^= (1ULL << s.name);
 			square(&s, lsBit(rooks));
 		}
 	} else {
@@ -505,8 +505,9 @@ void setUciMoveType(struct Move * move) {
 			  pawns &= RANK4;
 			else pawns &= RANK5;
 			//opponent pawns on adjacent files (adjacent to the moving pawn from its initial rank to rank 4 or 5)
-			if (move->sourceSquare.file < FileH) pawns &= files_bb[move->sourceSquare.file + 1]; 
-			if (move->sourceSquare.file > FileA) pawns &= files_bb[move->sourceSquare.file - 1];
+			if (move->sourceSquare.file == FileA) pawns &= files_bb[move->sourceSquare.file + 1];
+			else if (move->sourceSquare.file == FileH) pawns &= files_bb[move->sourceSquare.file - 1];
+			else pawns &= (files_bb[move->sourceSquare.file + 1] | files_bb[move->sourceSquare.file - 1]);
 			//if there are such opponent pawns, then the move is en passant
 			if (pawns) move->type |= MoveTypeEnPassant;
 			/*
@@ -570,7 +571,7 @@ int initMove(struct Move * move, struct Board * board, const char * moveString) 
 
 	if (!parseUciMove(moveString)) {
 		strncpy(move->sanMove, moveString, sizeof move->sanMove);
-		move->uciMove[0] = '\0'; //this is not needed because of memset() call above
+		//move->uciMove[0] = '\0'; //this is not needed because of memset() call above
 		if (validateSanMove(move)) {
 			printf("initMove() error: validateSanMove failed\n");
 			return 1;
@@ -579,7 +580,7 @@ int initMove(struct Move * move, struct Board * board, const char * moveString) 
 			san2uci(move);
 	} else {
 		strncpy(move->uciMove, moveString, sizeof move->uciMove);
-		move->sanMove[0] = '\0'; //this is not needed because of memset() call above
+		//move->sanMove[0] = '\0'; //this is not needed because of memset() call above
 		if (validateUciMove(move)) {
 			printf("initMove() error: validateUciMove failed\n");
 			return 1;

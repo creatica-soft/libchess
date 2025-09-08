@@ -26,13 +26,13 @@ unsigned long long bitCount(unsigned long long value) {
   return __builtin_popcountll(value);
 #endif
   /*
-	unsigned long long result = value - ((value >> 1) & 0x5555555555555555UL);
-	result = (result & 0x3333333333333333UL) + ((result >> 2) & 0x3333333333333333UL);
-	return (unsigned char)(((result + (result >> 4)) & 0xF0F0F0F0F0F0F0FUL) * 0x101010101010101UL >> 56);
+	unsigned long long result = value - ((value >> 1) & 0x5555555555555555ULL);
+	result = (result & 0x3333333333333333ULL) + ((result >> 2) & 0x3333333333333333ULL);
+	return (unsigned char)(((result + (result >> 4)) & 0xF0F0F0F0F0F0F0FULL) * 0x101010101010101ULL >> 56);
 	*/
 }
 /*
-const unsigned long long magic = 0x37E84A99DAE458F;
+const unsigned long long magic = 0x37E84A99DAE458FULL;
 unsigned char magicTable[] = {
 	0, 1, 17, 2, 18, 50, 3, 57,
 	47, 19, 22, 51, 29, 4, 33, 58,
