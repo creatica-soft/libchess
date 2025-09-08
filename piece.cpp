@@ -1,5 +1,3 @@
-#include <assert.h>
-#include <errno.h>
 #include <ctype.h>
 #include <string.h>
 #include <stdio.h>

@@ -183,44 +183,47 @@ void updateFen(struct Board * board) {
 bool isEnPassantLegal(struct Board * board) {
 	int  i;
 	int  shift;
-	struct Square kingSquare;
-	struct Square opponentRookOrQueenSquare;
-	unsigned char enPassantShift = board->fen->sideToMove == ColorWhite ? 16 : 40;
+	//struct Square kingSquare;
+	//struct Square opponentRookOrQueenSquare;
+	int kingSquare = lsBit(board->occupations[(board->fen->sideToMove << 3) | King]);
+	int enPassantShift = board->fen->sideToMove == ColorWhite ? 16 : 40; //rank3 * 8 or rank6 * 8
 	board->fen->enPassantLegalBit = 0;
 
-	square(&kingSquare, lsBit(board->occupations[(board->fen->sideToMove << 3) | King]));
+	//square(&kingSquare, lsBit(board->occupations[(board->fen->sideToMove << 3) | King]));
 	for (int pt = Rook; pt <= Queen; pt++) {
 		unsigned long long opponentRooksOrQueens = board->occupations[(board->opponentColor << 3) | pt];
-		square(&opponentRookOrQueenSquare, lsBit(opponentRooksOrQueens));
+		//square(&opponentRookOrQueenSquare, lsBit(opponentRooksOrQueens));
 		// a loop for all opponent rooks (or queens)
-		while (opponentRookOrQueenSquare.name < SquareNone) {
-			// check if opponent rook and board->fen->sideToMove king are on the same rank
-			if (kingSquare.rank != opponentRookOrQueenSquare.rank) {
-				opponentRooksOrQueens ^= opponentRookOrQueenSquare.bitSquare;
-				square(&opponentRookOrQueenSquare, lsBit(opponentRooksOrQueens));
+		//while (opponentRookOrQueenSquare.name < SquareNone) {
+		while (opponentRooksOrQueens) {
+			int opponentRookOrQueenSquare = lsBit(opponentRooksOrQueens);
+			// check if opponent rook or queen and board->fen->sideToMove king are on the same rank
+			if ((kingSquare / 8) != (opponentRookOrQueenSquare / 8)) {
+				opponentRooksOrQueens &= opponentRooksOrQueens - 1;
+				//square(&opponentRookOrQueenSquare, lsBit(opponentRooksOrQueens));
 				continue;
 			}
-			// if yes, then shift opponent rook (or queen) along it one way, then the other
+			// if yes, then shift opponent rook (or queen) one way, then the other
 			// to see if it attacks the king
-			i = opponentRookOrQueenSquare.file; shift = opponentRookOrQueenSquare.name;
+			i = opponentRookOrQueenSquare % 8; shift = opponentRookOrQueenSquare;
 			while (i++ < FileH)
 				// if there is something on the way but it is not the king, then break
 				// otherwise, return enPassant is not legal - return false
 				if (board->piecesOnSquares[shift += 1] != PieceNameNone) {
-					if (shift == kingSquare.name) return false;
+					if (shift == kingSquare) return false;
 					break;
 				}
-			i = opponentRookOrQueenSquare.file; shift = opponentRookOrQueenSquare.name;
+			i = opponentRookOrQueenSquare % 8; shift = opponentRookOrQueenSquare;
 			while (i-- > FileA)
 				if (board->piecesOnSquares[shift -= 1] != PieceNameNone) {
-					if (shift == kingSquare.name) return false;
+					if (shift == kingSquare) return false;
 					break;
 				}
-			opponentRooksOrQueens ^= (1ULL << opponentRookOrQueenSquare.name); //iterator
-			square(&opponentRookOrQueenSquare, lsBit(opponentRooksOrQueens));
+			opponentRooksOrQueens &= opponentRooksOrQueens - 1; //iterator
+			//square(&opponentRookOrQueenSquare, lsBit(opponentRooksOrQueens));
 		}
 	}
-	board->fen->enPassantLegalBit = 1ULL << (board->fen->enPassant + enPassantShift);
+	board->fen->enPassantLegalBit = 1ULL << (enPassantShift + board->fen->enPassant); //dst_sqr = dst_rank * 8 + dst_file
 	return true;
 }
 
@@ -411,12 +414,12 @@ unsigned long long pinnedRookMoves(struct Board * board, struct Square * sq, str
 
 void generateMoves(struct Board * board) {
 	int  whiteBlack[] = { SquareA1, SquareA8 }; //first squares of the pieces' ranks
-	signed char pawnShifts[3][3] = { { 8, 7, 9 }, { -8, -9, -7 } };
+	signed char pawnShifts[3][3] = { { 8, 7, 9 }, { -8, -9, -7 } }; // { { N, NW, NE}, {S, SW, SE} }
 	int  pawnRanks[3][3] = { { Rank2, Rank5, Rank6 }, { Rank7, Rank4, Rank3 } };
 	unsigned long long d = 0, checker = 0, attackedSquares = 0, defendedPieces = 0, blockingSquares = 0, pinnedPieces = 0, pinningPieces = 0;
-	struct Square pinnedBy, attackerSquare, sq, p;
+	struct Square pinnedBy, checkerSquare, sq, p;
 	square(&pinnedBy, SquareNone);
-	square(&attackerSquare, SquareNone);
+	square(&checkerSquare, SquareNone);
 	square(&sq, SquareNone);
 	board->moves = 0;
 	memset(board->movesFromSquares, 0, sizeof board->movesFromSquares);
@@ -618,14 +621,14 @@ void generateMoves(struct Board * board) {
 		if (bits > 1) goto exit;
 		//normal check by checker
 		else if (bits == 1) {
-			square(&attackerSquare, lsBit(checker));
+			square(&checkerSquare, lsBit(checker));
 			//checker = board->checkers;
 			//if not checked by knight or pawn, calculate blocking squares
-			if ((board->piecesOnSquares[attackerSquare.name] != (shiftedOpponentColor | Knight)) && board->piecesOnSquares[attackerSquare.name] != (shiftedOpponentColor | Pawn)) {
+			if ((board->piecesOnSquares[checkerSquare.name] != (shiftedOpponentColor | Knight)) && board->piecesOnSquares[checkerSquare.name] != (shiftedOpponentColor | Pawn)) {
 				d = 0;
-				ii = attackerSquare.file; jj = attackerSquare.rank; shift = attackerSquare.name;
-				if (king.square.diag == attackerSquare.diag) {
-					if (king.square.name > attackerSquare.name) {
+				ii = checkerSquare.file; jj = checkerSquare.rank; shift = checkerSquare.name;
+				if (king.square.diag == checkerSquare.diag) {
+					if (king.square.name > checkerSquare.name) {
 						while (ii++ < FileH && jj++ < Rank8)
 							if (board->piecesOnSquares[shift += 9] == PieceNameNone) d |= 1ULL << shift; else break;
 					}
@@ -634,8 +637,8 @@ void generateMoves(struct Board * board) {
 							if (board->piecesOnSquares[shift -= 9] == PieceNameNone) d |= 1ULL << shift; else break;
 					}
 				}
-				else if (king.square.antiDiag == attackerSquare.antiDiag) {
-					if (king.square.name > attackerSquare.name) {
+				else if (king.square.antiDiag == checkerSquare.antiDiag) {
+					if (king.square.name > checkerSquare.name) {
 						while (ii-- > FileA && jj++ < Rank8)
 							if (board->piecesOnSquares[shift += 7] == PieceNameNone) d |= 1ULL << shift; else break;
 					}
@@ -644,8 +647,8 @@ void generateMoves(struct Board * board) {
 							if (board->piecesOnSquares[shift -= 7] == PieceNameNone) d |= 1ULL << shift; else break;
 					}
 				}
-				else if (king.square.file == attackerSquare.file) {
-					if (king.square.name > attackerSquare.name) {
+				else if (king.square.file == checkerSquare.file) {
+					if (king.square.name > checkerSquare.name) {
 						while (jj++ < Rank8)
 							if (board->piecesOnSquares[shift += 8] == PieceNameNone) d |= 1ULL << shift; else break;
 					}
@@ -654,8 +657,8 @@ void generateMoves(struct Board * board) {
 							if (board->piecesOnSquares[shift -= 8] == PieceNameNone) d |= 1ULL << shift; else break;
 					}
 				}
-				else if (king.square.rank == attackerSquare.rank) {
-					if (king.square.name > attackerSquare.name) {
+				else if (king.square.rank == checkerSquare.rank) {
+					if (king.square.name > checkerSquare.name) {
 						while (ii++ < FileH)
 							if (board->piecesOnSquares[shift += 1] == PieceNameNone) d |= 1ULL << shift; else { d |= 1ULL << shift; break; }
 					}
@@ -843,9 +846,9 @@ void generateMoves(struct Board * board) {
 	
 	//pawn moves
 	while (pawns) {
-		sn = lsBit(pawns);
-		square(&sq, sn);
-		ii = sq.file; jj = sq.rank; shift = sq.name;
+		//sn = lsBit(pawns);
+		square(&sq, lsBit(pawns));
+		//ii = sq.file; jj = sq.rank; shift = sq.name;
 		square(&pinnedBy, SquareNone);
 		//alternative algorithm to find pinnedBy square
 		if (pinnedPieces & sq.bitSquare) {
@@ -862,13 +865,16 @@ void generateMoves(struct Board * board) {
     }
     d = 0;		
 		if (pinnedBy.name < SquareNone) {
-			if (board->isCheck) goto next; // this pawn can't do much
+			if (board->isCheck) { //goto next; // this pawn can't do much
+			  pawns &= pawns - 1;
+			  continue;
+			}
 			if (pinnedBy.diag == sq.diag) {
 				shift = board->fen->sideToMove == ColorWhite ? sq.name + 9 : sq.name - 9;
 				int  enPassantFile = board->fen->sideToMove == ColorWhite ? sq.file + 1 : sq.file - 1;
-				if ((board->fen->sideToMove == ColorWhite && ii < FileH) || (board->fen->sideToMove == ColorBlack && ii > FileA)) {
+				if ((board->fen->sideToMove == ColorWhite && sq.file < FileH) || (board->fen->sideToMove == ColorBlack && sq.file > FileA)) {
 					if (board->piecesOnSquares[shift] != PieceNameNone) {
-						if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
+						if ((board->piecesOnSquares[shift] >> 3) == board->opponentColor)
 							d |= 1ULL << shift;
 					}
 					else if (board->fen->enPassant == enPassantFile && sq.rank == pawnRanks[board->fen->sideToMove][1])
@@ -877,7 +883,7 @@ void generateMoves(struct Board * board) {
 			} else if (pinnedBy.antiDiag == sq.antiDiag) {
 				shift = board->fen->sideToMove == ColorWhite ? sq.name + 7 : sq.name - 7;
 				int  enPassantFile = board->fen->sideToMove == ColorWhite ? sq.file - 1 : sq.file + 1;
-				if ((board->fen->sideToMove == ColorWhite && ii > FileA) || (board->fen->sideToMove == ColorBlack && ii < FileH)) {
+				if ((board->fen->sideToMove == ColorWhite && sq.file > FileA) || (board->fen->sideToMove == ColorBlack && sq.file < FileH)) {
 					if (board->piecesOnSquares[shift] != PieceNameNone) {
 						if (board->piecesOnSquares[shift] >> 3 == board->opponentColor)
 							d |= 1ULL << shift;
@@ -889,34 +895,37 @@ void generateMoves(struct Board * board) {
 				shift = sq.name + pawnShifts[board->fen->sideToMove][0];
 				if (board->piecesOnSquares[shift] == PieceNameNone) {
 					d |= 1ULL << shift;
-					if (jj == pawnRanks[board->fen->sideToMove][0]) {
+					if (sq.rank == pawnRanks[board->fen->sideToMove][0]) {
 						shift += pawnShifts[board->fen->sideToMove][0];
 						if (board->piecesOnSquares[shift] == PieceNameNone) d |= 1ULL << shift;
 					}
 				}
 			}
-			else if (pinnedBy.rank == sq.rank) goto next; //not much can be done
+			else if (pinnedBy.rank == sq.rank) { //goto next; //not much can be done
+			  pawns &= pawns - 1;
+			  continue;
+      }
 			board->movesFromSquares[sq.name] = d;
 		}
-		else {
+		else { //pinnedBy.name == SquareNone
 			//normal pawn moves (non-capturing)
-			shift = sq.name + pawnShifts[board->fen->sideToMove][0];
+			shift = sq.name + pawnShifts[board->fen->sideToMove][0]; //N or S
 			if (board->piecesOnSquares[shift] == PieceNameNone) {
 				d |= 1ULL << shift;
-				//double advance from rank 2
-				if (jj == pawnRanks[board->fen->sideToMove][0]) {
+				//double advance from rank 2 or 7
+				if (sq.rank == pawnRanks[board->fen->sideToMove][0]) { //rank2 or rank7
 					shift += pawnShifts[board->fen->sideToMove][0];
 					if (board->piecesOnSquares[shift] == PieceNameNone) d |= 1ULL << shift;
 				}
 			}
 			//capturing pawn moves
-			if (ii > FileA) {
-				shift = sq.name + pawnShifts[board->fen->sideToMove][1];
-				if (board->piecesOnSquares[shift] != PieceNameNone) {
-					if (board->piecesOnSquares[shift] >> 3 == board->opponentColor) 
+			if (sq.file > FileA) {
+				shift = sq.name + pawnShifts[board->fen->sideToMove][1]; //NW or SW
+				if ((board->piecesOnSquares[shift] != PieceNameNone) && ((board->piecesOnSquares[shift] >> 3) == board->opponentColor)) {
+					//if ((board->piecesOnSquares[shift] >> 3) == board->opponentColor) 
 						d |= 1ULL << shift;
 				}
-				else if (board->fen->enPassant == sq.file - 1 && sq.rank == pawnRanks[board->fen->sideToMove][1]) {
+				else if ((board->fen->enPassant == (sq.file - 1)) && (sq.rank == pawnRanks[board->fen->sideToMove][1])) { //rank5 or rank4
 					//make sure there is no discover check from a queen or a rook
 					board->piecesOnSquares[sq.name] = PieceNameNone;
 					board->piecesOnSquares[sq.name - 1] = PieceNameNone;
@@ -925,13 +934,13 @@ void generateMoves(struct Board * board) {
 					board->piecesOnSquares[sq.name - 1] = shiftedOpponentColor | Pawn;
 				}
 			}
-			if (ii < FileH) {
-				shift = sq.name + pawnShifts[board->fen->sideToMove][2];
-				if (board->piecesOnSquares[shift] != PieceNameNone) {
-					if (board->piecesOnSquares[shift] >> 3 == board->opponentColor) 
+			if (sq.file < FileH) {
+				shift = sq.name + pawnShifts[board->fen->sideToMove][2]; //NE or SE
+				if ((board->piecesOnSquares[shift] != PieceNameNone) && ((board->piecesOnSquares[shift] >> 3) == board->opponentColor)) {
+					//if ((board->piecesOnSquares[shift] >> 3) == board->opponentColor) 
 						d |= 1ULL << shift;
 				}
-				else if (board->fen->enPassant == sq.file + 1 && sq.rank == pawnRanks[board->fen->sideToMove][1]) {
+				else if ((board->fen->enPassant == (sq.file + 1)) && (sq.rank == pawnRanks[board->fen->sideToMove][1])) {
 					//make sure there is no discover check from a queen or a rook
 					board->piecesOnSquares[sq.name] = PieceNameNone; 
 					board->piecesOnSquares[sq.name + 1] = PieceNameNone;
@@ -942,25 +951,25 @@ void generateMoves(struct Board * board) {
 			}
 			board->movesFromSquares[sq.name] = d;
 			if (checker > 0) {
-				//if checker is en passant pawn that can be captured
-				if (board->fen->enPassant == attackerSquare.file && attackerSquare.rank == pawnRanks[board->fen->sideToMove][1] && sq.rank == pawnRanks[board->fen->sideToMove][1] && ((sq.file == board->fen->enPassant - 1) || (sq.file == board->fen->enPassant + 1))) {
-					board->movesFromSquares[sq.name] &= 1ULL << ((pawnRanks[board->fen->sideToMove][2] << 3) + board->fen->enPassant);
-				}
-				else {
-					board->movesFromSquares[sq.name] &= (blockingSquares | checker);
-				}
+				//if checker is en passant pawn, can it be captured
+				if (board->fen->enPassant == checkerSquare.file &&
+				    checkerSquare.rank == pawnRanks[board->fen->sideToMove][1] && //rank5 or rank4
+				    sq.rank == pawnRanks[board->fen->sideToMove][1] && 
+				    ((sq.file == board->fen->enPassant - 1) || (sq.file == board->fen->enPassant + 1)))
+					board->movesFromSquares[sq.name] &= 1ULL << ((pawnRanks[board->fen->sideToMove][2] << 3) + board->fen->enPassant); //rank6 or rank3
+				else board->movesFromSquares[sq.name] &= (blockingSquares | checker); //can we block or capture checker
 			}
 		}
 		board->moves |= board->movesFromSquares[sq.name];
 		//board->pawnMoves |= board->movesFromSquares[sq.name];
-next:
+//next:
 		pawns &= pawns - 1;
 	}
 
 	//knight moves
 	while (knights) {
-		sn = lsBit(knights);
-		square(&sq, sn);
+		//sn = lsBit(knights);
+		square(&sq, lsBit(knights));
 		square(&pinnedBy, SquareNone);
 		//alternative algorithm to find pinnedBy square
 		if (pinnedPieces & sq.bitSquare) {

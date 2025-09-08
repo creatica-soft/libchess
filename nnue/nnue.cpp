@@ -26,10 +26,10 @@ extern "C" {
 #endif
 
 struct NNUEContext {
-    Stockfish::StateInfo * state;
-    Stockfish::Position * pos;
-    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
-    Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
+    Stockfish::StateInfo * state = nullptr;
+    Stockfish::Position * pos = nullptr;
+    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack = nullptr;
+    Stockfish::Eval::NNUE::AccumulatorCaches * caches = nullptr;    
 };
 
 CHESS_API void init_nnue(const char * nnue_file_big = EvalFileDefaultNameBig, const char * nnue_file_small = EvalFileDefaultNameSmall);
@@ -37,7 +37,7 @@ CHESS_API void cleanup_nnue();
 CHESS_API void init_nnue_context(struct NNUEContext * ctx);
 CHESS_API void free_nnue_context(struct NNUEContext * ctx);
 CHESS_API double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
-//CHESS_API double evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
+CHESS_API double evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx);
 
 void boardtopos(const struct Board * board, Stockfish::Position * pos, Stockfish::StateInfo * state) {
   if (board && board->fen) {
@@ -121,6 +121,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
     boardtopos(board, ctx->pos, ctx->state);
     Stockfish::StateInfo * new_state;
     Stockfish::Value v;
+    ctx->accumulator_stack->reset();
     if (move) {
       Stockfish::Move sf_move = movetomove(move);
       new_state = new Stockfish::StateInfo();
@@ -132,6 +133,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
       new_state->previous = ctx->state; // Preserve previous state
       ctx->state = new_state; // Update state
       ctx->accumulator_stack->push(dp);
+      //to preserve the perspective of board->fen->sideToMove,
       //here we negate the result of evaluate() because the move is made and perspective is changed to opponent
       v = -Stockfish::Eval::evaluate(*networks, *ctx->pos, *ctx->accumulator_stack, *ctx->caches, 0);
       ctx->accumulator_stack->pop();
@@ -141,13 +143,13 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
       delete ctx->state;
       ctx->state = new_state;
     } else {
-      ctx->accumulator_stack->reset();
       v = Stockfish::Eval::evaluate(*networks, *ctx->pos, *ctx->accumulator_stack, *ctx->caches, 0);      
     }
-    //v = ctx->pos->side_to_move() == Stockfish::WHITE ? v : -v; //keep it from the perspective of the side to move
+    //comment out next line to keep it from the perspective of the side to move
+    //v = ctx->pos->side_to_move() == Stockfish::WHITE ? v : -v; 
     return 0.01 * Stockfish::to_cp(v, *ctx->pos);
 }
-/*
+
 double evaluate_nnue_incremental(struct Board * board, struct Move * move, struct NNUEContext * ctx) {
     if (!board) return 0;
     Stockfish::Move sf_move = movetomove(move);
@@ -161,7 +163,7 @@ double evaluate_nnue_incremental(struct Board * board, struct Move * move, struc
     //v = ctx->pos->side_to_move() == Stockfish::WHITE ? v : -v; //keep it from the perspective of the side to move
     return 0.01 * Stockfish::to_cp(v, *ctx->pos);
 }
-*/
+
 #ifdef __cplusplus
 }
 #endif

@@ -6,15 +6,15 @@
 /// use -O0 -g for debugging with lldb or gdb instead of -O3 (lldb ./test, then run, and if crashes, bt)
 
 /// To compile on alpine linux, run:
-/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -Wno-strncat-size -fPIC -O3 -o libchess.so bitscanner.c board.c engine.c fen.c move.c piece.c square.c tag.c zobrist-hash.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
+/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -Wno-strncat-size -fPIC -O3 -o libchess.so bitscanner.cpp board.cpp engine.cpp fen.cpp pgn.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
 /// 
 
 
 /// To build for Windows using mingw
-/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -fPIC -O3 -o libchess.dll bitscanner.c board.c engine.cpp fen.c move.c piece.c square.c tag.c zobrist-hash.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
+/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -fPIC -O3 -o libchess.dll bitscanner.cpp board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
 /// 
 /// or in MSYS2 MINGW with clang
-/// clang++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -o libchess.dll bitscanner.c board.c engine.c fen.c move.c piece.c square.c tag.c zobrist-hash.c magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
+/// clang++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -o libchess.dll bitscanner.cpp board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
 /// 
 
 /// To build python bindings, use:
@@ -105,28 +105,28 @@ extern "C" {
 #define TIME_SAFETY_BUFFER 5000 // 5s in ms
 #define CRITICAL_TIME_FACTOR 1.5
 #define MIN_TIME_THRESHOLD 10000 // 10s in ms
-#define MIN_ITERATIONS 1001
+#define MIN_ITERATIONS 801
 #define MAX_ITERATIONS 1000000001 // Safety cap
 
 #define NNUE_CHECK 0.00001 //special value for check
 
-#define FILE_A 0x0101010101010101UL
-#define FILE_B 0x0202020202020202UL
-#define FILE_C 0x0404040404040404UL
-#define FILE_D 0x0808080808080808UL
-#define FILE_E 0x1010101010101010UL
-#define FILE_F 0x2020202020202020UL
-#define FILE_G 0x4040404040404040UL
-#define FILE_H 0x8080808080808080UL
+#define FILE_A 0x0101010101010101ULL
+#define FILE_B 0x0202020202020202ULL
+#define FILE_C 0x0404040404040404ULL
+#define FILE_D 0x0808080808080808ULL
+#define FILE_E 0x1010101010101010ULL
+#define FILE_F 0x2020202020202020ULL
+#define FILE_G 0x4040404040404040ULL
+#define FILE_H 0x8080808080808080ULL
 
-#define RANK1 0x00000000000000FFUL
-#define RANK2 0x000000000000FF00UL
-#define RANK3 0x0000000000FF0000UL
-#define RANK4 0x00000000FF000000UL
-#define RANK5 0x000000FF00000000UL
-#define RANK6 0x0000FF0000000000UL
-#define RANK7 0x00FF000000000000UL
-#define RANK8 0xFF00000000000000UL
+#define RANK1 0x00000000000000FFULL
+#define RANK2 0x000000000000FF00ULL
+#define RANK3 0x0000000000FF0000ULL
+#define RANK4 0x00000000FF000000ULL
+#define RANK5 0x000000FF00000000ULL
+#define RANK6 0x0000FF0000000000ULL
+#define RANK7 0x00FF000000000000ULL
+#define RANK8 0xFF00000000000000ULL
 
 static unsigned long long files_bb[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
 static unsigned long long ranks_bb[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
@@ -167,7 +167,7 @@ static const char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 static unsigned long long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
 static unsigned long long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
 
-// square / 8 = rank, square % 8 = file
+// square / 8 = rank, square % 8 = file; another words, square = rank * 8 + file
 enum SquareName {
 	SquareA1, SquareB1, SquareC1, SquareD1, SquareE1, SquareF1, SquareG1, SquareH1,
 	SquareA2, SquareB2, SquareC2, SquareD2, SquareE2, SquareF2, SquareG2, SquareH2,
@@ -436,25 +436,11 @@ CHESS_API int strtofen(struct Fen *, const char *);
 /// </summary>
 int fentostr(struct Fen *);
 
-/*
-struct BMPR {
-  long long samples;
-  long long sample;
-  long long channels;
-  float * boards_legal_moves; // [batch_size, number_of_channels, 8, 8]
-  //long long * move_type; // piece channel [0, 10] [batch_size]
-  //long long * src_sq;
-  //long long * dst_sq;
-  long long * move; // encoded as src_sq * 64 + dst_sq
-  long long * result; // [batch_size]
-  //int * stage; // [batch_size]
-};*/
-
 static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-static const unsigned long long STARTPOS_HASH = 0x958ee7dbd87b2d0aUL;
-static const unsigned long long STARTPOS_HASH2 = 0x4ed9a976a0f95be5UL;
-static const unsigned long long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995UL;
-static const unsigned long long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8UL;
+static const unsigned long long STARTPOS_HASH = 0x958ee7dbd87b2d0aULL;
+static const unsigned long long STARTPOS_HASH2 = 0x4ed9a976a0f95be5ULL;
+static const unsigned long long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995ULL;
+static const unsigned long long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8ULL;
 
 /*
 struct MoveScoreGames {
