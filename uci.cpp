@@ -31,8 +31,8 @@
 #define THREADS 8
 #define MULTI_PV 1
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH "/Users/ap/syzygy"
-#define HASH 2048 //default, GUI may set it via Hash option (once full, expansion won't happen!)
+#define SYZYGY_PATH ""
+#define HASH 1024 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
 #define PROBABILITY_MASS 90 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
 #define MAX_NOISE 15 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
@@ -553,7 +553,7 @@ void setEngineOptions() {
         log_file("info string successfully initialized tablebases in %s. Max number of pieces %d\n", chessEngine.optionString[SyzygyPath].value, TB_LARGEST);
         print("info string successfully initialized tablebases in %s. Max number of pieces %d\n", chessEngine.optionString[SyzygyPath].value, TB_LARGEST);
       }
-	  } else print("setEngineOptions() error: syzygy path is 0\n");
+	  }
 	  strcpy(chessEngine.optionSpin[Hash].name, "Hash");
 	  chessEngine.optionSpin[Hash].defaultValue = HASH;
 	  chessEngine.optionSpin[Hash].value = chessEngine.optionSpin[Hash].defaultValue;

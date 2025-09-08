@@ -14,7 +14,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
+#ifdef _WIN32
+#include "windows.h"
+#include "stdio.h"
+#endif
 ///<summary>
 /// draws moves from a given square sq
 /// it is called from writeDebug
@@ -69,8 +72,17 @@ void drawMoves(struct Board * board, int  sq) {
 /// Draws the chessboard and if displayMoves is true, then all leagal moves
 /// </summary>
 void writeDebug(struct Board * board, bool displayMoves) {
+#ifdef _WIN32
+	SetConsoleOutputCP(CP_UTF8);
+	SetConsoleCP(CP_UTF8);
+	//HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+	//DWORD mode;
+	//GetConsoleMode(hOut, &mode);
+	//SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+	//CloseHandle(hOut);
+#endif
   setlocale(LC_ALL, "en_US.UTF-8");
-	wchar_t buffer[8][256] = {};
+  wchar_t buffer[8][256] = {};
 	wchar_t pieceLetter[] = {L' ', 0x2659, 0x2658, 0x2657, 0x2656, 0x2655, 0x2654, L'C', L'*', 0x265F, 0x265E, 0x265D, 0x265C, 0x265B, 0x265A, L'c'};
 	int rank = Rank1;
 	//printf("chess board\n");

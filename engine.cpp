@@ -50,8 +50,10 @@ int getOptions(struct Engine * engine) {
 
 	fprintf(engine->toEngine, "uci\n");
 	fflush(engine->toEngine);
-	if (engine->logfile) fprintf(engine->logfile, "uci\n");
-	//fprintf(stderr, "uci\n");
+	if (engine->logfile) {
+		fprintf(engine->logfile, "uci\n");
+		fflush(engine->logfile);
+	}
 	char line[256];
 	engine->numberOfCheckOptions = 0;
 	engine->numberOfComboOptions = 0;
@@ -60,9 +62,17 @@ int getOptions(struct Engine * engine) {
 	engine->numberOfButtonOptions = 0;
 	char * lineMod = NULL, * tmp = NULL;
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
-		if (engine->logfile) fprintf(engine->logfile, "%s", line);
-		//fprintf(stderr, "%s", line);
-		if (strcmp(line, "uciok\n") == 0) break;
+		if (engine->logfile) {
+			fprintf(engine->logfile, "%s", line);
+			fflush(engine->logfile);
+		}
+		// Trim trailing \r and/or \n
+		char* end = line + strlen(line) - 1;
+		while (end >= line && (*end == '\r' || *end == '\n')) {
+			*end = '\0';
+			end--;
+		}
+		if (strcmp(line, "uciok") == 0) break;
 		if (strstr(line, "option name ") - line == 0) {
 			tmp = line + 12;
 			if ((lineMod = strstr(tmp, " type "))) {
@@ -274,8 +284,10 @@ int setOption(struct Engine * engine, const char * name, int type, void * value)
 	}
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
-	if (engine->logfile) fprintf(engine->logfile, "%s\n", line);	
-	//fprintf(stderr, "%s\n", line);
+	if (engine->logfile) {
+		fprintf(engine->logfile, "%s\n", line);
+		fflush(engine->logfile);
+	}
 	// without any output from the engine, fgets() will block
 	//while (fgets(line, sizeof(line), stdin)) {
 	//	fprintf(stderr, "%s", line);
@@ -328,12 +340,22 @@ bool isReady(struct Engine * engine) {
 	char line[256];
 	fprintf(engine->toEngine, "isready\n");
 	fflush(engine->toEngine);
-	if (engine->logfile) fprintf(engine->logfile, "isready\n");
-	//fprintf(stderr, "isready\n");
+	if (engine->logfile) {
+		fprintf(engine->logfile, "isready\n");
+		fflush(engine->logfile);
+	}
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
-  	if (engine->logfile) fprintf(engine->logfile, "%s", line);
-		//fprintf(stderr, "%s", line);
-		if (strcmp(line, "readyok\n") == 0) {
+		if (engine->logfile) {
+			fprintf(engine->logfile, "%s", line);
+			fflush(engine->logfile);
+		}
+		// Trim trailing \r and/or \n
+		char* end = line + strlen(line) - 1;
+		while (end >= line && (*end == '\r' || *end == '\n')) {
+			*end = '\0';
+			end--;
+		}
+		if (strcmp(line, "readyok") == 0) {
 			ready = true;
 			break;
 		}
@@ -344,26 +366,32 @@ bool isReady(struct Engine * engine) {
 bool newGame(struct Engine * engine) {
 	fprintf(engine->toEngine, "ucinewgame\n");
 	fflush(engine->toEngine);
-  if (engine->logfile) fprintf(engine->logfile, "ucinewgame\n");	
-	//fprintf(stderr, "ucinewgame\n");
+	if (engine->logfile) {
+		fprintf(engine->logfile, "ucinewgame\n");
+		fflush(engine->logfile);
+	}
 	return isReady(engine);
 }
 
 void stop(struct Engine * engine) {
 	fprintf(engine->toEngine, "stop\n");
 	fflush(engine->toEngine);
-  if (engine->logfile) fprintf(engine->logfile, "stop\n");	
-	//fprintf(stderr, "stop\n");
+	if (engine->logfile) {
+		fprintf(engine->logfile, "stop\n");
+		fflush(engine->logfile);
+	}
 }
 
 void quit(struct Engine * engine) {
 	fprintf(engine->toEngine, "quit\n");
 	fflush(engine->toEngine);
-  if (engine->logfile) fprintf(engine->logfile, "quit\n");	
-	//fprintf(stderr, "quit\n");
+	if (engine->logfile) {
+		fprintf(engine->logfile, "quit\n");
+		fflush(engine->logfile);
+		fclose(engine->logfile);
+	}
 	fclose(engine->toEngine);
 	fclose(engine->fromEngine);
-	fclose(engine->logfile);
 	remove(engine->namedPipeTo);
 	remove(engine->namedPipeFrom);
 }
@@ -379,8 +407,10 @@ bool position(struct Engine * engine) {
 	}
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
-  if (engine->logfile) fprintf(engine->logfile, "%s\n", line);
-	//fprintf(stderr, "%s\n", line);
+	if (engine->logfile) {
+		fprintf(engine->logfile, "%s\n", line);
+		fflush(engine->logfile);
+	}
 	return isReady(engine);
 }
 
@@ -403,9 +433,18 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 	enum Color sideToMove;
 	sideToMove = strchr(engine->position, 'w') ? ColorWhite : ColorBlack;
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
-		//if (engine->logfile) fprintf(engine->logfile, "%s", line);
+		if (engine->logfile) {
+			fprintf(engine->logfile, "%s", line);
+			fflush(engine->logfile);
+		}
+		// Trim trailing \r and/or \n
+		char* end = line + strlen(line) - 1;
+		while (end >= line && (*end == '\r' || *end == '\n')) {
+			*end = '\0';
+			end--;
+		}
 		if (strstr(line, "bestmove ") - line == 0) {
-			if ((sscanf(line, "bestmove %5s ponder %5s\n", eval[0]->bestmove, eval[0]->ponder) == 2) || (sscanf(line, "bestmove %5s\n", eval[0]->bestmove) == 1)) {
+			if ((sscanf(line, "bestmove %5s ponder %5s", eval[0]->bestmove, eval[0]->ponder) == 2) || (sscanf(line, "bestmove %5s", eval[0]->bestmove) == 1)) {
 				if (strncmp(eval[0]->bestmove, "(none", 5) == 0 || eval[0]->bestmove[0] == '\0') {
 					for (int i = 0; i < multiPV; i++) {
 					  if (prevLine[i]) free(prevLine[i]);
@@ -423,8 +462,8 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 						}		  
 						break;
 					}
-					if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
-					  if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score mate %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]\n", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->matein), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) == 10)
+					if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
+					  if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score mate %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->matein), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) == 10)
 					    eval[i]->scorecp = MATE_SCORE * (eval[i]->matein/abs(eval[i]->matein));
 					}
 					//truncate pv string to maxPlies
@@ -624,16 +663,20 @@ int go(struct Engine * engine, struct Evaluation ** eval) {
 
 	fprintf(engine->toEngine, "%s\n", line);
 	fflush(engine->toEngine);
-  if (engine->logfile) fprintf(engine->logfile, "%s\n", line);
-	//fprintf(stderr, "%s\n", line);
+	if (engine->logfile) {
+		fprintf(engine->logfile, "%s\n", line);
+		fflush(engine->logfile);
+	}
 
 	int multiPV = nametoindex(engine, "MultiPV", Spin);
 	if (multiPV < 0) {
-    if (engine->logfile) fprintf(engine->logfile, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
+		if (engine->logfile) {
+			fprintf(engine->logfile, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
+			fflush(engine->logfile);
+		}
 		fprintf(stderr, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
 		return 1;
 	}
-	//fprintf(stderr, "multiPV %ld\n", engine->optionSpin[multiPV].value);
 	return getPV(engine, eval, engine->optionSpin[multiPV].value);
 }
 
@@ -642,7 +685,10 @@ float getEval(struct Engine * engine) {
 	//char * tmpLine;
 	float score = 0;
 	while (fgets(line, sizeof(line), engine->fromEngine)) {
-		//fprintf(stderr, "%s", line);
+		if (engine->logfile) {
+			fprintf(engine->logfile, "%s", line);
+			fflush(engine->logfile);
+		}
 		if (strstr(line, "Final evaluation ") - line == 0) {
 			char * score_start = strpbrk(line, "+-");
 			score = strtof(score_start, NULL);
@@ -655,14 +701,12 @@ float getEval(struct Engine * engine) {
 float eval(struct Engine * engine) {
 	fprintf(engine->toEngine, "eval\n");
 	fflush(engine->toEngine);
-  if (engine->logfile) fprintf(engine->logfile, "eval\n");	
-	//fprintf(stderr, "eval\n");
+	if (engine->logfile) {
+		fprintf(engine->logfile, "eval\n");
+		fflush(engine->logfile);
+	}
 	return getEval(engine);
 }
-
-#ifdef _WIN32
-#include <windows.h>
-#include <io.h>   // For _open_osfhandle, _close
 
 int engine(struct Engine *engine, const char *engineName) {
     if (!engine) {
@@ -676,11 +720,16 @@ int engine(struct Engine *engine, const char *engineName) {
     strncpy(engine->engineName, engineName, MAX_ENGINE_NAME_LEN - 1);
     engine->engineName[MAX_ENGINE_NAME_LEN - 1] = '\0';
 
-    // Generate unique pipe names
-    const char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    char suffix[10];
+	// Generate unique pipe names
+	const char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	char suffix[10];
 
-    // Generate toEngine pipe name
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>   // For _open_osfhandle, _close
+
+	//To ensure random seeding, run srand(time(NULL)); from main()
+	// Generate toEngine pipe name
     suffix[0] = '.';
     for (int i = 1; i < 9; i++) {
         suffix[i] = symbols[randomNumber(0, 61)];
@@ -697,7 +746,7 @@ int engine(struct Engine *engine, const char *engineName) {
     snprintf(engine->namedPipeFrom, MAX_PIPE_NAME_LEN, "%s%s", FROM_ENGINE_NAMED_PIPE_PREFIX, suffix);
 
     // Create named pipes
-    HANDLE hPipeToEngine = CreateNamedPipeA(
+    engine->hPipeToEngine = CreateNamedPipeA(
         engine->namedPipeTo,
         PIPE_ACCESS_OUTBOUND, // Parent writes to this pipe
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -707,12 +756,12 @@ int engine(struct Engine *engine, const char *engineName) {
         0, // Default timeout
         NULL // Security attributes
     );
-    if (hPipeToEngine == INVALID_HANDLE_VALUE) {
+    if (engine->hPipeToEngine == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "engine() error: CreateNamedPipe(%s) failed: %lu\n", engine->namedPipeTo, GetLastError());
         return 1;
     }
 
-    HANDLE hPipeFromEngine = CreateNamedPipeA(
+	engine->hPipeFromEngine = CreateNamedPipeA(
         engine->namedPipeFrom,
         PIPE_ACCESS_INBOUND, // Parent reads from this pipe
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -722,26 +771,28 @@ int engine(struct Engine *engine, const char *engineName) {
         0,
         NULL
     );
-    if (hPipeFromEngine == INVALID_HANDLE_VALUE) {
+    if (engine->hPipeFromEngine == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "engine() error: CreateNamedPipe(%s) failed: %lu\n", engine->namedPipeFrom, GetLastError());
-        CloseHandle(hPipeToEngine);
+        CloseHandle(engine->hPipeToEngine);
         return 1;
     }
+	// Add this: security attributes to make handles inheritable
+	SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
 
     // Create client-side handles for the child process
     HANDLE hChildToEngine = CreateFileA(
         engine->namedPipeTo,
         GENERIC_READ,
         0,
-        NULL,
+        &sa,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
         NULL
     );
     if (hChildToEngine == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "engine() error: CreateFile(%s) failed: %lu\n", engine->namedPipeTo, GetLastError());
-        CloseHandle(hPipeToEngine);
-        CloseHandle(hPipeFromEngine);
+        CloseHandle(engine->hPipeToEngine);
+        CloseHandle(engine->hPipeFromEngine);
         return 1;
     }
 
@@ -749,15 +800,15 @@ int engine(struct Engine *engine, const char *engineName) {
         engine->namedPipeFrom,
         GENERIC_WRITE,
         0,
-        NULL,
+        &sa,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
         NULL
     );
     if (hChildFromEngine == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "engine() error: CreateFile(%s) failed: %lu\n", engine->namedPipeFrom, GetLastError());
-        CloseHandle(hPipeToEngine);
-        CloseHandle(hPipeFromEngine);
+        CloseHandle(engine->hPipeToEngine);
+        CloseHandle(engine->hPipeFromEngine);
         CloseHandle(hChildToEngine);
         return 1;
     }
@@ -786,13 +837,13 @@ int engine(struct Engine *engine, const char *engineName) {
         &pi
     )) {
         fprintf(stderr, "engine() error: CreateProcess failed: %lu\n", GetLastError());
-        CloseHandle(hPipeToEngine);
-        CloseHandle(hPipeFromEngine);
+        CloseHandle(engine->hPipeToEngine);
+        CloseHandle(engine->hPipeFromEngine);
         CloseHandle(hChildToEngine);
         CloseHandle(hChildFromEngine);
         return 1;
     }
-
+	engine->hProcess = pi.hProcess;
     // Close child handles in parent
     CloseHandle(hChildToEngine);
     CloseHandle(hChildFromEngine);
@@ -800,32 +851,32 @@ int engine(struct Engine *engine, const char *engineName) {
     // Note: Keep pi.hProcess to monitor child process if needed
 
     // Convert parent pipe handles to FILE* for fgets/fputs compatibility
-    int fdToEngine = _open_osfhandle((intptr_t)hPipeToEngine, _O_WRONLY);
+    int fdToEngine = _open_osfhandle((intptr_t)engine->hPipeToEngine, _O_WRONLY | _O_BINARY);
     if (fdToEngine == -1) {
         fprintf(stderr, "engine() error: _open_osfhandle(toEngine) failed\n");
-        CloseHandle(hPipeToEngine);
-        CloseHandle(hPipeFromEngine);
+        CloseHandle(engine->hPipeToEngine);
+        CloseHandle(engine->hPipeFromEngine);
         CloseHandle(pi.hProcess);
         return 1;
     }
-    engine->toEngine = _fdopen(fdToEngine, "w");
+    engine->toEngine = _fdopen(fdToEngine, "wb");
     if (!engine->toEngine) {
         fprintf(stderr, "engine() error: _fdopen(toEngine) failed\n");
         _close(fdToEngine);
-        CloseHandle(hPipeFromEngine);
+		CloseHandle(engine->hPipeFromEngine);
         CloseHandle(pi.hProcess);
         return 1;
     }
 
-    int fdFromEngine = _open_osfhandle((intptr_t)hPipeFromEngine, _O_RDONLY);
+    int fdFromEngine = _open_osfhandle((intptr_t)engine->hPipeFromEngine, _O_RDONLY | _O_BINARY);
     if (fdFromEngine == -1) {
         fprintf(stderr, "engine() error: _open_osfhandle(fromEngine) failed\n");
         fclose(engine->toEngine);
-        CloseHandle(hPipeFromEngine);
+		CloseHandle(engine->hPipeFromEngine);
         CloseHandle(pi.hProcess);
         return 1;
     }
-    engine->fromEngine = _fdopen(fdFromEngine, "r");
+    engine->fromEngine = _fdopen(fdFromEngine, "rb");
     if (!engine->fromEngine) {
         fprintf(stderr, "engine() error: _fdopen(fromEngine) failed\n");
         fclose(engine->toEngine);
@@ -838,27 +889,9 @@ int engine(struct Engine *engine, const char *engineName) {
     setvbuf(engine->toEngine, NULL, _IONBF, 0); // Unbuffered for timely writes
     setvbuf(engine->fromEngine, NULL, _IONBF, 0); // Unbuffered for timely reads
 
-    printf("Created pipes: toEngine=%s, fromEngine=%s\n", engine->namedPipeTo, engine->namedPipeFrom);
-    return 0;
-}
+    //printf("Created pipes: toEngine=%s, fromEngine=%s\n", engine->namedPipeTo, engine->namedPipeFrom);
 #else
 #include <pthread.h>
-int engine(struct Engine *engine, const char *engineName) {
-    if (!engine) {
-        fprintf(stderr, "engine() error: argument engine is NULL\n");
-        return 1;
-    }
-    if (!engineName || strlen(engineName) >= MAX_ENGINE_NAME_LEN) {
-        fprintf(stderr, "engine() error: invalid engineName\n");
-        return 1;
-    }
-    strncpy(engine->engineName, engineName, MAX_ENGINE_NAME_LEN - 1);
-    engine->engineName[MAX_ENGINE_NAME_LEN - 1] = '\0';
-
-    const char symbols[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    char suffix[10];
-    //srand(time(NULL)); // Ensure random seeding
-
     // Create toEngine pipe
     do {
         suffix[0] = '.';
@@ -924,9 +957,9 @@ int engine(struct Engine *engine, const char *engineName) {
         }
     }
     //printf("Created pipes: toEngine=%s, fromEngine=%s\n", engine->namedPipeTo, engine->namedPipeFrom);
-    return 0;
-}
 #endif
+	return 0;
+}
 
 struct Engine * initChessEngine(char * engineName, long long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool limitStrength, int elo) {
   //struct timespec delay;
@@ -1014,10 +1047,34 @@ struct Engine * initChessEngine(char * engineName, long long movetime, int depth
 }
 
 void releaseChessEngine(struct Engine * chessEngine) {
-  if (chessEngine->logfile) fprintf(chessEngine->logfile, "releaseChessEngine(): closing logfile...\n");
-  fclose(chessEngine->logfile);
+	if (chessEngine->logfile) {
+		fclose(chessEngine->logfile);
+		chessEngine->logfile = nullptr;
+	}
+	if (chessEngine->toEngine) {
+		fclose(chessEngine->toEngine);
+		chessEngine->toEngine = nullptr;
+	}
+	if (chessEngine->fromEngine) {
+		fclose(chessEngine->fromEngine);
+		chessEngine->fromEngine = nullptr;
+	}
+#ifdef _WIN32
+	if (chessEngine->hPipeToEngine != INVALID_HANDLE_VALUE) {
+		CloseHandle(chessEngine->hPipeToEngine);
+		chessEngine->hPipeToEngine = INVALID_HANDLE_VALUE;
+	}
+	if (chessEngine->hPipeFromEngine != INVALID_HANDLE_VALUE) {
+		CloseHandle(chessEngine->hPipeFromEngine);
+		chessEngine->hPipeFromEngine = INVALID_HANDLE_VALUE;
+	}
+	if (chessEngine->hProcess != INVALID_HANDLE_VALUE) {
+		CloseHandle(chessEngine->hProcess);
+		chessEngine->hProcess = INVALID_HANDLE_VALUE;
+	}
+#endif
   if (chessEngine) free(chessEngine);
-  chessEngine = NULL;
+  chessEngine = nullptr;
 }
 
 #ifdef __cplusplus
