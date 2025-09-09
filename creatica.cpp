@@ -92,8 +92,15 @@ extern "C" {
       std::shared_mutex mutex;  // For protecting children expansion
   };
   
+  // Custom hasher that uses the key directly
+  struct NoOpHash {
+      std::size_t operator()(unsigned long long key) const noexcept {
+          return key; // Directly use the key as the hash
+      }
+  };
+  
   struct MCTSSearch {
-      std::unordered_map<unsigned long long, MCTSNode *> tree;
+      std::unordered_map<unsigned long long, MCTSNode *, NoOpHash> tree;
       struct MCTSNode * root = nullptr;
       double exploration_constant = 1.0;
       double probability_mass = 0.9;
@@ -719,7 +726,7 @@ MCTS implementation follows the four core phases:
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
         
         numberOfIterations++;
-        if (numberOfIterations % 10 == 0) {
+        if (numberOfIterations % 100 == 0) {
           if (depth < engineDepth.currentDepth.load(std::memory_order_relaxed))
             depth = engineDepth.currentDepth.load(std::memory_order_relaxed);
           else break; //depth is not increasing after 10 search cycles of MIN_OTERATIONS each
