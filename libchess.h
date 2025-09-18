@@ -106,7 +106,7 @@ extern "C" {
 #define TIME_SAFETY_BUFFER 5000 // 5s in ms
 #define CRITICAL_TIME_FACTOR 1.5
 #define MIN_TIME_THRESHOLD 10000 // 10s in ms
-#define MIN_ITERATIONS 801
+#define MIN_ITERATIONS 401
 #define MAX_ITERATIONS 1000000001 // Safety cap
 
 #define NNUE_CHECK 0.00001 //special value for check
@@ -332,8 +332,9 @@ struct Move {
     int castlingRook = FileNone;
 };
 
-enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationConstant, Noise, VirtualLoss, PVPlies};
+enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationConstant, Noise, VirtualLoss, PVPlies, EvalScale};
 enum EngineStringOptions {SyzygyPath};
+enum EngineCheckOptions {Ponder};
 
 enum OptionType {
 	Button, Check, Combo, Spin, String

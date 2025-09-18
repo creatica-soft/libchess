@@ -22,7 +22,8 @@ extern "C" {
 
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define PROBABILITY_MASS 0.90
-#define NOISE 0.20
+#define NOISE 0.15
+#define EVAL_SCALE 6.0
 
 struct NNUEContext {
     Stockfish::StateInfo * state;
@@ -36,13 +37,13 @@ void cleanup_nnue();
 void init_nnue_context(struct NNUEContext * ctx);
 void free_nnue_context(struct NNUEContext * ctx);
 double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
-  
-  int get_prob(std::vector<std::pair<double, int>>& move_evals, double probability_mass, std::mt19937 rng) {
+double noise = NOISE;
+std::mt19937 rng(std::random_device{}());
+
+  int get_prob(std::vector<std::pair<double, int>>& move_evals, double probability_mass) {
     if (move_evals.empty()) return 0;
-    std::uniform_real_distribution<double> uniform(-NOISE, NOISE);
     double min_val = INFINITY;
     for (auto& ev : move_evals) {
-      ev.first += ev.first * uniform(rng); //apply relative noise
       if (ev.first < min_val) min_val = ev.first;
     }
     min_val = (min_val < 0) ? -min_val + 1.0 : 1.0;
@@ -100,6 +101,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
     	enum PieceName side = (enum PieceName)((temp_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
     	unsigned long long any = temp_board->occupations[side]; 
     	struct Move m;
+    	std::uniform_real_distribution<double> uniform(-noise, noise);
     	while (any) {
     	  int src = lsBit(any);
     	  unsigned long long moves = temp_board->sideToMoveMoves[src];
@@ -107,6 +109,7 @@ double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContex
       	  int dst = lsBit(moves);
           init_move(&m, temp_board, src, dst);
           double res = evaluate_nnue(temp_board, &m, ctx);
+          res += res * uniform(rng);
           if (res > best_value) best_value = res;
     		  moves &= moves - 1;
     		}
@@ -157,8 +160,8 @@ int main(int argc, char ** argv) {
   //init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue");
   init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
 	init_nnue_context(&ctx);
-	std::mt19937 rng;
-	rng.seed(static_cast<unsigned int>(std::random_device{}()));
+	//std::mt19937 rng(std::random_device()());
+	//rng.seed(static_cast<unsigned int>(std::random_device{}()));
   double result = 0;
   if (board.isCheck) {
       result = NNUE_CHECK; //NNUE cannot evaluate when in check - it will be resolved in expansion
@@ -169,7 +172,7 @@ int main(int argc, char ** argv) {
   } else {
     //evaluate_nnue() returns result in pawns (not centipawns!) from board.fen->sideToMove perspective
     result = evaluate_nnue(&board, NULL, &ctx);
-    result = tanh(result / 4.0);
+    result = tanh(result / EVAL_SCALE);
   }
   int effective_branching = 1;
   std::vector<std::pair<double, int>> move_evals;
@@ -178,6 +181,7 @@ int main(int argc, char ** argv) {
     double res;
   	enum PieceName side = (enum PieceName)((board.fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
   	unsigned long long any = board.occupations[side]; 
+  	std::uniform_real_distribution<double> uniform(-noise, noise);
   	while (any) {
   	  src = lsBit(any);
   	  unsigned long long moves = board.sideToMoveMoves[src];
@@ -211,6 +215,7 @@ int main(int argc, char ** argv) {
           }
         } //end of else (pieceCount <= TB_LARGEST)
         printf("%s%s %.4f\n", squareName[src], squareName[dst], res);
+        res += res * uniform(rng);
         move_evals.push_back({res, src * 64 + dst});
   		  moves &= moves - 1;
         freeBoard(tmp_board);
@@ -219,9 +224,9 @@ int main(int argc, char ** argv) {
     } //end of while(any)
     std::sort(move_evals.begin(), move_evals.end(), std::greater<>()); //sorted in descending order
     if (result == NNUE_CHECK)
-      result = tanh(move_evals[0].first / 4.0);
-    effective_branching = get_prob(move_evals, PROBABILITY_MASS, rng);
-    std::cout << "Outcome " << result << " (" << tanh(result / 4.0) << ") for " << color[board.fen->sideToMove] << std::endl;
+      result = tanh(move_evals[0].first / EVAL_SCALE);
+    effective_branching = get_prob(move_evals, PROBABILITY_MASS);
+    std::cout << "Outcome " << result << " for " << color[board.fen->sideToMove] << std::endl;
     for (int i = 0; i < effective_branching; i++) {
       char uci_move[6] = "";
       idx_to_move(&board, move_evals[i].second, uci_move);
