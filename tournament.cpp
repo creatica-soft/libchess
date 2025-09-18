@@ -13,9 +13,9 @@
 #define CREATICA_PATH "/Users/ap/libchess/creatica"
 #define STOCKFISH_PATH "/Users/ap/libchess/stockfish-macos-m1-apple-silicon"
 #define SYZYGY_PATH "/Users/ap/syzygy"
-#define PGN_FILE "creatica-stockfish-noise2"
-#define ELO_CREATICA 2400
-#define ELO_STOCKFISH 2400
+#define PGN_FILE "creatica-stockfish-scale"
+#define ELO_CREATICA 2500
+#define ELO_STOCKFISH 2500
 #define K_FACTOR 20 // 40 for new players (under 30 games), 20 for established players under 2400, 10 for masters (2400+) 
 #define MOVETIME 1000
 #define DEPTH 0
@@ -194,7 +194,7 @@ int main(int argc, char ** argv) {
   if (!stockfish) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for black\n", STOCKFISH_PATH);
   //else fprintf(stderr, "initilized chess engine %s for stockfish\n", stockfish->id);
 
-  int jj = 6; //number of tests for j loop
+  int jj = 3; //number of tests for j loop
   float elos_creatica[jj];
   float elos_stockfish[jj];
   float scores_creatica[jj];
@@ -207,8 +207,9 @@ int main(int argc, char ** argv) {
 	  creatica->optionSpin[VirtualLoss].value = 3;
 	  creatica->optionSpin[ExplorationConstant].value = 100;
 	  creatica->optionSpin[ProbabilityMass].value = 90;
-	for (int j = 0; j < jj; j++) { //1..26, step 5
-	  creatica->optionSpin[Noise].value = 1 + j * 5;
+	  creatica->optionSpin[Noise].value = 15;
+	for (int j = 0; j < jj; j++) { //2..6, step 5
+	  creatica->optionSpin[EvalScale].value = 2 + j * 2;
 	  n++;
 	  char suffix[13];
 	  sprintf(suffix, "-%d.pgn", n);
@@ -220,7 +221,7 @@ int main(int argc, char ** argv) {
   		fprintf(stderr, "error: failed to open/create a file %s: %s\n", filename, strerror(errno));
   		exit(1);
   	}
-  	fprintf(file, "Test chess engine options:\nNoise %lld%%\nExplorationConstant %.1f\nProbabilityMass %lld%%\nVirtualLoss %lld\n\n", creatica->optionSpin[Noise].value, (float)creatica->optionSpin[ExplorationConstant].value / 100.0, creatica->optionSpin[ProbabilityMass].value, creatica->optionSpin[VirtualLoss].value);
+  	fprintf(file, "Test chess engine options:\nNoise %lld%%\nExplorationConstant %.1f\nProbabilityMass %lld%%\nVirtualLoss %lld\nEvalScale %lld\n\n", creatica->optionSpin[Noise].value, (float)creatica->optionSpin[ExplorationConstant].value / 100.0, creatica->optionSpin[ProbabilityMass].value, creatica->optionSpin[VirtualLoss].value, creatica->optionSpin[EvalScale].value);
     e_creatica = 1 / (1 + pow(10, (double)(ELO_STOCKFISH - ELO_CREATICA) / 400.0)); //expected creatica score
     e_stockfish = 1.0 - e_creatica; //expected stockfish score
     score_creatica = 0;

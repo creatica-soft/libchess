@@ -37,7 +37,10 @@
 #define PROBABILITY_MASS 90 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
 #define MAX_NOISE 15 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
                      // where noise is sampled randomly from a uniform distribution [-0.2..0.2]
-#define VIRTUAL_LOSS 3
+#define VIRTUAL_LOSS 3 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
+#define EVAL_SCALE 6 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
+                     //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
+                     //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
 #define PV_PLIES 16
 
 // Shared variables
@@ -111,8 +114,8 @@ bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move)
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // 10-second timeout
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L); // 5-second connect timeout
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L); // 10-second timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L); // 5-second connect timeout
 
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
@@ -170,7 +173,7 @@ void search_thread_func() {
         lock.lock();
         searchFlag.store(false);
         stopFlag.store(false);
-        cv.notify_one(); // Signal search is done
+        cv.notify_all(); // Signal search is done
     }
 }
   
@@ -466,7 +469,7 @@ void search_thread_func() {
           std::lock_guard<std::mutex> lock(mtx);
           searchFlag.store(true);
           stopFlag.store(false);
-          cv.notify_one(); // Start search
+          cv.notify_all(); // Start search
       } else if (numberOfPieces > TB_LARGEST) {
           std::string fen(board->fen->fenString);
           if (fen.back() == ' ')
@@ -489,7 +492,7 @@ void search_thread_func() {
               std::lock_guard<std::mutex> lock(mtx);
               searchFlag.store(true);
               stopFlag.store(false);
-              cv.notify_one(); // Start search
+              cv.notify_all(); // Start search
           }        
       } else {
         best_move[0] = '\0';
@@ -528,18 +531,21 @@ void search_thread_func() {
     log_file("quit\n");    
     std::lock_guard<std::mutex> lock(mtx);
     quitFlag.store(true);
-    cv.notify_one();
+    cv.notify_all();
   }
 }
 
 void setEngineOptions() {
     strcpy(chessEngine.id, "Creatica Chess Engine 1.0");
     strcpy(chessEngine.authors, "Creatica");
-    chessEngine.numberOfCheckOptions = 0;
+    chessEngine.numberOfCheckOptions = 1;
 	  chessEngine.numberOfComboOptions = 0;
 	  chessEngine.numberOfSpinOptions = 8;
 		chessEngine.numberOfStringOptions = 1;
 		chessEngine.numberOfButtonOptions = 0;
+	  strcpy(chessEngine.optionCheck[Ponder].name, "Ponder");
+	  chessEngine.optionCheck[Ponder].defaultValue = false;
+	  chessEngine.optionCheck[Ponder].value = chessEngine.optionCheck[Ponder].defaultValue;
 	  strcpy(chessEngine.optionString[SyzygyPath].name, "SyzygyPath");
 	  strcpy(chessEngine.optionString[SyzygyPath].defaultValue, SYZYGY_PATH_DEFAULT);
 	  strcpy(chessEngine.optionString[SyzygyPath].value, SYZYGY_PATH);
@@ -594,6 +600,11 @@ void setEngineOptions() {
 	  chessEngine.optionSpin[PVPlies].value = chessEngine.optionSpin[PVPlies].defaultValue;
 	  chessEngine.optionSpin[PVPlies].min = 1;
 	  chessEngine.optionSpin[PVPlies].max = 32;
+	  strcpy(chessEngine.optionSpin[EvalScale].name, "EvalScale");
+	  chessEngine.optionSpin[EvalScale].defaultValue = EVAL_SCALE;
+	  chessEngine.optionSpin[EvalScale].value = chessEngine.optionSpin[EvalScale].defaultValue;
+	  chessEngine.optionSpin[EvalScale].min = 1;
+	  chessEngine.optionSpin[EvalScale].max = 16;
     chessEngine.wtime = 1e9;
     chessEngine.btime = 1e9;
     chessEngine.winc = 0;
@@ -614,7 +625,7 @@ int main(int argc, char **argv) {
     zobristHash(&zh);
     chess_board.zh = &zh;
     board = &chess_board;
-    logfile = fopen("uci2.log", "w");
+    logfile = fopen("uci.log", "w");
     srand(time(NULL)); 
     init_magic_bitboards();
     init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
