@@ -326,6 +326,9 @@ void search_thread_func() {
   void handleNewGame() {
     cleanup();
     position_history.clear();
+    prev_fen.clear();
+    prev_moves.clear();
+    last_move.clear();
   }
   
   void handlePosition(char * command) {
@@ -708,7 +711,7 @@ int main(int argc, char **argv) {
     zobristHash(&zh);
     chess_board.zh = &zh;
     board = &chess_board;
-    logfile = fopen("uci.log", "a");
+    logfile = fopen("uci.log", "w");
     srand(time(NULL)); 
     init_magic_bitboards();
     init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
