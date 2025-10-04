@@ -684,10 +684,11 @@ static int probe_wdl_table(const struct pos *pos, int *success)
         return 0;
     }
 
+    LOCK(TB_MUTEX);
     ptr = ptr2[i].ptr;
     if (!ptr->ready)
     {
-        LOCK(TB_MUTEX);
+        //LOCK(TB_MUTEX);
         if (!ptr->ready)
         {
             char str[16];
@@ -701,9 +702,10 @@ static int probe_wdl_table(const struct pos *pos, int *success)
             }
             // Memory barrier to ensure ptr->ready = 1 is not reordered.
             __asm__ __volatile__ ("" ::: "memory");
+            //__atomic_thread_fence(__ATOMIC_SEQ_CST); // Stronger barrier
             ptr->ready = 1;
         }
-        UNLOCK(TB_MUTEX);
+        //UNLOCK(TB_MUTEX);
     }
 
     int bside, mirror, cmirror;
@@ -768,10 +770,11 @@ static int probe_wdl_table(const struct pos *pos, int *success)
                 bb = poplsb(bb);
             } while (bb);
         }
-        idx = encode_pawn(entry, entry->file[f].norm[bside], p,
-            entry->file[f].factor[bside]);
+        //LOCK(TB_MUTEX); // Add lock
+        idx = encode_pawn(entry, entry->file[f].norm[bside], p, entry->file[f].factor[bside]);
         res = decompress_pairs(entry->file[f].precomp[bside], idx);
     }
+    UNLOCK(TB_MUTEX); // unlock later
 
     return ((int)res) - 2;
 }

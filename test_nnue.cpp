@@ -22,7 +22,7 @@ extern "C" {
 
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define PROBABILITY_MASS 0.90
-#define NOISE 0.15
+#define NOISE 0.05
 #define EVAL_SCALE 6.0
 
 struct NNUEContext {
@@ -107,7 +107,7 @@ std::mt19937 rng(std::random_device{}());
     	  unsigned long long moves = temp_board->sideToMoveMoves[src];
     	  while (moves) {
       	  int dst = lsBit(moves);
-          init_move(&m, temp_board, src, dst);
+          init_move(&m, temp_board, src, dst, Queen);
           double res = evaluate_nnue(temp_board, &m, ctx);
           res += res * uniform(rng);
           if (res > best_value) best_value = res;
@@ -188,7 +188,7 @@ int main(int argc, char ** argv) {
   	  while (moves) {
   	    dst = lsBit(moves);
       	struct Board * tmp_board = cloneBoard(&board);
-        init_move(&move, tmp_board, src, dst);
+        init_move(&move, tmp_board, src, dst, Queen);
         makeMove(&move); //perspective is changed to board.opponentColor - negate the eval to preserve perspective!
       	int pieceCount = bitCount(tmp_board->occupations[PieceNameAny]);
         if (pieceCount > TB_LARGEST || tmp_board->fen->halfmoveClock || tmp_board->fen->castlingRights) {

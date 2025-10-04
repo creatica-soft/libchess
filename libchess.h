@@ -102,11 +102,11 @@ extern "C" {
 
 // Time management constants
 #define MIN_MOVES_REMAINING 40
-#define MAX_MOVES_REMAINING 60
-#define TIME_SAFETY_BUFFER 5000 // 5s in ms
+#define MAX_MOVES_REMAINING 80
+#define TIME_SAFETY_BUFFER 5000 // 10s in ms
 #define CRITICAL_TIME_FACTOR 1.5
 #define MIN_TIME_THRESHOLD 10000 // 10s in ms
-#define MIN_ITERATIONS 401
+#define MIN_ITERATIONS 201
 #define MAX_ITERATIONS 1000000001 // Safety cap
 
 #define NNUE_CHECK 0.00001 //special value for check
@@ -310,6 +310,7 @@ struct Board {
     unsigned long long moves = 0;
     unsigned long long movesFromSquares[64] = {};
     unsigned long long sideToMoveMoves[64] = {};
+    //int allMoves[218] = {}; //theoretical maximum number of moves from a specially crafted position is 218
     int opponentColor = ColorNone;
     int plyNumber = 0;
     int capturedPiece = PieceNameNone;
@@ -524,7 +525,7 @@ CHESS_API void zobristHash(struct ZobristHash *);
 /// calculates Zobrist hash from a Board struct and updates
 /// ZobristHash struct, which should be initialized first
 ///<summary>
-CHESS_API void getHash(struct ZobristHash *, struct Board *);
+CHESS_API int getHash(struct ZobristHash *, struct Board *);
 
 ///<summary>
 /// resets ZobristHash struct to initial game position
@@ -591,7 +592,7 @@ CHESS_API int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dat
 /// and initializes the Move struct on a given board
 ///</summary>
 CHESS_API int initMove(struct Move * move, struct Board * board, const char * moveString);
-CHESS_API void init_move(struct Move * move, struct Board * board, int src, int dst);
+CHESS_API void init_move(struct Move * move, struct Board * board, int src, int dst, int promo);
 CHESS_API bool promoMove(struct Board * board, int src, int dst);
 
 ///<summary>
@@ -741,6 +742,7 @@ CHESS_API bool position(struct Engine *);
 //void go(long long, int, int, int, char *, bool, bool, long long, long long, long long, long long, int, struct Engine *, struct Evaluation **);
 CHESS_API int go(struct Engine *, struct Evaluation **);
 CHESS_API float eval(struct Engine *);
+CHESS_API int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV);
 
 //CHESS_API unsigned long long md5(char *);
 

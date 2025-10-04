@@ -1,6 +1,7 @@
 /*
   Copyright (c) 2011-2015 Ronald de Man
 */
+#include <stdatomic.h>
 
 #ifndef TBCORE_H
 #define TBCORE_H
@@ -20,6 +21,8 @@ extern "C" {
 #define FD HANDLE
 #define FD_ERR INVALID_HANDLE_VALUE
 #endif
+
+#define TB_HAVE_THREADS
 
 #ifdef TB_HAVE_THREADS
 #ifndef _WIN32

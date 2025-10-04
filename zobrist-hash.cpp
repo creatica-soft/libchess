@@ -59,15 +59,15 @@ void zobristHash(struct ZobristHash * hash) {
 	//printf("k %d k2 %d\n", k, k2);
 }
 
-void getHash(struct ZobristHash * hash, struct Board * board) {	
+int getHash(struct ZobristHash * hash, struct Board * board) {	
   if (!hash || !board) {
   	fprintf(stderr, "getHash() arg error: either hash or board or both are NULL\n");
-  	return;
+  	return 1;
   }
 	if (strncmp(board->fen->fenString, startPos, strlen(startPos)) == 0) {
 		resetHash(hash);
 	  board->zh = hash;
-		return;
+		return 0;
 	}
 	hash->hash = 0; hash->prevEnPassant = 0;
 	hash->hash2 = 0; hash->prevEnPassant2 = 0;
@@ -101,7 +101,7 @@ void getHash(struct ZobristHash * hash, struct Board * board) {
 	//save castling rights for an update
 	hash->prevCastlingRights = hash->castling[board->fen->castlingRights];
 	hash->prevCastlingRights2 = hash->castling2[board->fen->castlingRights];
-	//xor in en passant if any
+	//xor in en passant if any and save it for an update
 	if (board->fen->enPassant != FileNone) {
 		hash->hash ^= hash->enPassant[board->fen->enPassant];
 		hash->hash2 ^= hash->enPassant2[board->fen->enPassant];
@@ -109,6 +109,7 @@ void getHash(struct ZobristHash * hash, struct Board * board) {
 		hash->prevEnPassant2 = hash->enPassant2[board->fen->enPassant];
 	}
 	board->zh = hash;
+	return 0;
 }
 
 void resetHash(struct ZobristHash * hash) {
@@ -133,10 +134,7 @@ int updateHash(struct Board * board, struct Move * move) {
 	}
 	int srcPieceType = (board->movingPiece.color * 6) + board->movingPiece.type;
 	if ((move->type & (MoveTypeEnPassant | MoveTypeCapture)) == (MoveTypeEnPassant | MoveTypeCapture)) {
-		int s;
-		if (board->movingPiece.color == ColorWhite) 
-			s = move->destinationSquare.name - 8;
-		else s = move->destinationSquare.name + 8;
+		int s = board->movingPiece.color == ColorWhite ? move->destinationSquare.name - 8 : move->destinationSquare.name + 8;
 		//xor out the capturing piece in its src square
 		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->sourceSquare.name];
 		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->sourceSquare.name];
@@ -257,7 +255,7 @@ int updateHash(struct Board * board, struct Move * move) {
 	board->zh->hash2 ^= board->zh->castling2[board->fen->castlingRights];
 	board->zh->prevCastlingRights = board->zh->castling[board->fen->castlingRights];
 	board->zh->prevCastlingRights2 = board->zh->castling2[board->fen->castlingRights];
-	//xor in black's move
+	//xor in black's move if it's black turn or xor out black's move if it's white turn
 	board->zh->hash ^= board->zh->blackMove;
 	board->zh->hash2 ^= board->zh->blackMove2;
 	return 0;
