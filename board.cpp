@@ -448,7 +448,6 @@ void generateMoves(struct Board * board) {
 	board->isCheck = false; board->isStaleMate = false; board->isMate = false;
 	//reset enPassantLegalBit
 	board->fen->enPassantLegalBit = 0;
-  //board->move = 0;
 
 	struct ChessPiece king;
 	struct Square kingSquare;
@@ -616,16 +615,11 @@ void generateMoves(struct Board * board) {
 	board->movesFromSquares[king.square.name] = generateKingMoves(board, &(king.square));
 	//filter these moves to find the legal ones: 
 	//the king cannot capture defended opponent's pieces
-	//board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & defendedPieces;
 	//it can't go to a square occupied by other pieces of its color
-	//board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & board->occupations[shiftedColor | PieceTypeAny];
 	//and it can't go to a square attacked by opponent piece(s)
-	//board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & attackedSquares;
-	//all three ops above in one go
 	board->movesFromSquares[king.square.name] ^= board->movesFromSquares[king.square.name] & (defendedPieces | board->occupations[shiftedColor | PieceTypeAny] | attackedSquares);
 	
 	board->moves |= board->movesFromSquares[king.square.name];
-	//board->kingMoves = board->movesFromSquares[king.square.name];
 	//is king checked?
 	if ((board->isCheck = board->occupations[shiftedColor | King] & attackedSquares)) {
 		//if double check, no other moves rather than the king's move are possible
@@ -634,7 +628,6 @@ void generateMoves(struct Board * board) {
 		//normal check by checker
 		else if (bits == 1) {
 			square(&checkerSquare, lsBit(checker));
-			//checker = board->checkers;
 			//if not checked by knight or pawn, calculate blocking squares
 			if ((board->piecesOnSquares[checkerSquare.name] != (shiftedOpponentColor | Knight)) && board->piecesOnSquares[checkerSquare.name] != (shiftedOpponentColor | Pawn)) {
 				d = 0;
@@ -858,11 +851,8 @@ void generateMoves(struct Board * board) {
 	
 	//pawn moves
 	while (pawns) {
-		//sn = lsBit(pawns);
 		square(&sq, lsBit(pawns));
-		//ii = sq.file; jj = sq.rank; shift = sq.name;
 		square(&pinnedBy, SquareNone);
-		//alternative algorithm to find pinnedBy square
 		if (pinnedPieces & sq.bitSquare) {
  			d = pinningPieces;
  			while (d) {
@@ -877,7 +867,7 @@ void generateMoves(struct Board * board) {
     }
     d = 0;		
 		if (pinnedBy.name < SquareNone) {
-			if (board->isCheck) { //goto next; // this pawn can't do much
+			if (board->isCheck) {// this pawn can't do much
 			  pawns &= pawns - 1;
 			  continue;
 			}
@@ -934,7 +924,6 @@ void generateMoves(struct Board * board) {
 			if (sq.file > FileA) {
 				shift = sq.name + pawnShifts[board->fen->sideToMove][1]; //NW or SW
 				if ((board->piecesOnSquares[shift] != PieceNameNone) && ((board->piecesOnSquares[shift] >> 3) == board->opponentColor)) {
-					//if ((board->piecesOnSquares[shift] >> 3) == board->opponentColor) 
 						d |= 1ULL << shift;
 				}
 				else if ((board->fen->enPassant == (sq.file - 1)) && (sq.rank == pawnRanks[board->fen->sideToMove][1])) { //rank5 or rank4
@@ -949,7 +938,6 @@ void generateMoves(struct Board * board) {
 			if (sq.file < FileH) {
 				shift = sq.name + pawnShifts[board->fen->sideToMove][2]; //NE or SE
 				if ((board->piecesOnSquares[shift] != PieceNameNone) && ((board->piecesOnSquares[shift] >> 3) == board->opponentColor)) {
-					//if ((board->piecesOnSquares[shift] >> 3) == board->opponentColor) 
 						d |= 1ULL << shift;
 				}
 				else if ((board->fen->enPassant == (sq.file + 1)) && (sq.rank == pawnRanks[board->fen->sideToMove][1])) {
@@ -973,8 +961,6 @@ void generateMoves(struct Board * board) {
 			}
 		}
 		board->moves |= board->movesFromSquares[sq.name];
-		//board->pawnMoves |= board->movesFromSquares[sq.name];
-//next:
 		pawns &= pawns - 1;
 	}
 

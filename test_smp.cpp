@@ -46,7 +46,7 @@ char best_move[6];
 std::atomic<bool> search_done{false}; // Signals search completion
 double exploration_constant = 1.0;
 double probability_mass = 0.9;
-double noise = 0.15;
+double noise = 0.01;
 double virtual_loss = 3.0;  // Tune: UCI option, e.g., 1.0-3.0
 double eval_scale = 6.0; //Tune as well
 
@@ -245,7 +245,7 @@ extern "C" {
     for (int i = 0; i < num_moves; ++i) {
         struct Board * temp_board = cloneBoard(chess_board);
         struct Move move;
-        init_move(&move, temp_board, top_moves[i].second / 64, top_moves[i].second % 64);
+        init_move(&move, temp_board, top_moves[i].second >> 9, (top_moves[i].second >> 3) & 63, (top_moves[i].second & 7) + 1);
         makeMove(&move);
   			if (updateHash(temp_board, &move)) {
   				print("expand_node() error: updateHash() returned non-zero value\n");
@@ -382,7 +382,7 @@ extern "C" {
       (*move_idx)[i] = search.root->children[child_index].move;
       idx_to_move(temp_board, (*move_idx)[i], uci_move);
       strcat((*pv)[i], uci_move);
-      init_move(&move, temp_board, (*move_idx)[i] / 64, (*move_idx)[i] % 64);
+      init_move(&move, temp_board, (*move_idx)[i] >> 9, ((*move_idx)[i] >> 3) & 63, ((*move_idx)[i] & 7) + 1);
       makeMove(&move);
       current_node = search.root->children[child_index].child;      
       // Build PV by following most visited children
@@ -393,7 +393,7 @@ extern "C" {
         idx_to_move(temp_board, current_node->children[next_idx].move, uci_move);
         strcat((*pv)[i], " ");
         strcat((*pv)[i], uci_move);
-        init_move(&move, temp_board, current_node->children[next_idx].move / 64, current_node->children[next_idx].move % 64);
+        init_move(&move, temp_board, current_node->children[next_idx].move >> 9, (current_node->children[next_idx].move >> 3) & 63, (current_node->children[next_idx].move & 7) + 1);
         makeMove(&move);
         current_node = current_node->children[next_idx].child;
         num_child = current_node->num_children.load(std::memory_order_relaxed);
@@ -479,7 +479,7 @@ extern "C" {
     	  unsigned long long moves = temp_board->sideToMoveMoves[src];
     	  while (moves) {
       	  int dst = lsBit(moves);
-          init_move(&m, temp_board, src, dst);
+          init_move(&m, temp_board, src, dst, Queen);
           double res = evaluate_nnue(temp_board, &m, ctx);
           res += res * uniform(rng);
           if (res > best_value) best_value = res;
@@ -557,7 +557,7 @@ MCTS implementation follows the four core phases:
         node->mutex.lock_shared();
         int move_idx = node->children[idx].move;
         node->mutex.unlock_shared();
-    		init_move(&move, sim_board, move_idx / 64, move_idx % 64);
+    		init_move(&move, sim_board, move_idx >> 9, (move_idx >> 3) & 63, (move_idx & 7) + 1);
         //make the move
         makeMove(&move); //this updates sim_board
         //update Zobrist hash (it is needed so that we can call updateHash later instead of getHash)
@@ -609,7 +609,7 @@ MCTS implementation follows the four core phases:
       	  while (moves) {
       	    dst = lsBit(moves);
           	struct Board * tmp_board = cloneBoard(sim_board);
-            init_move(&move, tmp_board, src, dst);
+            init_move(&move, tmp_board, src, dst, Queen);
             makeMove(&move); //the move is made - negate the result of eval to preserve sim_board perspective!
           	int pieceCount = bitCount(tmp_board->occupations[PieceNameAny]);
             if (pieceCount > TB_LARGEST || tmp_board->fen->halfmoveClock || tmp_board->fen->castlingRights) {
@@ -738,7 +738,7 @@ MCTS implementation follows the four core phases:
       for (int i = 0; i < multiPV && move_idx && pv; i++) {
         struct Move move;
         struct Board * temp_board = cloneBoard(board);
-        init_move(&move, temp_board, move_idx[i] / 64, move_idx[i] % 64);
+        init_move(&move, temp_board, move_idx[i] >> 9, (move_idx[i] >> 3) & 63, (move_idx[i] & 7) + 1);
         double res = evaluate_nnue(temp_board, &move, &ctx);
         if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
           res = process_check(temp_board, &move, &ctx, rng); 
@@ -882,7 +882,7 @@ MCTS implementation follows the four core phases:
     for (int i = 0; i < multiPV && move_idx && pv; i++) {
       struct Board * temp_board = cloneBoard(board);
       //Get NNUE eval for the best_move (move_idx)
-      init_move(&move, temp_board, move_idx[i] / 64, move_idx[i] % 64);
+      init_move(&move, temp_board, move_idx[i] >> 9, (move_idx[i] >> 3) & 63, (move_idx[i] & 7) + 1);
       double res = evaluate_nnue(temp_board, &move, &ctx);
       if (res == NNUE_CHECK) //we need to resolve the check to get NNUE score
         res = process_check(temp_board, &move, &ctx, rng);

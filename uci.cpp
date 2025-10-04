@@ -22,6 +22,7 @@
 #include <random>
 #include <thread>
 #include <mutex>
+#include <unordered_map>
 #include <condition_variable>
 #include <curl/curl.h>
 #include "json.hpp"
@@ -29,13 +30,13 @@
 #include "libchess.h"
 
 #define THREADS 8
-#define MULTI_PV 1
+#define MULTI_PV 2
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH ""
-#define HASH 1024 //default, GUI may set it via Hash option (once full, expansion won't happen!)
+#define SYZYGY_PATH "/Users/ap/syzygy"
+#define HASH 2048 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
 #define PROBABILITY_MASS 90 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-#define MAX_NOISE 15 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
+#define MAX_NOISE 5 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
                      // where noise is sampled randomly from a uniform distribution [-0.2..0.2]
 #define VIRTUAL_LOSS 3 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
 #define EVAL_SCALE 6 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
@@ -49,10 +50,16 @@ std::condition_variable cv;
 std::atomic<bool> searchFlag {false};
 std::atomic<bool> stopFlag {false};
 std::atomic<bool> quitFlag {false};
+std::atomic<bool> ponderHit {false};
 FILE * logfile = nullptr;
 double timeAllocated = 0.0; //ms
 char best_move[6] = "";
 using json = nlohmann::json;
+std::string prev_fen;
+std::string prev_moves;
+std::string last_move;
+
+std::unordered_map<unsigned long long, int> position_history;
 
 extern "C" {  
   struct Board * board = nullptr;
@@ -72,6 +79,7 @@ extern "C" {
   void handlePosition(char * command);
   void handleOption(char * command);
   void handleGo(char * command);
+  void handlePonderhit(char * command);
   void handleStop();
   void handleQuit(void);
 
@@ -162,10 +170,11 @@ bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move)
 void search_thread_func() {
     while (!quitFlag.load()) {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [] { return searchFlag.load() || quitFlag.load(); }); // Wait for "go"
+        cv.wait(lock, [] { return searchFlag.load() || quitFlag.load(); }); // Wait for "go" or "quit"
         lock.unlock();
         if (quitFlag.load()) {
           cleanup();
+          position_history.clear();
           break;
         }
         if (searchFlag.load()) runMCTS();
@@ -179,6 +188,7 @@ void search_thread_func() {
   
   void uciLoop() {
       char line[4096];
+      char go_line[4096];
       print("id name %s\n", chessEngine.id);
       log_file("id name %s\n", chessEngine.id);
       while (!quitFlag.load()) {
@@ -186,31 +196,36 @@ void search_thread_func() {
               log_file("uciloop() error: fgets() returned NULL\n");
               exit(-1);
           }
+          log_file("%s", line);
           line[strcspn(line, "\n")] = 0;
   
           if (strcmp(line, "ucinewgame") == 0) {
-              log_file("ucinewgame\n");
               handleNewGame();
           }
           else if (strcmp(line, "uci") == 0) {
-              log_file("uci\n");
               handleUCI();
           }
           else if (strncmp(line, "setoption", 9) == 0) {
-              log_file("%s\n", line);
               handleOption(line);
           }
           else if (strcmp(line, "isready") == 0) {
-              log_file("isready\n");
               handleIsReady();
           }
           else if (strncmp(line, "position", 8) == 0) {
-              log_file("%s\n", line);
               handlePosition(line);
           }
           else if (strncmp(line, "go", 2) == 0) {
-              log_file("%s\n", line);
+              char * ponder = strstr(line, "ponder");
+              if (ponder) {
+                strncpy(go_line, line, ponder - line - 1);
+                go_line[ponder - line - 1] = 0;
+                strcat(go_line, ponder + 6);
+              } else strcpy(go_line, line);
               handleGo(line);
+          }
+          else if (strcmp(line, "ponderhit") == 0) { //engine should not output bestmove prior to executing ponder move
+              ponderHit.store(true);
+              handlePonderhit(go_line);
           }
           else if (strcmp(line, "stop") == 0) {
               handleStop();
@@ -259,7 +274,7 @@ void search_thread_func() {
     if (strncmp(token, "name", 4) == 0) {
       char * name = strtok(NULL, " ");
       token = strtok(NULL, " ");
-      if (strncmp(token, "value", 5) == 0) {
+      if (strncmp(token, "value", 5) == 0) { //Button option does not have value and its name may have space; for example, Clear Hash
         char * value = strtok(NULL, " ");
         int idx, type;
         for (int i = Button; i <= String; i++) {
@@ -304,93 +319,106 @@ void search_thread_func() {
   }
   
   void handleIsReady(void) {
-    if (!searchFlag.load()) {
-      print("readyok\n");
-      log_file("readyok\n");
-    }
+    print("readyok\n");
+    log_file("readyok\n");
   }
   
   void handleNewGame() {
-      strtofen(board->fen, startPos);
-      fentoboard(board->fen, board);
-      getHash(board->zh, board);
+    cleanup();
+    position_history.clear();
   }
   
   void handlePosition(char * command) {
-      char * token;
-      char tempFen[MAX_FEN_STRING_LEN];
-      struct Move move;
-      token = strtok(command, " ");
-      if (strncmp(token, "position", 8) != 0) {
+    struct Move move;
+    std::string new_position(command);
+    bool new_pos = true;
+    std::string new_fen;
+    std::string new_moves;
+    std::vector<std::string> last_moves;
+    last_move.clear();
+    size_t moves_pos = new_position.find("moves", 18);
+    if (moves_pos != std::string::npos) new_moves = new_position.substr(moves_pos + 6);
+    if (new_position.find("startpos", 9) != std::string::npos) new_fen.assign(startPos);
+    else {
+      size_t fen_pos = new_position.find("fen", 9);
+      if (fen_pos != std::string::npos) {
+        if (moves_pos != std::string::npos)
+          new_fen = new_position.substr(fen_pos + 4, moves_pos - fen_pos - 5);
+        else new_fen = new_position.substr(fen_pos + 4);
+      } else {
+        log_file("handlePosition() error: neither startpos no fen keyword is present in position command\n");
+        return;
+      }
+    }
+    if (new_fen.compare(startPos) == 0 && new_moves.empty()) position_history.clear();
+    if (!new_moves.empty() && !new_fen.empty()) {
+      std::string last_moves_str;
+      if (!prev_fen.empty() && new_fen == prev_fen) {
+        new_pos = false;
+        if (!prev_moves.empty() && new_moves.starts_with(prev_moves) && new_moves.size() > prev_moves.size())
+          last_moves_str = new_moves.substr(prev_moves.size() + 1);
+        else last_moves_str = new_moves;
+      } else last_moves_str = new_moves;
+      while (!last_moves_str.empty() && std::isspace(last_moves_str.back())) {
+        last_moves_str.pop_back(); //trim whitespaces at the end
+      }
+      if (last_moves_str.size() >= 4) { //we have at least one new move
+        std::istringstream last_moves_stream(last_moves_str);
+        std::string some_move;
+        while (last_moves_stream >> some_move) {
+          last_moves.push_back(some_move);
+        }
+      }
+    }
+    if (new_pos) {
+        strtofen(board->fen, new_fen.c_str());
+        fentoboard(board->fen, board);
+        if (getHash(board->zh, board)) {
+          log_file("handlePosition() error: getHash() returned non-zero value\n");
+          exit(-1);          
+        }
+        unsigned long long hash = board->zh->hash ^ board->zh->hash2;
+        position_history[hash]++;
+        log_file("handlePosition(new_pos) debug: repetition count %d, fen %s\n", position_history[hash], board->fen->fenString);   
+    }
+    if (!last_moves.empty()) {
+      size_t num_moves = last_moves.size() - 1; //last move should wait till go
+      for (int i = 0; i < num_moves; i++) {
+        if (initMove(&move, board, last_moves[i].c_str())) {
+          log_file("handlePosition() error: invalid move %u%s%s (%s); FEN %s\n",
+            move.chessBoard->fen->moveNumber,
+            move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
+            move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
           exit(-1);
+        }
+        makeMove(&move);
+        if (updateHash(board, &move)) {
+          log_file("handlePosition() error: updateHash() returned non-zero value\n");
+          exit(-1);
+        }
+        unsigned long long hash = board->zh->hash ^ board->zh->hash2;
+        position_history[hash]++;
+        log_file("handlePosition(%s) debug: repetition count %d, fen %s\n", last_moves[i].c_str(), position_history[hash], board->fen->fenString);           
       }
-      token = strtok(NULL, " ");
-      if (strcmp(token, "startpos") == 0) {
-          strtofen(board->fen, startPos);
-          fentoboard(board->fen, board);
-          getHash(board->zh, board);
-          token = strtok(NULL, " ");
-          if (token != NULL && strcmp(token, "moves") == 0) {
-              while ((token = strtok(NULL, " ")) != NULL) {
-                  if (initMove(&move, board, token)) {
-                      log_file("handlePosition() error: invalid move %u%s%s (%s); FEN %s\n",
-                              move.chessBoard->fen->moveNumber,
-                              move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
-                              move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
-                      exit(-1);
-                  }
-                  makeMove(&move);
-                  if (updateHash(board, &move)) {
-                      log_file("handlePosition() error: updateHash() returned non-zero value\n");
-                      exit(-1);
-                  }
-              }
-          }
-      }
-      else if (strcmp(token, "fen") == 0) {
-          tempFen[0] = '\0';
-          while ((token = strtok(NULL, " ")) != NULL) {
-              if (strcmp(token, "moves") == 0) {
-                  break;
-              }
-              if (strlen(tempFen) + strlen(token) + 2 <= MAX_FEN_STRING_LEN) {
-                  strcat(tempFen, token);
-                  strcat(tempFen, " ");
-              } else {
-                  log_file("handlePosition() error: FEN string is too long, max length is %d\n",
-                          MAX_FEN_STRING_LEN - 1);
-                  exit(-1);
-              }
-          }
-          if (strtofen(board->fen, tempFen)) {
-            log_file("handlePosition() error: strtofen() returned non-zero code, fen %s\n", tempFen);
-            exit(-1);
-          }
-          if (fentoboard(board->fen, board)) {
-            log_file("handlePosition() error: fentoboard() returned non-zero code, fen %s\n", board->fen->fenString);
-            exit(-1);
-          }
-          getHash(board->zh, board);
-          if (token != NULL && strcmp(token, "moves") == 0) {
-              while ((token = strtok(NULL, " ")) != NULL) {
-                  if (initMove(&move, board, token)) {
-                      log_file("handlePosition() error: invalid move %u%s%s (%s); FEN %s\n",
-                              move.chessBoard->fen->moveNumber,
-                              move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
-                              move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
-                      exit(-1);
-                  }
-                  makeMove(&move);
-                  if (updateHash(board, &move)) {
-                      log_file("handlePosition() error: updateHash() returned non-zero value\n");
-                      exit(-1);
-                  }
-              }
-          }
-      }
+      last_move = last_moves.back();
+    }
+    last_moves.clear();    
+    prev_fen = new_fen;
+    prev_moves = new_moves;
   }
   
   void handleGo(char * command) {
+      chessEngine.wtime = 1e9;
+      chessEngine.btime = 1e9;
+      chessEngine.winc = 0;
+      chessEngine.binc = 0;
+      chessEngine.movestogo = 0;
+      chessEngine.movetime = 0;
+      chessEngine.depth = 0;
+      chessEngine.nodes = 0;
+      chessEngine.infinite = false;
+      chessEngine.ponder = false;
+
       char * token;
       if (searchFlag.load()) {
         std::unique_lock<std::mutex> lock(mtx);
@@ -435,6 +463,32 @@ void search_thread_func() {
           else if (strcmp(token, "infinite") == 0) {
               chessEngine.infinite = true;
           }
+          else if (strcmp(token, "ponder") == 0) {
+              chessEngine.ponder = true;
+          }
+      }
+      if (!chessEngine.ponder && !last_move.empty()) { //execute last move
+        //last move in ponder mode (go ponder) should only be executed on ponderhit
+        //It is usually opponent's move2 in engine's output "bestmove move1 ponder move2"
+        //In any case a decision to exec last move should be suspended until go command!
+        //If it's without ponder, then execute; otherwise, ponder on this move 
+        struct Move move;
+        if (initMove(&move, board, last_move.c_str())) {
+          log_file("handleGo() error: invalid move %u%s%s (%s); FEN %s\n",
+            move.chessBoard->fen->moveNumber,
+            move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
+            move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+          exit(-1);
+        }
+        makeMove(&move);
+        if (updateHash(board, &move)) {
+          log_file("handleGo() error: updateHash() returned non-zero value\n");
+          exit(-1);
+        }
+        unsigned long long hash = board->zh->hash ^ board->zh->hash2;
+        position_history[hash]++;
+        log_file("handleGo() debug: repetition count %d, fen %s\n", position_history[hash], board->fen->fenString);           
+        last_move.clear();
       }
   
       if (chessEngine.movetime > 0) {
@@ -446,21 +500,19 @@ void search_thread_func() {
       else {
           int remainingTime = board->fen->sideToMove == ColorWhite ? chessEngine.wtime : chessEngine.btime;
           int increment = board->fen->sideToMove == ColorWhite ? chessEngine.winc : chessEngine.binc;
-          int movesLeft = chessEngine.movestogo ? chessEngine.movestogo : MIN_MOVES_REMAINING; //40
-          if (strstr(board->fen->fenString, "rnbqkbnr") != NULL) {
-              movesLeft = MAX_MOVES_REMAINING;
-          }
+          int movesLeft = chessEngine.movestogo ? chessEngine.movestogo : MAX_MOVES_REMAINING - board->fen->moveNumber;
+          if (movesLeft < MIN_MOVES_REMAINING) movesLeft = MIN_MOVES_REMAINING;
           if (remainingTime > TIME_SAFETY_BUFFER) { //5000 ms
               remainingTime -= TIME_SAFETY_BUFFER;
           }
-          timeAllocated = (double)remainingTime / movesLeft + increment * 0.7;
+          timeAllocated = (double)remainingTime / movesLeft + increment * 0.5;
           if (board->fen->moveNumber > 10) {
               timeAllocated *= CRITICAL_TIME_FACTOR; //1.5
           }
           if (remainingTime < MIN_TIME_THRESHOLD) { //10000 ms
               timeAllocated = remainingTime * 0.5;
           }
-          if (timeAllocated < 100) {
+          if (timeAllocated < 3000) {
               timeAllocated = 100;
           }
       }
@@ -472,8 +524,9 @@ void search_thread_func() {
           cv.notify_all(); // Start search
       } else if (numberOfPieces > TB_LARGEST) {
           std::string fen(board->fen->fenString);
-          if (fen.back() == ' ')
-            fen.erase(fen.end() - 1);
+          while (!fen.empty() && std::isspace(fen.back())) {
+            fen.pop_back(); //trim whitespaces at the end
+          }
           size_t pos = fen.rfind(" ");
           while (pos != std::string::npos) {
             fen.replace(pos, 1, "_");
@@ -521,6 +574,34 @@ void search_thread_func() {
       }          
   }
   
+  void handlePonderhit(char * command) { //stop pondering, execute last_move and continue searching normally
+    log_file("handlePonderhit(): stop\n");
+    handleStop();
+    if (!last_move.empty()) {
+      struct Move move;
+      if (initMove(&move, board, last_move.c_str())) {
+        log_file("handlePonderhit() error: invalid move %u%s%s (%s); FEN %s\n",
+          move.chessBoard->fen->moveNumber,
+          move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
+          move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
+        exit(-1);
+      }
+      makeMove(&move);
+      if (updateHash(board, &move)) {
+        log_file("handlePonderhit() error: updateHash() returned non-zero value\n");
+        exit(-1);
+      }
+      unsigned long long hash = board->zh->hash ^ board->zh->hash2;
+      position_history[hash]++;
+      log_file("handlePonderhit(%s) debug: repetition count %d, fen %s\n", last_move.c_str(), position_history[hash], board->fen->fenString);   
+      last_move.clear();
+    }    
+    chessEngine.ponder = false;
+    ponderHit.store(false);
+    log_file("%s\n", command);
+    handleGo(command);
+  }
+  
   void handleStop() {
     std::unique_lock<std::mutex> lock(mtx);
     stopFlag.store(true);
@@ -528,9 +609,10 @@ void search_thread_func() {
   }
   
   void handleQuit(void) {
-    log_file("quit\n");    
-    std::lock_guard<std::mutex> lock(mtx);
-    quitFlag.store(true);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      quitFlag.store(true);
+    }
     cv.notify_all();
   }
 }
@@ -614,6 +696,7 @@ void setEngineOptions() {
     chessEngine.depth = 0;
     chessEngine.nodes = 0;
     chessEngine.infinite = false;
+    chessEngine.ponder = false;
 }
 
 int main(int argc, char **argv) {
@@ -625,7 +708,7 @@ int main(int argc, char **argv) {
     zobristHash(&zh);
     chess_board.zh = &zh;
     board = &chess_board;
-    logfile = fopen("uci.log", "w");
+    logfile = fopen("uci.log", "a");
     srand(time(NULL)); 
     init_magic_bitboards();
     init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");

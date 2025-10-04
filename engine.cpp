@@ -415,7 +415,7 @@ bool position(struct Engine * engine) {
 }
 
 int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
-	char line[2048];
+	char line[4096];
 	char * prevLine[MAX_UCI_MULTI_PV];
 	if (multiPV > MAX_UCI_MULTI_PV) {
 		fprintf(stderr, "getPV() error: multiPV is greater than the maximum of %d\n", MAX_UCI_MULTI_PV);
@@ -557,7 +557,8 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 		} //end of else (not bestmove)
 	} //end of while (fgets(line...))
 	if (feof(engine->fromEngine)) {
-	  fprintf(stderr, "getPV(): fgets() reached EOF in engine->fromEngine pipe\n");
+	  fprintf(stderr, "getPV(): fgets() reached EOF in engine->fromEngine pipe\n"); //engine crashed
+	  return 1;
 	}
 	else if (ferror(engine->fromEngine)) {
 	  fprintf(stderr, "getPV() error: fgets() failed to read from engine->fromEngine pipe\n");
@@ -667,7 +668,7 @@ int go(struct Engine * engine, struct Evaluation ** eval) {
 		fprintf(engine->logfile, "%s\n", line);
 		fflush(engine->logfile);
 	}
-
+	if (engine->infinite) return 0;
 	int multiPV = nametoindex(engine, "MultiPV", Spin);
 	if (multiPV < 0) {
 		if (engine->logfile) {
