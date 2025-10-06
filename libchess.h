@@ -333,7 +333,7 @@ struct Move {
     int castlingRook = FileNone;
 };
 
-enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationConstant, Noise, VirtualLoss, PVPlies, EvalScale};
+enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationConstant, Noise, VirtualLoss, PVPlies, EvalScale, Temperature};
 enum EngineStringOptions {SyzygyPath};
 enum EngineCheckOptions {Ponder};
 

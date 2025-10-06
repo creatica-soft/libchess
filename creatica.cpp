@@ -467,7 +467,7 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, int>>& move
     // Loop 2: Compute total sum of exp(shifted)
     double total = 0.0;
     for (const auto& ev : move_evals) {
-        total += std::exp(std::get<0>(ev) - max_val);
+        total += std::exp((std::get<0>(ev) - max_val)/temperature);
     }
 
     if (total == 0.0) {  // Rare case: all -inf or underflow
@@ -523,8 +523,8 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, int>>& move
     }
     return best_value;
   }
-  
-  int doMove(struct Board * chessBoard, int src, int dst, int promo, int result, struct NNUEContext * ctx, std::mt19937 rng, unsigned long long& child_hash) {
+  //returns eval result in pawns
+  double doMove(struct Board * chessBoard, int src, int dst, int promo, const int scorecp, struct NNUEContext * ctx, std::mt19937 rng, unsigned long long& child_hash, std::unordered_map<unsigned long long, int>& pos_history) {
     double res;
     struct Move move;
     struct Board * tmp_board = cloneBoard(chessBoard);
@@ -535,15 +535,19 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, int>>& move
       exit(-1);
     }
     child_hash = tmp_board->zh->hash ^ tmp_board->zh->hash2;
+    bool repetition3x = false;
+    if (position_history.count(child_hash) + pos_history.count(child_hash) >= 2) repetition3x = true;
   	int pieceCount = bitCount(tmp_board->occupations[PieceNameAny]);
   	if (pieceCount > TB_LARGEST || tmp_board->fen->halfmoveClock || tmp_board->fen->castlingRights) {
       //evaluate_nnue() returns result in pawns (not centipawns!)
       //we made the move above, so the eval res is from the perspective of sim_board->opponentColor or tmp_board->fen->sideToMove
       //and must be negated to preserve the perspective of sim_board->fen->sideToMove
       if (tmp_board->isMate) res = MATE_SCORE * 0.01; //sim_board->fen->sideToMove wins
-      else if (tmp_board->isStaleMate) {
-        if (result > 0) res = -1.0; //discourage stale mate in winning position
-        else res = 1.0; //encourage stalemate in non-winning position
+      else if (tmp_board->isStaleMate || repetition3x) {
+        res = -evaluate_nnue(tmp_board, NULL, ctx);
+        if (scorecp > 200 && res > 2.0) res = -2.0; //discourage stale mate or repetition in winning position
+        else if (scorecp < -200 && res < -2.0) res = 2.0; //encourage stalemate or repetition in losing position
+        else res = 0.0;
       }
       else if (tmp_board->isCheck) res = -process_check(tmp_board, NULL, ctx, rng);
       else res = -evaluate_nnue(tmp_board, NULL, ctx);
@@ -552,12 +556,14 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, int>>& move
       unsigned int wdl = tb_probe_wdl(tmp_board->occupations[PieceNameWhite], tmp_board->occupations[PieceNameBlack], tmp_board->occupations[WhiteKing] | tmp_board->occupations[BlackKing],
         tmp_board->occupations[WhiteQueen] | tmp_board->occupations[BlackQueen], tmp_board->occupations[WhiteRook] | tmp_board->occupations[BlackRook], tmp_board->occupations[WhiteBishop] | tmp_board->occupations[BlackBishop], tmp_board->occupations[WhiteKnight] | tmp_board->occupations[BlackKnight], tmp_board->occupations[WhitePawn] | tmp_board->occupations[BlackPawn],
         0, 0, ep == 64 ? 0 : ep, tmp_board->opponentColor == ColorBlack ? 1 : 0);
-      if (res == TB_RESULT_FAILED) {
+      if (wdl == TB_RESULT_FAILED) {
         log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, pieceCount, tmp_board->fen->fenString, ep, tmp_board->fen->halfmoveClock, tmp_board->opponentColor == ColorBlack ? 1 : 0, tmp_board->occupations[PieceNameWhite], tmp_board->occupations[PieceNameBlack], tmp_board->occupations[WhiteKing] | tmp_board->occupations[BlackKing], tmp_board->occupations[WhiteQueen] | tmp_board->occupations[BlackQueen], tmp_board->occupations[WhiteRook] | tmp_board->occupations[BlackRook], tmp_board->occupations[WhiteBishop] | tmp_board->occupations[BlackBishop], tmp_board->occupations[WhiteKnight] | tmp_board->occupations[BlackKnight], tmp_board->occupations[WhitePawn] | tmp_board->occupations[BlackPawn], strerror(errno));
         if (tmp_board->isMate) res = MATE_SCORE * 0.01;
-        else if (tmp_board->isStaleMate) {
-          if (result > 0) res = -1.0; //discourage stale mate in winning position
-          else res = 1.0; //encourage stalemate in non-winning position
+        else if (tmp_board->isStaleMate || repetition3x) {
+          res = -evaluate_nnue(tmp_board, NULL, ctx);
+          if (scorecp > 200 && res > 2.0) res = -2.0; //discourage stale mate in winning position
+          else if (scorecp < -200 && res < -2.0) res = 2.0; //encourage stalemate in non-winning position
+          else res = 0.0; 
         } else if (tmp_board->isCheck) res = -process_check(tmp_board, NULL, ctx, rng);
         else res = -evaluate_nnue(tmp_board, NULL, ctx);
       } else { //tb_probe_wdl() succeeded
@@ -602,11 +608,12 @@ MCTS implementation follows the four core phases:
     std::unordered_map<unsigned long long, int> pos_history;
     while (node && node->num_children.load(std::memory_order_relaxed) > 0 && !sim_board->isStaleMate && !sim_board->isMate) { //traversal stops at a leaf or terminal node or at 3x repetition
       //unsigned long long hash = sim_board->zh->hash ^ sim_board->zh->hash2;
-      if (pos_history[node->hash.load(std::memory_order_relaxed)] >= 2) {
+      unsigned long long hash = node->hash.load(std::memory_order_relaxed);
+      if (position_history.count(hash) + pos_history.count(hash) >= 2) { //we need to count repetitions that have already occured + simulated ones
           repetition3x = true;
           break;
       }
-      pos_history[node->hash.load(std::memory_order_relaxed)]++;
+      pos_history[hash]++;
       //return child node with the best score using PUCT (Predictor + Upper Confidence Bound)
       //log_file("mcts_search(%d) calling select_best_child()...\n", params->thread_id);
       int idx = select_best_child(node);
@@ -635,39 +642,42 @@ MCTS implementation follows the four core phases:
       lock.unlock();
       params->currentDepth++;
     } //end of while(node && node->num_children > 0 && !sim_board->isStaleMate && !sim_board->isMate) loop
-    pos_history.clear();
+    //pos_history.clear(); //this should be done after expansion
     path.push_back(node);  // Add leaf to path - sim_board and result correspond to this node!
 
     //Here we are at the bottom of the tree, i.e. at a leaf or at the terminal node (mate, stalemate)
     // Evaluation - evaluate a leaf, i.e. a node without children, then we expand it - add children, which will be evaluated at the subsequent iterations - seems like redundant because the node is already evaluated during expansion!
     double result;
-    int scorecp = node->cp.load(std::memory_order_relaxed);
+    int scorecp = node->cp.load(std::memory_order_relaxed); //cp is stored during expansion
     //log_file("mcts_search() debug: scorecp %d\n", scorecp);
     if (scorecp == NO_MATE_SCORE) {
       if (sim_board->isCheck) {
           result = NNUE_CHECK; //NNUE cannot evaluate when in check - it will be resolved in expansion
       } else if (sim_board->isMate) { //sim_board->fen->sideToMove is mated
         result = -1.0;
-        node->cp.store(-MATE_SCORE);
+        scorecp = -MATE_SCORE;
+        node->cp.store(scorecp);
   			//log_file("mcts_search() debug: checkmate for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
       } else if (sim_board->isStaleMate || repetition3x) {
         result = evaluate_nnue(sim_board, NULL, ctx);
-        if (result > 2.0) result = -1.0; //try to discourage stalemate or 3x repetition if winning
-        else if (result < -2.0) result = 1.0; //and encourage it if losing
+        scorecp = static_cast<int>(result * 100);
+        node->cp.store(scorecp, std::memory_order_relaxed);
+        if (result > 2.0) result = tanh(-1.5 / eval_scale); //try to discourage stalemate or 3x repetition if winning
+        else if (result < -2.0) result = tanh(1.5 / eval_scale); //and encourage it if losing
         else result = 0.0;
-        node->cp.store(static_cast<int>(result * 100), std::memory_order_relaxed);
   			//log_file("mcts_search() debug: stalemate or 3x repetition for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
       } else {
         //evaluate_nnue() returns result in pawns (not centipawns!) from sim_board->fen->sideToMove perspective
         result = evaluate_nnue(sim_board, NULL, ctx);
-        node->cp.store(static_cast<int>(result * 100), std::memory_order_relaxed);
+        scorecp = static_cast<int>(result * 100);
+        node->cp.store(scorecp, std::memory_order_relaxed);
   			//log_file("mcts_search() debug: evaluate_nnue result %f, fen %s\n", result, sim_board->fen->fenString);
         result = tanh(result / eval_scale);
       }
     } else result = tanh(scorecp * 0.01 / eval_scale);
     //log_file("mcts_search() debug: result %f\n", result);
     // Expansion - add more children - increase the depth of the tree down using the model's predictions, NNUE evals or randomly
-    if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !repetition3x && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000) {
+    if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000) {
       if (node->mutex.try_lock()) {
         int src, dst, effective_branching = 1;
         double res;
@@ -683,12 +693,12 @@ MCTS implementation follows the four core phases:
       	    unsigned long long child_hash;
           	if (promoMove(sim_board, src, dst)) {
           	  for (int pt = Knight; pt <= Queen; pt++) {
-          	    res = doMove(sim_board, src, dst, pt, result, ctx, params->rng, child_hash);
+          	    res = doMove(sim_board, src, dst, pt, scorecp, ctx, params->rng, child_hash, pos_history);
                 res += res * uniform(params->rng);
                 move_evals.push_back({res, (src << 9) | (dst << 3) | (pt - 1), child_hash, static_cast<int>(-res * 100)});
           	  }
           	} else {
-          	  res = doMove(sim_board, src, dst, PieceTypeNone, result, ctx, params->rng, child_hash);          	  
+          	  res = doMove(sim_board, src, dst, PieceTypeNone, scorecp, ctx, params->rng, child_hash, pos_history);          	  
               res += res * uniform(params->rng);
               move_evals.push_back({res, (src << 9) | (dst << 3), child_hash, static_cast<int>(-res * 100)});
             }
@@ -696,9 +706,16 @@ MCTS implementation follows the four core phases:
           }
           any &= any - 1;
         }
+        pos_history.clear();
         // Sort by res descending (use lambda for tuple)
         std::sort(move_evals.begin(), move_evals.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b);});
-        if (result == NNUE_CHECK) result = tanh(std::get<0>(move_evals[0]) / eval_scale);
+        if (result == NNUE_CHECK) {
+          if (scorecp == NO_MATE_SCORE) {
+            scorecp = static_cast<int>(std::get<0>(move_evals[0]) * 100);
+            node->cp.store(scorecp, std::memory_order_relaxed);
+          }
+          result = tanh(std::get<0>(move_evals[0]) / eval_scale);
+        }
         effective_branching = get_prob(move_evals);
         move_evals.resize(effective_branching);  // Slice to top effective
         expand_node(node, move_evals);
@@ -825,6 +842,7 @@ MCTS implementation follows the four core phases:
       noise = (double)chessEngine.optionSpin[Noise].value * 0.01;
       virtual_loss = chessEngine.optionSpin[VirtualLoss].value;
       eval_scale = chessEngine.optionSpin[EvalScale].value;
+      temperature = chessEngine.optionSpin[Temperature].value;
       unsigned long iterations = MIN_ITERATIONS;
       std::vector<ThreadParams> thread_params(chessEngine.optionSpin[Threads].value);
       for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {

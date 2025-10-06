@@ -39,6 +39,9 @@
 #define EVAL_SCALE 6 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
+#define TEMPERATURE 110 //used in calculating probabilities for moves in get_prob() using softmax:
+                        // exp((eval - max_eval)/(temperature/100)) / eval_sum
+                        //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
 
 const std::string token = "faked_token"; // Replace with real token
 std::string current_game_id = "";
@@ -78,14 +81,15 @@ void setEngineOptions() {
 	  creatica->optionSpin[Noise].value = MAX_NOISE;
 	  creatica->optionSpin[VirtualLoss].value = VIRTUAL_LOSS;
 	  creatica->optionSpin[EvalScale].value = EVAL_SCALE;
+	  creatica->optionSpin[Temperature].value = TEMPERATURE;
 }
 
 // Callback for curl to write response data incrementally
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    if (!playing.load()) return 0; //exit streaming if ctrl-c is pressed
     StreamState* state = static_cast<StreamState*>(userp);
     std::string data((char*)contents, size * nmemb);
     //std::cout << "WriteCallback() debug: received chunk: " << data << std::endl;
-
     size_t pos = 0;
     while ((pos = data.find('\n', pos)) != std::string::npos) {
         std::string line = state->partial_line + data.substr(0, pos);
@@ -541,6 +545,7 @@ void HandleGame(const std::string& game_id) {
 
 // Example processor for event stream
 void ProcessEvent(const json& event) {
+    if (!playing.load()) return; //do not process any events if ctrl-c is pressed
     if (event.contains("type") && (event["type"] == "challenge" || event["type"] == "challengeCanceled" || event["type"] == "challengeDeclined")) {
         std::string type = event["type"];
         std::string challenge_id = event["challenge"]["id"];

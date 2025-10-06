@@ -42,6 +42,9 @@
 #define EVAL_SCALE 6 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
+#define TEMPERATURE 110 //used in calculating probabilities for moves in get_prob() using softmax:
+                        // exp((eval - max_eval)/(temperature/100)) / eval_sum
+                        //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
 #define PV_PLIES 16
 
 // Shared variables
@@ -625,7 +628,7 @@ void setEngineOptions() {
     strcpy(chessEngine.authors, "Creatica");
     chessEngine.numberOfCheckOptions = 1;
 	  chessEngine.numberOfComboOptions = 0;
-	  chessEngine.numberOfSpinOptions = 8;
+	  chessEngine.numberOfSpinOptions = 9;
 		chessEngine.numberOfStringOptions = 1;
 		chessEngine.numberOfButtonOptions = 0;
 	  strcpy(chessEngine.optionCheck[Ponder].name, "Ponder");
@@ -690,6 +693,11 @@ void setEngineOptions() {
 	  chessEngine.optionSpin[EvalScale].value = chessEngine.optionSpin[EvalScale].defaultValue;
 	  chessEngine.optionSpin[EvalScale].min = 1;
 	  chessEngine.optionSpin[EvalScale].max = 16;
+	  strcpy(chessEngine.optionSpin[Temperature].name, "Temperature");
+	  chessEngine.optionSpin[Temperature].defaultValue = TEMPERATURE;
+	  chessEngine.optionSpin[Temperature].value = chessEngine.optionSpin[Temperature].defaultValue;
+	  chessEngine.optionSpin[Temperature].min = 1;
+	  chessEngine.optionSpin[Temperature].max = 200;
     chessEngine.wtime = 1e9;
     chessEngine.btime = 1e9;
     chessEngine.winc = 0;

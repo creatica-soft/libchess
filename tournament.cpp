@@ -189,7 +189,7 @@ int main(int argc, char ** argv) {
   evaluations[0] = &evaluation;
   evaluations[0]->maxPlies = 1; //we just need the next move  
 
-  creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, 1, false, false, ELO_CREATICA);
+  creatica = initChessEngine(CREATICA_PATH, 2 * MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, 1, false, false, ELO_CREATICA);
   if (!creatica) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for creatica\n", CREATICA_PATH);
   //else fprintf(stderr, "initilized chess engine %s for creatica\n", creatica->id);
   
@@ -197,7 +197,7 @@ int main(int argc, char ** argv) {
   if (!stockfish) fprintf(stderr, "tournament main() error: failed to init chessEngine %s for black\n", STOCKFISH_PATH);
   //else fprintf(stderr, "initilized chess engine %s for stockfish\n", stockfish->id);
 
-  int jj = 3; //number of tests for j loop
+  int jj = 5; //number of tests for j loop
   float elos_creatica[jj];
   float elos_stockfish[jj];
   float scores_creatica[jj];
@@ -211,8 +211,8 @@ int main(int argc, char ** argv) {
 	  creatica->optionSpin[ExplorationConstant].value = 100;
 	  creatica->optionSpin[ProbabilityMass].value = 90;
 	  creatica->optionSpin[Noise].value = 3;
-	//for (int j = 0; j < jj; j++) { //2..6, step 5
-	  creatica->optionSpin[EvalScale].value = 6;
+	for (int j = 0; j < jj; j++) { //80..120, step 10
+	  creatica->optionSpin[Temperature].value = 80 + j * 10;
 	  n++;
 	  char suffix[13];
 	  sprintf(suffix, "-%d.pgn", n);
@@ -249,7 +249,7 @@ int main(int argc, char ** argv) {
     else fprintf(file, "n (%d) > sizeof(elos_stockfish) (%llu)\n", n, sizeof(elos_stockfish));
     fprintf(file, "Elo creatica %.0f, elo stockfish %.0f after %d games (%.1f : %.1f)\n", elo_creatica, elo_stockfish, NUMBER_OF_GAMES, score_creatica, score_stockfish);
     fclose(file);
-//  }
+  }
 //  }
 //  }
   quit(creatica);
