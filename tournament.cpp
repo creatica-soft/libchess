@@ -14,7 +14,7 @@
 #define CREATICA_PATH "/Users/ap/libchess/creatica"
 #define STOCKFISH_PATH "/Users/ap/libchess/stockfish-macos-m1-apple-silicon"
 #define SYZYGY_PATH "/Users/ap/syzygy"
-#define PGN_FILE "creatica-stockfish"
+#define PGN_FILE "creatica-stockfish-temp"
 #define ELO_CREATICA 2500
 #define ELO_STOCKFISH 2500
 #define K_FACTOR 20 // 40 for new players (under 30 games), 20 for established players under 2400, 10 for masters (2400+) 
@@ -41,14 +41,8 @@ struct Evaluation * evaluations[1] = { nullptr };
 char sanMoves[4096] = "";
 FILE * file = nullptr;
 char filename[255];
-
-struct PairHash {
-    std::size_t operator()(const std::pair<uint64_t, uint64_t>& p) const {
-        return p.first ^ p.second;
-    }
-};
   
-void playGame(struct Engine * white, struct Engine * black, int n) {
+void play_game(struct Engine * white, struct Engine * black, int n) {
   fprintf(stdout, "game %d, score creatica : stockfish %.1f : %.1f\n", n, score_creatica, score_stockfish);
   newGame(white);
   newGame(black);
@@ -57,8 +51,7 @@ void playGame(struct Engine * white, struct Engine * black, int n) {
   zobristHash(&zh);
   board.zh = &zh;
   sanMoves[0] = 0;
-  std::unordered_map<std::pair<uint64_t, uint64_t>, int, PairHash> position_history;
-  std::pair<uint64_t, uint64_t> pos_key;
+  std::unordered_map<unsigned long long, int> position_history;
   bool repetition3x = false;
   while (!board.isMate && !board.isStaleMate && board.fen->halfmoveClock != 100 && !(__builtin_popcountl(board.occupations[PieceNameAny]) <= 5 && evaluations[0]->scorecp == 0) && !repetition3x) {
     strncpy(white->position, board.fen->fenString, MAX_FEN_STRING_LEN);
@@ -70,25 +63,18 @@ void playGame(struct Engine * white, struct Engine * black, int n) {
       fprintf(stderr, "error: go(white, evaluations) returned non-zero code, fen %s\n", white->position);
       exit(2);
     }
-  	if (initMove(&move, &board, evaluations[0]->bestmove)) {
-    	fprintf(stderr, "error: invalid move %u%s%s (%s); FEN %s, bestmove %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString, evaluations[0]->bestmove);
-    	exit(1);
-    }
+  	initMove(&move, &board, evaluations[0]->bestmove);
     strcat(sanMoves, move.sanMove);
     strcat(sanMoves, " ");
     makeMove(&move);
     fprintf(stdout, "game %d, score creatica : stockfish %.1f : %.1f, score cp %d\n", n, score_creatica, score_stockfish, evaluations[0]->scorecp);
     writeDebug(&board, false);
-    if (updateHash(&board, &move)) {
-        fprintf(stderr, "playGame() error: updateHash() returned non-zero value\n");
-        exit(-1);
-    }
-    pos_key = std::make_pair(board.zh->hash, board.zh->hash2);
-    if (position_history[pos_key] >= 2) { // 3rd occurrence
+    updateHash(&board, &move);
+    if (position_history[board.zh->hash] >= 2) { // 3rd occurrence
         repetition3x = true;
         break;
     }
-    position_history[pos_key]++;
+    position_history[board.zh->hash]++;
     if (board.isMate || board.isStaleMate || board.fen->halfmoveClock == 100 && !(__builtin_popcountl(board.occupations[PieceNameAny]) <= 5 && evaluations[0]->scorecp == 0) || repetition3x) {
       //fprintf(stderr, "mate, stalemate or halfmoveClock = 100\n");
       break;
@@ -102,25 +88,18 @@ void playGame(struct Engine * white, struct Engine * black, int n) {
       fprintf(stderr, "error: go(black, evaluations) returned non-zero code, fen %s\n", black->position);
       exit(2);
     }
-  	if (initMove(&move, &board, evaluations[0]->bestmove)) {
-    	fprintf(stderr, "error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
-    	exit(1);
-    }
+  	initMove(&move, &board, evaluations[0]->bestmove);
     strcat(sanMoves, move.sanMove);
     strcat(sanMoves, " ");
     makeMove(&move);
     fprintf(stdout, "game %d, score creatica : stockfish %.1f : %.1f, score cp %d\n", n, score_creatica, score_stockfish, -evaluations[0]->scorecp);
     writeDebug(&board, false);
-    if (updateHash(&board, &move)) {
-        fprintf(stderr, "playGame() error: updateHash() returned non-zero value\n");
-        exit(-1);
-    }
-    pos_key = std::make_pair(board.zh->hash, board.zh->hash2);
-    if (position_history[pos_key] >= 2) { // 3rd occurrence
+    updateHash(&board, &move);
+    if (position_history[board.zh->hash] >= 2) { // 3rd occurrence
         repetition3x = true;
         break;
     }
-    position_history[pos_key]++;
+    position_history[board.zh->hash]++;
   }
   position_history.clear();
   
@@ -206,13 +185,20 @@ int main(int argc, char ** argv) {
 //	for (int l = 0; l < ll; l++) { // 3..7 with step 1; default 5
 //	  creatica->optionSpin[Noise].value = 3 + l;
 //	for (int k = 0; k < kk; k++) { //80..120 with step 20
-	  //creatica->optionSpin[ExplorationConstant].value = 80 + k * 20;
-	  creatica->optionSpin[VirtualLoss].value = 3;
-	  creatica->optionSpin[ExplorationConstant].value = 100;
-	  creatica->optionSpin[ProbabilityMass].value = 90;
-	  creatica->optionSpin[Noise].value = 3;
-	for (int j = 0; j < jj; j++) { //80..120, step 10
-	  creatica->optionSpin[Temperature].value = 80 + j * 10;
+	  //creatica->optionSpin[ExplorationMax].value = 80 + k * 20;
+	  creatica->optionCheck[FinalInfoLines].value = false;
+	  creatica->optionCheck[IntermittentInfoLines].value = false;
+	  creatica->optionSpin[VirtualLoss].value = 4;
+	  creatica->optionSpin[ExplorationMax].value = 120;
+	  creatica->optionSpin[ExplorationMin].value = 40;
+	  creatica->optionSpin[ProbabilityMass].value = 100;
+	  creatica->optionSpin[ExplorationDepthDecay].value = 6;
+	  //creatica->optionSpin[Noise].value = 3;
+	  creatica->optionSpin[EvalScale].value = 4;
+	  //creatica->optionSpin[Temperature].value = 60; //55 - 60 sweet spot
+	for (int j = 0; j < jj; j++) { //50..70, step 5
+	  creatica->optionSpin[Temperature].value = 50 + j * 5;
+	  setOptions(creatica);
 	  n++;
 	  char suffix[13];
 	  sprintf(suffix, "-%d.pgn", n);
@@ -224,16 +210,16 @@ int main(int argc, char ** argv) {
   		fprintf(stderr, "error: failed to open/create a file %s: %s\n", filename, strerror(errno));
   		exit(1);
   	}
-  	fprintf(file, "Test chess engine options:\nNoise %lld%%\nExplorationConstant %.1f\nProbabilityMass %lld%%\nVirtualLoss %lld\nEvalScale %lld\n\n", creatica->optionSpin[Noise].value, (float)creatica->optionSpin[ExplorationConstant].value / 100.0, creatica->optionSpin[ProbabilityMass].value, creatica->optionSpin[VirtualLoss].value, creatica->optionSpin[EvalScale].value);
+  	fprintf(file, "Test chess engine options:\nExplorationMin %.1f\nExplorationMax %.1f\nExplorationDepthDecay %.1f\nProbabilityMass %lld%%\nVirtualLoss %lld\nEvalScale %lld\nTemperature %lld\n\n", (float)creatica->optionSpin[ExplorationMin].value / 100.0, (float)creatica->optionSpin[ExplorationMax].value / 100.0, (float)creatica->optionSpin[ExplorationDepthDecay].value / 100.0, creatica->optionSpin[ProbabilityMass].value, creatica->optionSpin[VirtualLoss].value, creatica->optionSpin[EvalScale].value, creatica->optionSpin[Temperature].value);
     e_creatica = 1 / (1 + pow(10, (double)(ELO_STOCKFISH - ELO_CREATICA) / 400.0)); //expected creatica score
     e_stockfish = 1.0 - e_creatica; //expected stockfish score
     score_creatica = 0;
     score_stockfish = 0;
     for (int i = 0; i < NUMBER_OF_GAMES; i++) {
       if (i % 2)
-        playGame(stockfish, creatica, (n - 1) * NUMBER_OF_GAMES + i + 1);
+        play_game(stockfish, creatica, (n - 1) * NUMBER_OF_GAMES + i + 1);
       else
-        playGame(creatica, stockfish, (n - 1) * NUMBER_OF_GAMES + i + 1);
+        play_game(creatica, stockfish, (n - 1) * NUMBER_OF_GAMES + i + 1);
     }
     elo_creatica = round(ELO_CREATICA + K_FACTOR * (score_creatica - e_creatica * NUMBER_OF_GAMES));
     if (n <= sizeof(elos_creatica)) {

@@ -49,12 +49,12 @@ void boardtopos(const struct Board * board, Stockfish::Position * pos, Stockfish
 }
 
 Stockfish::Move movetomove(struct Move * move) {
-    Stockfish::Square from = (Stockfish::Square)move->sourceSquare.name;
-    Stockfish::Square to = (Stockfish::Square)move->destinationSquare.name;
+    Stockfish::Square from = (Stockfish::Square)move->src;
+    Stockfish::Square to = (Stockfish::Square)move->dst;
     Stockfish::PieceType pt;
     int rookRank, rookSquare;
     if (move->type & 16) { // MoveTypePromotion = 16
-        pt = (Stockfish::PieceType)(move->chessBoard->promoPiece & 7);
+        pt = (Stockfish::PieceType)PC_TYPE(move->promoPiece);
         return Stockfish::Move::make<Stockfish::PROMOTION>(from, to, pt);
     } else if ((move->type & 34) == 34) { // MoveTypeEnPassant = 32 | MoveTypeCapture = 2
         return Stockfish::Move::make<Stockfish::EN_PASSANT>(from, to);

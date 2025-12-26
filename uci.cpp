@@ -22,7 +22,7 @@
 #include <random>
 #include <thread>
 #include <mutex>
-#include <unordered_map>
+#include <unordered_set>
 #include <condition_variable>
 #include <curl/curl.h>
 #include "json.hpp"
@@ -30,19 +30,22 @@
 #include "libchess.h"
 
 #define THREADS 8
-#define MULTI_PV 2
+#define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define HASH 2048 //default, GUI may set it via Hash option (once full, expansion won't happen!)
-#define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
-#define PROBABILITY_MASS 90 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-#define MAX_NOISE 5 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
-                     // where noise is sampled randomly from a uniform distribution [-0.2..0.2]
-#define VIRTUAL_LOSS 3 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
+#define EXPLORATION_MIN 40 // used in formular for exploration constant decay with depth
+#define EXPLORATION_MAX 120 //smaller value favor exploitation, i.e. deeper tree vs wider tree
+#define EXPLORATION_DEPTH_DECAY 6 //linear decay of EXPLORATION CONSTANT with depth using formula:
+                      // C * 100 = max(EXPLORATION_MIN, (EXPLORATION_MAX - seldepth * EXPLORATION_DEPTH_DECAY))
+#define PROBABILITY_MASS 100 //% - cumulative probability - how many moves we consider
+//#define MAX_NOISE 3 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise, not used because not effective
+                     // where noise is sampled randomly from a uniform distribution [-0.3..0.3]
+#define VIRTUAL_LOSS 4 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
 #define EVAL_SCALE 6 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
-#define TEMPERATURE 110 //used in calculating probabilities for moves in get_prob() using softmax:
+#define TEMPERATURE 60 //used in calculating probabilities for moves in get_prob() using softmax:
                         // exp((eval - max_eval)/(temperature/100)) / eval_sum
                         //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
 #define PV_PLIES 16
@@ -58,17 +61,24 @@ FILE * logfile = nullptr;
 double timeAllocated = 0.0; //ms
 char best_move[6] = "";
 using json = nlohmann::json;
-std::string prev_fen;
-std::string prev_moves;
+//std::string prev_fen;
+//std::string prev_moves;
 std::string last_move;
 
-std::unordered_map<unsigned long long, int> position_history;
+std::unordered_set<unsigned long long> position_history;
 
 extern "C" {  
   struct Board * board = nullptr;
   struct Engine chessEngine;
   bool tb_init_done = false;
-
+  double exploration_min;
+  double exploration_max;
+  double exploration_depth_decay;
+  double probability_mass;
+  //double noise;
+  double virtual_loss;
+  double eval_scale;
+  double temperature;
   void init_nnue(const char * nnue_file_big, const char * nnue_file_small);
   void cleanup_nnue();
   extern void runMCTS();
@@ -85,6 +95,7 @@ extern "C" {
   void handlePonderhit(char * command);
   void handleStop();
   void handleQuit(void);
+  void handlePieces(void); //non-standard UCI commnand "pieces" - returns the number of pieces on board
 
 void log_file(const char * message, ...) {
   std::lock_guard<std::mutex> lock(log_mtx);
@@ -118,20 +129,22 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
 bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move) {
     CURL* curl = curl_easy_init();
     if (!curl) return false;
-
+    
+    char errbuf[CURL_ERROR_SIZE] = "";
     std::string response = "";
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L); // 10-second timeout
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L); // 5-second connect timeout
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L); // in sec
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L); // in sec
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);    
 
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    log_file("sendGetRequest() debug: GET %s, HTTP code %ld, Response: %s\n", url.c_str(),  http_code, response.c_str());
+    //log_file("sendGetRequest() debug: GET %s, HTTP code %ld, Response: %s\n", url.c_str(),  http_code, response.c_str());
  
     bool success = (res == CURLE_OK && http_code == 200);
     if (success && !response.empty()) {
@@ -157,7 +170,7 @@ bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move)
             success = false;
         }
     } else {
-        log_file("sendGetRequest() error: curl error: %s or HTTP code %ld or empty response \"%s\"\n", curl_easy_strerror(res), http_code, response.c_str());
+        log_file("sendGetRequest() error: curl error: %s (%s) or HTTP code %ld or empty response \"%s\"\n", curl_easy_strerror(res), errbuf, http_code, response.c_str());
     }
          
     curl_easy_cleanup(curl);
@@ -190,8 +203,8 @@ void search_thread_func() {
 }
   
   void uciLoop() {
-      char line[4096];
-      char go_line[4096];
+      char line[4096] = "";
+      char go_line[4096] = "";
       print("id name %s\n", chessEngine.id);
       log_file("id name %s\n", chessEngine.id);
       while (!quitFlag.load()) {
@@ -204,36 +217,32 @@ void search_thread_func() {
   
           if (strcmp(line, "ucinewgame") == 0) {
               handleNewGame();
-          }
-          else if (strcmp(line, "uci") == 0) {
+          } else if (strcmp(line, "uci") == 0) {
               handleUCI();
-          }
-          else if (strncmp(line, "setoption", 9) == 0) {
+          } else if (strncmp(line, "setoption", 9) == 0) {
               handleOption(line);
-          }
-          else if (strcmp(line, "isready") == 0) {
+          } else if (strcmp(line, "isready") == 0) {
               handleIsReady();
-          }
-          else if (strncmp(line, "position", 8) == 0) {
+          } else if (strncmp(line, "position", 8) == 0) {
               handlePosition(line);
-          }
-          else if (strncmp(line, "go", 2) == 0) {
+          } else if (strncmp(line, "go", 2) == 0) {
               char * ponder = strstr(line, "ponder");
-              if (ponder) {
+              if (ponder) { //remove "ponder" from  go_line for ponderhit
                 strncpy(go_line, line, ponder - line - 1);
                 go_line[ponder - line - 1] = 0;
                 strcat(go_line, ponder + 6);
               } else strcpy(go_line, line);
               handleGo(line);
-          }
-          else if (strcmp(line, "ponderhit") == 0) { //engine should not output bestmove prior to executing ponder move
-              ponderHit.store(true);
-              handlePonderhit(go_line);
-          }
-          else if (strcmp(line, "stop") == 0) {
+          } else if (strcmp(line, "ponderhit") == 0) { //engine should not output bestmove prior to executing ponder move
+              if (go_line[0] != '\0') {
+                ponderHit.store(true);
+                handlePonderhit(go_line);
+              }
+          } else if (strcmp(line, "pieces") == 0) {
+            handlePieces();
+          } else if (strcmp(line, "stop") == 0) {
               handleStop();
-          }
-          else if (strcmp(line, "quit") == 0) {
+          } else if (strcmp(line, "quit") == 0) {
               handleQuit();
               break;
           }
@@ -326,94 +335,104 @@ void search_thread_func() {
     log_file("readyok\n");
   }
   
+  void handlePieces(void) {
+    int numberOfPieces = 0;
+    //if (!prev_fen.empty())
+      numberOfPieces = bitCount(board->occupations[PieceNameAny]);
+    print("%d\n", numberOfPieces);
+    log_file("%d\n", numberOfPieces);
+  }
+  
   void handleNewGame() {
     cleanup();
     position_history.clear();
-    prev_fen.clear();
-    prev_moves.clear();
+    //prev_fen.clear();
+    //prev_moves.clear();
     last_move.clear();
   }
   
   void handlePosition(char * command) {
     struct Move move;
-    std::string new_position(command);
-    bool new_pos = true;
-    std::string new_fen;
-    std::string new_moves;
-    std::vector<std::string> last_moves;
+    std::string position(command);
     last_move.clear();
-    size_t moves_pos = new_position.find("moves", 18);
-    if (moves_pos != std::string::npos) new_moves = new_position.substr(moves_pos + 6);
-    if (new_position.find("startpos", 9) != std::string::npos) new_fen.assign(startPos);
+    std::string fen;
+    std::string uci_moves;
+    std::vector<std::string> moves;
+    size_t moves_pos = position.find("moves", 18);
+    if (moves_pos != std::string::npos) uci_moves = position.substr(moves_pos + 6);
+    if (position.find("startpos", 9) != std::string::npos) fen.assign(startPos);
     else {
-      size_t fen_pos = new_position.find("fen", 9);
+      size_t fen_pos = position.find("fen", 9);
       if (fen_pos != std::string::npos) {
         if (moves_pos != std::string::npos)
-          new_fen = new_position.substr(fen_pos + 4, moves_pos - fen_pos - 5);
-        else new_fen = new_position.substr(fen_pos + 4);
+          fen = position.substr(fen_pos + 4, moves_pos - fen_pos - 5);
+        else fen = position.substr(fen_pos + 4);
       } else {
         log_file("handlePosition() error: neither startpos no fen keyword is present in position command\n");
         return;
       }
     }
-    if (new_fen.compare(startPos) == 0 && new_moves.empty()) position_history.clear();
-    if (!new_moves.empty() && !new_fen.empty()) {
+    if (fen.compare(startPos) == 0 && uci_moves.empty()) position_history.clear();
+    //log_file("handlePosition() debug:\nnew fen \'%s\' moves \'%s\'\n", fen.c_str(), uci_moves.c_str());
+    /*if (!uci_moves.empty() && !fen.empty()) {
       std::string last_moves_str;
-      if (!prev_fen.empty() && new_fen == prev_fen) {
-        new_pos = false;
-        if (!prev_moves.empty() && new_moves.starts_with(prev_moves) && new_moves.size() > prev_moves.size())
-          last_moves_str = new_moves.substr(prev_moves.size() + 1);
-        else last_moves_str = new_moves;
-      } else last_moves_str = new_moves;
-      while (!last_moves_str.empty() && std::isspace(last_moves_str.back())) {
-        last_moves_str.pop_back(); //trim whitespaces at the end
+      if (!prev_fen.empty() && fen == prev_fen) {
+        if (!prev_moves.empty() && prev_moves == uci_moves) return;
+        if (!prev_moves.empty() && uci_moves.starts_with(prev_moves) && uci_moves.size() > prev_moves.size() + 4) {
+          new_pos = false;
+          last_moves_str = uci_moves.substr(prev_moves.size() + 1);
+        } else {
+          last_moves_str = uci_moves;
+          last_move.clear();
+        }
+      } else {
+        last_moves_str = uci_moves;
+      }*/
+      while (!uci_moves.empty() && std::isspace(uci_moves.back())) {
+        uci_moves.pop_back(); //trim whitespaces at the end
       }
-      if (last_moves_str.size() >= 4) { //we have at least one new move
-        std::istringstream last_moves_stream(last_moves_str);
+      if (uci_moves.size() >= 4) { //we have at least one new move
+        std::istringstream moves_stream(uci_moves);
         std::string some_move;
-        while (last_moves_stream >> some_move) {
-          last_moves.push_back(some_move);
+        while (moves_stream >> some_move) {
+          moves.push_back(some_move);
         }
       }
-    }
-    if (new_pos) {
-        strtofen(board->fen, new_fen.c_str());
+    //}
+    //if (new_pos) {
+        unsigned long long h = board->zh->hash;
+        strtofen(board->fen, fen.c_str());
         fentoboard(board->fen, board);
-        if (getHash(board->zh, board)) {
-          log_file("handlePosition() error: getHash() returned non-zero value\n");
-          exit(-1);          
-        }
-        unsigned long long hash = board->zh->hash ^ board->zh->hash2;
-        position_history[hash]++;
-        log_file("handlePosition(new_pos) debug: repetition count %d, fen %s\n", position_history[hash], board->fen->fenString);   
-    }
-    if (!last_moves.empty()) {
-      size_t num_moves = last_moves.size() - 1; //last move should wait till go
+        getHash(board->zh, board);
+        if (h != board->zh->hash) position_history.insert(board->zh->hash);
+        //log_file("handlePosition(new_pos) debug: repetition count %d, fen %s\n", position_history.count(board->zh->hash), board->fen->fenString);   
+    //}
+    if (!moves.empty()) {
+      size_t num_moves = moves.size() - 1; //last move should wait till go
+      //log_file("handlePosition() debug: num_moves (expect 0): %d\n", num_moves);
       for (int i = 0; i < num_moves; i++) {
-        if (initMove(&move, board, last_moves[i].c_str())) {
-          log_file("handlePosition() error: invalid move %u%s%s (%s); FEN %s\n",
-            move.chessBoard->fen->moveNumber,
-            move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
-            move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
-          exit(-1);
-        }
-        makeMove(&move);
-        if (updateHash(board, &move)) {
-          log_file("handlePosition() error: updateHash() returned non-zero value\n");
-          exit(-1);
-        }
-        unsigned long long hash = board->zh->hash ^ board->zh->hash2;
-        position_history[hash]++;
-        log_file("handlePosition(%s) debug: repetition count %d, fen %s\n", last_moves[i].c_str(), position_history[hash], board->fen->fenString);           
+        int src = 0, dst = 0, promo = 0;
+        move_to_idx(moves[i].c_str(), &src, &dst, &promo);
+        struct Move move;
+        //init_move(&move, board, src, dst, promo);
+        //make_move(&move);
+        ff_move(board, &move, src, dst, promo);
+        updateFen(board);
+        //log_file("handlePosition() debug: fen after move %s is %s\n", moves[i].c_str(), board->fen->fenString);
+        updateHash(board, &move);
+        position_history.insert(board->zh->hash);
+        //log_file("handlePosition(%s) debug: repetition count %d, fen %s\n", last_moves[i].c_str(), position_history[board->zh->hash], board->fen->fenString);           
       }
-      last_move = last_moves.back();
+      last_move = moves.back();
+      //log_file("handlePosition() debug: last_move (delayed for go): %s\n", last_move.c_str());
     }
-    last_moves.clear();    
-    prev_fen = new_fen;
-    prev_moves = new_moves;
+    //moves.clear();    
+    //prev_fen = fen;
+    //prev_moves = uci_moves;
   }
   
   void handleGo(char * command) {
+      //if (prev_fen.empty()) return;
       chessEngine.wtime = 1e9;
       chessEngine.btime = 1e9;
       chessEngine.winc = 0;
@@ -478,31 +497,25 @@ void search_thread_func() {
         //It is usually opponent's move2 in engine's output "bestmove move1 ponder move2"
         //In any case a decision to exec last move should be suspended until go command!
         //If it's without ponder, then execute; otherwise, ponder on this move 
+        int src = 0, dst = 0, promo = 0;
+        move_to_idx(last_move.c_str(), &src, &dst, &promo);
         struct Move move;
-        if (initMove(&move, board, last_move.c_str())) {
-          log_file("handleGo() error: invalid move %u%s%s (%s); FEN %s\n",
-            move.chessBoard->fen->moveNumber,
-            move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
-            move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
-          exit(-1);
-        }
-        makeMove(&move);
-        if (updateHash(board, &move)) {
-          log_file("handleGo() error: updateHash() returned non-zero value\n");
-          exit(-1);
-        }
-        unsigned long long hash = board->zh->hash ^ board->zh->hash2;
-        position_history[hash]++;
-        log_file("handleGo() debug: repetition count %d, fen %s\n", position_history[hash], board->fen->fenString);           
+        //init_move(&move, board, src, dst, promo);
+        //log_file("handleGo() debug: executing move %s, fen %s...\n", move.uciMove, board->fen->fenString);
+        //make_move(&move);
+        //log_file("handleGo() debug: fen after move %s is %s...\n", move.uciMove, board->fen->fenString);
+        //log_file("handleGo() debug: fen after the move %s, %s\n", last_move.c_str(), board->fen->fenString);
+        ff_move(board, &move, src, dst, promo);
+        updateHash(board, &move);
+        //log_file("handleGo() debug: fen after updateHash(): %s\n", board->fen->fenString);
+        //unsigned long long hash = board->zh->hash ^ board->zh->hash2;
+        position_history.insert(board->zh->hash);
+        //log_file("handleGo() debug: repetition count %d after move %s, fen %s\n", position_history[board->zh->hash], last_move.c_str(), board->fen->fenString);           
         last_move.clear();
       }
   
-      if (chessEngine.movetime > 0) {
-          timeAllocated = chessEngine.movetime * 0.95;
-      }
-      else if (chessEngine.infinite) {
-          timeAllocated = 1e9;
-      }
+      if (chessEngine.movetime > 0) timeAllocated = chessEngine.movetime * 0.99;
+      else if (chessEngine.infinite) timeAllocated = 1e9;
       else {
           int remainingTime = board->fen->sideToMove == ColorWhite ? chessEngine.wtime : chessEngine.btime;
           int increment = board->fen->sideToMove == ColorWhite ? chessEngine.winc : chessEngine.binc;
@@ -529,6 +542,12 @@ void search_thread_func() {
           stopFlag.store(false);
           cv.notify_all(); // Start search
       } else if (numberOfPieces > TB_LARGEST) {
+          if (chessEngine.ponder) {
+            if (chessEngine.infinite) chessEngine.infinite = false;
+            chessEngine.ponder = false;
+            return; //no need to query table bases for the opponent
+          }
+          updateFen(board);
           std::string fen(board->fen->fenString);
           while (!fen.empty() && std::isspace(fen.back())) {
             fen.pop_back(); //trim whitespaces at the end
@@ -546,6 +565,16 @@ void search_thread_func() {
               //log_file("HandleGo() debug: Syzygy TB request sent successfully");
               print("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", score_cp, best_move, best_move);
               log_file("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", score_cp, best_move, best_move);
+              int src = 0, dst = 0, promo = 0;
+              move_to_idx(best_move, &src, &dst, &promo);
+              struct Move move;
+              //init_move(&move, board, src, dst, promo);
+              //make_move(&move);
+              ff_move(board, &move, src, dst, promo);
+              updateHash(board, &move);
+              position_history.insert(board->zh->hash);
+              //if (!prev_moves.empty()) prev_moves.append(" ");
+              //prev_moves.append(move.uciMove);
           } else {
               log_file("HandleGo() error: failed to send Syzygy TB request to lichess\n");
               std::lock_guard<std::mutex> lock(mtx);
@@ -554,14 +583,19 @@ void search_thread_func() {
               cv.notify_all(); // Start search
           }        
       } else {
+        if (chessEngine.ponder) {
+          if (chessEngine.infinite) chessEngine.infinite = false;
+          chessEngine.ponder = false;
+          return; //no need to query table bases for the opponent
+        }        
         best_move[0] = '\0';
         unsigned int ep = lsBit(board->fen->enPassantLegalBit);
         unsigned int result = tb_probe_root(board->occupations[PieceNameWhite], board->occupations[PieceNameBlack], 
             board->occupations[WhiteKing] | board->occupations[BlackKing],
             board->occupations[WhiteQueen] | board->occupations[BlackQueen], board->occupations[WhiteRook] | board->occupations[BlackRook], board->occupations[WhiteBishop] | board->occupations[BlackBishop], board->occupations[WhiteKnight] | board->occupations[BlackKnight], board->occupations[WhitePawn] | board->occupations[BlackPawn],
-            board->fen->halfmoveClock, 0, ep == 64 ? 0 : ep, board->opponentColor == ColorBlack ? 1 : 0, NULL);
+            board->fen->halfmoveClock, 0, ep == 64 ? 0 : ep, OPP_COLOR(board->fen->sideToMove) == ColorBlack ? 1 : 0, NULL);
         if (result == TB_RESULT_FAILED) {
-            log_file("handleGo() error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s\n", TB_LARGEST, bitCount(board->occupations[PieceNameAny]), board->fen->fenString);
+            log_file("handleGo() error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u\n", TB_LARGEST, bitCount(board->occupations[PieceNameAny]));
             exit(-1);
         }
         unsigned int wdl      = TB_GET_WDL(result); //0 - loss, 4 - win, 1..3 - draw
@@ -577,6 +611,16 @@ void search_thread_func() {
         best_move[5] = '\0';
         print("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", scorecp, best_move, best_move);
         log_file("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", scorecp, best_move, best_move);
+        int src = 0, dst = 0, promo = 0;
+        move_to_idx(best_move, &src, &dst, &promo);
+        struct Move move;
+        //init_move(&move, board, src, dst, promo);
+        //make_move(&move);
+        ff_move(board, &move, src, dst, promo);
+        updateHash(board, &move);
+        position_history.insert(board->zh->hash);
+        //if (!prev_moves.empty()) prev_moves.append(" ");
+        //prev_moves.append(move.uciMove);        
       }          
   }
   
@@ -584,22 +628,17 @@ void search_thread_func() {
     log_file("handlePonderhit(): stop\n");
     handleStop();
     if (!last_move.empty()) {
+      int src = 0, dst = 0, promo = 0;
+      move_to_idx(last_move.c_str(), &src, &dst, &promo);
       struct Move move;
-      if (initMove(&move, board, last_move.c_str())) {
-        log_file("handlePonderhit() error: invalid move %u%s%s (%s); FEN %s\n",
-          move.chessBoard->fen->moveNumber,
-          move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ",
-          move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
-        exit(-1);
-      }
-      makeMove(&move);
-      if (updateHash(board, &move)) {
-        log_file("handlePonderhit() error: updateHash() returned non-zero value\n");
-        exit(-1);
-      }
-      unsigned long long hash = board->zh->hash ^ board->zh->hash2;
-      position_history[hash]++;
-      log_file("handlePonderhit(%s) debug: repetition count %d, fen %s\n", last_move.c_str(), position_history[hash], board->fen->fenString);   
+      //init_move(&move, board, src, dst, promo);
+      //make_move(&move);
+      ff_move(board, &move, src, dst, promo);
+      updateHash(board, &move);
+      position_history.insert(board->zh->hash);
+      updateFen(board);
+      log_file("position fen %s\n", board->fen->fenString);
+      //log_file("handlePonderhit(%s) debug: repetition count %d, fen %s\n", last_move.c_str(), position_history[board->zh->hash], board->fen->fenString);   
       last_move.clear();
     }    
     chessEngine.ponder = false;
@@ -626,14 +665,20 @@ void search_thread_func() {
 void setEngineOptions() {
     strcpy(chessEngine.id, "Creatica Chess Engine 1.0");
     strcpy(chessEngine.authors, "Creatica");
-    chessEngine.numberOfCheckOptions = 1;
+    chessEngine.numberOfCheckOptions = 3;
 	  chessEngine.numberOfComboOptions = 0;
-	  chessEngine.numberOfSpinOptions = 9;
+	  chessEngine.numberOfSpinOptions = 11;
 		chessEngine.numberOfStringOptions = 1;
 		chessEngine.numberOfButtonOptions = 0;
 	  strcpy(chessEngine.optionCheck[Ponder].name, "Ponder");
 	  chessEngine.optionCheck[Ponder].defaultValue = false;
 	  chessEngine.optionCheck[Ponder].value = chessEngine.optionCheck[Ponder].defaultValue;
+	  strcpy(chessEngine.optionCheck[FinalInfoLines].name, "FinalInfoLines");
+	  chessEngine.optionCheck[FinalInfoLines].defaultValue = true;
+	  chessEngine.optionCheck[FinalInfoLines].value = chessEngine.optionCheck[FinalInfoLines].defaultValue;
+	  strcpy(chessEngine.optionCheck[IntermittentInfoLines].name, "IntermittentInfoLines");
+	  chessEngine.optionCheck[IntermittentInfoLines].defaultValue = true;
+	  chessEngine.optionCheck[IntermittentInfoLines].value = chessEngine.optionCheck[IntermittentInfoLines].defaultValue;
 	  strcpy(chessEngine.optionString[SyzygyPath].name, "SyzygyPath");
 	  strcpy(chessEngine.optionString[SyzygyPath].defaultValue, SYZYGY_PATH_DEFAULT);
 	  strcpy(chessEngine.optionString[SyzygyPath].value, SYZYGY_PATH);
@@ -668,16 +713,26 @@ void setEngineOptions() {
 	  chessEngine.optionSpin[ProbabilityMass].value = chessEngine.optionSpin[ProbabilityMass].defaultValue;
 	  chessEngine.optionSpin[ProbabilityMass].min = 1;
 	  chessEngine.optionSpin[ProbabilityMass].max = 100;
-	  strcpy(chessEngine.optionSpin[ExplorationConstant].name, "ExplorationConstant");
-	  chessEngine.optionSpin[ExplorationConstant].defaultValue = EXPLORATION_CONSTANT;
-	  chessEngine.optionSpin[ExplorationConstant].value = chessEngine.optionSpin[ExplorationConstant].defaultValue;
-	  chessEngine.optionSpin[ExplorationConstant].min = 0;
-	  chessEngine.optionSpin[ExplorationConstant].max = 200;
-	  strcpy(chessEngine.optionSpin[Noise].name, "Noise");
-	  chessEngine.optionSpin[Noise].defaultValue = MAX_NOISE;
-	  chessEngine.optionSpin[Noise].value = chessEngine.optionSpin[Noise].defaultValue;
-	  chessEngine.optionSpin[Noise].min = 1;
-	  chessEngine.optionSpin[Noise].max = 30;
+	  strcpy(chessEngine.optionSpin[ExplorationMax].name, "ExplorationMax");
+	  chessEngine.optionSpin[ExplorationMax].defaultValue = EXPLORATION_MAX;
+	  chessEngine.optionSpin[ExplorationMax].value = chessEngine.optionSpin[ExplorationMax].defaultValue;
+	  chessEngine.optionSpin[ExplorationMax].min = 0;
+	  chessEngine.optionSpin[ExplorationMax].max = 200;
+	  strcpy(chessEngine.optionSpin[ExplorationMin].name, "ExplorationMin");
+	  chessEngine.optionSpin[ExplorationMin].defaultValue = EXPLORATION_MIN;
+	  chessEngine.optionSpin[ExplorationMin].value = chessEngine.optionSpin[ExplorationMin].defaultValue;
+	  chessEngine.optionSpin[ExplorationMin].min = 0;
+	  chessEngine.optionSpin[ExplorationMin].max = 100;
+	  strcpy(chessEngine.optionSpin[ExplorationDepthDecay].name, "ExplorationDepthDecay");
+	  chessEngine.optionSpin[ExplorationDepthDecay].defaultValue = EXPLORATION_DEPTH_DECAY;
+	  chessEngine.optionSpin[ExplorationDepthDecay].value = chessEngine.optionSpin[ExplorationDepthDecay].defaultValue;
+	  chessEngine.optionSpin[ExplorationDepthDecay].min = 0;
+	  chessEngine.optionSpin[ExplorationDepthDecay].max = 10;
+	  //strcpy(chessEngine.optionSpin[Noise].name, "Noise");
+	  //chessEngine.optionSpin[Noise].defaultValue = MAX_NOISE;
+	  //chessEngine.optionSpin[Noise].value = chessEngine.optionSpin[Noise].defaultValue;
+	  //chessEngine.optionSpin[Noise].min = 1;
+	  //chessEngine.optionSpin[Noise].max = 30;
 	  strcpy(chessEngine.optionSpin[VirtualLoss].name, "VirtualLoss");
 	  chessEngine.optionSpin[VirtualLoss].defaultValue = VIRTUAL_LOSS;
 	  chessEngine.optionSpin[VirtualLoss].value = chessEngine.optionSpin[VirtualLoss].defaultValue;
@@ -708,6 +763,15 @@ void setEngineOptions() {
     chessEngine.nodes = 0;
     chessEngine.infinite = false;
     chessEngine.ponder = false;
+    exploration_min = static_cast<double>(chessEngine.optionSpin[ExplorationMin].value) * 0.01;
+    exploration_max = static_cast<double>(chessEngine.optionSpin[ExplorationMax].value) * 0.01;
+    exploration_depth_decay = static_cast<double>(chessEngine.optionSpin[ExplorationDepthDecay].value) * 0.01;
+    probability_mass = static_cast<double>(chessEngine.optionSpin[ProbabilityMass].value) * 0.01;
+    //noise = static_cast<double>(chessEngine.optionSpin[Noise].value) * 0.01;
+    virtual_loss = static_cast<double>(chessEngine.optionSpin[VirtualLoss].value);
+    eval_scale = static_cast<double>(chessEngine.optionSpin[EvalScale].value);
+    temperature = static_cast<double>(chessEngine.optionSpin[Temperature].value); //used in calculating probabilities for moves in softmax exp((eval - max_eval)/temperature) / eval_sum
+                          //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
 }
 
 int main(int argc, char **argv) {
@@ -719,7 +783,7 @@ int main(int argc, char **argv) {
     zobristHash(&zh);
     chess_board.zh = &zh;
     board = &chess_board;
-    logfile = fopen("uci.log", "w");
+    logfile = fopen("uci.log", "a"); //was "w"
     srand(time(NULL)); 
     init_magic_bitboards();
     init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");

@@ -1,7 +1,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
+#include <assert.h>
 #include <errno.h>
 #include <ctype.h>
 #include <string.h>
@@ -364,12 +364,14 @@ int initGame(struct Game * game, FILE * file) {
 ///</summary>
 int playGame(struct Game * game) {
   int numberOfPlies = 0;
-	struct Move move;
 	struct Board board;
 	struct Fen fen;
-	char * fenString;
+	//struct ZobristHash zh;//, zh2;
+	//zobristHash(&zh);
+	//zobristHash(&zh2); //for debugging
+	char fenString[MAX_FEN_STRING_LEN];
 	if (game->tags[FEN][0] == '\0') strcpy(fenString, startPos);
-	else fenString = game->tags[FEN];
+	else strncpy(fenString, game->tags[FEN],MAX_FEN_STRING_LEN);
 	if (strtofen(&fen, fenString)) {
 		printf("playGame() error: strtofen() failed; FEN %s\n", fenString);
 		return 1;
@@ -377,7 +379,8 @@ int playGame(struct Game * game) {
 	if (fentoboard(&fen, &board)) {
 		printf("playGame() error: fentoboard() failed; FEN %s\n", fen.fenString);
 		return 1;
-	}	
+	}
+	//getHash(&zh, &board);
 	char * sanMoves = strdup(game->sanMoves);
 	if (!sanMoves) {
 		printf("playGame() error: strdup() returned NULL: %s. sanMoves %s\n", strerror(errno), game->sanMoves);
@@ -386,12 +389,14 @@ int playGame(struct Game * game) {
 	char * saveptr;
 	char * token = strtok_r(sanMoves, " ", &saveptr);
 	while (token) {
-		if (initMove(&move, &board, token)) {
-			printf("playGame() error: invalid move %u%s%s (%s); FEN %s\n", move.chessBoard->fen->moveNumber, move.chessBoard->fen->sideToMove == ColorWhite ? ". " : "... ", move.sanMove, move.uciMove, move.chessBoard->fen->fenString);
-			free(sanMoves);
-			return 1;
-		}    
+   	struct Move move;
+		initMove(&move, &board, token);
 		makeMove(&move);
+		//updateHash(&board, &move);
+		//unsigned long long hash = board.zh->hash;
+		//unsigned long long hash2 = board.zh->hash2;
+		//getHash(&zh2, &board);
+		//assert(hash != board.zh->hash || hash2 != board.zh->hash2);
 		//reconcile(&board);
 		token = strtok_r(NULL, " ", &saveptr);
 		numberOfPlies++;

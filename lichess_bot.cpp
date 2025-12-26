@@ -1,4 +1,4 @@
-//c++ -Wno-writable-strings -std=c++20 -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot2.cpp -o lichess_bot2
+//c++ -Wno-writable-strings -std=c++20 -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot.cpp -o lichess_bot
 
 #include <functional>
 #include <iostream>
@@ -6,6 +6,7 @@
 #include <sstream>
 #include <cstdio>
 #include <thread>
+#include <atomic>
 #include <condition_variable>
 #include <chrono>
 #include <unordered_set>
@@ -16,6 +17,8 @@
 #include "json.hpp"     // https://github.com/nlohmann/json
 #include "libchess.h"
 
+#define INTERMITTENT_INFO_LINES false
+#define FINAL_INFO_LINES false
 #define CREATICA_PATH "/Users/ap/libchess/creatica"
 #define DEPTH 0
 #define MOVETIME 0
@@ -24,26 +27,31 @@
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
 #define DRAW_CP 30 //accept draw if score cp is less than this value in centipawns
-#define MIN_ELO 1800
-#define MAX_ELO 2100
+#define MIN_ELO 2000
+#define MAX_ELO 2300
 #define ELO_CREATICA 2000
 #define CLOCK_LIMIT 180 //seconds
 #define CLOCK_INCREMENT 3 //seconds
 #define NUMBER_OF_BOTS 50 //number of online bots to return from the list
-#define MULTI_PV 2
-#define EXPLORATION_CONSTANT 100 //smaller value favor exploitation, i.e. deeper tree vs wider tree - varies per thread
-#define PROBABILITY_MASS 90 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-#define MAX_NOISE 1 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
-                     // where noise is sampled randomly from a uniform distribution [-0.2..0.2]
-#define VIRTUAL_LOSS 3 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
+#define MULTI_PV 1 //number of PVs
+#define PV_PLIES 2 //number of plies in PV
+#define EXPLORATION_MIN 40 // used in formular for exploration constant decay with depth
+#define EXPLORATION_MAX 120 //smaller value favor exploitation, i.e. deeper tree vs wider tree
+#define EXPLORATION_DEPTH_DECAY 6 //linear decay of EXPLORATION CONSTANT with depth using formula:
+                      // C * 100 = max(EXPLORATION_MIN, (EXPLORATION_MAX - seldepth * EXPLORATION_DEPTH_DECAY))
+#define PROBABILITY_MASS 100 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
+//#define MAX_NOISE 3 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
+                     // where noise is sampled randomly from a uniform distribution [-MAX_NOISE/100..MAX_NOISE/100]
+#define VIRTUAL_LOSS 4 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
 #define EVAL_SCALE 6 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
-#define TEMPERATURE 110 //used in calculating probabilities for moves in get_prob() using softmax:
+#define TEMPERATURE 60 //used in calculating probabilities for moves in get_prob() using softmax:
                         // exp((eval - max_eval)/(temperature/100)) / eval_sum
                         //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
+#define PONDER false
 
-const std::string token = "faked_token"; // Replace with real token
+const std::string token = "fake_token"; // Replace with real token
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
 std::atomic<bool> challenge_accepted {false};
@@ -59,7 +67,11 @@ std::mt19937 rng;
 struct Engine * creatica = nullptr;
 struct Evaluation * evaluations[MULTI_PV] = { nullptr };
 //enum GameStateStatus { created, started, aborted, mate, resign, stalemate, timeout, draw, outoftime, cheat, noStart, unknownFinish, insufficientMaterialClaim, variantEnd };
-std::string gameStateStatus = "";
+enum GameStateStatus { unknown, created, started, aborted, mate, resign, stalemate, timeout, draw, outoftime, cheat, noStart, unknownFinish, insufficientMaterialClaim, variantEnd };
+std::vector<std::string> gameSS = { "unknown", "created", "started", "aborted", "mate", "resign", "stalemate", "timeout", "draw", "outoftime", "cheat", "noStart", "unknownFinish", "insufficientMaterialClaim", "variantEnd" };
+int game_states = 15;
+//std::string gameStateStatus = "";
+std::atomic<int> gameStateStatus {0};
 
 struct Bot {
     std::string botname;
@@ -76,68 +88,83 @@ struct StreamState {
 };
 
 void setEngineOptions() {
+	  creatica->optionSpin[MultiPV].value = MULTI_PV;
+	  creatica->optionSpin[PVPlies].value = PV_PLIES;
 	  creatica->optionSpin[ProbabilityMass].value = PROBABILITY_MASS;
-	  creatica->optionSpin[ExplorationConstant].value = EXPLORATION_CONSTANT;
-	  creatica->optionSpin[Noise].value = MAX_NOISE;
+	  creatica->optionSpin[ExplorationMin].value = EXPLORATION_MIN;
+	  creatica->optionSpin[ExplorationMax].value = EXPLORATION_MAX;
+	  creatica->optionSpin[ExplorationDepthDecay].value = EXPLORATION_DEPTH_DECAY;
+	  //creatica->optionSpin[Noise].value = MAX_NOISE;
 	  creatica->optionSpin[VirtualLoss].value = VIRTUAL_LOSS;
 	  creatica->optionSpin[EvalScale].value = EVAL_SCALE;
 	  creatica->optionSpin[Temperature].value = TEMPERATURE;
+	  creatica->optionCheck[FinalInfoLines].value = FINAL_INFO_LINES;
+	  creatica->optionCheck[IntermittentInfoLines].value = INTERMITTENT_INFO_LINES;
+	  creatica->optionCheck[Ponder].value = PONDER;
+	  setOptions(creatica);
 }
 
 // Callback for curl to write response data incrementally
-size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    if (!playing.load()) return 0; //exit streaming if ctrl-c is pressed
-    StreamState* state = static_cast<StreamState*>(userp);
-    std::string data((char*)contents, size * nmemb);
+size_t WriteCallback(void * contents, size_t size, size_t nmemb, void * userp) {
+    if (!playing.load()) return 0; //exit streaming if ctrl-c is pressed - common way to abort streaming is to return 0
+    StreamState * state = static_cast<StreamState *>(userp);
+    std::string data((char *)contents, size * nmemb);
     //std::cout << "WriteCallback() debug: received chunk: " << data << std::endl;
     size_t pos = 0;
+    //ndjson - new line delimited json
     while ((pos = data.find('\n', pos)) != std::string::npos) {
-        std::string line = state->partial_line + data.substr(0, pos);
-        data.erase(0, pos + 1);
-        state->partial_line.clear();
+        std::string line = state->partial_line + data.substr(0, pos); //complete the line with a chunk that is terminated with '\n'
+        data.erase(0, pos + 1); //delete this chunk once it is consumed
+        state->partial_line.clear(); //empty partial_line
 
         if (!line.empty()) {
             try {
-                json j = json::parse(line);
+                int gss = gameStateStatus.load();
+                json j = json::parse(line); //pass the complete line to json parse
                 //std::cout << "WriteCallback() debug: parsed line: " << j.dump() << std::endl;
-                state->process_line(j);
-                if (game_in_progress.load() && gameStateStatus != "created" && gameStateStatus != "started" && gameStateStatus != "") {
-                  std::cout << "WriteCallback() debug: gameStateStatus " << gameStateStatus << std::endl;
-                  gameStateStatus = ""; //reset gameStateStatus
+                state->process_line(j); //pass parsed json object to event or game state processing function
+                if (game_in_progress.load() && gss != created && gss != started && gss != 0) {
+                  std::cout << "WriteCallback() debug: gameStateStatus " << gameSS[gss] << std::endl;
+                  gameStateStatus.store(0); //reset gameStateStatus
                   return 0;
                 }
             } catch (const std::exception& e) {
                 std::cerr << "WriteCallback() error: JSON parse error: " << e.what() << " - Line: " << line << std::endl;
             }
         } else {
+            //lichess sends an empty line every 7 seconds to keep the connection alive
             //std::cout << "WriteCallback() debug: keep-alive empty line received" << std::endl;
         }
-    }
-    state->partial_line += data;  // Save any remaining partial line
+    } //end of while("a line is terminated with new line char '\n'")
+    state->partial_line += data;  // Save any remaining partial line, not terminated with new line delimiter '\n'
     return size * nmemb;
 }
 
 // A classic C-style callback function that libcurl will call to write data.
-static size_t WriteCallback2(void* contents, size_t size, size_t nmemb, void* userp) {
+static size_t WriteCallback2(void * contents, size_t size, size_t nmemb, void * userp) {
     // userp is the pointer to our std::string object.
     // Append the data received from libcurl to our string.
     size_t total_size = size * nmemb;
-    static_cast<std::string*>(userp)->append(static_cast<char*>(contents), total_size);
+    static_cast<std::string*>(userp)->append(static_cast<char *>(contents), total_size);
     return total_size;
 }
 
 // Combined function for HTTP requests (GET or POST) with retries
-bool HttpRequest(const std::string& method, const std::string& url, const std::string& postfields = "", std::string* response_out = nullptr, const std::string& accept = "", bool auth_required = true) {
-    const int max_retries = 3;
+bool HttpRequest(const std::string& method, const std::string& url, const std::string& postfields = "", std::string * response_out = nullptr, const std::string& accept = "", bool auth_required = true) {
+    const int max_retries = 5;
     int retry_count = 0;
     bool success = false;
 
-    while (!success && retry_count < max_retries) {
-        CURL* curl = curl_easy_init();
-        if (!curl) break;
+    while (!success && retry_count <= max_retries) {
+        CURL * curl = curl_easy_init();
+        if (!curl) {
+          std::cerr << "HttpRequest() error: curl_easy_init() failed. " << method << " to " << url << std::endl;
+          break;
+        }
         std::string auth_header;
         std::string accept_header;
-        struct curl_slist* headers = nullptr;
+        struct curl_slist * headers = nullptr;
+        char errbuf[CURL_ERROR_SIZE] = "";
         if (auth_required) {
             auth_header = "Authorization: Bearer " + token;
             headers = curl_slist_append(headers, auth_header.c_str());
@@ -147,10 +174,10 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
             headers = curl_slist_append(headers, accept_header.c_str());
         }
 
-        curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L); //for better performance?
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 65536L);
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
         if (method == "POST") {
             curl_easy_setopt(curl, CURLOPT_POST, 1L);
             if (!postfields.empty()) {
@@ -172,8 +199,8 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, response_out);
         }
 
-        CURLcode res = curl_easy_perform(curl);
         long http_code = 0;
+        CURLcode res = curl_easy_perform(curl);
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
         std::cout << "HttpRequest() debug: " << method << " to " << url << " - HTTP code: " << http_code << std::endl;  // Debug
@@ -186,14 +213,14 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
             success = true;
         } else if (res != CURLE_OK || http_code == 429 || http_code >= 500) {
             // Retryable error
-            std::cerr << "HttpRequest() error: retryable error - CURL: " << res << " HTTP: " << http_code << std::endl;
             retry_count++;
-            if (retry_count < max_retries) {
-                std::this_thread::sleep_for(std::chrono::seconds(retry_count));  // Exponential backoff (1s, 2s, ...)
+            std::cerr << "HttpRequest() error: retryable error: " << curl_easy_strerror(res) << ": " << errbuf << " HTTP: " << http_code << "Retry count " << retry_count << ". Max retries " << max_retries << std::endl;
+            if (retry_count <= max_retries) {
+                std::this_thread::sleep_for(std::chrono::seconds(retry_count));  // Linear delay (1s, 2s, 3s...)
             }
         } else {
             // Non-retryable error (e.g., 4xx client errors)
-            std::cerr << "HttpRequest() error: non-retryable error - CURL: " << res << " HTTP: " << http_code << std::endl;
+            std::cerr << "HttpRequest() error: non-retryable error: " << curl_easy_strerror(res) << ": " << errbuf << " HTTP: " << http_code << std::endl;
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
             return false;
@@ -201,7 +228,7 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
 
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
-    }
+    } //end of while (!success && retry_count <= max_retries)
 
     return success;
 }
@@ -256,7 +283,7 @@ void GetAndProcessBots(int nb) {
       if (!playing.load()) {
         break;
       }
-      std::this_thread::sleep_for(std::chrono::seconds(5)); //just to give time to kill the bot is needed
+      std::this_thread::sleep_for(std::chrono::seconds(15)); //just to give time to kill the bot if needed
       if (!game_in_progress.load()) {
           while (bots.empty()) {
               std::string query = bot_url + "?nb=" + std::to_string(nb);
@@ -351,27 +378,32 @@ void GetAndProcessBots(int nb) {
 
 // Updated StreamAndProcess for incremental processing
 void StreamAndProcess(const std::string& url, std::function<void(const json&)> process_line) {
-    CURL* curl = curl_easy_init();
+    CURL * curl = curl_easy_init();
     if (!curl) return;
+    char errbuf[CURL_ERROR_SIZE] = "";
 
     StreamState state;
     state.process_line = process_line;
-    struct curl_slist* headers = nullptr;
+    struct curl_slist * headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + token).c_str());
     headers = curl_slist_append(headers, "Accept: application/x-ndjson");
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback); //WriteCallback() may be called multiple times
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state); //state is where received data is written, passed as last arg to WriteCallback
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state); // state is where received data is processed
+                                                       // it is passed as last arg to WriteCallback()
 
-    // Keep connection alive longer for correspondence games
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 180L);  // 1min timeout
+    // Keep connection alive longer for correspondence games - this may not be needed - we terminate curl_easy_perform() with
+    // WriteCallback() returning 0 when we press Ctrl-C, which sets playng to false. 
+    // WriteCallback() is called at least every 7 seconds with empty line as a keep alive if no other events occur
+    //curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); //1 byte a second - average speed over CURLOPT_LOW_SPEED_TIME interval
+    //curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 600L);  // 10min timeout - if average speed is below CURLOPT_LOW_SPEED_LIMIT, abort
 
-    CURLcode res = curl_easy_perform(curl); //this blocks until curl times out or receives some ndjson data 
+    CURLcode res = curl_easy_perform(curl); //this blocks until curl times out or errors out
     if (res != CURLE_OK) {
-        std::cerr << "StreamAndProcess() error: " << curl_easy_strerror(res) << std::endl;
+        std::cerr << "StreamAndProcess() error: " << curl_easy_strerror(res) << ": " << errbuf << std::endl;
     }
 
     curl_slist_free_all(headers);
@@ -379,19 +411,25 @@ void StreamAndProcess(const std::string& url, std::function<void(const json&)> p
 }
 
 // Helper to compute and post move if it's our turn
-void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, bool& is_pondering, const std::string& initial_fen, const std::string& moves, const long long wtime, const long long btime, const long long winc, const long long binc) {
-    std::cout << "ComputeAndPostMove() debug: game state - status: " << gameStateStatus << ", moves: " << moves << std::endl;
-    if (gameStateStatus != "started" && gameStateStatus != "created") {
-      gameStateStatus = "";
+void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, const std::string& initial_fen, const std::string& moves, const long long wtime, const long long btime, const long long winc, const long long binc) {
+    int gss = gameStateStatus.load();
+    std::cout << "ComputeAndPostMove() debug: game state - status: " << gameSS[gss] << ", moves: " << moves << std::endl;
+    if (gss != started && gss != created) {
+      std::cout << "ComputeAndPostMove() warning: game state - status: " << gameSS[gss] << ", returning..." << std::endl;      
+      gameStateStatus.store(0);
       return;
     }
-    if (gameStateStatus == "started") {
-        if (is_pondering) {
-          is_pondering = false;
+    if (gss == started) {
+        if (creatica->ponder) {
+          creatica->infinite = false;
+          creatica->ponder = false;
+          //std::cout << "ComputeAndPostMove() debug: stopping pondering..." << std::endl; 
           stop(creatica);
+          //std::cout << "ComputeAndPostMove() debug: and getting PV..." << std::endl; 
           if (getPV(creatica, evaluations, MULTI_PV)) {
             std::cerr << "ComputeAndPostMove() error: getPV(creatica, evaluations, MULTI_PV) returned non-zero code, restarting..." << std::endl;
             releaseChessEngine(creatica);
+            //exit(-1); //temp exit for debugging
             creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
             if (!creatica) {
               std::cerr << "ComputeAndPostMove() error: failed to restart chessEngine" << std::endl;
@@ -399,20 +437,39 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
             }
             //else fprintf(stderr, "initilized chess engine %s for creatica\n", creatica->id);
             setEngineOptions();
-          }
-        }
+          } //end of if (getPV())
+        } //end of if (ponder)
+        //std::cout << "ComputeAndPostMove() debug: and getting PV..." << std::endl; 
         strncpy(creatica->position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
-        strncpy(creatica->moves, moves.c_str(), MAX_UCI_MOVES_LEN);
-        if (!position(creatica)) {
+        if (!moves.empty()) {
+          strncpy(creatica->moves, moves.c_str(), MAX_UCI_MOVES_LEN);
+          //uci GUIs use last move as a ponder move for "go ponder" command
+          //lichess last move in position command has already been played, hence we need to play it, 
+          //otherwise, the engine will ponder on it!
+          //actually, it is easier to just append our ponder move to lichess moves - the engine does not care what it is anyway
+          if (PONDER && !our_turn && strcmp(evaluations[0]->ponder, "") != 0) {
+            strcat(creatica->moves, " ");
+            strcat(creatica->moves, evaluations[0]->ponder);
+          }
+        } else creatica->moves[0] = '\0';
+try_pos: if (!position(creatica)) {
           fprintf(stderr, "ComputeAndPostMove() error: position() returned false, fen %s\n", creatica->position);
           exit(-1);
+          creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
+          if (!creatica) {
+            std::cerr << "ComputeAndPostMove() error: failed to restart chessEngine" << std::endl;
+            exit(-1);
+          }
+          setEngineOptions();
+          strncpy(creatica->position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
+          goto try_pos;
         }
+        int numberOfPieces = pieces(creatica);
         creatica->wtime = wtime;
         creatica->btime = btime;
         creatica->winc = winc;
         creatica->binc = binc;
         if (our_turn) {
-            creatica->infinite = false;
 try_again:  if (go(creatica, evaluations)) {
               std::cerr << "ComputeAndPostMove() error: go(creatica, evaluations) returned non-zero code, restarting..." << std::endl;
               releaseChessEngine(creatica);
@@ -433,7 +490,7 @@ try_again:  if (go(creatica, evaluations)) {
               creatica->winc = winc;
               creatica->binc = binc;
               goto try_again;
-            }
+            } //end of if (go())
             if (draw_offer) {
                 if (evaluations[0]->scorecp < DRAW_CP) {
                   std::string draw_url = "https://lichess.org/api/bot/game/" + game_id + "/draw/yes";
@@ -448,31 +505,45 @@ try_again:  if (go(creatica, evaluations)) {
             } //end of if (draw_offer)
             std::string new_move = evaluations[0]->bestmove;
             std::string move_url = "https://lichess.org/api/bot/game/" + game_id + "/move/" + new_move;
+            std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "..." << std::endl;
             if (!HttpRequest("POST", move_url))
               std::cerr << "ComputeAndPostMove() error: failed to post request to " << move_url << std::endl;
+            std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "... done" << std::endl;
         } else { // Not our turn
+            if (numberOfPieces > 7 && PONDER) {
               creatica->infinite = true;
-              is_pondering = true;
+              creatica->ponder = true;
               go(creatica, evaluations);
+            }
         }
-    } //end of if (gameStateStatus == "started")
+    } //end of if (gameStateStatus == started)
 }
 
-// Function to handle a single game
+// Function to handle a single game in a detached thread
 void HandleGame(const std::string& game_id) {
     newGame(creatica);
     bool is_white = false;  // To be set in gameFull
-    bool is_pondering = false;
     std::string initial_fen;  // To be set in gameFull
-
-    // Stream game state
-    while (game_in_progress.load() && (gameStateStatus == "created" || gameStateStatus != "started")) {
-        std::string stream_url = "https://lichess.org/api/bot/game/stream/" + game_id;
-        StreamAndProcess(stream_url, [game_id, &is_white, &initial_fen, &is_pondering](const json& state) {
+    creatica->ponder = false;
+    creatica->infinite = false;
+    
+    // Stream game state - game-specific stream, which is separate from the main events one
+    // It has its own ProcessEvent() lambda function used by libcurl once the game state (lines) is parsed by nlohmann json library into json state object 
+    std::string stream_url = "https://lichess.org/api/bot/game/stream/" + game_id;
+    int gss = gameStateStatus.load();
+    while (game_in_progress.load() && (gss == created || gss != started)) {
+        StreamAndProcess(stream_url, [game_id, &is_white, &initial_fen, &gss](const json& state) { //this is process_line() function for game-specific events
             if (state.contains("type") && state["type"] == "gameFull") {
                 // Determine color (use value() for safety if key missing)
-                gameStateStatus = state["state"].value("status", "");
-                if (gameStateStatus != "created" && gameStateStatus != "started") return;
+                gameStateStatus.store(0);
+                for (int i = 0; i < game_states; i++) {
+                  if (gameSS[i] == state["state"].value("status", "unknown")) {
+                    gameStateStatus.store(i);
+                    gss = i;
+                    break;
+                  }
+                }
+                if (gss != created && gss != started) return; //from process_line() function in StreamAndProcess()
                 std::string white_id = state["white"].value("id", "");
                 std::string black_id = state["black"].value("id", "");
                 is_white = (white_id == BOT_USERNAME);
@@ -498,10 +569,18 @@ void HandleGame(const std::string& game_id) {
                 bool wdraw = state["state"].value("wdraw", false);
                 bool bdraw = state["state"].value("bdraw", false);
                 bool draw_offer = is_white ? bdraw : wdraw;
-                ComputeAndPostMove(game_id, draw_offer, our_turn, is_pondering, initial_fen, moves, wtime, btime, winc, binc);
+                ComputeAndPostMove(game_id, draw_offer, our_turn, initial_fen, moves, wtime, btime, winc, binc);
               } else if (state.contains("type") && state["type"] == "gameState") {
-                gameStateStatus = state.value("status", "");
-                if (gameStateStatus != "created" && gameStateStatus != "started") return;                
+                gameStateStatus.store(0);
+                for (int i = 0; i < game_states; i++) {
+                  if (gameSS[i] == state.value("status", "unknown")) {
+                    gameStateStatus.store(i);
+                    gss = i;
+                    break;
+                  }
+                }
+                //gameStateStatus = state.value("status", "");
+                if (gss != created && gss != started) return;                
                 std::string moves = state.value("moves", "");
                 int num_plies = 0;
                 std::string uci_move = "";
@@ -518,7 +597,7 @@ void HandleGame(const std::string& game_id) {
                 bool wdraw = state.value("wdraw", false);
                 bool bdraw = state.value("bdraw", false);
                 bool draw_offer = is_white ? bdraw : wdraw;
-                ComputeAndPostMove(game_id, draw_offer, our_turn, is_pondering, initial_fen, moves, wtime, btime, winc, binc);
+                ComputeAndPostMove(game_id, draw_offer, our_turn, initial_fen, moves, wtime, btime, winc, binc);
             } else if (state.contains("type") && state["type"] == "opponentGone") {
                 bool gone = state["gone"];
                 int claimWinInSeconds = state["claimWinInSeconds"];
@@ -537,13 +616,13 @@ void HandleGame(const std::string& game_id) {
                 }
             }
         });
-        std::cout << "HandleGame() debug: StreamAndProcess() returned. Reconnecting..." << std::endl;
-    } //end of while (game_in_progress)
-    gameStateStatus = "";
+        std::cout << "HandleGame() debug: StreamAndProcess() returned. Stopping the engine..." << std::endl;
+    } //end of while (game_in_progress && (gameStateStatus == "created" || gameStateStatus != "started"))
+    gameStateStatus.store(0);
     stop(creatica);
 }
 
-// Example processor for event stream
+// processor for event stream used by libcurl once an event (lines) is parsed by nlohmann json library into json event object
 void ProcessEvent(const json& event) {
     if (!playing.load()) return; //do not process any events if ctrl-c is pressed
     if (event.contains("type") && (event["type"] == "challenge" || event["type"] == "challengeCanceled" || event["type"] == "challengeDeclined")) {
@@ -574,8 +653,8 @@ void ProcessEvent(const json& event) {
         }
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
-            if ((!game_in_progress.load() && variant == "standard" || variant == "chess960") &&
-                (speed == "blitz" || speed == "rapid" || speed == "classical") && challenger_id != "poliakevitch") {
+            if ((!game_in_progress.load() && variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960") &&
+                (speed == "blitz" || speed == "rapid" || speed == "classical") && challenger_id == "poliakevitch") {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -620,12 +699,15 @@ void ProcessEvent(const json& event) {
             game_in_progress.store(true);
           }
           game_cv.notify_one();
+          //start a detached thread to play a single game
+          gameStateStatus.store(1); //created
           std::thread play(HandleGame, game_id);
           play.detach();
         }
     } else if (event.contains("type") && event["type"] == "gameFinish") {
         std::string game_id = event["game"]["gameId"];
         std::cout << "ProcessEvent() debug: game " << game_id << " (" << event["game"]["fullId"] << ") finished with " << event["game"]["status"]["name"] << std::endl;
+        gameStateStatus.store(0);
         std::unique_lock<std::mutex> lock(mutex);
         current_game_id = "";
         lock.unlock();
@@ -645,6 +727,11 @@ void ProcessEvent(const json& event) {
 void signal_handler(int sig) {
     std::cout << "Received Ctrl-C (SIGINT). Shutting down gracefully..." << std::endl;
     playing.store(false);
+    {
+      std::lock_guard<std::mutex> lk(playing_mutex);
+      game_in_progress.store(false);
+    }
+    game_cv.notify_one();
 }
 
 int main() {
@@ -653,6 +740,7 @@ int main() {
   init_magic_bitboards();
   rng.seed(static_cast<unsigned int>(std::random_device{}()));
 
+  //start chess engine process and communicate with it over stdin, stdout redirected to named pipes internally
   creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
   if (!creatica) {
     fprintf(stderr, "tournament main() error: failed to init chessEngine %s for creatica\n", CREATICA_PATH);
@@ -667,8 +755,8 @@ int main() {
 
   curl_global_init(CURL_GLOBAL_DEFAULT);
   std::thread challenge(GetAndProcessBots, nb);
-  while (playing.load()) {  // Main loop: Keep streaming events. Need to add keyboard CTR-C handling to break from this loop gracefully
-      std::string event_url = "https://lichess.org/api/stream/event";
+  std::string event_url = "https://lichess.org/api/stream/event";
+  while (playing.load()) {  // Main loop: Keep streaming events
       StreamAndProcess(event_url, ProcessEvent);
       std::cerr << "main() debug: stream ended; reconnecting in 3s..." << std::endl;
       std::this_thread::sleep_for(std::chrono::seconds(3));
