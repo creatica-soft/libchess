@@ -59,15 +59,12 @@ void zobristHash(struct ZobristHash * hash) {
 	//printf("k %d k2 %d\n", k, k2);
 }
 
-int getHash(struct ZobristHash * hash, struct Board * board) {	
-  if (!hash || !board) {
-  	fprintf(stderr, "getHash() arg error: either hash or board or both are NULL\n");
-  	return 1;
-  }
+void getHash(struct ZobristHash * hash, struct Board * board) {	
+  assert(hash && board);
 	if (strncmp(board->fen->fenString, startPos, strlen(startPos)) == 0) {
 		resetHash(hash);
 	  board->zh = hash;
-		return 0;
+	  return;
 	}
 	hash->hash = 0; hash->prevEnPassant = 0;
 	hash->hash2 = 0; hash->prevEnPassant2 = 0;
@@ -76,7 +73,7 @@ int getHash(struct ZobristHash * hash, struct Board * board) {
 	unsigned long long bitboard = board->occupations[PieceNameNone];
 	while (bitboard) {
 		sn = lsBit(bitboard);
-		pt = (((board->piecesOnSquares[sn]) >> 3) * 6) + ((board->piecesOnSquares[sn]) & 7);
+		pt = PC_COLOR(board->piecesOnSquares[sn]) * 6 + PC_TYPE(board->piecesOnSquares[sn]);
 		hash->hash ^= hash->piecesAtSquares[pt][sn];
 		hash->hash2 ^= hash->piecesAtSquares2[pt][sn];
 		bitboard &= bitboard - 1;
@@ -85,7 +82,7 @@ int getHash(struct ZobristHash * hash, struct Board * board) {
 	bitboard = board->occupations[PieceNameAny];
 	while (bitboard) {
 		sn = lsBit(bitboard);
-		pt = (((board->piecesOnSquares[sn]) >> 3) * 6) + ((board->piecesOnSquares[sn]) & 7);
+		pt = PC_COLOR(board->piecesOnSquares[sn]) * 6 + PC_TYPE(board->piecesOnSquares[sn]);
 		hash->hash ^= hash->piecesAtSquares[pt][sn];
 		hash->hash2 ^= hash->piecesAtSquares2[pt][sn];
 		bitboard &= bitboard - 1;
@@ -109,7 +106,6 @@ int getHash(struct ZobristHash * hash, struct Board * board) {
 		hash->prevEnPassant2 = hash->enPassant2[board->fen->enPassant];
 	}
 	board->zh = hash;
-	return 0;
 }
 
 void resetHash(struct ZobristHash * hash) {
@@ -121,124 +117,118 @@ void resetHash(struct ZobristHash * hash) {
 	hash->prevEnPassant2 = 0;
 }
 
-int updateHash(struct Board * board, struct Move * move) {
-  if (!board || !(board->zh)) {
-  	fprintf(stderr, "updateHash() arg error: either board, board->zh or both are NULL\n");
-  	return 1;
-  }
+void updateHash(struct Board * board, struct Move * move) {
+  assert(board && board->zh);
 	if (board->zh->prevEnPassant && board->zh->prevEnPassant2) {
 		board->zh->hash ^= board->zh->prevEnPassant;
 		board->zh->hash2 ^= board->zh->prevEnPassant2;
 		board->zh->prevEnPassant = 0;
 		board->zh->prevEnPassant2 = 0;
 	}
-	int srcPieceType = (board->movingPiece.color * 6) + board->movingPiece.type;
+	const int pcColor = PC_COLOR(move->movingPiece);
+	const int oppColor = OPP_COLOR(pcColor);
+	const int srcPieceType = pcColor * 6 + PC_TYPE(move->movingPiece);
 	if ((move->type & (MoveTypeEnPassant | MoveTypeCapture)) == (MoveTypeEnPassant | MoveTypeCapture)) {
-		int s = board->movingPiece.color == ColorWhite ? move->destinationSquare.name - 8 : move->destinationSquare.name + 8;
+		const int s = pcColor == ColorWhite ? move->dst - 8 : move->dst + 8;
 		//xor out the capturing piece in its src square
-		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->src];
 		//xor in empty square in the src square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->src];
 		//xor out empty square in the dst square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][move->destinationSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->destinationSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][move->dst];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->dst];
 		//xor in empty square in the captured square
 		board->zh->hash ^= board->zh->piecesAtSquares[0][s];
 		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][s];
 		//xor out captured piece in the dst square
-		int pt = ((board->capturedPiece >> 3) * 6) + (board->capturedPiece & 7);
+		const int pt = oppColor * 6 + PC_TYPE(move->capturedPiece);
 		board->zh->hash ^= board->zh->piecesAtSquares[pt][s];
 		board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][s];
 		//xor in the capturing piece in its dst square
-		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->destinationSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->destinationSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->dst];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->dst];
 	}
 	else if ((move->type & MoveTypeCapture) == MoveTypeCapture) {
 		//xor out the capturing piece in its src square
-		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->src];
 		//xor in empty square in the src square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->src];
 		//xor out captured piece in the dst square
-		int pt = ((board->capturedPiece >> 3) * 6) + (board->capturedPiece & 7);
-		board->zh->hash ^= board->zh->piecesAtSquares[pt][move->destinationSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][move->destinationSquare.name];
+		const int pt = oppColor * 6 + PC_TYPE(move->capturedPiece);
+		board->zh->hash ^= board->zh->piecesAtSquares[pt][move->dst];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][move->dst];
 		//xor in the promotion piece in its dst square
 		if ((move->type & MoveTypePromotion) == MoveTypePromotion) {
-			int pt = ((board->promoPiece >> 3) * 6) + (board->promoPiece & 7);
-			board->zh->hash ^= board->zh->piecesAtSquares[pt][move->destinationSquare.name];
-			board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][move->destinationSquare.name];
+			const int pt = pcColor * 6 + PC_TYPE(move->promoPiece);
+			board->zh->hash ^= board->zh->piecesAtSquares[pt][move->dst];
+			board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][move->dst];
 		}
 		//xor in the capturing piece in its dst square
 		else {
-			board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->destinationSquare.name];
-			board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->destinationSquare.name];
+			board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->dst];
+			board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->dst];
 		}
 	}
 	else if (((move->type & MoveTypeCastlingKingside) == MoveTypeCastlingKingside) || ((move->type & MoveTypeCastlingQueenside) == MoveTypeCastlingQueenside)) {
-		int castlingKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
-		int castlingRookSquare[2][2] = { { SquareF1, SquareF8 }, { SquareD1, SquareD8 } };
-		unsigned char side = ((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside)) - 1) >> 2;
+		const int castlingKingSquare[2][2] = { { SquareG1, SquareG8 }, { SquareC1, SquareC8 } };
+		const int castlingRookSquare[2][2] = { { SquareF1, SquareF8 }, { SquareD1, SquareD8 } };
+		const unsigned char side = ((move->type & (MoveTypeCastlingKingside | MoveTypeCastlingQueenside)) - 1) >> 2;
 		int rookSquare = SquareNone;
-		unsigned char whiteBlack[2] = { 0, 56 };
+		const unsigned char whiteBlack[2] = { 0, 56 };
 		//xor out the king in its src square
-		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->src];
 		//xor in empty square in the src square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->src];
 		//xor out empty square in the king dst square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][castlingKingSquare[side][board->movingPiece.color]];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][castlingKingSquare[side][board->movingPiece.color]];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][castlingKingSquare[side][pcColor]];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][castlingKingSquare[side][pcColor]];
 		//xor in the king in its dst square
-		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][castlingKingSquare[side][board->movingPiece.color]];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][castlingKingSquare[side][board->movingPiece.color]];
+		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][castlingKingSquare[side][pcColor]];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][castlingKingSquare[side][pcColor]];
 
 		//xor out the rook in its src square
 		//need to find out the src square of the rook for chess960
-		if (move->castlingRook != FileNone) {
-			rookSquare = move->castlingRook + whiteBlack[board->movingPiece.color];
- 		}
-		else {
-			printf("updateHash() error: %s %s castling rook is on FileNone; FEN %s\n", board->movingPiece.color == ColorWhite ? "White" : "Black", (side + 1) == MoveTypeCastlingKingside ? "Kingside" : "Queenside", move->chessBoard->fen->fenString);
-			return 1;
-		}
-		board->zh->hash ^= board->zh->piecesAtSquares[(board->movingPiece.color + 1) * Rook][rookSquare];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[(board->movingPiece.color + 1) * Rook][rookSquare];
+		assert(move->castlingRook != FileNone);
+		rookSquare = move->castlingRook + whiteBlack[pcColor];
+		board->zh->hash ^= board->zh->piecesAtSquares[(pcColor + 1) * Rook][rookSquare];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[(pcColor + 1) * Rook][rookSquare];
 		//xor in empty square in rook src square
 		board->zh->hash ^= board->zh->piecesAtSquares[0][rookSquare];
 		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][rookSquare];
 		//xor out empty square in rook dst square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][castlingRookSquare[side][board->movingPiece.color]];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][castlingRookSquare[side][board->movingPiece.color]];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][castlingRookSquare[side][pcColor]];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][castlingRookSquare[side][pcColor]];
 		//xor in the rook in its dst square
-		int pt = (board->movingPiece.color * 6) + Rook;
-		board->zh->hash ^= board->zh->piecesAtSquares[pt][castlingRookSquare[side][board->movingPiece.color]];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][castlingRookSquare[side][board->movingPiece.color]];
+		int pt = pcColor * 6 + Rook;
+		board->zh->hash ^= board->zh->piecesAtSquares[pt][castlingRookSquare[side][pcColor]];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][castlingRookSquare[side][pcColor]];
 	}
 	else { //normal move
 		//xor out the moving piece in its src square
-		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->src];
 		//xor in empty square in the src square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][move->sourceSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->sourceSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][move->src];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->src];
 		//xor out empty square in the dst square
-		board->zh->hash ^= board->zh->piecesAtSquares[0][move->destinationSquare.name];
-		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->destinationSquare.name];
+		board->zh->hash ^= board->zh->piecesAtSquares[0][move->dst];
+		board->zh->hash2 ^= board->zh->piecesAtSquares2[0][move->dst];
 		//xor in the promotion piece in its dst square
 		if ((move->type & MoveTypePromotion) == MoveTypePromotion) {
-			int pt = ((board->promoPiece >> 3) * 6) + (board->promoPiece & 7);
-			board->zh->hash ^= board->zh->piecesAtSquares[pt][move->destinationSquare.name];
-			board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][move->destinationSquare.name];
+			int pt = pcColor * 6 + PC_TYPE(move->promoPiece);
+			board->zh->hash ^= board->zh->piecesAtSquares[pt][move->dst];
+			board->zh->hash2 ^= board->zh->piecesAtSquares2[pt][move->dst];
 		}
 		//xor in the moving piece in its dst square
 		else {
-			board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->destinationSquare.name];
-			board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->destinationSquare.name];
+			board->zh->hash ^= board->zh->piecesAtSquares[srcPieceType][move->dst];
+			board->zh->hash2 ^= board->zh->piecesAtSquares2[srcPieceType][move->dst];
 			if ((move->type & MoveTypeEnPassant) == MoveTypeEnPassant) {
 				board->zh->hash ^= board->zh->enPassant[board->fen->enPassant];
 				board->zh->hash2 ^= board->zh->enPassant2[board->fen->enPassant];
@@ -258,7 +248,6 @@ int updateHash(struct Board * board, struct Move * move) {
 	//xor in black's move if it's black turn or xor out black's move if it's white turn
 	board->zh->hash ^= board->zh->blackMove;
 	board->zh->hash2 ^= board->zh->blackMove2;
-	return 0;
 }
 #ifdef __cplusplus
 }

@@ -373,6 +373,32 @@ bool newGame(struct Engine * engine) {
 	return isReady(engine);
 }
 
+int pieces(struct Engine * engine) {
+	fprintf(engine->toEngine, "pieces\n");
+	fflush(engine->toEngine);
+	if (engine->logfile) {
+		fprintf(engine->logfile, "pieces\n");
+		fflush(engine->logfile);
+	}
+	char line[256];	
+	int pieceNumber = 0;
+	while (fgets(line, sizeof(line), engine->fromEngine)) {
+		if (engine->logfile) {
+			fprintf(engine->logfile, "%s", line);
+			fflush(engine->logfile);
+		}
+		// Trim trailing \r and/or \n
+		char* end = line + strlen(line) - 1;
+		while (end >= line && (*end == '\r' || *end == '\n')) {
+			*end = '\0';
+			end--;
+		}
+		pieceNumber = atoi(line);
+		if (pieceNumber > 0) break;
+	}
+	return pieceNumber;	
+}
+
 void stop(struct Engine * engine) {
 	fprintf(engine->toEngine, "stop\n");
 	fflush(engine->toEngine);
@@ -608,14 +634,8 @@ int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV) {
 */
 //void go(long long movetime, int depth, int nodes, int mate, char * searchmoves, bool ponder, bool infinite, long long wtime, long btime, long winc, long binc, int movestogo, struct Engine * engine, struct Evaluation ** eval) {
 int go(struct Engine * engine, struct Evaluation ** eval) {
-  if (!engine) {
-		printf("go() error: argument engine is NULL\n");
-  	return 1;
-  }
-	if (!eval) {
-		printf("go() error: argument eval is NULL\n");
-		return 1;			
-	}
+  assert(engine);
+	assert(eval);
 
 	char line[4096], tmp[256];
 	sprintf(line, "go");
@@ -709,7 +729,7 @@ float eval(struct Engine * engine) {
 	return getEval(engine);
 }
 
-int engine(struct Engine *engine, const char *engineName) {
+int engine(struct Engine * engine, const char * engineName) {
     if (!engine) {
         fprintf(stderr, "engine() error: argument engine is NULL\n");
         return 1;
@@ -963,14 +983,8 @@ int engine(struct Engine *engine, const char *engineName) {
 }
 
 struct Engine * initChessEngine(char * engineName, long long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool limitStrength, int elo) {
-  //struct timespec delay;
-  //delay.tv_sec = 1;
-  //delay.tv_nsec = 0;
   struct Engine * chessEngine = (struct Engine *)calloc(1, sizeof(struct Engine));
-  if (!chessEngine) {
-    printf("initChessEngine() error: calloc(1, sizeof(struct Engine)) returned NULL\n");
-    return NULL;  	
-  }
+  assert(chessEngine);
   chessEngine->movetime = movetime;
   chessEngine->depth = depth;
   int res = engine(chessEngine, engineName);

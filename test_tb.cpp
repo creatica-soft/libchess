@@ -44,9 +44,9 @@
     unsigned int res = tb_probe_root(board.occupations[PieceNameWhite], board.occupations[PieceNameBlack], 
     board.occupations[WhiteKing] | board.occupations[BlackKing],
         board.occupations[WhiteQueen] | board.occupations[BlackQueen], board.occupations[WhiteRook] | board.occupations[BlackRook], board.occupations[WhiteBishop] | board.occupations[BlackBishop], board.occupations[WhiteKnight] | board.occupations[BlackKnight], board.occupations[WhitePawn] | board.occupations[BlackPawn],
-        board.fen->halfmoveClock, 0, ep == 64 ? 0 : ep, board.opponentColor == ColorBlack ? 1 : 0, NULL);
+        board.fen->halfmoveClock, 0, ep == 64 ? 0 : ep, board.fen->sideToMove == ColorWhite ? 1 : 0, NULL);
     //if (res == TB_RESULT_FAILED) {
-      fprintf(stderr, "info: res %d, TB_LARGEST %d, occupations %u, fen %s, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu\n", res, TB_LARGEST, __builtin_popcountl(board.occupations[PieceNameAny]), board.fen->fenString, ep, board.fen->halfmoveClock, board.opponentColor == ColorBlack ? 1 : 0, board.occupations[PieceNameWhite], board.occupations[PieceNameBlack], board.occupations[WhiteKing] | board.occupations[BlackKing],
+      fprintf(stderr, "info: res %d, TB_LARGEST %d, occupations %u, fen %s, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu\n", res, TB_LARGEST, __builtin_popcountl(board.occupations[PieceNameAny]), board.fen->fenString, ep, board.fen->halfmoveClock, board.fen->sideToMove == ColorWhite ? 1 : 0, board.occupations[PieceNameWhite], board.occupations[PieceNameBlack], board.occupations[WhiteKing] | board.occupations[BlackKing],
         board.occupations[WhiteQueen] | board.occupations[BlackQueen], board.occupations[WhiteRook] | board.occupations[BlackRook], board.occupations[WhiteBishop] | board.occupations[BlackBishop], board.occupations[WhiteKnight] | board.occupations[BlackKnight], board.occupations[WhitePawn] | board.occupations[BlackPawn]);
       //exit(-1);
     //}

@@ -1,5 +1,5 @@
 /// 
-/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.so bitscanner.cpp board.cpp engine.cpp fen.cpp pgn.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
+/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib bitscanner.cpp board-new.cpp engine-new.cpp fen-new.cpp pgn-new.cpp move-new.cpp tag-new.cpp zobrist-hash-new.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue-new.cpp nnue/position.cpp
 
 /// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
 
@@ -110,6 +110,7 @@ extern "C" {
 #define MAX_ITERATIONS 1000000001 // Safety cap
 
 #define NNUE_CHECK 0.00001 //special value for check
+#define STALE_MATE -0.00001 //special value for stalemate
 
 #define FILE_A 0x0101010101010101ULL
 #define FILE_B 0x0202020202020202ULL
@@ -128,6 +129,22 @@ extern "C" {
 #define RANK6 0x0000FF0000000000ULL
 #define RANK7 0x00FF000000000000ULL
 #define RANK8 0xFF00000000000000ULL
+
+// Macros for on-fly computation (inline-able, zero cost)
+#define SQ(rank, file) (((rank) << 3) | (file))
+#define SQ_FILE(sq) ((sq) & 7)
+#define SQ_RANK(sq) ((sq) >> 3)
+#define SQ_BIT(sq)  ((sq) == SquareNone ? 0 : (1ULL << (sq)))
+#define SQ_DIAG(sq) (7 + SQ_RANK(sq) - SQ_FILE(sq))
+#define SQ_ANTIDIAG(sq) (SQ_FILE(sq) + SQ_RANK(sq))
+
+#define PC_TYPE(pc) ((pc) & 7)
+#define PC_COLOR(pc) ((pc) >> 3)
+#define PC(color, type) (((color) << 3) | (type))
+#define PC_INIT(pc, pcName, sq) do { (pc)->name = (pcName); (pc)->square = (sq); } while (0)
+
+#define OPP_COLOR(color) ((color) ^ 1)  // White=0, Black=1
+#define PLY_NUM(fen) (((fen)->moveNumber - 1) * 2 + ((fen)->sideToMove == ColorBlack)) //for white move 1, ply is 0
 
 static unsigned long long files_bb[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
 static unsigned long long ranks_bb[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
@@ -256,19 +273,24 @@ enum ProblemType { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
 enum GameStage { OpeningGame, MiddleGame, EndGame, FullGame };
 static const char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
 
+static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+static const unsigned long long STARTPOS_HASH = 0x958ee7dbd87b2d0aULL;
+static const unsigned long long STARTPOS_HASH2 = 0x4ed9a976a0f95be5ULL;
+static const unsigned long long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995ULL;
+static const unsigned long long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8ULL;
+
 // Forthys-Edwards Notation for the position preceding a move 
 struct Fen {
-    char fenString[MAX_FEN_STRING_LEN] = {};
-    char ranks[8][9] = {RankNone};
-    int sideToMove = ColorNone;
-    int castlingRights = CastlingRightsWhiteNoneBlackNone;
+    char fenString[MAX_FEN_STRING_LEN] = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    int sideToMove = ColorWhite;
+    int castlingRights = CastlingRightsWhiteBothBlackBoth;
     int enPassant = FileNone;
-    unsigned long long enPassantLegalBit = 0;
+    unsigned long long enPassantLegalBit = SquareNone;
     int halfmoveClock = 0;
-    int moveNumber = 1;
+    int moveNumber = 0;
     bool isChess960 = false;
-    int castlingRook[2][2] = {FileNone};
-    unsigned long long castlingBits = 0;
+    int castlingRook[2][2] = { { FileH, FileA }, { FileH, FileA } };
+    unsigned long long castlingBits = 0x8100000000000081ULL;
 };
 
 struct ZobristHash {
@@ -288,54 +310,55 @@ struct ZobristHash {
     unsigned long long piecesAtSquares2[13][64] = {};
 };
 
-struct Square {
+/*struct Square {
     int name = SquareNone;
     unsigned long long bitSquare = 0;
     int file = FileNone;
     int rank = RankNone;
     int diag = DiagonalNone;
     int antiDiag = AntidiagonalNone;
-};
+};*/
 
 struct ChessPiece {
     int name = PieceNameNone;
-    int type = PieceTypeNone;
-    int color = ColorNone;
-    struct Square square = {};
+    int square = SquareNone;
 };
 
 struct Board {
-    unsigned long long occupations[16] = {};
-    int piecesOnSquares[64] = {PieceNameNone};
-    unsigned long long moves = 0;
-    unsigned long long movesFromSquares[64] = {};
-    unsigned long long sideToMoveMoves[64] = {};
-    //int allMoves[218] = {}; //theoretical maximum number of moves from a specially crafted position is 218
-    int opponentColor = ColorNone;
-    int plyNumber = 0;
-    int capturedPiece = PieceNameNone;
-    int promoPiece = PieceNameNone;
-    struct ChessPiece movingPiece = {};
+    unsigned long long occupations[16] = {};  // Bitboards per PieceName
+    int piecesOnSquares[64] = {PieceNameNone};             // PieceName at sq (keep for fast lookup; sync with occupations)
+    unsigned long long moves = 0;            // Union of all legal moves
+    unsigned long long movesFromSquares[64] = {};  // Legal moves from each sq
     bool isCheck = false;
     bool isStaleMate = false;
     bool isMate = false;
-    struct Fen * fen = nullptr;
-    struct ZobristHash * zh = nullptr;
+    struct Fen *fen = nullptr;
+    struct ZobristHash *zh = nullptr;
 };
 
 struct Move {
-    int type = 0;
-    struct Square sourceSquare = {};
-    struct Square destinationSquare = {};
-    char sanMove[12] = {};
-    char uciMove[6] = {};
-    struct Board * chessBoard = nullptr;
+    char sanMove[12] = "";
+    char uciMove[6] = "";
+    //next 7 are used in undoMove() and updateHash()
+    int type = MoveTypeNormal;
+    int src = SquareNone;
+    int dst = SquareNone;
+    int movingPiece = PieceNameNone;
+    int capturedPiece = PieceNameNone;
+    int promoPiece = PieceNameNone;
     int castlingRook = FileNone;
+    //last 5 are used in undoMove() only
+    int otherCastlingRook = FileNone;  
+    int prevCastlingRights = CastlingRightsWhiteNoneBlackNone;
+    int prevEnPassant = FileNone;
+    int prevHalfmoveClock = 0;
+    int prevCastlingRook = FileNone;
+    struct Board *chessBoard = nullptr;
 };
 
-enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationConstant, Noise, VirtualLoss, PVPlies, EvalScale, Temperature};
+enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationMin, ExplorationMax, ExplorationDepthDecay, VirtualLoss, PVPlies, EvalScale, Temperature};
 enum EngineStringOptions {SyzygyPath};
-enum EngineCheckOptions {Ponder};
+enum EngineCheckOptions {Ponder, FinalInfoLines, IntermittentInfoLines};
 
 enum OptionType {
 	Button, Check, Combo, Spin, String
@@ -444,12 +467,6 @@ CHESS_API int strtofen(struct Fen *, const char *);
 /// </summary>
 int fentostr(struct Fen *);
 
-static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-static const unsigned long long STARTPOS_HASH = 0x958ee7dbd87b2d0aULL;
-static const unsigned long long STARTPOS_HASH2 = 0x4ed9a976a0f95be5ULL;
-static const unsigned long long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995ULL;
-static const unsigned long long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8ULL;
-
 /*
 struct MoveScoreGames {
   char move[6]; //uci move
@@ -508,6 +525,8 @@ struct EcoLine {
 	EcoTag tags = {}; // Chess eco header tag array
 };
 
+CHESS_API char * idx_to_move(const int move_idx, char * uci_move);
+CHESS_API int move_to_idx(const char * uci_move, int * src, int * dst, int * promo);
 CHESS_API struct Board * cloneBoard(struct Board * src);
 CHESS_API void freeBoard(struct Board * board);
 ///<summary>
@@ -525,7 +544,7 @@ CHESS_API void zobristHash(struct ZobristHash *);
 /// calculates Zobrist hash from a Board struct and updates
 /// ZobristHash struct, which should be initialized first
 ///<summary>
-CHESS_API int getHash(struct ZobristHash *, struct Board *);
+CHESS_API void getHash(struct ZobristHash *, struct Board *);
 
 ///<summary>
 /// resets ZobristHash struct to initial game position
@@ -535,7 +554,7 @@ CHESS_API void resetHash(struct ZobristHash *);
 ///<summary>
 /// updates ZobristHash of a given Board after a given move
 ///</summary>
-CHESS_API int updateHash(struct Board *, struct Move *);
+CHESS_API void updateHash(struct Board *, struct Move *);
 
 ///<summary>
 /// fills Square struct from SquareName enum
@@ -591,15 +610,22 @@ CHESS_API int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dat
 /// validates a UCI or SAN move given by the last argument
 /// and initializes the Move struct on a given board
 ///</summary>
-CHESS_API int initMove(struct Move * move, struct Board * board, const char * moveString);
+CHESS_API void initMove(struct Move * move, struct Board * board, const char * moveString);
+//lightweight version of initMove() without move validation
 CHESS_API void init_move(struct Move * move, struct Board * board, int src, int dst, int promo);
+//fast-forward a valid uci move on a given board without init_move(), move will be set for updateHash() to work
+CHESS_API void ff_move(struct Board * board, struct Move * move, const int src, const int dst, const int promo);
 CHESS_API bool promoMove(struct Board * board, int src, int dst);
 
 ///<summary>
 /// makes a given Move on board and updates Board and Fen struct
 ///</summary>
 CHESS_API void makeMove(struct Move * move);
-//void undoMove(struct Move * move);
+CHESS_API void undoMove(struct Move * move);
+
+CHESS_API void make_move(struct Move * move); //does not handle null move, update FEN and generate moves
+CHESS_API void undo_move(struct Move * move); //does not handle null move, update FEN and generate moves
+CHESS_API void updateFen(struct Board * board); //updates just board->fen->fenString
 
 /// <summary>
 /// Parses the line into tag name and tag value
@@ -671,13 +697,13 @@ CHESS_API int initGame(struct Game *, FILE *);
 ///<summary>
 /// Plays a game given its struct
 ///</summary
-//int playGame(struct Game *);
+int playGame(struct Game *);
 
 /// <summary>
 /// draws a chessboard
 /// if the second argument is true, then also all legal moves for each piece 
 /// </summary>
-CHESS_API void writeDebug(struct Board *, bool);
+CHESS_API void writeDebug(const struct Board *, bool);
 
 ///<summary>
 /// draws a board with just a specified piece name such as white pawns, for example
@@ -743,7 +769,7 @@ CHESS_API bool position(struct Engine *);
 CHESS_API int go(struct Engine *, struct Evaluation **);
 CHESS_API float eval(struct Engine *);
 CHESS_API int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV);
-
+CHESS_API int pieces(struct Engine * engine); //non-standard UCI command pieces - returns the number of pieces on board
 //CHESS_API unsigned long long md5(char *);
 
 ///<summary>

@@ -1,5 +1,5 @@
 //For MacOS using clang
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica
+//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica-new.cpp uci-new.cpp tbcore.c tbprobe.c -o creatica
 
 // For linux or Windows using mingw
 // add -mpopcnt for X86_64
@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstdarg>
 #endif
+#include <cassert>
 #include <vector>
 #include <thread>
 #include <unordered_map>
@@ -41,9 +42,12 @@
 extern std::atomic<bool> stopFlag;
 extern double timeAllocated; //ms
 extern char best_move[6];
+extern std::string prev_moves;
+extern std::string prev_fen;
 std::atomic<bool> search_done{false}; // Signals search completion
-double temperature = 1.0; //used in calculating probabilities for moves in softmax exp((eval - max_eval)/temperature) / eval_sum
-                        //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
+std::condition_variable cv_search_done;
+std::mutex search_done_mtx;
+
 extern "C" {
 
   struct NNUEContext {
@@ -58,50 +62,50 @@ extern "C" {
   void log_file(const char * message, ...);
   void print(const char * message, ...);
   bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move);
+  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history, std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass);//, bool in_playout = false);
+  double position_eval(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history);
   
   #define MAX_DEPTH 100
-  //extern std::atomic<bool> quitFlag;
-  //extern std::atomic<bool> searchFlag;
-  extern struct Board * board;
-  extern struct Engine chessEngine;
-  extern std::unordered_map<unsigned long long, int> position_history;
   std::mutex probe_mutex;
   std::shared_mutex map_mutex;
+  extern struct Board * board;
+  extern struct Engine chessEngine;
+  extern std::unordered_set<unsigned long long> position_history;
+  extern std::atomic<bool> ponderHit;
+  extern double exploration_min;
+  extern double exploration_max;
+  extern double exploration_depth_decay;
+  extern double probability_mass;
+  //extern double noise;
+  extern double virtual_loss;
+  extern double eval_scale;
+  extern double temperature;
   std::atomic<unsigned long long> total_children{0};
   std::atomic<int> hash_full{0};
   std::atomic<unsigned long long> tbhits{0};
   std::atomic<int> generation{0};
-  extern std::atomic<bool> ponderHit;
-  double exploration_constant = 1.0;
-  double probability_mass = 0.9;
-  double noise = 0.1;
-  double virtual_loss = 3.0;  // Tune: UCI option, e.g., 1.0-3.0
-  double eval_scale = 4.0; //Tune as well
-  
-  struct EngineDepth {
-    std::atomic<int> currentDepth{0};
-    std::atomic<int> seldepth{0};
-  };
-  
-  struct EngineDepth engineDepth;
-  
+  std::atomic<int> depth{0};
+  std::atomic<int> seldepth{0};
+    
   struct Edge {
-      int move = 0;             // The move that leads to the child position
-      double P = 0.0;            // Prior probability - model move_probs for a given move in the node
-      struct MCTSNode * child = nullptr; // Pointer to the child node
+      std::atomic<int> move {0};             // The move that leads to the child position
+      std::atomic<double> P {0.0};            // Prior probability - model move_probs for a given move in the node
+      std::atomic<struct MCTSNode *> child {nullptr}; // Pointer to the child node
   };
 
   struct MCTSNode {
       std::atomic<unsigned long long> hash{0};
-      std::atomic<int> count{1}; //count the number of identical positions (nodes), i.e. for a given hash
+      std::atomic<unsigned long long> hash2{0};
       std::atomic<unsigned long long> N{0};  // Atomic for lock-free updates
       std::atomic<double> W{0};
       std::atomic<int> cp {NO_MATE_SCORE}; //position evaluation in centipawns 
       std::atomic<int> num_children{0};
       std::atomic<int> generation{0};
       std::shared_mutex mutex;  // For protecting children expansion
-      struct Edge * children = nullptr;
+      std::atomic<struct Edge *> children {nullptr}; //array of moves and priors leading to next nodes
   };
+
+  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, unsigned long long& child_hash2, const std::unordered_set<unsigned long long>& pos_history);//, bool in_playout = false);
   
   // Custom hasher that uses the key directly
   struct NoOpHash {
@@ -112,7 +116,7 @@ extern "C" {
   
   struct MCTSSearch {
       struct MCTSNode * root = nullptr;
-      std::unordered_map<unsigned long long, MCTSNode *, NoOpHash> tree;
+      std::unordered_map<unsigned long long, MCTSNode *, NoOpHash> tree; //Zobrist hash and node 
   };
 
   static MCTSSearch search;
@@ -120,464 +124,494 @@ extern "C" {
   // Remove MCTSSearch from ThreadParams (shared now)
   struct ThreadParams {
       int thread_id;
-      //int num_sims;
       unsigned long long time_alloc;
-      unsigned long long currentNodes;
-      int currentDepth;
       int seldepth;
-      std::mt19937 rng;
+      //std::mt19937 rng;
   };
-  
   
   void cleanup() {
     for (auto& [h, node] : search.tree) {
-        free(node->children);
+        struct Edge * children = node->children.load(std::memory_order_relaxed);
+        delete[] children;
         delete node;
     }
     search.tree.clear();
     search.root = nullptr;
   }
   
-  //ideally garbage collection should be done by a separate thread
-  //so locking is important here
+  //we run gc() in runMCTS() before starting search threads, so no locking
   void gc() {
-    if (!search.root) return;
-    //while (!stopFlag.load(std::memory_order_relaxed) && !search_done.load(std::memory_order_relaxed)) {
-    //  if (hash_full.load(std::memory_order_relaxed) >= 750) {
-        // Increment the global generation.
-        int current_gen = generation.fetch_add(1, std::memory_order_relaxed) + 1;
-        // BFS traversal to mark reachable nodes with the current generation.
-        // Use queue to avoid recursion and potential stack overflow in deep trees.
-        std::queue<MCTSNode *> q;
-        // Mark root
-        search.root->generation.store(current_gen, std::memory_order_relaxed);
-        q.push(search.root);
-    
-        while (!q.empty()) {
-            MCTSNode * node = q.front();
-            q.pop();
-    
-            // Acquire shared lock to read children safely.
-            //std::shared_lock<std::shared_mutex> lock(node->mutex);
-            int num_child = node->num_children.load(std::memory_order_relaxed);
-            if (num_child > 0 && node->children != nullptr) {
-                for (int i = 0; i < num_child; ++i) {
-                    MCTSNode * child = node->children[i].child;
-                    if (child != nullptr) {
-                        // Atomically update generation if it's outdated to avoid revisiting.
-                        int expected = current_gen - 1;
-                        if (child->generation.compare_exchange_strong(expected, current_gen, std::memory_order_relaxed)) {
-                            q.push(child);
-                        }
-                    }
+    assert(search.root);
+    //fetch_add() updates generation but returns original value before addition; hence, we add 1
+    int current_gen = generation.fetch_add(1, std::memory_order_relaxed) + 1;
+    // BFS traversal to mark reachable nodes with the current generation.
+    // Use queue to avoid recursion and potential stack overflow in deep trees.
+    std::queue<MCTSNode *> q;
+    // Update generation for root and push it to the queue
+    search.root->generation.store(current_gen, std::memory_order_relaxed);
+    q.push(search.root);
+
+    while (!q.empty()) {
+        MCTSNode * node = q.front();
+        q.pop();  
+        int num_children = node->num_children.load(std::memory_order_relaxed);
+        struct Edge * children = node->children.load(std::memory_order_relaxed);
+        for (int i = 0; i < num_children; ++i) {
+            MCTSNode * child = children[i].child.load(std::memory_order_relaxed);
+            if (child) {
+                // Atomically update generation if it's outdated to avoid revisiting.
+                int expected = current_gen - 1;
+                //compare_exchange_strong<weak> logic: 
+                //if (child->generation == expected) child->generation = current_gen; else expected = child->generation; 
+                //weak form allows spurious failures and works faster in loops
+                if (child->generation.compare_exchange_strong(expected, current_gen, std::memory_order_relaxed)) {
+                    q.push(child); //only push to the queue those nodes (that are reachable) that we updated
                 }
             }
-            //lock.unlock();
         }
-        // Now iterate through the map and erase nodes with outdated generations.
-        // Also clean up allocated children arrays.
-        //std::unique_lock delete_lock(map_mutex);
-        for (auto it = search.tree.begin(); it != search.tree.end();) {
-          MCTSNode * node = it->second;
-          if (node->generation.load(std::memory_order_relaxed) < current_gen) {
-            // Clean up dynamically allocated children if any.
-            if (node->children != nullptr) {
-              total_children.fetch_sub(node->num_children, std::memory_order_relaxed);
-              delete[] node->children;
-            }
-            it = search.tree.erase(it);
-            delete node;
-          } else ++it;
+    }
+    // Now iterate through the map and erase nodes with outdated generations, i.e. nodes that are not reachable
+    // Also clean up allocated children arrays.
+    for (auto it = search.tree.begin(); it != search.tree.end();) {
+      MCTSNode * node = it->second;
+      if (node->generation.load(std::memory_order_relaxed) < current_gen) {
+        // Clean up dynamically allocated children if any.
+        struct Edge * children = node->children.load(std::memory_order_relaxed);
+        int num_children = node->num_children.load(std::memory_order_relaxed);
+        if (num_children > 0) {
+          total_children.fetch_sub(num_children, std::memory_order_relaxed); //update total_children count
+          delete[] children;
         }
-        //fprintf(stderr, "gc() debug: delete %d nodes\n", deleted_nodes);
-        //delete_lock.unlock();
-     // } else std::this_thread::sleep_for(std::chrono::milliseconds(1000)); //hash_full < 750
-    //} //end of while(!stopFlag.load(std::memory_order_relaxed) && !search_done.load(std::memory_order_relaxed) loop
-      size_t total_memory = search.tree.size() * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
-      size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
-      int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
-      if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
-      //fprintf(stderr, "gc() debug: hashfull %d\n", hashfull);
-      hash_full.store(hashfull, std::memory_order_relaxed);    
-      //fprintf(stderr, "gc() debug: hash_full %d\n", hash_full.load(std::memory_order_relaxed));
+        it = search.tree.erase(it);
+        delete node;
+      } else ++it;
+    }
+    //update hash_full
+    size_t total_memory = search.tree.size() * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+    size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
+    int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
+    if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
+    hash_full.store(hashfull, std::memory_order_relaxed);    
   }
   
   //no locking, call it before starting other threads (search, etc)
   void set_root() {
-    unsigned long long hash = board->zh->hash ^ board->zh->hash2;
-    auto it = search.tree.find(hash);
+    auto it = search.tree.find(board->zh->hash);
     struct MCTSNode * root = (it != search.tree.end()) ? it->second : nullptr;
     if (!root) {
-      //root = search.tree[hash];
       root = new MCTSNode();
-      search.tree.emplace(hash, root);
-      root->hash.store(hash, std::memory_order_relaxed);
-      root->generation.store(generation.load(std::memory_order_relaxed));
+      root->hash.store(board->zh->hash, std::memory_order_relaxed);
+      root->hash2.store(board->zh->hash2, std::memory_order_relaxed);
+      root->generation.store(generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      struct NNUEContext ctx;
+      init_nnue_context(&ctx);
+      //updateFen(board);
+      //generateMoves(board); //called in position_eval()
+      //double res = evaluate_nnue(board, NULL, &ctx);
+      std::unordered_set<unsigned long long> pos_history;
+      double res = position_eval(board, &ctx, pos_history);
+      free_nnue_context(&ctx);
+      root->cp.store(static_cast<int>(res * 100), std::memory_order_relaxed);
+      //we should probably update N and W as well. We're storing cp, the node is evaluated, meaning it's been visited
+      root->N.store(1, std::memory_order_relaxed);
+      root->W.store(tanh(res / eval_scale), std::memory_order_relaxed);      
+      search.tree.emplace(board->zh->hash, root);
+    } else {
+      if (root->hash2 != board->zh->hash2) {
+        updateFen(board);
+        log_file("set_root() error: Zobrist hash collision detected, hash %llu hash2 %llu fen %s\n", board->zh->hash, board->zh->hash2, board->fen->fenString);
+        exit(1);
+      }
     }
     search.root = root;    
   }
   
-  //Predictor + Upper Confidence Bound applied to Trees - used in select_best_child()
-  double puct_score(struct MCTSNode * parent, int idx) {
-      parent->mutex.lock_shared();
-      double P = parent->children[idx].P;
-      unsigned long long n = parent->children[idx].child->N.load(std::memory_order_relaxed);
-      double w = parent->children[idx].child->W.load(std::memory_order_relaxed);
-      parent->mutex.unlock_shared();
-      double Q = n ? w / n : 0.0;
-      return -Q + exploration_constant * P * sqrt((double)parent->N.load(std::memory_order_relaxed)) / (1.0 + n);
-  }
-  
-  char * idx_to_move(int move_idx, char * uci_move) {
-    if (!uci_move) {
-      log_file("idx_to_move() error: invalid arg - uci_move is NULL\n");
-      return NULL;
+  //called from expand_node() and do_move()
+  //returns new or existing node
+  struct MCTSNode * make_child(const unsigned long hash, const unsigned long hash2, const int cp) {
+    struct MCTSNode * child = nullptr;
+    //first, try to find child_hash in the tree
+    std::shared_lock search_lock(map_mutex);
+    auto it = search.tree.find(hash);
+    child = (it != search.tree.end()) ? it->second : nullptr;
+    search_lock.unlock();
+    if (child) {
+      if (child->hash2.load(std::memory_order_relaxed) != hash2) {
+        log_file("make_child() error: hash collision detected: hash %llu, hash2 %llu != hash2 %llu\n", hash, child->hash2.load(std::memory_order_relaxed), hash2);
+        exit(-1); //need to decide how to better handle it later (perhaps, use both hash and hash2 for indexing)
+      }
+      //int child_cp = child->cp.load(std::memory_order_relaxed);
+      //if (child_cp != cp) print("make_child() warning: child exists but its cp %d is not equal to recent cp %d. Child N %lld, W %f\n", child_cp, cp, child->N.load(std::memory_order_relaxed), child->W.load(std::memory_order_relaxed));
+    } else { //then, if the child_hash is not found, create a child
+      child = new MCTSNode();
+      child->hash.store(hash, std::memory_order_relaxed);
+      child->hash2.store(hash2, std::memory_order_relaxed);
+      child->generation.store(generation.load(std::memory_order_relaxed));
+      child->cp.store(cp, std::memory_order_relaxed);
+      //we should probably update N and W as well. We're updating cp, the node is evaluated, meaning it's been visited
+      if (cp != NO_MATE_SCORE) {
+        child->N.store(1, std::memory_order_relaxed);
+        child->W.store(tanh(cp * 0.01 / eval_scale), std::memory_order_relaxed);
+      }
+      std::unique_lock insert_lock(map_mutex);
+      auto [it, inserted] = search.tree.emplace(hash, child);
+      insert_lock.unlock();
+      if (!inserted) {
+        // Another thread inserted first; use the existing node and clean up ours.
+        delete child;
+        child = it->second; //it->second - is a pointer to the existing node (it->first is a hash)
+        // Verify no collision on the existing node.
+        if (child->hash2.load(std::memory_order_relaxed) != hash2) {
+          log_file("make_child() error: hash collision detected in insert: hash %llu, hash2 %llu != hash2 %llu\n", hash, child->hash2.load(std::memory_order_relaxed), hash2);
+          exit(-1); // Or handle as needed.
+        }
+      }
     }
-    memset(uci_move, 0, 6);
-    enum SquareName source_square = (enum SquareName)(move_idx >> 9);
-    enum SquareName destination_square = (enum SquareName)((move_idx >> 3) & 63);
-    int promo = (move_idx & 7) + 1; //need to add 1 because we encode promo as 0 - no promo, 1 - knight, 2 - bishop, 3 - rook and 4 - queen
-    strcat(uci_move, squareName[source_square]);
-    strcat(uci_move, squareName[destination_square]);
-    uci_move[4] = uciPromoLetter[promo];
-    return uci_move;
+    return child; //may not be nullptr
   }
- /* 
-  void expand_node(struct MCTSNode * parent, struct Board * chess_board, const std::vector<std::pair<double, int>>& top_moves) {//, std::mt19937 rng) {
-    if (parent->num_children.load(std::memory_order_relaxed) > 0) return;  // Already expanded      
+    
+  struct TempEdge {
+      int move = 0;
+      double P = 0.0; 
+      struct MCTSNode * child = nullptr;
+  };
+  //called from mcts_search() and process_check()
+  //calls make_child()
+  void expand_node(struct MCTSNode * parent, const std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& top_moves, const std::unordered_set<unsigned long long>& pos_history) {
+    //parent is locked for the expansion with unique_lock in caller - mcts_search() or process_check()
+    if (parent->num_children.load(std::memory_order_relaxed) > 0) return; //already expanded by other threads, perhaps
     int num_moves = top_moves.size();
-    total_children.fetch_add(num_moves, std::memory_order_relaxed);
-    //struct Edge * children = (struct Edge *)calloc(num_moves, sizeof(struct Edge));
+    assert(num_moves > 0);
     struct Edge * children = new Edge[num_moves];
     for (int i = 0; i < num_moves; ++i) {
-        struct Board * temp_board = cloneBoard(chess_board);
-        struct Move move;
-        init_move(&move, temp_board, top_moves[i].second >> 9, (top_moves[i].second >> 3) & 63, (top_moves[i].second & 7) + 1);
-        makeMove(&move);
-  			if (updateHash(temp_board, &move)) {
-  				log_file("expand_node() error: updateHash() returned non-zero value\n");
-  				exit(-1);
-  			}
-        unsigned long long hash = temp_board->zh->hash ^ temp_board->zh->hash2;
-        freeBoard(temp_board);
-        std::shared_lock search_lock(map_mutex);
-        auto it = search.tree.find(hash);
-        struct MCTSNode * child = (it != search.tree.end()) ? it->second : nullptr;
-        search_lock.unlock();
-        if (!child) {
-          child = new MCTSNode();
-          std::unique_lock insert_lock(map_mutex);
-          search.tree.emplace(hash, child);
-          insert_lock.unlock();
-          child->hash.store(hash, std::memory_order_relaxed);
-          //child->count.store(1, std::memory_order_relaxed);
-          child->generation.store(generation.load(std::memory_order_relaxed));
-        } else child->count.fetch_add(1, std::memory_order_relaxed);
-        children[i].child = child;
-        children[i].P = top_moves[i].first;  // Use noised priors for root
-        children[i].move = top_moves[i].second;
+        auto [prior, move_idx, child_hash, child_hash2, child_cp] = top_moves[i];
+        struct MCTSNode * child = make_child(child_hash, child_hash2, child_cp);
+        children[i].P.store(prior, std::memory_order_relaxed);
+        children[i].move.store(move_idx, std::memory_order_relaxed);
+        children[i].child.store(child, std::memory_order_relaxed);        
     }
-    parent->children = children;
-    parent->num_children.store(num_moves, std::memory_order_relaxed);
-  }*/
-  
-  void expand_node(struct MCTSNode * parent, const std::vector<std::tuple<double, int, unsigned long long, int>>& top_moves) {
-    if (parent->num_children.load(std::memory_order_relaxed) > 0) return;
-    int num_moves = top_moves.size();
-    std::vector<Edge> valid_children;
-    valid_children.reserve(num_moves);  // Optimistic reserve
-    for (int i = 0; i < num_moves; ++i) {
-        auto [prior, move_idx, child_hash, child_cp] = top_moves[i];
-        struct MCTSNode * child = nullptr;
-        int existing_count = 0;
-        {
-            std::shared_lock search_lock(map_mutex);
-            auto it = search.tree.find(child_hash);
-            child = (it != search.tree.end()) ? it->second : nullptr;
-            if (child) existing_count = child->count.load(std::memory_order_relaxed);
-            search_lock.unlock();
-        }
-        if (existing_count >= 1 && i < num_moves - 1 && child_cp > 100 && std::get<3>(top_moves[i + 1]) > 100) continue;
-        if (!child) {
-            child = new MCTSNode();
-            std::unique_lock insert_lock(map_mutex);
-            search.tree.emplace(child_hash, child);
-            insert_lock.unlock();
-            child->hash.store(child_hash, std::memory_order_relaxed);
-            child->generation.store(generation.load(std::memory_order_relaxed));
-            child->cp.store(child_cp, std::memory_order_relaxed);
-        } else child->count.fetch_add(1, std::memory_order_relaxed);
-        Edge e;
-        e.P = prior;
-        e.move = move_idx;
-        e.child = child;
-        valid_children.push_back(e);        
-    }
-    int actual_num = valid_children.size();
-    if (actual_num == 0) return;  // No valid moves; leave unexpanded
-    total_children.fetch_add(actual_num, std::memory_order_relaxed);
-    parent->children = new Edge[actual_num];
-    std::copy(valid_children.begin(), valid_children.end(), parent->children);
-    parent->num_children.store(actual_num, std::memory_order_relaxed);    
-}
+    total_children.fetch_add(num_moves, std::memory_order_relaxed); //update total_children counter
+    //below are two separate atomic operations: first - for the children pointer, second - for num_children
+    //we need to remember this when processing children in other threads!
+    //for instance, children might be a valid pointer but num_children might be 0!
+    //so checking for num_children > 0 means that children is not null, right?
+    parent->children.store(children, std::memory_order_release);
+    parent->num_children.store(num_moves, std::memory_order_release);    
+  }
   
   //no locking, call only when search threads finished
+  //called from select_best_moves(), which in turn is called from runMCTS()
   int most_visited_child(struct MCTSNode * parent) {
     unsigned long long N = 0;
     int idx = -1;
-    std::vector<std::pair<double, int>> children;
-    int num_children = parent->num_children.load(std::memory_order_relaxed);
-    for (int i = 0; i < num_children; i++) {
-      unsigned long long n = parent->children[i].child->N.load(std::memory_order_relaxed);
-      children.push_back({parent->children[i].P, i});
+    std::vector<std::pair<double, int>> priors; //prior, child index
+    int num_children = parent->num_children.load(std::memory_order_relaxed); // will be 0 for the last node
+    struct Edge * children = parent->children.load(std::memory_order_relaxed); // will be nullptr for the last node
+    for (int i = 0; i < num_children; i++) { //this loop will be skipped for the last node
+      struct MCTSNode * child = children[i].child.load(std::memory_order_relaxed);
+      unsigned long long n = child->N.load(std::memory_order_relaxed);
+      priors.push_back({children[i].P.load(std::memory_order_relaxed), i});
       if (n > N) {
         N = n;
         idx = i;
       } 
     }
-    //in case of unexpanded child, return idx of best prior
+    //in case of unexpanded child (node before last, last has no children), return idx of best prior and hence, the best scorecp
     if (idx == -1 && num_children > 0) {
-      std::sort(children.begin(), children.end(), std::greater<>());
-      idx = children[0].second;
+      std::sort(priors.begin(), priors.end(), [](const auto& a, const auto& b) { return a.first > b.first;});
+      return priors[0].second;
     }
-    return idx;
-  }
-
-  int select_best_children(int ** idx) {
-    std::vector<std::pair<unsigned long long, int>> children;
-    //std::lock_guard<std::mutex> lock(search.root->mutex); //perhaps, it is not needed here as root is only expanded once
-    int num_children = search.root->num_children.load(std::memory_order_relaxed);
-    
-    for (int i = 0; i < num_children; i++) {
-      search.root->mutex.lock_shared();
-      children.push_back({search.root->children[i].child->N.load(std::memory_order_relaxed), i});
-      search.root->mutex.unlock_shared();
-    }      
-    std::sort(children.begin(), children.end(), std::greater<>());
-    int multiPV = std::min<int>(num_children, (int)chessEngine.optionSpin[MultiPV].value);
-    if (multiPV > 0) {
-      *idx = (int *)calloc(multiPV, sizeof(int));
-      if (!*idx) {
-        log_file("select_best_children() error: calloc() failed for idx\n");
-        exit(-1);
-      }      
-    } else {
-      log_file("select_best_children() error: root node has 0 children\n");
-      exit(-1);      
-    }
-    for (int i = 0; i < multiPV; i++) {
-      (*idx)[i] = children[i].second;
-      //log_file("move_idx[%d] %d, pv[%d] %s\n", i, (*move_idx)[i], i, (*pv)[i]);
-    }
-    children.clear();
-    return multiPV;
+    return idx; //this will be negative for the last node
   }
 
   //no locking, call only when search threads finished
-  int select_best_moves(char *** pv, int ** move_idx) {
+  //called from runMCTS()
+  int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) { 
     char uci_move[6];
-    std::vector<std::pair<unsigned long long, int>> children;
+    std::vector<std::tuple<unsigned long long, int>> visits; //N, child_idx
     int num_children = search.root->num_children.load(std::memory_order_relaxed);
-    int multiPV = std::min<int>(num_children, (int)chessEngine.optionSpin[MultiPV].value);
-    if (num_children > 0) {
-      for (int i = 0; i < num_children; i++) {
-        children.push_back({search.root->children[i].child->N.load(std::memory_order_relaxed), i});
-      }
-      std::sort(children.begin(), children.end(), std::greater<>()); //sort children desc by the number of visits N
-    } else {
-      log_file("select_best_moves() error: root node has 0 children\n");
-      exit(-1);      
+    if (!num_children) return 0;
+    struct Edge * children = search.root->children.load(std::memory_order_relaxed);
+    for (int i = 0; i < num_children; i++) {
+      struct MCTSNode * child = children[i].child.load(std::memory_order_relaxed);
+      visits.push_back({child->N.load(std::memory_order_relaxed), i});
     }
+    std::sort(visits.begin(), visits.end(), std::greater()); //sort children desc by the number of visits N    
+    while (visits.size() > 1) {
+      int idx = std::get<1>(visits[0]); //index of the most visited child
+      int next_idx = std::get<1>(visits[1]); //index of the next most visited child
+      struct MCTSNode * child = children[idx].child.load(std::memory_order_relaxed);
+      struct MCTSNode * next_child = children[next_idx].child.load(std::memory_order_relaxed);
+      //NNUE static eval is not reliable for deciding whether the position is winning
+      //Let's try to use W instead. If it is positive, the position is winning 
+      int cp = -child->cp.load(std::memory_order_relaxed);
+      int next_cp = -next_child->cp.load(std::memory_order_relaxed);
+      //if (cp > 100 && next_cp > 100) { //check for repetition in winning position
+      double w = -child->W.load(std::memory_order_relaxed);
+      double next_w = -next_child->W.load(std::memory_order_relaxed);
+      if (w > 0 && next_w > 0) { //check for repetition in winning position
+        int global_count = position_history.count(child->hash.load(std::memory_order_relaxed));
+        if (global_count) {
+            int move = children[idx].move.load(std::memory_order_relaxed);
+            int promo = move & 7;
+            log_file("select_best_moves() debug: skipping move %s%s%c (would cause repetition in winning position %s, W %f, nextW %f, cp %d, nextCP %d)\n", squareName[move >> 9], squareName[(move >> 3) & 63], promo ? uciPromoLetter[promo] : ' ', board->fen->fenString, w, next_w, cp, next_cp);
+            visits.erase(visits.begin());
+            continue;
+        } else break;
+      } else break;
+    }
+    int num_visits = visits.size();
+    int multiPV = std::min<int>(num_visits, (int)chessEngine.optionSpin[MultiPV].value);
     int pvLength = chessEngine.optionSpin[PVPlies].value * sizeof(uci_move);
-    *pv = (char **)calloc(multiPV, sizeof(char *));
-    if (!*pv) {
-      log_file("select_best_moves() error: calloc() failed for pv\n");
-      exit(-1);
-    }
-    for (int i = 0; i < multiPV; i++) {
-      (*pv)[i] = (char *)calloc(1, pvLength);
-      if (!(*pv)[i]) {
-        log_file("select_best_moves() error: calloc() failed for pv[%d], pvLength %d\n", i, pvLength);
-        exit(-1);
-      }
-    }
-    *move_idx = (int *)calloc(multiPV, sizeof(int));
-    if (!*move_idx) {
-      log_file("select_best_moves() error: calloc() failed for move_idx, multiPV %d\n", multiPV);
-      exit(-1);
-    }
-
     int maxLen = pvLength - sizeof(uci_move);
-    struct Move move;
     for (int i = 0; i < multiPV; i++) {
-      int child_index = children[i].second;
-      struct MCTSNode * current_node = search.root;
-      (*move_idx)[i] = search.root->children[child_index].move;
-      idx_to_move((*move_idx)[i], uci_move);
-      strcat((*pv)[i], uci_move);
-      current_node = search.root->children[child_index].child;      
+      int index = std::get<1>(visits[i]);
+      idx_to_move(children[index].move.load(std::memory_order_relaxed), uci_move);
+      struct MCTSNode * child = children[index].child.load(std::memory_order_relaxed);      
+      int cp = -child->cp.load(std::memory_order_relaxed);
+      double parent_N = static_cast<double>(search.root->N.load(std::memory_order_relaxed));
+      double prior = children[index].P.load(std::memory_order_relaxed);
+      unsigned long long N = child->N.load(std::memory_order_relaxed);
+      double W = -child->W.load(std::memory_order_relaxed);
+      double Q = W / N;
+      double U = exploration_max * prior * sqrt(parent_N) / (1 + N);
+      std::string pv(uci_move);
+      std::string pv2(uci_move);
+      pv2 += " (" + std::to_string(N) + ", " + std::to_string(llround(W)) + ", " + std::to_string(cp) + ", " + std::to_string(Q) + " + " + std::to_string(U) + " = " + std::to_string(Q + U) + ")";
       // Build PV by following most visited children
-      int num_child = current_node->num_children.load(std::memory_order_relaxed);
-      while (current_node && num_child > 0 && strlen((*pv)[i]) < maxLen) {
-        int next_idx = most_visited_child(current_node);
-        if (next_idx < 0) break;
-        idx_to_move(current_node->children[next_idx].move, uci_move);
-        strcat((*pv)[i], " ");
-        strcat((*pv)[i], uci_move);
-        current_node = current_node->children[next_idx].child;
-        num_child = current_node->num_children.load(std::memory_order_relaxed);
+      num_children = child->num_children.load(std::memory_order_relaxed);
+      struct Edge * children2 = child->children.load(std::memory_order_relaxed);
+      int depth = 0;
+      while (num_children > 0 && pv.size() < maxLen) {
+        int idx = most_visited_child(child); 
+        if (idx < 0) break;
+        depth++;
+        parent_N = child->N.load(std::memory_order_relaxed);
+        prior = children2->P.load(std::memory_order_relaxed);
+        idx_to_move(children2[idx].move.load(std::memory_order_relaxed), uci_move);
+        pv += ' ';
+        pv.append(uci_move);  
+        pv2 += ' ';
+        pv2.append(uci_move);   
+        child = children2[idx].child.load(std::memory_order_relaxed);
+        cp = -child->cp.load(std::memory_order_relaxed);
+        N = child->N.load(std::memory_order_relaxed);
+        W = -child->W.load(std::memory_order_relaxed);
+        Q = W / N;
+        U = std::max(exploration_min, exploration_max - (depth * exploration_depth_decay)) * exploration_max * prior * sqrt(parent_N) / (1 + N);
+        pv2 += " (" + std::to_string(N) + ", " + std::to_string(llround(W)) + ", " + std::to_string(cp) + ", " + std::to_string(Q) + " + " + std::to_string(U) + " = " + std::to_string(Q + U) + ")";
+        children2 = child->children.load(std::memory_order_relaxed);
+        num_children = child->num_children.load(std::memory_order_relaxed);
       }
+      pvs.push_back({cp, pv});
+      log_file("select_best_moves() debug: PV[%d] %s\n", i, pv2.c_str());
+      //std::sort(pvs.begin(), pvs.end(), std::greater<>()); //this is incorrect because short pv have less accurate score
     }
-    children.clear();
     return multiPV;
   }
   
-  int select_best_child(struct MCTSNode * parent) {
+  //called from mcts_search() in selection phase
+  //returns child index with the best PUCT value  
+  int select_best_child(struct MCTSNode * parent, int depth) {
+    // 1. Dynamic Exploration Constant - linear decay with depth
+    // setting exploration_depth_decay to 0 will make exploration constant static = exploration_max
+    // Decay: Start at exploration_constant, then for example drop by 0.05 - 0.1 per ply, floor at 0.25 - all tunable
+    double C = std::max(exploration_min, exploration_max - (depth * exploration_depth_decay));
+    //or square root decay with depth
+    //double C = std::max(exploration_min, exploration_max - (sqrt(static_cast<double>(depth)) * exploration_depth_decay));
+    
+    // OPTIONAL: Bonus for Root Node (Depth 0) to ensure wide scanning
+    //if (depth == 0) C = 2.0;
+        
+    int num_children = parent->num_children.load(std::memory_order_acquire);
+    struct Edge * children = parent->children.load(std::memory_order_acquire);
+    
     double best_score = -INFINITY;
-    double score;
     int selected = -1;
-    //parent->mutex.lock();  // Lock parent for read consistency (optional, but safe)
-    int num_children = parent->num_children.load(std::memory_order_relaxed);
-    //parent->mutex.unlock();
     for (int i = 0; i < num_children; i++) {
-      score = puct_score(parent, i);
+      parent->mutex.lock_shared();
+      double P = children[i].P.load(std::memory_order_relaxed);
+      struct MCTSNode * child = children[i].child.load(std::memory_order_acquire);
+      parent->mutex.unlock_shared();
+      unsigned long long N = child->N.load(std::memory_order_relaxed);
+      double W = -child->W.load(std::memory_order_relaxed); //parent perspective
+      double Q = N ? W / N : 0.0;
+      double score = Q + C * P * sqrt(static_cast<double>(parent->N.load(std::memory_order_acquire))) / (1.0 + N);
       if (score > best_score) {
         best_score = score;
         selected = i;
       }
     }
-    // Apply virtual loss to selected child
+    // Apply virtual loss to selected child to avoid contention among threads for the same node
+    children = parent->children.load(std::memory_order_acquire);
     parent->mutex.lock_shared();
-    parent->children[selected].child->N.fetch_add(1, std::memory_order_relaxed);
-    parent->children[selected].child->W.fetch_sub(virtual_loss, std::memory_order_relaxed);
+    struct MCTSNode * child = children[selected].child.load(std::memory_order_acquire);
     parent->mutex.unlock_shared();
+    child->N.fetch_add(1, std::memory_order_release);
+    child->W.fetch_sub(virtual_loss, std::memory_order_release);
     return selected;
   }
 
-int get_prob(std::vector<std::tuple<double, int, unsigned long long, int>>& move_evals) {
-    size_t n = move_evals.size();
-    if (n == 0) return 0;
-
-    // Loop 1: Find max for stability
-    double max_val = -std::numeric_limits<double>::infinity();
-    for (const auto& ev : move_evals) {
-        if (std::get<0>(ev) > max_val) max_val = std::get<0>(ev);
-    }
-
-    // Loop 2: Compute total sum of exp(shifted)
-    double total = 0.0;
-    for (const auto& ev : move_evals) {
-        total += std::exp((std::get<0>(ev) - max_val)/temperature);
-    }
-
-    if (total == 0.0) {  // Rare case: all -inf or underflow
-        double uniform = 1.0 / n;
-        for (auto& ev : move_evals) std::get<0>(ev) = uniform;
-        return static_cast<int>(n);
-    }
-
-    // Loop 3: Normalize to probs, accumulate cum_mass
-    double cum_mass = 0.0;
-    int effective = 0;
-    for (auto& ev : move_evals) {
-        std::get<0>(ev) = std::exp((std::get<0>(ev) - max_val)/temperature) / total;
-        cum_mass += std::get<0>(ev);
-        ++effective;
-        if (cum_mass >= probability_mass) break;
-    }
-    return effective;
-}
-  
-  //return the eval result from the perspective of chess_board->fen->sideToMove
-  double process_check(struct Board * chess_board, struct Move * move, struct NNUEContext * ctx, std::mt19937 rng) {
-    struct Board * temp_board;
-    if (move) {
-      temp_board = cloneBoard(chess_board);
-      move->chessBoard = temp_board;
-      makeMove(move); //to preserve the perspective, negate the result of eval!
-    } else temp_board = chess_board;
-    double best_value = -INFINITY;
-    if (!temp_board->isMate) {
-    	enum PieceName side = (enum PieceName)((temp_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
-    	unsigned long long any = temp_board->occupations[side]; 
-    	struct Move m;
-    	std::uniform_real_distribution<double> uniform(-noise, noise);
-    	while (any) {
-    	  int src = lsBit(any);
-    	  unsigned long long moves = temp_board->sideToMoveMoves[src];
-    	  while (moves) {
-      	  int dst = lsBit(moves);
-          init_move(&m, temp_board, src, dst, Queen);
-          double res = evaluate_nnue(temp_board, &m, ctx);
-          res += res * uniform(rng);
-          if (res > best_value) best_value = res;
-    		  moves &= moves - 1;
-    		}
-        any &= any - 1;
+  int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass) {
+      size_t n = move_evals.size();
+      if (n == 0) return 0;
+      // Loop 1: Find max for stability
+      double max_val = -std::numeric_limits<double>::infinity();
+      for (const auto& ev : move_evals) {
+          if (std::get<0>(ev) > max_val) max_val = std::get<0>(ev);
       }
-    } else best_value = -0.01 * MATE_SCORE;
-    if (move) {
-      move->chessBoard = chess_board;
-      freeBoard(temp_board);
-      best_value = -best_value; //negate the result of nnue eval to preserve the perspective - move was made!
-    }
-    return best_value;
+      // Loop 2: Compute total sum of exp(shifted)
+      double total = 0.0;
+      for (const auto& ev : move_evals) {
+          total += std::exp((std::get<0>(ev) - max_val)/temperature);
+      }
+      if (total == 0.0) {  // Rare case: all -inf or underflow
+          double uniform = 1.0 / n;
+          for (auto& ev : move_evals) std::get<0>(ev) = uniform;
+          return static_cast<int>(n);
+      }
+      // Loop 3: Normalize to probs, accumulate cum_mass
+      double cum_mass = 0.0;
+      int effective = 0;
+      for (auto& ev : move_evals) {
+          std::get<0>(ev) = std::exp((std::get<0>(ev) - max_val)/temperature) / total;
+          cum_mass += std::get<0>(ev);
+          ++effective;
+          if (cum_mass >= prob_mass) break;
+      }
+      return effective;
   }
-  //returns eval result in pawns
-  double doMove(struct Board * chessBoard, int src, int dst, int promo, const int scorecp, struct NNUEContext * ctx, std::mt19937 rng, unsigned long long& child_hash, std::unordered_map<unsigned long long, int>& pos_history) {
-    double res;
-    struct Move move;
-    struct Board * tmp_board = cloneBoard(chessBoard);
-    init_move(&move, tmp_board, src, dst, promo);
-    makeMove(&move);
-    if (updateHash(tmp_board, &move)) {
-      log_file("mcts_search() error: updateHash() returned non-zero value\n");
-      exit(-1);
-    }
-    child_hash = tmp_board->zh->hash ^ tmp_board->zh->hash2;
-    bool repetition3x = false;
-    if (position_history.count(child_hash) + pos_history.count(child_hash) >= 2) repetition3x = true;
-  	int pieceCount = bitCount(tmp_board->occupations[PieceNameAny]);
-  	if (pieceCount > TB_LARGEST || tmp_board->fen->halfmoveClock || tmp_board->fen->castlingRights) {
-      //evaluate_nnue() returns result in pawns (not centipawns!)
-      //we made the move above, so the eval res is from the perspective of sim_board->opponentColor or tmp_board->fen->sideToMove
-      //and must be negated to preserve the perspective of sim_board->fen->sideToMove
-      if (tmp_board->isMate) res = MATE_SCORE * 0.01; //sim_board->fen->sideToMove wins
-      else if (tmp_board->isStaleMate || repetition3x) {
-        res = -evaluate_nnue(tmp_board, NULL, ctx);
-        if (scorecp > 200 && res > 2.0) res = -2.0; //discourage stale mate or repetition in winning position
-        else if (scorecp < -200 && res < -2.0) res = 2.0; //encourage stalemate or repetition in losing position
-        else res = 0.0;
+
+  //called from do_move() and run_MCTS()
+  //calls compute_move_evals(), make_child() and expand_node()
+  //returns the result in pawns from the temp_board->fen->sideToMove perspective
+  double process_check(struct Board * temp_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history) {
+    struct MCTSNode * node = make_child(temp_board->zh->hash, temp_board->zh->hash2, NO_MATE_SCORE);
+    int stored_cp = node->cp.load(std::memory_order_relaxed);
+    if (stored_cp == NO_MATE_SCORE) { //make_child() returned new node without a parent, let's update its cp and expand it
+      //we will link this node to the parent during a call expand_node() made later from mcts_search() 
+      std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>> move_evals; 
+      //use 1.0 for probability mass to try all moves - when in check, there shouldn't be too many moves
+      compute_move_evals(temp_board, ctx, pos_history, move_evals, 1.0); 
+      int cp = -std::get<4>(move_evals[0]); //select the best cp for check evasion, may not be the best one though
+                                            //for example, capture moves would always have high priors
+      node->cp.store(cp, std::memory_order_relaxed);
+      node->N.store(1, std::memory_order_relaxed);
+      node->W.store(tanh(cp * 0.01 / eval_scale), std::memory_order_relaxed);
+      if (node->mutex.try_lock()) { //this should always return true because the node is new
+        expand_node(node, move_evals, pos_history); //preserve move_evals in the tree to avoid costly repeat of evaluate_nnue()
+        node->mutex.unlock();
       }
-      else if (tmp_board->isCheck) res = -process_check(tmp_board, NULL, ctx, rng);
-      else res = -evaluate_nnue(tmp_board, NULL, ctx);
+      return cp * 0.01;
+    } else return -stored_cp * 0.01;
+  }
+  
+  //called from do_move() and set_root()
+  //calls evaluate_nnue() and process_check()
+  //returns position evaluation in pawns from chess_board->fen->sideToMove perspective
+  double position_eval(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history) {
+    double res;
+  	const int pieceCount = bitCount(chess_board->occupations[PieceNameAny]);
+  	if (pieceCount > TB_LARGEST || chess_board->fen->halfmoveClock || chess_board->fen->castlingRights) {
+      //evaluate_nnue() returns result in pawns (not centipawns!)
+      //we made the move above, so the eval res is from the perspective of opponent color or chess_board->fen->sideToMove
+      //and must be negated to preserve the perspective of sim_board->fen->sideToMove
+      generateMoves(chess_board);
+      if (chess_board->isMate) res = -MATE_SCORE * 0.01; //chess_board->fen->sideToMove wins
+      else if (chess_board->isStaleMate) {
+        res = 0.0;
+      } else if (chess_board->isCheck) {
+        res = process_check(chess_board, ctx, pos_history);
+      } else {
+        updateFen(chess_board);
+        res = evaluate_nnue(chess_board, NULL, ctx);
+      }
     } else { //pieceCount <= TB_LARGEST, etc
-      unsigned int ep = lsBit(tmp_board->fen->enPassantLegalBit);
-      unsigned int wdl = tb_probe_wdl(tmp_board->occupations[PieceNameWhite], tmp_board->occupations[PieceNameBlack], tmp_board->occupations[WhiteKing] | tmp_board->occupations[BlackKing],
-        tmp_board->occupations[WhiteQueen] | tmp_board->occupations[BlackQueen], tmp_board->occupations[WhiteRook] | tmp_board->occupations[BlackRook], tmp_board->occupations[WhiteBishop] | tmp_board->occupations[BlackBishop], tmp_board->occupations[WhiteKnight] | tmp_board->occupations[BlackKnight], tmp_board->occupations[WhitePawn] | tmp_board->occupations[BlackPawn],
-        0, 0, ep == 64 ? 0 : ep, tmp_board->opponentColor == ColorBlack ? 1 : 0);
+      const unsigned int ep = lsBit(chess_board->fen->enPassantLegalBit);
+      const unsigned int wdl = tb_probe_wdl(chess_board->occupations[PieceNameWhite], chess_board->occupations[PieceNameBlack], chess_board->occupations[WhiteKing] | chess_board->occupations[BlackKing],
+        chess_board->occupations[WhiteQueen] | chess_board->occupations[BlackQueen], chess_board->occupations[WhiteRook] | chess_board->occupations[BlackRook], chess_board->occupations[WhiteBishop] | chess_board->occupations[BlackBishop], chess_board->occupations[WhiteKnight] | chess_board->occupations[BlackKnight], chess_board->occupations[WhitePawn] | chess_board->occupations[BlackPawn],
+        0, 0, ep == 64 ? 0 : ep, OPP_COLOR(chess_board->fen->sideToMove) == ColorBlack ? 1 : 0);
       if (wdl == TB_RESULT_FAILED) {
-        log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, fen %s, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, pieceCount, tmp_board->fen->fenString, ep, tmp_board->fen->halfmoveClock, tmp_board->opponentColor == ColorBlack ? 1 : 0, tmp_board->occupations[PieceNameWhite], tmp_board->occupations[PieceNameBlack], tmp_board->occupations[WhiteKing] | tmp_board->occupations[BlackKing], tmp_board->occupations[WhiteQueen] | tmp_board->occupations[BlackQueen], tmp_board->occupations[WhiteRook] | tmp_board->occupations[BlackRook], tmp_board->occupations[WhiteBishop] | tmp_board->occupations[BlackBishop], tmp_board->occupations[WhiteKnight] | tmp_board->occupations[BlackKnight], tmp_board->occupations[WhitePawn] | tmp_board->occupations[BlackPawn], strerror(errno));
-        if (tmp_board->isMate) res = MATE_SCORE * 0.01;
-        else if (tmp_board->isStaleMate || repetition3x) {
-          res = -evaluate_nnue(tmp_board, NULL, ctx);
-          if (scorecp > 200 && res > 2.0) res = -2.0; //discourage stale mate in winning position
-          else if (scorecp < -200 && res < -2.0) res = 2.0; //encourage stalemate in non-winning position
-          else res = 0.0; 
-        } else if (tmp_board->isCheck) res = -process_check(tmp_board, NULL, ctx, rng);
-        else res = -evaluate_nnue(tmp_board, NULL, ctx);
+        log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, pieceCount, ep, chess_board->fen->halfmoveClock, OPP_COLOR(chess_board->fen->sideToMove) == ColorBlack ? 1 : 0, chess_board->occupations[PieceNameWhite], chess_board->occupations[PieceNameBlack], chess_board->occupations[WhiteKing] | chess_board->occupations[BlackKing], chess_board->occupations[WhiteQueen] | chess_board->occupations[BlackQueen], chess_board->occupations[WhiteRook] | chess_board->occupations[BlackRook], chess_board->occupations[WhiteBishop] | chess_board->occupations[BlackBishop], chess_board->occupations[WhiteKnight] | chess_board->occupations[BlackKnight], chess_board->occupations[WhitePawn] | chess_board->occupations[BlackPawn], strerror(errno));
+        generateMoves(chess_board);
+        if (chess_board->isMate) res = -MATE_SCORE * 0.01;
+        else if (chess_board->isStaleMate) {
+          res = 0.0; 
+        } else if (chess_board->isCheck) {
+          res = process_check(chess_board, ctx, pos_history);
+        } else {
+          updateFen(chess_board);
+          res = evaluate_nnue(chess_board, NULL, ctx);
+        }
       } else { //tb_probe_wdl() succeeded
         //0 - loss, 4 - win, 1..3 - draw
-        if (wdl == 4) res = -MATE_SCORE * 0.001; //tmp_board->fen->sideToMove wins, sim_board->fen->sideToMove loses
-        else if (wdl == 0) res = MATE_SCORE * 0.001;
+        if (wdl == 4) res = MATE_SCORE * 0.001; //chess_board->fen->sideToMove wins, sim_board->fen->sideToMove loses
+        else if (wdl == 0) res = -MATE_SCORE * 0.001;
         else res = 0.0;
         tbhits.fetch_add(1, std::memory_order_relaxed);
       }
     } //end of else (pieceCount <= TB_LARGEST)
-    freeBoard(tmp_board);
     return res;
   }
+  
+  //called from compute_move_evals()
+  //calls process_check() and evaluate_nnue()
+  //returns eval result in pawns from the perspective of chess_board->fen->sideToMove
+  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, unsigned long long& child_hash2, const std::unordered_set<unsigned long long>& pos_history) {
+    struct Board * tmp_board = cloneBoard(chess_board);
+    struct Move move;
+    //init_move(&move, tmp_board, src, dst, promo);
+    //make_move(&move);
+    ff_move(tmp_board, &move, src, dst, promo);
+    updateHash(tmp_board, &move);
+    child_hash = tmp_board->zh->hash;
+    child_hash2 = tmp_board->zh->hash2;
+    if (pos_history.count(tmp_board->zh->hash) > 0) {
+        // This specific move causes a repetition relative to the current search path.
+        // Return a draw score immediately.
+        freeBoard(tmp_board);
+        return 0.0; 
+    }
+    double res = position_eval(tmp_board, ctx, pos_history);        
+    freeBoard(tmp_board);    
+    return -res;
+  }
 
+  //called from mcts_search() and process_check()
+  //calls do_move()
+  //computes and returns move_evals tuple given chess_board, prob_mass and pos_history
+  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history, std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass) {
+        int src, dst;
+        double res;
+        //std::uniform_real_distribution<double> uniform(-noise, noise);
+      	int side = PC(chess_board->fen->sideToMove, PieceTypeAny);//either PieceNameWhite or PieceNameBlack
+      	unsigned long long any = chess_board->occupations[side]; 
+      	while (any) { //loop for all pieces of the side to move
+      	  src = lsBit(any);
+      	  unsigned long long moves = chess_board->movesFromSquares[src];
+      	  while (moves) { //loop for all piece moves
+      	    dst = lsBit(moves);
+      	    unsigned long long child_hash = 0, child_hash2 = 0;
+          	int startPiece = PieceTypeNone, endPiece = PieceTypeNone;
+          	if (promoMove(chess_board, src, dst)) {
+          	  startPiece = Knight;
+          	  endPiece = Queen;
+          	}
+        	  for (int pt = startPiece; pt <= endPiece; pt++) { //loop over promotions if any, Pawn means no promo
+        	    res = do_move(chess_board, src, dst, pt, ctx, child_hash, child_hash2, pos_history);
+              //res += res * uniform(rng);
+              move_evals.push_back({res, (src << 9) | (dst << 3) | pt, child_hash, child_hash2, static_cast<int>(-res * 100)});
+        	  }
+            moves &= moves - 1;
+          }
+          any &= any - 1;
+        }
+        // Sort by res descending
+        std::sort(move_evals.begin(), move_evals.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b);});
+        int effective_branching = get_prob(move_evals, prob_mass);
+        move_evals.resize(effective_branching);
+  }
+      
 /*
 Overview of the MCTS Logic
 
@@ -592,153 +626,95 @@ MCTS implementation follows the four core phases:
     Backpropagation: Update visit counts (N) and total value (W) from the leaf back to the root, alternating the sign of the result to reflect perspective changes.
 */
 
+  //called from thread_search()
+  //calls compute_move_evals() and expand_node()
   void mcts_search(ThreadParams * params, struct NNUEContext * ctx) {
-    char uci_move[6];
-    struct Move move;
     std::vector<struct MCTSNode *> path;  // Track the path from root to leaf
     path.reserve(chessEngine.depth);
-    bool repetition3x = false;
-    params->currentDepth = 0;
+    bool repetition = false;
+    params->seldepth = 0;
     struct MCTSNode * node = search.root;
-    //start from the same initial position given by board (at the root node, i.e. at the top of the tree)
+    //start from the same initial position given by board (at the root node, i.e. at the top of the tree - the up side down tree)
     //clone the board to preserve it for subsequent iterations
     struct Board * sim_board = cloneBoard(board);
     // Selection
     //iterate down the tree updating sim_board by initiating and making moves
-    std::unordered_map<unsigned long long, int> pos_history;
-    while (node && node->num_children.load(std::memory_order_relaxed) > 0 && !sim_board->isStaleMate && !sim_board->isMate) { //traversal stops at a leaf or terminal node or at 3x repetition
-      //unsigned long long hash = sim_board->zh->hash ^ sim_board->zh->hash2;
-      unsigned long long hash = node->hash.load(std::memory_order_relaxed);
-      if (position_history.count(hash) + pos_history.count(hash) >= 2) { //we need to count repetitions that have already occured + simulated ones
-          repetition3x = true;
-          break;
-      }
-      pos_history[hash]++;
-      //return child node with the best score using PUCT (Predictor + Upper Confidence Bound)
-      //log_file("mcts_search(%d) calling select_best_child()...\n", params->thread_id);
-      int idx = select_best_child(node);
-      //log_file("mcts_search(%d) returned from select_best_child()...\n", params->thread_id);
-      if (idx < 0) {
-        log_file("mcts_search() error: select_best_child() returned negative index\n");
-        exit(-1);
-      }
-      //log_file("select_best_child() debug: selected move is %s%s, fen %s\n", squareName[node->children[idx].move / 64], squareName[node->children[idx].move % 64], sim_board->fen->fenString);
-      //init edge's move that leads to the child node
-      node->mutex.lock_shared();
-      int move_idx = node->children[idx].move;
-      node->mutex.unlock_shared();
-  		init_move(&move, sim_board, move_idx >> 9, (move_idx >> 3) & 63, (move_idx & 7) + 1);
-      //make the move
-      makeMove(&move); //this updates sim_board
-      //update Zobrist hash (it is needed so that we can call updateHash later instead of getHash)
-			if (updateHash(sim_board, &move)) {
-				log_file("mcts_search() error: updateHash() returned non-zero value\n");
-				exit(-1);
-			}
-      //continue iterating down the tree until no more children or the end of the game is reached
-      path.push_back(node);  // Add node to path
+    //thread-local map to prevent repetition cycles - it should be global I think but thread-safety may be a problem
+    std::unordered_set<unsigned long long> pos_history;
+    int idx = -1;
+    struct Edge * children = nullptr;
+    while (node->num_children.load(std::memory_order_relaxed) > 0) { //traversal stops at a leaf or at 3x repetition (mate or stalemate node should not have children)
+      //return child node index with the best score using PUCT (Predictor + Upper Confidence Bound)
+      //it also adds virtual loss to the node to reduce contention for the same node in multi-threaded engine
+      idx = select_best_child(node, params->seldepth);
+      assert(idx >= 0);
+      children = node->children.load(std::memory_order_acquire);
       std::shared_lock lock(node->mutex);
-      node = node->children[idx].child;
+      int move_idx = children[idx].move.load(std::memory_order_relaxed);
+      path.push_back(node);  // Add parent node to path (the move is made, so the node is a parent one)
+      //continue iterating down the tree by getting next node until no more children
+      node = children[idx].child.load(std::memory_order_acquire);
       lock.unlock();
-      params->currentDepth++;
-    } //end of while(node && node->num_children > 0 && !sim_board->isStaleMate && !sim_board->isMate) loop
-    //pos_history.clear(); //this should be done after expansion
-    path.push_back(node);  // Add leaf to path - sim_board and result correspond to this node!
-
+      //init and take edge's move that leads to the child node
+      struct Move move;
+  		//init_move(&move, sim_board, move_idx >> 9, (move_idx >> 3) & 63, move_idx & 7);
+      //make_move(&move); //this updates sim_board
+      ff_move(sim_board, &move, move_idx >> 9, (move_idx >> 3) & 63, move_idx & 7);
+      //update Zobrist hash (it is needed so that we can call updateHash() later instead of getHash())
+			updateHash(sim_board, &move);
+      params->seldepth++;
+      int global_count = position_history.count(sim_board->zh->hash); //actual positions that have occured in the game
+      int path_count = pos_history.count(sim_board->zh->hash); //simulated positions ahead of the current one
+      if (path_count == 0) pos_history.insert(sim_board->zh->hash);
+      repetition = (global_count + path_count >= 1); 
+      if (repetition) break;
+    } //end of while(node->num_children > 0) loop
+    path.push_back(node);  // Add leaf to path - sim_board corresponds to this node!
     //Here we are at the bottom of the tree, i.e. at a leaf or at the terminal node (mate, stalemate)
-    // Evaluation - evaluate a leaf, i.e. a node without children, then we expand it - add children, which will be evaluated at the subsequent iterations - seems like redundant because the node is already evaluated during expansion!
-    double result;
-    int scorecp = node->cp.load(std::memory_order_relaxed); //cp is stored during expansion
-    //log_file("mcts_search() debug: scorecp %d\n", scorecp);
-    if (scorecp == NO_MATE_SCORE) {
-      if (sim_board->isCheck) {
-          result = NNUE_CHECK; //NNUE cannot evaluate when in check - it will be resolved in expansion
-      } else if (sim_board->isMate) { //sim_board->fen->sideToMove is mated
-        result = -1.0;
-        scorecp = -MATE_SCORE;
-        node->cp.store(scorecp);
-  			//log_file("mcts_search() debug: checkmate for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
-      } else if (sim_board->isStaleMate || repetition3x) {
-        result = evaluate_nnue(sim_board, NULL, ctx);
-        scorecp = static_cast<int>(result * 100);
-        node->cp.store(scorecp, std::memory_order_relaxed);
-        if (result > 2.0) result = tanh(-1.5 / eval_scale); //try to discourage stalemate or 3x repetition if winning
-        else if (result < -2.0) result = tanh(1.5 / eval_scale); //and encourage it if losing
-        else result = 0.0;
-  			//log_file("mcts_search() debug: stalemate or 3x repetition for %s, fen %s\n", color[sim_board->fen->sideToMove], sim_board->fen->fenString);
-      } else {
-        //evaluate_nnue() returns result in pawns (not centipawns!) from sim_board->fen->sideToMove perspective
-        result = evaluate_nnue(sim_board, NULL, ctx);
-        scorecp = static_cast<int>(result * 100);
-        node->cp.store(scorecp, std::memory_order_relaxed);
-  			//log_file("mcts_search() debug: evaluate_nnue result %f, fen %s\n", result, sim_board->fen->fenString);
-        result = tanh(result / eval_scale);
-      }
-    } else result = tanh(scorecp * 0.01 / eval_scale);
-    //log_file("mcts_search() debug: result %f\n", result);
-    // Expansion - add more children - increase the depth of the tree down using the model's predictions, NNUE evals or randomly
-    if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000) {
-      if (node->mutex.try_lock()) {
-        int src, dst, effective_branching = 1;
-        double res;
-      	std::vector<std::tuple<double, int, unsigned long long, int>> move_evals; //res, move_idx, hash
-      	enum PieceName side = (enum PieceName)((sim_board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
-      	unsigned long long any = sim_board->occupations[side]; 
-        std::uniform_real_distribution<double> uniform(-noise, noise);
-      	while (any) {
-      	  src = lsBit(any);
-      	  unsigned long long moves = sim_board->sideToMoveMoves[src];
-      	  while (moves) {
-      	    dst = lsBit(moves);
-      	    unsigned long long child_hash;
-          	if (promoMove(sim_board, src, dst)) {
-          	  for (int pt = Knight; pt <= Queen; pt++) {
-          	    res = doMove(sim_board, src, dst, pt, scorecp, ctx, params->rng, child_hash, pos_history);
-                res += res * uniform(params->rng);
-                move_evals.push_back({res, (src << 9) | (dst << 3) | (pt - 1), child_hash, static_cast<int>(-res * 100)});
-          	  }
-          	} else {
-          	  res = doMove(sim_board, src, dst, PieceTypeNone, scorecp, ctx, params->rng, child_hash, pos_history);          	  
-              res += res * uniform(params->rng);
-              move_evals.push_back({res, (src << 9) | (dst << 3), child_hash, static_cast<int>(-res * 100)});
-            }
-            moves &= moves - 1;
-          }
-          any &= any - 1;
-        }
-        pos_history.clear();
-        // Sort by res descending (use lambda for tuple)
-        std::sort(move_evals.begin(), move_evals.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b);});
-        if (result == NNUE_CHECK) {
-          if (scorecp == NO_MATE_SCORE) {
-            scorecp = static_cast<int>(std::get<0>(move_evals[0]) * 100);
-            node->cp.store(scorecp, std::memory_order_relaxed);
-          }
-          result = tanh(std::get<0>(move_evals[0]) / eval_scale);
-        }
-        effective_branching = get_prob(move_evals);
-        move_evals.resize(effective_branching);  // Slice to top effective
-        expand_node(node, move_evals);
-        node->mutex.unlock();
-        move_evals.clear();
-      }
-    } //end of if (params->currentDepth < chessEngine.depth && !sim_board->isMate && !sim_board->isStaleMate && node->mutex.try_lock() && hash_full.load(std::memory_order_relaxed) < 1000) 
-    // Backpropagation: update node visits and results
+    // Evaluation - the node is already evaluated during previous expansion!
+    // We could actually improve the eval by using move_evals calculated later in the code for the children nodes before expansion for evaluating its parent (this node), kind of look ahead eval
+    int scorecp = 0;
+    double result = 0.0;
+    if (!repetition) {
+      scorecp = node->cp.load(std::memory_order_relaxed);
+      result = tanh(scorecp * 0.01 / eval_scale);
+    }
+    // Expansion - add more children - increase the depth of the tree using the model's predictions, NNUE evals or randomly
+    // in theory, if children evaluation is noticably different from its parent, 
+    // then we need to continue selectively expanding until position is quiet
+    // otherwise, this difference gets propagated to the root and may affect selection, leading to suboptimal play
+    if (node->mutex.try_lock()) { //the leaf node in a tree is locked only for expansion
+                                  //nodes locked in selection phase are not leaf nodes, i.e. nodes without children
+                                  //if leaf node is already locked, it means that other thread is expanding it already
+      generateMoves(sim_board); //needed for checks such as isMate or isStaleMate as well as compute_move_evals()
+      if (!sim_board->isMate && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000) {
+        	std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>> move_evals; //res, move_idx, hash, hash2, cp (res is converted to probabilities in get_prob(), hence we need to preserve it in cp)
+          compute_move_evals(sim_board, ctx, pos_history, move_evals, probability_mass);
+          //updating node's cp with improve evaluation 
+          scorecp = -std::get<4>(move_evals[0]);
+          result = tanh(scorecp * 0.01 / eval_scale);
+          node->cp.store(scorecp, std::memory_order_relaxed); //look-ahead update
+          //before expanding, it would be nice to insure that position is quiet for correct cp, i.e. evals are correct!
+          //we could try to iteratively play moves that are different in evals from scorecp by at least 1 pawn
+          expand_node(node, move_evals, pos_history);
+      } //end of if (!sim_board->isMate && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000)
+      node->mutex.unlock();
+    } //if node->mutex.try_lock() 
+    // Backpropagation: update node visits and results only if this thread expanded it to avoid inflating N and W
     for (auto n = path.rbegin(); n != path.rend(); ++n) {
       node = *n;
       node->N.fetch_add(1, std::memory_order_relaxed);
       node->W.fetch_add(result, std::memory_order_relaxed);
       result = -result;
     }
-    // Revert virtual loss for the selected path (skip root, as no loss was applied to it)
+    // Revert virtual loss for the selected path (skip root, as no loss was applied to it) regardless of expansion
+    // because virtual loss was applied in select_best_child() which is called in the selection phase
     for (size_t j = 1; j < path.size(); ++j) {  // From first child to leaf
       struct MCTSNode * nd = path[j];
       nd->N.fetch_sub(1, std::memory_order_relaxed);
       nd->W.fetch_add(virtual_loss, std::memory_order_relaxed);
     }      
-    path.clear();
     freeBoard(sim_board);
-    if (params->currentDepth > params->seldepth) params->seldepth = params->currentDepth;   
   }
     
   void thread_search(ThreadParams * params) {
@@ -746,55 +722,65 @@ MCTS implementation follows the four core phases:
     init_nnue_context(&ctx);
     auto iter_start = std::chrono::steady_clock::now();
     double elapsed = 0.0;
-    int depth = 0;
-    params->currentNodes = 0;
-    while (elapsed < (params->time_alloc * 0.001) && !stopFlag.load(std::memory_order_relaxed) && hash_full.load(std::memory_order_relaxed) < 1000) {
-        mcts_search(params, &ctx);
-        
-        // Update depth
-        int expected = engineDepth.currentDepth.load(std::memory_order_relaxed);
-        while (params->currentDepth > expected && !engineDepth.currentDepth.compare_exchange_strong(expected, params->currentDepth, std::memory_order_relaxed)) {
-            expected = engineDepth.currentDepth.load(std::memory_order_relaxed);
-        }
+    while (depth.load(std::memory_order_relaxed) < chessEngine.depth && elapsed < (params->time_alloc * 0.001) && !stopFlag.load(std::memory_order_relaxed) && hash_full.load(std::memory_order_relaxed) < 1000) {
+        mcts_search(params, &ctx); //single sim
+
         // Update seldepth
-        expected = engineDepth.seldepth.load(std::memory_order_relaxed);
-        while (params->seldepth > expected && !engineDepth.seldepth.compare_exchange_strong(expected, params->seldepth, std::memory_order_relaxed)) {
-            expected = engineDepth.seldepth.load(std::memory_order_relaxed);
+        int expected = seldepth.load(std::memory_order_relaxed);
+        while (params->seldepth > expected && !seldepth.compare_exchange_strong(expected, params->seldepth, std::memory_order_relaxed)) {
+            expected = seldepth.load(std::memory_order_relaxed);
         }
         
-        params->currentNodes++;
-        if ((chessEngine.depth && params->currentDepth >= chessEngine.depth) || (chessEngine.nodes && params->currentNodes >= chessEngine.nodes)) break;        
+        if ((chessEngine.depth && depth.load(std::memory_order_relaxed) >= chessEngine.depth) || (chessEngine.nodes && search.root->N.load(std::memory_order_relaxed) >= chessEngine.nodes)) break;        
 
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
-        //numberOfIterations++;
-        if (elapsed > 1 && (int)elapsed % 10 == 0) {
-          if (depth < engineDepth.currentDepth.load(std::memory_order_relaxed))
-            depth = engineDepth.currentDepth.load(std::memory_order_relaxed);
-          else {
-            log_file("thread_search() debug: depth %d is not increasing after 10 sec\n", depth);
-            break; //depth is not increasing after 5 sec
-          }
-        }
     }
     free_nnue_context(&ctx);
   }
   
   void uci_output_thread() {
-    std::mt19937 rng(std::random_device{}());
     auto iter_start = std::chrono::steady_clock::now();
 
     while (!stopFlag.load(std::memory_order_relaxed) && !search_done.load(std::memory_order_relaxed)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      std::unique_lock<std::mutex> lk(search_done_mtx);
+      cv_search_done.wait_for(lk, std::chrono::milliseconds(1000), []{return search_done.load(std::memory_order_relaxed);});
       // Calculate nodes (total simulations)
-      unsigned long long nodes = search.root->N.load(std::memory_order_relaxed);
+      struct MCTSNode * current_node = search.root;
+      unsigned long long nodes = current_node->N.load(std::memory_order_relaxed);
       // Get elapsed time
       double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
       // Compute NPS
       double nps = elapsed > 0 ? nodes / elapsed : 0;
-      int * idx = nullptr;
-      int multiPV = select_best_children(&idx); //select best child indexes
-      int depth = engineDepth.currentDepth.load(std::memory_order_relaxed);
-      int seldepth = engineDepth.seldepth.load(std::memory_order_relaxed);
+      //depth should be calculated by traversing the most visited nodes similar to select_best_moves()      
+      int d = 0;
+      std::unordered_set<unsigned long long> visited;
+      std::vector<std::pair<unsigned long long, int>> visits; //N, child_idx
+      int num_root_children = current_node->num_children.load(std::memory_order_relaxed);
+      while (current_node && d < MAX_DEPTH) {
+        unsigned long long current_hash = current_node->hash.load(std::memory_order_relaxed);
+        if (visited.find(current_hash) != visited.end()) {
+            log_file("uci_output_thread() debug: cycle detected at depth %d, breaking loop\n", d);
+            break;
+        }
+        visited.insert(current_hash);        
+        unsigned long long N = 0;
+        int next_idx = -1;
+        int num_children = current_node->num_children.load(std::memory_order_acquire);
+        struct Edge * children = current_node->children.load(std::memory_order_acquire);
+        for (int i = 0; i < num_children; i++) {
+          struct MCTSNode * child = children[i].child.load(std::memory_order_acquire);
+          unsigned long long n = child->N.load(std::memory_order_relaxed);
+          if (current_node == search.root) visits.push_back({n, i});
+          if (n > N) {
+            N = n;
+            next_idx = i;
+          } 
+        }
+        if (next_idx < 0) break; //meaning current_node is a leaf node, i.e. no children
+        current_node = children[next_idx].child.load(std::memory_order_acquire);
+        d++;
+      }
+      depth.store(d, std::memory_order_relaxed);
       std::shared_lock lock(map_mutex);
       size_t unique_nodes = search.tree.size();
       lock.unlock();
@@ -804,137 +790,143 @@ MCTS implementation follows the four core phases:
       if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
       hash_full.store(hashfull, std::memory_order_relaxed);
 
-      for (int i = 0; i < multiPV && idx; i++) {
-        //to include promotions, we need to add 3 extra bits for promos 
-        //(0 - no promo, 1 - knight, 2 - bishop, 3 - rook, 4 - queen) to 12-bit existing encoding like this:
-        //move_idx = (source << 9) | (dest << 3) | promotion_type
-        //decoding:
-        //promotion_type = move_idx & 7 (lower 3 bits)
-        //dest = (move_idx >> 3) & 63 (bits from 4 to 9)
-        //source = move_idx >> 9 (bits from 10 to 15)
-        int move_idx = search.root->children[idx[i]].move;
+      std::sort(visits.begin(), visits.end(), std::greater<>());
+      int multiPV = std::min<int>(num_root_children, (int)chessEngine.optionSpin[MultiPV].value);
+      struct Edge * children = search.root->children.load(std::memory_order_acquire);
+      for (int i = 0; i < multiPV; i++) {
+        const int move_idx = children[visits[i].second].move.load(std::memory_order_relaxed);
         char uci_move[6];
         idx_to_move(move_idx, uci_move);
-        log_file("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", depth, seldepth, i + 1, search.root->children[idx[i]].child->cp.load(std::memory_order_relaxed), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, uci_move);
-        print("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", depth, seldepth, i + 1, search.root->children[idx[i]].child->cp.load(std::memory_order_relaxed), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, uci_move);
+        struct MCTSNode * child = children[visits[i].second].child.load(std::memory_order_acquire);
+        log_file("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", d, seldepth.load(std::memory_order_relaxed), i + 1, -child->cp.load(std::memory_order_relaxed), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, uci_move);
+        print("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", d, seldepth.load(std::memory_order_relaxed), i + 1, -child->cp.load(std::memory_order_relaxed), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, uci_move);
       }
-      if (idx) free(idx);
     }
   }
   
   void runMCTS() {
     double elapsed = 0.0;
-    int * move_idx = nullptr;
     size_t unique_nodes = 0;
     unsigned long long nodes = 0;
     int hashfull = 0;
     int move_number = bitCount(board->moves);
-    //log_file("runMCTS() debug: move_number %d\n", move_number);
-    char ** pv = nullptr;
-    int * idx = nullptr;
+    std::vector<std::pair<int, std::string>> pvs;
     int multiPV = 1;
-    std::mt19937 rng(std::random_device{}());
     
     if (move_number > 1) {
       tbhits.store(0, std::memory_order_relaxed);
-      exploration_constant = (double)chessEngine.optionSpin[ExplorationConstant].value * 0.01;
-      probability_mass = (double)chessEngine.optionSpin[ProbabilityMass].value * 0.01;
-      noise = (double)chessEngine.optionSpin[Noise].value * 0.01;
-      virtual_loss = chessEngine.optionSpin[VirtualLoss].value;
-      eval_scale = chessEngine.optionSpin[EvalScale].value;
-      temperature = chessEngine.optionSpin[Temperature].value;
-      unsigned long iterations = MIN_ITERATIONS;
       std::vector<ThreadParams> thread_params(chessEngine.optionSpin[Threads].value);
       for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
         thread_params[i].thread_id = i;
-        //thread_params[i].num_sims = iterations;  // Or time-based loop inside thread
         thread_params[i].time_alloc = timeAllocated;
-        thread_params[i].currentNodes = 0;
-        thread_params[i].currentDepth = 0;
         thread_params[i].seldepth = 0;
-        thread_params[i].rng.seed(static_cast<unsigned int>(std::random_device{}() ^ std::hash<int>{}(i)));
+      }
+      //it seems there rarely is some kind of contamination or corruption of the tree
+      //so let's try cleanup() instead of gc() if UCI Ponder option is false
+      //avoid using Ponder option, sometimes called "permanent brain", i.e. thinking during opponent's time
+      if (chessEngine.optionCheck[Ponder].value) {
+        set_root();      
+        gc();
+      } else {
+        cleanup(); 
+        set_root();      
       }
       
-      set_root();
-      gc();
-      
       if (!chessEngine.depth) chessEngine.depth = MAX_DEPTH;
-      engineDepth.currentDepth.store(0, std::memory_order_relaxed);
-      engineDepth.seldepth.store(0, std::memory_order_relaxed);
+      depth.store(0, std::memory_order_relaxed);
+      seldepth.store(0, std::memory_order_relaxed);
       std::vector<std::thread> threads;
       auto iter_start = std::chrono::steady_clock::now();
       for (int i = 0; i < chessEngine.optionSpin[Threads].value && !stopFlag.load(std::memory_order_relaxed) && hash_full.load(std::memory_order_relaxed) < 1000; ++i) {
         threads.emplace_back(thread_search, &thread_params[i]);
       }
-      if (!chessEngine.ponder && !stopFlag.load(std::memory_order_relaxed) && hash_full.load(std::memory_order_relaxed) < 1000) {
+      if (chessEngine.optionCheck[IntermittentInfoLines].value && !chessEngine.ponder && !stopFlag.load(std::memory_order_relaxed) && hash_full.load(std::memory_order_relaxed) < 1000) {
         search_done.store(false, std::memory_order_relaxed); // Reset
         std::thread output_thread(uci_output_thread);
         for (auto& t : threads) t.join();
-        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
-        search_done.store(true, std::memory_order_relaxed); // Signal search complete
+        {
+          std::lock_guard<std::mutex> lk(search_done_mtx);
+          search_done.store(true, std::memory_order_relaxed); // Signal search complete
+        }
+        cv_search_done.notify_one();
         output_thread.join();
       } else {
         for (auto& t : threads) t.join();
-        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();        
       }
-
-      multiPV = select_best_children(&idx); //select best child indexes
-      //log_file("runMCTS() debug: select_best_children() returned multiPV %d\n", multiPV);
-      multiPV = select_best_moves(&pv, &move_idx);
-      //log_file("runMCTS() debug: select_best_moves() returned multiPV %d\n", multiPV);
-      nodes = search.root->N.load(std::memory_order_relaxed);
-      unique_nodes = search.tree.size();
-      // Calculate hashfull (in per-mille)
-      // hashfull using unique_nodes
-      size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
-      size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
-      hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
-      if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
-      hash_full.store(hashfull, std::memory_order_relaxed);
+      multiPV = select_best_moves(pvs);
+      if (chessEngine.optionCheck[FinalInfoLines].value) {    
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+        nodes = search.root->N.load(std::memory_order_relaxed);
+        unique_nodes = search.tree.size();
+        // Calculate hashfull (in per-mille) using unique_nodes
+        size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+        size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
+        hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
+        if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
+        hash_full.store(hashfull, std::memory_order_relaxed);
+      }
     } else if (move_number == 1) {
         auto iter_start = std::chrono::steady_clock::now();
-        enum PieceName side = (enum PieceName)((board->fen->sideToMove << 3) | PieceTypeAny);//either PieceNameWhite or PieceNameBlack
+        int side = PC(board->fen->sideToMove, PieceTypeAny); //either PieceNameWhite or PieceNameBlack
         unsigned long long any = board->occupations[side];
         int src = 0, dst = 0;
-        move_idx = (int *)calloc(1, sizeof(int));
-        if (!move_idx) {
-          log_file("runMCTS() error: calloc() failed for move_idx\n");
-          exit(-1);
-        }
+        int move_idx = 0;
+        int promoPiece = PieceNameNone;
         while (any) {
             src = lsBit(any);
-            unsigned long long moves = board->sideToMoveMoves[src];
+            unsigned long long moves = board->movesFromSquares[src];
             while (moves) {
                 dst = lsBit(moves);
               	if (promoMove(board, src, dst)) {
               	  for (int promo = Queen; promo >= Knight; promo--) {
                     struct Move move;
                     struct Board * tmp_board = cloneBoard(board);
-              	    init_move(&move, tmp_board, src, dst, promo);
-                    makeMove(&move);
-                    if (tmp_board->isStaleMate) continue;
-                    else {
-                      move_idx[0] = src << 9 | dst << 3 | promo - 1; //1 will be added to Rook to make it Queen (default promo)
+                    ff_move(tmp_board, &move, src, dst, promo);
+                    generateMoves(tmp_board);
+                    if (tmp_board->isStaleMate) {
+                      freeBoard(tmp_board);
+                      continue;
+                    } else {
+                      promoPiece = promo;
+                      move_idx = (src << 9) | (dst << 3) | promo;
+                      freeBoard(tmp_board);
                       break;
                     }
               	  }
               	} else {
-                  move_idx[0] = src << 9 | dst << 3;
+                  move_idx = (src << 9) | (dst << 3);
                   break;
                 }            
                 moves &= moves - 1;
             }
+            if (move_idx) break;
             any &= any - 1;
         }
-        idx_to_move(move_idx[0], best_move);
-        pv = (char **)calloc(1, sizeof(char *));
-        pv[0] = (char *)calloc(1, 6);
-        strcpy(pv[0], best_move);
+        struct NNUEContext ctx;
+        init_nnue_context(&ctx);        
+        struct Board * tmp_board = cloneBoard(board);
+        struct Move move;
+        ff_move(tmp_board, &move, src, dst, promoPiece);
+        generateMoves(tmp_board);
+        double res;
+        if (tmp_board->isMate) res = MATE_SCORE * 0.01;
+        else if (tmp_board->isStaleMate) res = 0.0;
+        else if (tmp_board->isCheck) {
+          std::unordered_set<unsigned long long>pos_history;
+          res = -process_check(tmp_board, &ctx, pos_history);
+        } else res = -evaluate_nnue(tmp_board, NULL, &ctx);
+        freeBoard(tmp_board);
+        free_nnue_context(&ctx);
+        idx_to_move(move_idx, best_move);
+        std::string pv(best_move);
+        pvs.push_back({static_cast<int>(100.0 * res), pv});
         multiPV = 1;
-        nodes = 1;
-        engineDepth.currentDepth.store(1, std::memory_order_relaxed);
-        engineDepth.seldepth.store(1, std::memory_order_relaxed);
-        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+        if (chessEngine.optionCheck[FinalInfoLines].value) {    
+          nodes = 1;
+          depth.store(1, std::memory_order_relaxed);
+          seldepth.store(1, std::memory_order_relaxed);
+          elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+        }
     }
     else {
         if (board->isMate) {
@@ -951,30 +943,38 @@ MCTS implementation follows the four core phases:
         }
         return;
     }
-    
-    double nps = nodes / elapsed;
-    int depth = engineDepth.currentDepth.load(std::memory_order_relaxed);
-    int seldepth = engineDepth.seldepth.load(std::memory_order_relaxed);
-    for (int i = 0; i < multiPV && idx; i++) {      
-      log_file("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s timeAllocated %.2f\n", depth, seldepth, i + 1, search.root->children[idx[i]].child->cp.load(std::memory_order_relaxed), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, pv[i], timeAllocated * 0.001);
-      print("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", depth, seldepth, i + 1, search.root->children[idx[i]].child->cp.load(std::memory_order_relaxed), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, pv[i]);
-    }
-    if (!ponderHit.load()) {
-      char * bestmove = strtok(pv[0], " ");
-      char * ponder = strtok(NULL, " ");
-      if (ponder) {
-        log_file("bestmove %s ponder %s\n", bestmove, ponder);
-        print("bestmove %s ponder %s\n", bestmove, ponder);
-      } else {
-        log_file("bestmove %s\n", bestmove);
-        print("bestmove %s\n", bestmove);      
+    if (chessEngine.optionCheck[FinalInfoLines].value) {
+      double nps = nodes / elapsed;
+      for (int i = 0; i < multiPV; i++) {      
+        log_file("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s timeAllocated %.2f\n", depth.load(std::memory_order_relaxed), seldepth.load(std::memory_order_relaxed), i + 1, pvs[i].first, nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, pvs[i].second.c_str(), timeAllocated * 0.001);
+        print("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", depth.load(std::memory_order_relaxed), seldepth.load(std::memory_order_relaxed), i + 1, pvs[i].first, nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, pvs[i].second.c_str());
       }
     }
-    if (idx) free(idx);
-    if (pv) {
-      for (int i = 0; i < multiPV; i++) free(pv[i]);
-      free(pv);
+    if (!ponderHit.load(std::memory_order_relaxed)) {
+      std::string bestmove;
+      std::string ponder;
+      if (!pvs.empty()) {
+        int pos = pvs[0].second.find(" ");
+        int pos2 = pvs[0].second.find(" ", pos + 5);
+        bestmove = pvs[0].second.substr(0, pos);
+        if (pos != std::string::npos) ponder = pvs[0].second.substr(pos + 1, pos2 - pos - 1);
+        //here we need to make bestmove to update position_history
+        if (!chessEngine.ponder) {
+          struct Move move;
+          int src = 0, dst = 0, promo = 0;
+          move_to_idx(bestmove.c_str(), &src, &dst, &promo);
+          ff_move(board, &move, src, dst, promo);
+          updateHash(board, &move);
+          position_history.insert(board->zh->hash);
+        }
+      } else bestmove = "(none)";
+      if (!ponder.empty()) {
+        log_file("bestmove %s ponder %s\n", bestmove.c_str(), ponder.c_str());
+        print("bestmove %s ponder %s\n", bestmove.c_str(), ponder.c_str());
+      } else {
+        log_file("bestmove %s\n", bestmove.c_str());
+        print("bestmove %s\n", bestmove.c_str());      
+      }
     }
-    if (move_idx) free(move_idx);
   }
 }
