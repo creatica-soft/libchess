@@ -40,7 +40,7 @@
       printf("info string successfully initialized tablebases in %s. Max number of pieces %d\n", SYZYGY_PATH, TB_LARGEST);
     }
     
-    unsigned int ep = __builtin_ctzl(board.fen->enPassantLegalBit);
+    const unsigned int ep = lsBit(enPassantLegalBit(&board));
     unsigned int res = tb_probe_root(board.occupations[PieceNameWhite], board.occupations[PieceNameBlack], 
     board.occupations[WhiteKing] | board.occupations[BlackKing],
         board.occupations[WhiteQueen] | board.occupations[BlackQueen], board.occupations[WhiteRook] | board.occupations[BlackRook], board.occupations[WhiteBishop] | board.occupations[BlackBishop], board.occupations[WhiteKnight] | board.occupations[BlackKnight], board.occupations[WhitePawn] | board.occupations[BlackPawn],

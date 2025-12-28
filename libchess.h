@@ -129,6 +129,38 @@ extern "C" {
 #define RANK6 0x0000FF0000000000ULL
 #define RANK7 0x00FF000000000000ULL
 #define RANK8 0xFF00000000000000ULL
+//diag = 7 - file + rank
+#define DIAG_H1H1 0x0000000000000080ULL
+#define DIAG_G1H2 0x0000000000008040ULL
+#define DIAG_F1H3 0x0000000000804020ULL
+#define DIAG_E1H4 0x0000000080402010ULL
+#define DIAG_D1H5 0x0000008040201008ULL
+#define DIAG_C1H6 0x0000804020100804ULL
+#define DIAG_B1H7 0x0080402010080402ULL
+#define DIAG_A1H8 0x8040201008040201ULL
+#define DIAG_A2G8 0x4020100804020100ULL
+#define DIAG_A3F8 0x2010080402010000ULL
+#define DIAG_A4E8 0x1008040201000000ULL
+#define DIAG_A5D8 0x0804020100000000ULL
+#define DIAG_A6C8 0x0402010000000000ULL
+#define DIAG_A7B8 0x0201000000000000ULL
+#define DIAG_A8A8 0x0100000000000000ULL
+//antidiag = file + rank
+#define ADIAG_A1A1 0x0000000000000001ULL
+#define ADIAG_A2B1 0x0000000000000102ULL
+#define ADIAG_A3C1 0x0000000000010204ULL
+#define ADIAG_A4D1 0x0000000001020408ULL
+#define ADIAG_A5E1 0x0000000102040810ULL
+#define ADIAG_A6F1 0x0000010204081020ULL
+#define ADIAG_A7G1 0x0001020408102040ULL
+#define ADIAG_A8H1 0x0102040810204080ULL
+#define ADIAG_B8H2 0x0204081020408000ULL
+#define ADIAG_C8H3 0x0408102040800000ULL
+#define ADIAG_D8H4 0x0810204080000000ULL
+#define ADIAG_E8H5 0x1020408000000000ULL
+#define ADIAG_F8H6 0x2040800000000000ULL
+#define ADIAG_G8H7 0x4080000000000000ULL
+#define ADIAG_H8H8 0x8000000000000000ULL
 
 // Macros for on-fly computation (inline-able, zero cost)
 #define SQ(rank, file) (((rank) << 3) | (file))
@@ -137,6 +169,7 @@ extern "C" {
 #define SQ_BIT(sq)  ((sq) == SquareNone ? 0 : (1ULL << (sq)))
 #define SQ_DIAG(sq) (7 + SQ_RANK(sq) - SQ_FILE(sq))
 #define SQ_ANTIDIAG(sq) (SQ_FILE(sq) + SQ_RANK(sq))
+#define SQ_COLOR(sq) (((SQ_FILE(sq) ^ SQ_RANK(sq)) & 1) ? ColorWhite : ColorBlack)
 
 #define PC_TYPE(pc) ((pc) & 7)
 #define PC_COLOR(pc) ((pc) >> 3)
@@ -146,8 +179,10 @@ extern "C" {
 #define OPP_COLOR(color) ((color) ^ 1)  // White=0, Black=1
 #define PLY_NUM(fen) (((fen)->moveNumber - 1) * 2 + ((fen)->sideToMove == ColorBlack)) //for white move 1, ply is 0
 
-static unsigned long long files_bb[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
-static unsigned long long ranks_bb[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
+static unsigned long long files_bb[] = { FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H };
+static unsigned long long ranks_bb[] = { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
+static unsigned long long diag_bb[] = { DIAG_H1H1, DIAG_G1H2, DIAG_F1H3, DIAG_E1H4, DIAG_D1H5, DIAG_C1H6, DIAG_B1H7, DIAG_A1H8, DIAG_A2G8, DIAG_A3F8, DIAG_A4E8, DIAG_A5D8, DIAG_A6C8, DIAG_A7B8, DIAG_A8A8 };
+static unsigned long long antidiag_bb[] = { ADIAG_A1A1, ADIAG_A2B1, ADIAG_A3C1, ADIAG_A4D1, ADIAG_A5E1, ADIAG_A6F1, ADIAG_A7G1, ADIAG_A8H1, ADIAG_B8H2, ADIAG_C8H3, ADIAG_D8H4, ADIAG_E8H5, ADIAG_F8H6, ADIAG_G8H7, ADIAG_H8H8 };
 
 enum CastlingSide { CastlingSideNone, CastlingSideKingside, CastlingSideQueenside, CastlingSideBoth };
 
@@ -173,19 +208,23 @@ enum CastlingRightsEnum {
 	CastlingRightsWhiteBothBlackBoth = CastlingSideBoth | (CastlingSideBoth << 2)
 };
 
-enum Color { ColorWhite, ColorBlack, ColorNone };
+enum Color { ColorWhite, ColorBlack };
 
-static const char * color[] = { "white", "black", "none" };
+static const char * color[] = { "white", "black" };
+static const char fenColor[] = { 'w', 'b' };
 
 enum Files {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone};
 static const char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
 enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
 static const char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
-static unsigned long long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
-static unsigned long long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
+//redifinition of files_bb[] and ranks_bb[] above
+//static unsigned long long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
+//static unsigned long long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
 
-// square / 8 = rank, square % 8 = file; another words, square = rank * 8 + file
+// rank = square / 8, same as rank = square >> 3
+// file = square % 8, same as file = square & 7
+// square = rank * 8 + file, same as square = (rank << 3) | file
 enum SquareName {
 	SquareA1, SquareB1, SquareC1, SquareD1, SquareE1, SquareF1, SquareG1, SquareH1,
 	SquareA2, SquareB2, SquareC2, SquareD2, SquareE2, SquareF2, SquareG2, SquareH2,
@@ -208,12 +247,12 @@ static const char * squareName[] = {
 	"a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8", "none"
 };
 
-int squareColor(int sqName);
+//int squareColor(int sqName); //use SQ_COLOR(sq) macro instead
 
 enum Diagonals {
-	DiagonalH1H1, DiagonalG1H2, DiagonalF1H3, DiagonalE1H4, DiagonalD1H5, DiagonalC1H6, 
-	DiagonalB1H7, DiagonalA1H8, DiagonalA2G8, DiagonalA3F8, DiagonalA4E8, DiagonalA5D8, 
-	DiagonalA6C8, DiagonalA7B8, DiagonalA8A8, DiagonalNone
+	DiagonalH1H1, DiagonalG1H2, DiagonalF1H3, DiagonalE1H4, DiagonalD1H5,
+	DiagonalC1H6, DiagonalB1H7, DiagonalA1H8, DiagonalA2G8, DiagonalA3F8, 
+	DiagonalA4E8, DiagonalA5D8, DiagonalA6C8, DiagonalA7B8, DiagonalA8A8, DiagonalNone
 };
 
 enum Antidiagonals {
@@ -228,9 +267,11 @@ static const char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "
 static float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
 static float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
 
-// Piece enumeration: first three bits are used to encode the type, fourth bit defines the color.
+// Piece enumeration: first three bits are used to encode the type, fourth bit defines the color, total 16 pieces
 // Shifting PieceName by 3 to the right gives PieceColor: color = piece >> 3
 // Masking 3 lowest bits returns the PieceType: type = piece & 7
+// PieceNameAny is an exception to the rules above (its color is black and type none)
+// To overcome this exception, we could encode color as 2 bits but this would mean occupations array size will be 32
 enum PieceName {
 	PieceNameNone,
 	WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNameWhite, PieceNameAny,
@@ -281,33 +322,35 @@ static const unsigned long long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8UL
 
 // Forthys-Edwards Notation for the position preceding a move 
 struct Fen {
-    char fenString[MAX_FEN_STRING_LEN] = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     int sideToMove = ColorWhite;
     int castlingRights = CastlingRightsWhiteBothBlackBoth;
-    int enPassant = FileNone;
-    unsigned long long enPassantLegalBit = SquareNone;
-    int halfmoveClock = 0;
+    int enPassant = FileNone; //rank can be derived from sideToMove: 3 for white and 6 for black, and hence, the square
+//    unsigned long long enPassantLegalBit = SquareNone; //use enPassantLegalBit() instead
+    int halfmoveClock = 0; //50-move draw counter (no pawn advance and no capture)
     int moveNumber = 0;
     bool isChess960 = false;
-    int castlingRook[2][2] = { { FileH, FileA }, { FileH, FileA } };
-    unsigned long long castlingBits = 0x8100000000000081ULL;
+    int castlingRook[2][2] = { { FileH, FileA }, { FileH, FileA } }; //needed for chess960
+//    unsigned long long castlingBits = 0x8100000000000081ULL;
+    char fenString[MAX_FEN_STRING_LEN] = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 };
 
+//having two hashes and verifying the second one when the first is the same for two positions,
+//I've never seen a hash collision, so perhaps, one hash is enough, re-enable if needed and update zobrist-hash.cpp file
 struct ZobristHash {
     unsigned long long hash = 0;
-    unsigned long long hash2 = 0;
+    //unsigned long long hash2 = 0;
     unsigned long long blackMove = 0;
-    unsigned long long blackMove2 = 0;
+    //unsigned long long blackMove2 = 0;
     unsigned long long prevCastlingRights = 0;
-    unsigned long long prevCastlingRights2 = 0;
+    //unsigned long long prevCastlingRights2 = 0;
     unsigned long long prevEnPassant = 0;
-    unsigned long long prevEnPassant2 = 0;
+    //unsigned long long prevEnPassant2 = 0;
     unsigned long long castling[16] = {};
-    unsigned long long castling2[16] = {};
+    //unsigned long long castling2[16] = {};
     unsigned long long enPassant[8] = {};
-    unsigned long long enPassant2[8] = {};
+    //unsigned long long enPassant2[8] = {};
     unsigned long long piecesAtSquares[13][64] = {};
-    unsigned long long piecesAtSquares2[13][64] = {};
+    //unsigned long long piecesAtSquares2[13][64] = {};
 };
 
 /*struct Square {
@@ -332,8 +375,8 @@ struct Board {
     bool isCheck = false;
     bool isStaleMate = false;
     bool isMate = false;
-    struct Fen *fen = nullptr;
-    struct ZobristHash *zh = nullptr;
+    struct Fen * fen = nullptr;
+    struct ZobristHash * zh = nullptr;
 };
 
 struct Move {
@@ -353,7 +396,7 @@ struct Move {
     int prevEnPassant = FileNone;
     int prevHalfmoveClock = 0;
     int prevCastlingRook = FileNone;
-    struct Board *chessBoard = nullptr;
+    struct Board * chessBoard = nullptr;
 };
 
 enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationMin, ExplorationMax, ExplorationDepthDecay, VirtualLoss, PVPlies, EvalScale, Temperature};
@@ -559,19 +602,22 @@ CHESS_API void updateHash(struct Board *, struct Move *);
 ///<summary>
 /// fills Square struct from SquareName enum
 ///</summary>
-CHESS_API void square(struct Square *, int squareName);
+//CHESS_API void square(struct Square *, int squareName);
 
 ///<summary>
 /// fills ChessPiece struct from a given Square and a PieceName
 ///</summary>
-CHESS_API void piece(struct Square *, struct ChessPiece *, int pieceName);
+//CHESS_API void piece(struct Square *, struct ChessPiece *, int pieceName);
 
 ///<summary>
 /// makes a Board struct from a Fen one including legal moves generation stored in Board->movesFromSquares
 ///</summary>
 CHESS_API int fentoboard(struct Fen *, struct Board *);
 
-// four standard bit manupulation functions
+//returns en passant bit square if it is legal or 0 otherwise
+CHESS_API unsigned long long enPassantLegalBit(struct Board * board);
+
+// two standard bit manupulation functions
 CHESS_API unsigned long long bitCount(unsigned long long);
 CHESS_API unsigned long lsBit(unsigned long long);
 //CHESS_API void unpack_bits(unsigned long long number, float * bit_array);
