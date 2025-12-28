@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,16 +25,18 @@ unsigned char find_king_file(const char *rank_str, char king_char) {
     return FileNone;  // Error value
 }
 
-int strtofen(struct Fen *fen, const char *fenstr) {
-    if (!fen) {
+int strtofen(struct Fen * fen, const char * fenstr) {
+    /*if (!fen) {
         fprintf(stderr, "strtofen() error: fen arg is NULL\n");
         return 1;
     }
-    size_t len = strlen(fenstr) + 1;
     if (len > MAX_FEN_STRING_LEN) {
         fprintf(stderr, "strtofen() error: FEN string is too long (%zu), it must be shorter than %d\n", len, MAX_FEN_STRING_LEN);
         return 1;
-    }
+    }*/
+    assert(fen);
+    size_t len = strlen(fenstr) + 1;
+    assert(len <= MAX_FEN_STRING_LEN);
     strncpy(fen->fenString, fenstr, MAX_FEN_STRING_LEN);
 
     char local_fen[MAX_FEN_STRING_LEN];
@@ -73,7 +76,7 @@ int strtofen(struct Fen *fen, const char *fenstr) {
             } else {
                 fen->enPassant = token[0] - 'a';
             }
-            fen->enPassantLegalBit = 0;
+            //fen->enPassantLegalBit = 0;
             break;
         case 4:
             fen->halfmoveClock = atoi(token);
@@ -110,7 +113,7 @@ int strtofen(struct Fen *fen, const char *fenstr) {
     // Castling parsing
     memset(fen->castlingRook, FileNone, sizeof(fen->castlingRook));
     fen->castlingRights = CastlingRightsWhiteNoneBlackNone;
-    fen->castlingBits = 0;
+    //fen->castlingBits = 0;
     fen->isChess960 = false;
 
     if (castling_ptr[0] != '-') {
@@ -128,22 +131,22 @@ int strtofen(struct Fen *fen, const char *fenstr) {
                 switch (ch) {
                 case 'K':
                     fen->castlingRook[0][0] = FileH;
-                    fen->castlingBits |= (1ULL << FileH);
+                    //fen->castlingBits |= (1ULL << FileH);
                     fen->castlingRights |= CastlingSideKingside;
                     break;
                 case 'Q':
                     fen->castlingRook[1][0] = FileA;
-                    fen->castlingBits |= (1ULL << FileA);
+                    //fen->castlingBits |= (1ULL << FileA);
                     fen->castlingRights |= CastlingSideQueenside;
                     break;
                 case 'k':
                     fen->castlingRook[0][1] = FileH;
-                    fen->castlingBits |= (1ULL << (FileH + 56));
+                    //fen->castlingBits |= (1ULL << (FileH + 56));
                     fen->castlingRights |= (CastlingSideKingside << 2);
                     break;
                 case 'q':
                     fen->castlingRook[1][1] = FileA;
-                    fen->castlingBits |= (1ULL << (FileA + 56));
+                    //fen->castlingBits |= (1ULL << (FileA + 56));
                     fen->castlingRights |= (CastlingSideQueenside << 2);
                     break;
                 }
@@ -172,11 +175,11 @@ int strtofen(struct Fen *fen, const char *fenstr) {
                 f = tolower(ch) - 'a';
                 if ((unsigned char)f > white_king_file) {
                     fen->castlingRook[0][0] = f;
-                    fen->castlingBits |= (1ULL << f);
+                    //fen->castlingBits |= (1ULL << f);
                     fen->castlingRights |= CastlingSideKingside;
                 } else {
                     fen->castlingRook[1][0] = f;
-                    fen->castlingBits |= (1ULL << f);
+                    //fen->castlingBits |= (1ULL << f);
                     fen->castlingRights |= CastlingSideQueenside;
                 }
             } else if (strchr(bf, ch)) {
@@ -203,11 +206,11 @@ int strtofen(struct Fen *fen, const char *fenstr) {
                 f = ch - 'a';
                 if ((unsigned char)f > black_king_file) {
                     fen->castlingRook[0][1] = f;
-                    fen->castlingBits |= (1ULL << (f + 56));
+                    //fen->castlingBits |= (1ULL << (f + 56));
                     fen->castlingRights |= (CastlingSideKingside << 2);
                 } else {
                     fen->castlingRook[1][1] = f;
-                    fen->castlingBits |= (1ULL << (f + 56));
+                    //fen->castlingBits |= (1ULL << (f + 56));
                     fen->castlingRights |= (CastlingSideQueenside << 2);
                 }
             }
@@ -256,9 +259,9 @@ int fentoboard(struct Fen *fen, struct Board *board) {
                         fprintf(stderr, "fentoboard() error: rank overflows 8 squares. FEN = %s\n", fen->fenString);
                         return 1;
                     }
-                    unsigned char sq = (rank_idx << 3) | file_idx;
+                    unsigned char sq = SQ(rank_idx, file_idx);
                     board->piecesOnSquares[sq] = PieceNameNone;
-                    board->occupations[PieceNameNone] |= 1ULL << sq;
+                    board->occupations[PieceNameNone] |= SQ_BIT(sq);
                     file_idx++;
                 }
             } else {
@@ -271,8 +274,8 @@ int fentoboard(struct Fen *fen, struct Board *board) {
                             fprintf(stderr, "fentoboard() error: rank overflows 8 squares. FEN = %s\n", fen->fenString);
                             return 1;
                         }
-                        unsigned char sq = (rank_idx << 3) | file_idx;
-                        board->occupations[(int)s] |= 1ULL << sq;
+                        unsigned char sq = SQ(rank_idx, file_idx);
+                        board->occupations[(int)s] |= SQ_BIT(sq);
                         board->piecesOnSquares[sq] = (int)s;
                         file_idx++;
                     } else if (s == 0) {

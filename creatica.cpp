@@ -1,5 +1,5 @@
 //For MacOS using clang
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica-new.cpp uci-new.cpp tbcore.c tbprobe.c -o creatica
+//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica
 
 // For linux or Windows using mingw
 // add -mpopcnt for X86_64
@@ -62,7 +62,7 @@ extern "C" {
   void log_file(const char * message, ...);
   void print(const char * message, ...);
   bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move);
-  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history, std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass);//, bool in_playout = false);
+  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history, std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& move_evals, double prob_mass);//, bool in_playout = false);
   double position_eval(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history);
   
   #define MAX_DEPTH 100
@@ -95,7 +95,7 @@ extern "C" {
 
   struct MCTSNode {
       std::atomic<unsigned long long> hash{0};
-      std::atomic<unsigned long long> hash2{0};
+      //std::atomic<unsigned long long> hash2{0};
       std::atomic<unsigned long long> N{0};  // Atomic for lock-free updates
       std::atomic<double> W{0};
       std::atomic<int> cp {NO_MATE_SCORE}; //position evaluation in centipawns 
@@ -105,7 +105,7 @@ extern "C" {
       std::atomic<struct Edge *> children {nullptr}; //array of moves and priors leading to next nodes
   };
 
-  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, unsigned long long& child_hash2, const std::unordered_set<unsigned long long>& pos_history);//, bool in_playout = false);
+  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, /*unsigned long long& child_hash2,*/ const std::unordered_set<unsigned long long>& pos_history);//, bool in_playout = false);
   
   // Custom hasher that uses the key directly
   struct NoOpHash {
@@ -201,7 +201,7 @@ extern "C" {
     if (!root) {
       root = new MCTSNode();
       root->hash.store(board->zh->hash, std::memory_order_relaxed);
-      root->hash2.store(board->zh->hash2, std::memory_order_relaxed);
+      //root->hash2.store(board->zh->hash2, std::memory_order_relaxed);
       root->generation.store(generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
       struct NNUEContext ctx;
       init_nnue_context(&ctx);
@@ -216,36 +216,37 @@ extern "C" {
       root->N.store(1, std::memory_order_relaxed);
       root->W.store(tanh(res / eval_scale), std::memory_order_relaxed);      
       search.tree.emplace(board->zh->hash, root);
-    } else {
+    } /*else {
       if (root->hash2 != board->zh->hash2) {
         updateFen(board);
         log_file("set_root() error: Zobrist hash collision detected, hash %llu hash2 %llu fen %s\n", board->zh->hash, board->zh->hash2, board->fen->fenString);
         exit(1);
       }
-    }
+    }*/
     search.root = root;    
   }
   
   //called from expand_node() and do_move()
   //returns new or existing node
-  struct MCTSNode * make_child(const unsigned long hash, const unsigned long hash2, const int cp) {
+  struct MCTSNode * make_child(const unsigned long hash, /*const unsigned long hash2,*/ const int cp) {
     struct MCTSNode * child = nullptr;
     //first, try to find child_hash in the tree
     std::shared_lock search_lock(map_mutex);
     auto it = search.tree.find(hash);
     child = (it != search.tree.end()) ? it->second : nullptr;
     search_lock.unlock();
-    if (child) {
-      if (child->hash2.load(std::memory_order_relaxed) != hash2) {
+    //if (child) {
+    if (!child) { //if the child_hash is not found, create a child
+      /*if (child->hash2.load(std::memory_order_relaxed) != hash2) {
         log_file("make_child() error: hash collision detected: hash %llu, hash2 %llu != hash2 %llu\n", hash, child->hash2.load(std::memory_order_relaxed), hash2);
         exit(-1); //need to decide how to better handle it later (perhaps, use both hash and hash2 for indexing)
-      }
+      }*/
       //int child_cp = child->cp.load(std::memory_order_relaxed);
       //if (child_cp != cp) print("make_child() warning: child exists but its cp %d is not equal to recent cp %d. Child N %lld, W %f\n", child_cp, cp, child->N.load(std::memory_order_relaxed), child->W.load(std::memory_order_relaxed));
-    } else { //then, if the child_hash is not found, create a child
+    //} else { //then, if the child_hash is not found, create a child
       child = new MCTSNode();
       child->hash.store(hash, std::memory_order_relaxed);
-      child->hash2.store(hash2, std::memory_order_relaxed);
+      //child->hash2.store(hash2, std::memory_order_relaxed);
       child->generation.store(generation.load(std::memory_order_relaxed));
       child->cp.store(cp, std::memory_order_relaxed);
       //we should probably update N and W as well. We're updating cp, the node is evaluated, meaning it's been visited
@@ -261,10 +262,10 @@ extern "C" {
         delete child;
         child = it->second; //it->second - is a pointer to the existing node (it->first is a hash)
         // Verify no collision on the existing node.
-        if (child->hash2.load(std::memory_order_relaxed) != hash2) {
+        /*if (child->hash2.load(std::memory_order_relaxed) != hash2) {
           log_file("make_child() error: hash collision detected in insert: hash %llu, hash2 %llu != hash2 %llu\n", hash, child->hash2.load(std::memory_order_relaxed), hash2);
           exit(-1); // Or handle as needed.
-        }
+        }*/
       }
     }
     return child; //may not be nullptr
@@ -277,15 +278,15 @@ extern "C" {
   };
   //called from mcts_search() and process_check()
   //calls make_child()
-  void expand_node(struct MCTSNode * parent, const std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& top_moves, const std::unordered_set<unsigned long long>& pos_history) {
+  void expand_node(struct MCTSNode * parent, const std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& top_moves, const std::unordered_set<unsigned long long>& pos_history) {
     //parent is locked for the expansion with unique_lock in caller - mcts_search() or process_check()
     if (parent->num_children.load(std::memory_order_relaxed) > 0) return; //already expanded by other threads, perhaps
     int num_moves = top_moves.size();
     assert(num_moves > 0);
     struct Edge * children = new Edge[num_moves];
     for (int i = 0; i < num_moves; ++i) {
-        auto [prior, move_idx, child_hash, child_hash2, child_cp] = top_moves[i];
-        struct MCTSNode * child = make_child(child_hash, child_hash2, child_cp);
+        auto [prior, move_idx, child_cp, child_hash/*, child_hash2*/ ] = top_moves[i];
+        struct MCTSNode * child = make_child(child_hash, /*child_hash2,*/ child_cp);
         children[i].P.store(prior, std::memory_order_relaxed);
         children[i].move.store(move_idx, std::memory_order_relaxed);
         children[i].child.store(child, std::memory_order_relaxed);        
@@ -452,7 +453,7 @@ extern "C" {
     return selected;
   }
 
-  int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass) {
+  int get_prob(std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& move_evals, double prob_mass) {
       size_t n = move_evals.size();
       if (n == 0) return 0;
       // Loop 1: Find max for stability
@@ -486,14 +487,14 @@ extern "C" {
   //calls compute_move_evals(), make_child() and expand_node()
   //returns the result in pawns from the temp_board->fen->sideToMove perspective
   double process_check(struct Board * temp_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history) {
-    struct MCTSNode * node = make_child(temp_board->zh->hash, temp_board->zh->hash2, NO_MATE_SCORE);
+    struct MCTSNode * node = make_child(temp_board->zh->hash, /*temp_board->zh->hash2,*/ NO_MATE_SCORE);
     int stored_cp = node->cp.load(std::memory_order_relaxed);
     if (stored_cp == NO_MATE_SCORE) { //make_child() returned new node without a parent, let's update its cp and expand it
       //we will link this node to the parent during a call expand_node() made later from mcts_search() 
-      std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>> move_evals; 
+      std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>> move_evals; 
       //use 1.0 for probability mass to try all moves - when in check, there shouldn't be too many moves
       compute_move_evals(temp_board, ctx, pos_history, move_evals, 1.0); 
-      int cp = -std::get<4>(move_evals[0]); //select the best cp for check evasion, may not be the best one though
+      int cp = -std::get<2>(move_evals[0]); //select the best cp for check evasion, may not be the best one though
                                             //for example, capture moves would always have high priors
       node->cp.store(cp, std::memory_order_relaxed);
       node->N.store(1, std::memory_order_relaxed);
@@ -527,12 +528,13 @@ extern "C" {
         res = evaluate_nnue(chess_board, NULL, ctx);
       }
     } else { //pieceCount <= TB_LARGEST, etc
-      const unsigned int ep = lsBit(chess_board->fen->enPassantLegalBit);
+      const unsigned int ep = lsBit(enPassantLegalBit(chess_board));
       const unsigned int wdl = tb_probe_wdl(chess_board->occupations[PieceNameWhite], chess_board->occupations[PieceNameBlack], chess_board->occupations[WhiteKing] | chess_board->occupations[BlackKing],
         chess_board->occupations[WhiteQueen] | chess_board->occupations[BlackQueen], chess_board->occupations[WhiteRook] | chess_board->occupations[BlackRook], chess_board->occupations[WhiteBishop] | chess_board->occupations[BlackBishop], chess_board->occupations[WhiteKnight] | chess_board->occupations[BlackKnight], chess_board->occupations[WhitePawn] | chess_board->occupations[BlackPawn],
-        0, 0, ep == 64 ? 0 : ep, OPP_COLOR(chess_board->fen->sideToMove) == ColorBlack ? 1 : 0);
+        0, 0, ep == 64 ? 0 : ep, chess_board->fen->sideToMove == ColorWhite ? 1 : 0);
       if (wdl == TB_RESULT_FAILED) {
-        log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, pieceCount, ep, chess_board->fen->halfmoveClock, OPP_COLOR(chess_board->fen->sideToMove) == ColorBlack ? 1 : 0, chess_board->occupations[PieceNameWhite], chess_board->occupations[PieceNameBlack], chess_board->occupations[WhiteKing] | chess_board->occupations[BlackKing], chess_board->occupations[WhiteQueen] | chess_board->occupations[BlackQueen], chess_board->occupations[WhiteRook] | chess_board->occupations[BlackRook], chess_board->occupations[WhiteBishop] | chess_board->occupations[BlackBishop], chess_board->occupations[WhiteKnight] | chess_board->occupations[BlackKnight], chess_board->occupations[WhitePawn] | chess_board->occupations[BlackPawn], strerror(errno));
+        updateFen(chess_board);
+        log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, fen %s, err %s\n", TB_LARGEST, pieceCount, ep, chess_board->fen->halfmoveClock, chess_board->fen->sideToMove == ColorWhite ? 1 : 0, chess_board->occupations[PieceNameWhite], chess_board->occupations[PieceNameBlack], chess_board->occupations[WhiteKing] | chess_board->occupations[BlackKing], chess_board->occupations[WhiteQueen] | chess_board->occupations[BlackQueen], chess_board->occupations[WhiteRook] | chess_board->occupations[BlackRook], chess_board->occupations[WhiteBishop] | chess_board->occupations[BlackBishop], chess_board->occupations[WhiteKnight] | chess_board->occupations[BlackKnight], chess_board->occupations[WhitePawn] | chess_board->occupations[BlackPawn], chess_board->fen->fenString, strerror(errno));
         generateMoves(chess_board);
         if (chess_board->isMate) res = -MATE_SCORE * 0.01;
         else if (chess_board->isStaleMate) {
@@ -557,7 +559,7 @@ extern "C" {
   //called from compute_move_evals()
   //calls process_check() and evaluate_nnue()
   //returns eval result in pawns from the perspective of chess_board->fen->sideToMove
-  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, unsigned long long& child_hash2, const std::unordered_set<unsigned long long>& pos_history) {
+  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, /*unsigned long long& child_hash2,*/ const std::unordered_set<unsigned long long>& pos_history) {
     struct Board * tmp_board = cloneBoard(chess_board);
     struct Move move;
     //init_move(&move, tmp_board, src, dst, promo);
@@ -565,7 +567,7 @@ extern "C" {
     ff_move(tmp_board, &move, src, dst, promo);
     updateHash(tmp_board, &move);
     child_hash = tmp_board->zh->hash;
-    child_hash2 = tmp_board->zh->hash2;
+    //child_hash2 = tmp_board->zh->hash2;
     if (pos_history.count(tmp_board->zh->hash) > 0) {
         // This specific move causes a repetition relative to the current search path.
         // Return a draw score immediately.
@@ -580,7 +582,7 @@ extern "C" {
   //called from mcts_search() and process_check()
   //calls do_move()
   //computes and returns move_evals tuple given chess_board, prob_mass and pos_history
-  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history, std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass) {
+  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, const std::unordered_set<unsigned long long>& pos_history, std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& move_evals, double prob_mass) {
         int src, dst;
         double res;
         //std::uniform_real_distribution<double> uniform(-noise, noise);
@@ -591,16 +593,16 @@ extern "C" {
       	  unsigned long long moves = chess_board->movesFromSquares[src];
       	  while (moves) { //loop for all piece moves
       	    dst = lsBit(moves);
-      	    unsigned long long child_hash = 0, child_hash2 = 0;
+      	    unsigned long long child_hash = 0; //, child_hash2 = 0;
           	int startPiece = PieceTypeNone, endPiece = PieceTypeNone;
           	if (promoMove(chess_board, src, dst)) {
           	  startPiece = Knight;
           	  endPiece = Queen;
           	}
-        	  for (int pt = startPiece; pt <= endPiece; pt++) { //loop over promotions if any, Pawn means no promo
-        	    res = do_move(chess_board, src, dst, pt, ctx, child_hash, child_hash2, pos_history);
+        	  for (int pt = startPiece; pt <= endPiece; pt++) { //loop over promotions if any
+        	    res = do_move(chess_board, src, dst, pt, ctx, child_hash, /*child_hash2,*/ pos_history);
               //res += res * uniform(rng);
-              move_evals.push_back({res, (src << 9) | (dst << 3) | pt, child_hash, child_hash2, static_cast<int>(-res * 100)});
+              move_evals.push_back({res, (src << 9) | (dst << 3) | pt, static_cast<int>(-res * 100), child_hash/*, child_hash2*/});
         	  }
             moves &= moves - 1;
           }
@@ -688,10 +690,10 @@ MCTS implementation follows the four core phases:
                                   //if leaf node is already locked, it means that other thread is expanding it already
       generateMoves(sim_board); //needed for checks such as isMate or isStaleMate as well as compute_move_evals()
       if (!sim_board->isMate && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000) {
-        	std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>> move_evals; //res, move_idx, hash, hash2, cp (res is converted to probabilities in get_prob(), hence we need to preserve it in cp)
+        	std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>> move_evals; //res, move_idx, cp, hash, hash2 (res is converted to probabilities in get_prob(), hence we need to preserve it in cp)
           compute_move_evals(sim_board, ctx, pos_history, move_evals, probability_mass);
           //updating node's cp with improve evaluation 
-          scorecp = -std::get<4>(move_evals[0]);
+          scorecp = -std::get<2>(move_evals[0]);
           result = tanh(scorecp * 0.01 / eval_scale);
           node->cp.store(scorecp, std::memory_order_relaxed); //look-ahead update
           //before expanding, it would be nice to insure that position is quiet for correct cp, i.e. evals are correct!
@@ -869,8 +871,7 @@ MCTS implementation follows the four core phases:
         auto iter_start = std::chrono::steady_clock::now();
         int side = PC(board->fen->sideToMove, PieceTypeAny); //either PieceNameWhite or PieceNameBlack
         unsigned long long any = board->occupations[side];
-        int src = 0, dst = 0;
-        int move_idx = 0;
+        int src = 0, dst = 0, move_idx = 0;
         int promoPiece = PieceNameNone;
         while (any) {
             src = lsBit(any);
@@ -893,7 +894,7 @@ MCTS implementation follows the four core phases:
                       break;
                     }
               	  }
-              	} else {
+              	} else { //not a promotion
                   move_idx = (src << 9) | (dst << 3);
                   break;
                 }            
@@ -902,6 +903,7 @@ MCTS implementation follows the four core phases:
             if (move_idx) break;
             any &= any - 1;
         }
+        //we found the only move, just need to get the position evaluation for this move
         struct NNUEContext ctx;
         init_nnue_context(&ctx);        
         struct Board * tmp_board = cloneBoard(board);
@@ -914,7 +916,10 @@ MCTS implementation follows the four core phases:
         else if (tmp_board->isCheck) {
           std::unordered_set<unsigned long long>pos_history;
           res = -process_check(tmp_board, &ctx, pos_history);
-        } else res = -evaluate_nnue(tmp_board, NULL, &ctx);
+        } else {
+          updateFen(tmp_board);
+          res = -evaluate_nnue(tmp_board, NULL, &ctx);
+        }
         freeBoard(tmp_board);
         free_nnue_context(&ctx);
         idx_to_move(move_idx, best_move);

@@ -146,65 +146,34 @@ int reconcile(struct Board * board) {
 		}
 	}
 	for (int j = PieceNameNone; j <= PieceNameBlack; j++) {
-		unsigned char s;
 		unsigned long long o = board->occupations[j];
-		while ((s = lsBit(o)) < SquareNone) {
+		while (o) {
+  		unsigned char s = lsBit(o);
 			if (board->piecesOnSquares[s] != j) {
 				switch (j) {
 				case PieceNameAny:
 					if (board->piecesOnSquares[s] == PieceNameNone)
 						break;
 				case PieceNameWhite:
-					if (board->piecesOnSquares[s] >> 3 == ColorWhite)
+					if (PC_COLOR(board->piecesOnSquares[s]) == ColorWhite)
 						break;
 				case PieceNameBlack:
-					if (board->piecesOnSquares[s] >> 3 == ColorBlack)
+					if (PC_COLOR(board->piecesOnSquares[s]) == ColorBlack)
 						break;
 				default:
 					printf("reconcile() error: %s piece in occupations does not match one in piecesOnSquares[%s] %s, fen %s\n", pieceName[j], squareName[s], pieceName[board->piecesOnSquares[s]], board->fen->fenString);
 					err = 1;
 				}
 			}
-			o ^= 1ULL << s;
+			o &= o - 1;
 		}
 	}
 	return err;
 }
 
-/*void updateFen(struct Board * board) {
-	for (signed char i = 7; i >= 0; i--) {
-		bool prevSquareEmpty = false;
-		unsigned char n = 0, r = 0;
-		char fenRank[9];
-		for (unsigned char j = 0; j <= 7; j++) {
-			unsigned char s = (i << 3) | j;
-			if (board->piecesOnSquares[s] == PieceNameNone) {
-				if (!prevSquareEmpty) {
-					prevSquareEmpty = true;
-					n = 1;
-				} else n++;
-			} else {
-				if (prevSquareEmpty) {
-					fenRank[r++] = '0' + n;
-					prevSquareEmpty = false;
-				}
-				fenRank[r++] = pieceLetter[board->piecesOnSquares[s]];
-			}
-		}
-		if (prevSquareEmpty) fenRank[r++] = '0' + n;
-		fenRank[r] = '\0';
-		strncpy(board->fen->ranks[i], fenRank, strlen(fenRank) + 1);
-	}
-	fentostr(board->fen);
-}*/
-
 //updates board->fen->fenString only
 void updateFen(struct Board * board) {
     assert(board && board->fen);
-    /*if (!board || !board->fen) {
-        fprintf(stderr, "updateFen() error: board or fen is NULL\n");
-        return;
-    }*/
 
     char position[73] = {0};
     char *pos_ptr = position;
@@ -262,51 +231,49 @@ void updateFen(struct Board * board) {
         en_passant[0] = board->fen->enPassant + 'a';
         en_passant[1] = (board->fen->sideToMove == ColorWhite) ? '6' : '3';
     }
-    sprintf(board->fen->fenString, "%s %c %s %s %d %d", position,
-            (board->fen->sideToMove == ColorWhite) ? 'w' : 'b',
-            castling, en_passant, board->fen->halfmoveClock, board->fen->moveNumber);
+    sprintf(board->fen->fenString, "%s %c %s %s %d %d", position, fenColor[board->fen->sideToMove], castling, en_passant, board->fen->halfmoveClock, board->fen->moveNumber);
 }
 
-bool isEnPassantLegal(struct Board *board) {
-    // Simplified: use macros for file/rank
-    int kingSq = lsBit(board->occupations[PC(board->fen->sideToMove, King)]);
-    int enPassantShift = board->fen->sideToMove == ColorWhite ? 16 : 40;
-    board->fen->enPassantLegalBit = 0;
+//returns en passant bit square if en passant move is legal or 0 otherwise
+unsigned long long enPassantLegalBit(struct Board * board) {
+  int kingSq = lsBit(board->occupations[PC(board->fen->sideToMove, King)]);
+  int enPassantRank = board->fen->sideToMove == ColorWhite ? Rank6 : Rank3;
 
-    for (int pt = Rook; pt <= Queen; pt++) {
-        unsigned long long oppRooksQueens = board->occupations[PC(OPP_COLOR(board->fen->sideToMove), pt)];
-        while (oppRooksQueens) {
-            int oppSq = lsBit(oppRooksQueens);
-            if (SQ_RANK(kingSq) != SQ_RANK(oppSq)) {
-                oppRooksQueens &= oppRooksQueens - 1;
-                continue;
-            }
-            int dir = (oppSq > kingSq) ? 1 : -1;
-            int shift = kingSq + dir;
-            while (SQ_RANK(shift) == SQ_RANK(kingSq) && shift >= 0 && shift < 64) {
-                if (board->piecesOnSquares[shift] != PieceNameNone) {
-                    if (shift == oppSq) return false;
-                    break;
-                }
-                shift += dir;
-            }
-            oppRooksQueens &= oppRooksQueens - 1;
+  for (int pt = Rook; pt <= Queen; pt++) {
+    unsigned long long oppRooksQueens = board->occupations[PC(OPP_COLOR(board->fen->sideToMove), pt)];
+    while (oppRooksQueens) { //a loop for all opponent's rooks and queens
+      int oppSq = lsBit(oppRooksQueens);
+      if (SQ_RANK(kingSq) != SQ_RANK(oppSq)) {
+        oppRooksQueens &= oppRooksQueens - 1;
+        continue; //king and opponent's rook or queen are not on the same rank, no check from en passant move is possible
+      }
+      //move the king towards opponent's rook or queen
+      int dir = (oppSq > kingSq) ? 1 : -1;
+      int shift = kingSq + dir;
+      while (shift >= 0 && shift < 64 && SQ_RANK(shift) == SQ_RANK(kingSq)) {
+        if (board->piecesOnSquares[shift] != PieceNameNone) { //if there is something on the way
+          if (shift == oppSq) return 0; //if it is the rook or the queen, then en passant is illegal because of check
+          break; //something other than the rook or the queen - not a problem
         }
+        shift += dir; //continue moving the king towards opponent's rook or queen
+      }
+      oppRooksQueens &= oppRooksQueens - 1; //next opponent's rook or queen
     }
-    board->fen->enPassantLegalBit = 1ULL << (enPassantShift + board->fen->enPassant);
-    return true;
+  }
+  return SQ_BIT(SQ(enPassantRank, board->fen->enPassant)); //en passant move is legal
 }
 
 //these two functions are based on the modern ray piece move generation technique 
 //known as magic bitboards (see magic_bitboards.c)
 //to use them, they must be initialized by calling init_magic_bitboards();
 //and freed at the end by calling cleanup_magic_bitboards();
-unsigned long long generate_bishop_moves(struct Board * board, int  sn) {
-  return get_bishop_moves(sn, board->occupations[PieceNameAny]);
-}
-unsigned long long generate_rook_moves(struct Board * board, int  sn) {
-  return get_rook_moves(sn, board->occupations[PieceNameAny]);
-}
+//we call get_bishop_moves() and get_root_moves() directly without these wrappers
+//unsigned long long generate_bishop_moves(struct Board * board, int  sn) {
+//  return get_bishop_moves(sn, board->occupations[PieceNameAny]);
+//}
+//unsigned long long generate_rook_moves(struct Board * board, int  sn) {
+//  return get_rook_moves(sn, board->occupations[PieceNameAny]);
+//}
 
 //generates knight moves from a given square limited by board boundaries only
 unsigned long long generateKnightMoves(struct Board * board, const int sq) {
@@ -343,16 +310,15 @@ unsigned long long generateKingMoves(struct Board * board, const int sq) {
 
 unsigned long long rookPinFinder(struct Board * board, const int sq, const int kingSquare) {
 	unsigned long long d = 0;
-	int  ii = SQ_FILE(kingSquare); 
-	int  jj = SQ_RANK(kingSquare); 
-	int  shift = kingSquare;
-	const int file = SQ_FILE(sq);
-	const int rank = SQ_RANK(sq);
+	int shift;
+	int ii = SQ_FILE(kingSquare); 
 	//King and opponent rook (or queen) are on the same file
-	if (file == ii) {
+	if (SQ_FILE(sq) == ii) {
 		//We move the king along the file towards the opponent rook (or queen) until we bump into something.
-		//Later in is_pinned() function we'll see if that "something" is the same color as the king and if it is attacked
+		//Later in generateMoves() function we'll see if that "something" is the same color as the king and if it is attacked
 		//by opponent rook (or queen). If it is, then this "something" is pinned against the king
+  	int  jj = SQ_RANK(kingSquare);
+  	shift = kingSquare;
 		if (sq > kingSquare) {
 			while (jj++ < Rank8)
 				if (board->piecesOnSquares[shift += 8] != PieceNameNone) { d |= SQ_BIT(shift); break; }
@@ -363,10 +329,11 @@ unsigned long long rookPinFinder(struct Board * board, const int sq, const int k
 		}
 	}
 	//King and opponent rook (or queen) are on the same rank
-	else if (rank == SQ_RANK(kingSquare)) {
+	else if (SQ_RANK(sq) == SQ_RANK(kingSquare)) {
 		//We move the king along the rank towards the opponent rook (or queen) until we bump into something.
-		//Later in is_pinned() function we'll see if that "something" is the same color as the king and if it is attacked
+		//Later in generateMoves() function we'll see if that "something" is the same color as the king and if it is attacked
 		//by opponet rook (or queen). If it is, then this "something" is pinned against the king
+  	shift = kingSquare;		
 		if (sq > kingSquare) {
 			while (ii++ < FileH)
 				if (board->piecesOnSquares[shift += 1] != PieceNameNone) { d |= SQ_BIT(shift); break; }
@@ -381,29 +348,30 @@ unsigned long long rookPinFinder(struct Board * board, const int sq, const int k
 
 unsigned long long bishopPinFinder(struct Board * board, const int sq, const int kingSquare) {
 	unsigned long long d = 0;
-	int  ii = SQ_FILE(kingSquare); 
-	int  jj = SQ_RANK(kingSquare); 
-	int  shift = kingSquare;
-	const int diag = SQ_DIAG(sq);
-	const int antiDiag = SQ_ANTIDIAG(sq);
+	int  ii, jj, shift;
 	//King and opponent bishop (or queen) are on the same diagonal
-	if (diag == SQ_DIAG(kingSquare)) {
+	if (SQ_DIAG(sq) == SQ_DIAG(kingSquare)) {
+		ii = SQ_FILE(kingSquare); 
+		jj = SQ_RANK(kingSquare); 
+		shift = kingSquare;
 		//We move the king along this diagonal towards the opponent bishop (or queen) until we bump into something.
-		//Later in is_pinned() function we'll see if that "something" is the same color as the king and if it is attacked
+		//Later in generateMoves() we'll see if that "something" is the same color as the king and if it is attacked
 		//by opponent bishop (or queen). If it is, then this "something" is pinned against the king
 		if (sq > kingSquare) {
 			while (ii++ < FileH && jj++ < Rank8)
 				if (board->piecesOnSquares[shift += 9] != PieceNameNone) { d |= SQ_BIT(shift); break; }
-		}
-		else {
+		} else {
 			while (ii-- > FileA && jj-- > Rank1)
 				if (board->piecesOnSquares[shift -= 9] != PieceNameNone) { d |= SQ_BIT(shift); break; }
 		}
 	}
 	//King and opponent bishop (or queen) are on the same anti-diagonal
-	else if (antiDiag == SQ_ANTIDIAG(kingSquare)) {
+	else if (SQ_ANTIDIAG(sq) == SQ_ANTIDIAG(kingSquare)) {
+		ii = SQ_FILE(kingSquare); 
+		jj = SQ_RANK(kingSquare); 
+		shift = kingSquare;
 		//We move the king along this anti-diagonal towards the opponent bishop (or queen) until we bump into something.
-		//Later in is_pinned() function we'll see if that "something" is the same color as the king and if it is attacked
+		//Later in generateMoves() function we'll see if that "something" is the same color as the king and if it is attacked
 		//by opponent bishop (or queen). If it is, then this "something" is pinned against the king
 		if (sq > kingSquare) {
 			while (ii-- > FileA && jj++ < Rank8)
@@ -418,13 +386,15 @@ unsigned long long bishopPinFinder(struct Board * board, const int sq, const int
 }
 
 unsigned long long pinnedBishopMoves(struct Board * board, const int sq, const int pinnedBy) {
-	unsigned long long d = 0;  
-	int  ii = SQ_FILE(sq);
-	int  jj = SQ_RANK(sq);
-	int  shift = sq;
+	unsigned long long d = 0;
+	const int diag = SQ_DIAG(sq);
+	//int  ii = SQ_FILE(sq);
+	//int  jj = SQ_RANK(sq);
+	//int  shift = sq;
 	//if pinned on diagonal, then it can only move along it
-	if (SQ_DIAG(pinnedBy) == SQ_DIAG(sq)) {
-		while (ii++ < FileH && jj++ < Rank8) {
+	if (SQ_DIAG(pinnedBy) == diag) {
+		d = get_bishop_moves(sq, board->occupations[PieceNameAny]) & diag_bb[diag];
+		/*while (ii++ < FileH && jj++ < Rank8) {
 			shift += 9;
 			d |= SQ_BIT(shift);
 			if (board->piecesOnSquares[shift] != PieceNameNone) break; 
@@ -434,33 +404,39 @@ unsigned long long pinnedBishopMoves(struct Board * board, const int sq, const i
 			shift -= 9;
 			d |= SQ_BIT(shift);
 			if (board->piecesOnSquares[shift] != PieceNameNone) break; 
-		}
+		}*/
 	}
 	//the same is for antidiagonal
-	else if (SQ_ANTIDIAG(pinnedBy) == SQ_ANTIDIAG(sq)) {
-		while (ii-- > FileA && jj++ < Rank8) {
-			shift += 7;
-			d |= SQ_BIT(shift);
-			if (board->piecesOnSquares[shift] != PieceNameNone) break; 
-		}
-		ii = SQ_FILE(sq); jj = SQ_RANK(sq); shift = sq;
-		while (ii++ < FileH && jj-- > Rank1) {
-			shift -= 7;
-			d |= SQ_BIT(shift);
-			if (board->piecesOnSquares[shift] != PieceNameNone) break; 
-		}
+	else {
+  	const int antidiag = SQ_ANTIDIAG(sq);
+		if (SQ_ANTIDIAG(pinnedBy) == antidiag) {
+			d = get_bishop_moves(sq, board->occupations[PieceNameAny]) & antidiag_bb[antidiag];
+			/*while (ii-- > FileA && jj++ < Rank8) {
+				shift += 7;
+				d |= SQ_BIT(shift);
+				if (board->piecesOnSquares[shift] != PieceNameNone) break; 
+			}
+			ii = SQ_FILE(sq); jj = SQ_RANK(sq); shift = sq;
+			while (ii++ < FileH && jj-- > Rank1) {
+				shift -= 7;
+				d |= SQ_BIT(shift);
+				if (board->piecesOnSquares[shift] != PieceNameNone) break; 
+			}*/
+	  }
 	}
 	return d;
 }
 
 unsigned long long pinnedRookMoves(struct Board * board, const int sq, const int pinnedBy) {
 	unsigned long long d = 0;
-	int  ii = SQ_FILE(sq);
-	int  jj = SQ_RANK(sq);
-	int  shift = sq;
+	const int file = SQ_FILE(sq);
+	//int  ii = SQ_FILE(sq);
+	//int  jj = SQ_RANK(sq);
+	//int  shift = sq;
 	//if the rook is pinned on a file, it can only move along it
-	if (SQ_FILE(pinnedBy) == SQ_FILE(sq)) {
-		while (jj++ < Rank8) {
+	if (SQ_FILE(pinnedBy) == file) {
+		d = get_rook_moves(sq, board->occupations[PieceNameAny]) & files_bb[file];
+		/*while (jj++ < Rank8) {
 			shift += 8;
 			d |= SQ_BIT(shift);
 			if (board->piecesOnSquares[shift] != PieceNameNone) break; 
@@ -470,21 +446,25 @@ unsigned long long pinnedRookMoves(struct Board * board, const int sq, const int
 			shift -= 8;
 			d |= SQ_BIT(shift);
 			if (board->piecesOnSquares[shift] != PieceNameNone) break; 
-		}
+		}*/
 	}
 	//the same applies to a rank
-	else if (SQ_RANK(pinnedBy) == SQ_RANK(sq)) {
-		while (ii++ < FileH) {
-			shift++;
-			d |= SQ_BIT(shift);
-			if (board->piecesOnSquares[shift] != PieceNameNone) break; 
-		}
-		ii = SQ_FILE(sq); shift = sq;
-		while (ii-- > FileA) {
-			shift--;
-			d |= SQ_BIT(shift);
-			if (board->piecesOnSquares[shift] != PieceNameNone) break;
-		}
+	else {
+		const int rank = SQ_RANK(sq);
+		if (SQ_RANK(pinnedBy) == rank) {
+  		d = get_rook_moves(sq, board->occupations[PieceNameAny]) & ranks_bb[rank];
+			/*while (ii++ < FileH) {
+				shift++;
+				d |= SQ_BIT(shift);
+				if (board->piecesOnSquares[shift] != PieceNameNone) break; 
+			}
+			ii = SQ_FILE(sq); shift = sq;
+			while (ii-- > FileA) {
+				shift--;
+				d |= SQ_BIT(shift);
+				if (board->piecesOnSquares[shift] != PieceNameNone) break;
+			}*/
+	  }
 	}
 	return d;
 }
@@ -594,12 +574,12 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
 		else {
    		d = 0;
 		  if (pieceType == Bishop)
-			  d = generate_bishop_moves(board, sq);
+			  d = get_bishop_moves(sq, board->occupations[PieceNameAny]);
 			else if (pieceType == Rook)
-			  d = generate_rook_moves(board, sq);
+			  d = get_rook_moves(sq, board->occupations[PieceNameAny]);
 			else if (pieceType == Queen) {
-			  d = generate_bishop_moves(board, sq);
-			  d |= generate_rook_moves(board, sq);			  
+			  d = get_bishop_moves(sq, board->occupations[PieceNameAny]);
+			  d |= get_rook_moves(sq, board->occupations[PieceNameAny]);			  
 			} else if (pieceType == Pawn) {
 			  //d = 0;
   			//normal pawn moves (non-capturing)
@@ -616,31 +596,27 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
   			if (sqFile > FileA) {
   				shift = sq + pawnShifts[board->fen->sideToMove][1]; //NW (white) or SW (black)
           unsigned long long bit_sq = SQ_BIT(shift);
-          //is this faster than commented line below?
           if (board->occupations[PC(OPP_COLOR(board->fen->sideToMove), PieceTypeAny)] & bit_sq) d |= bit_sq; 
-  				//if (board->piecesOnSquares[shift] != PieceNameNone && PC_COLOR(board->piecesOnSquares[shift]) == OPP_COLOR(board->fen->sideToMove)) d |= bit_sq;
   				else if ((board->fen->enPassant == (sqFile - 1)) && (sqRank == pawnRanks[board->fen->sideToMove][1])) { //rank5 or rank4
   					//make sure there is no discover check from a queen or a rook
-  					board->piecesOnSquares[sq] = PieceNameNone;
-  					board->piecesOnSquares[sq - 1] = PieceNameNone;
-  					if (isEnPassantLegal(board)) d |= bit_sq;
-  					board->piecesOnSquares[sq] = ctx->shiftedColor | Pawn; 
-  					board->piecesOnSquares[sq - 1] = ctx->shiftedOpponentColor | Pawn;
+  					board->piecesOnSquares[sq] = PieceNameNone; //temporarily remove moving pawn
+  					board->piecesOnSquares[sq - 1] = PieceNameNone; //temporarily remove en passant pawn
+  					if (enPassantLegalBit(board)) d |= bit_sq;
+  					board->piecesOnSquares[sq] = ctx->shiftedColor | Pawn; //restore moving pawn
+  					board->piecesOnSquares[sq - 1] = ctx->shiftedOpponentColor | Pawn; //restore en passant pawn
   				}
   			}
   			if (sqFile < FileH) {
   				shift = sq + pawnShifts[board->fen->sideToMove][2]; //NE (white) or SE (black)
-          //is this faster than commented line below?
           unsigned long long bit_sq = SQ_BIT(shift);
           if (board->occupations[PC(OPP_COLOR(board->fen->sideToMove), PieceTypeAny)] & bit_sq) d |= bit_sq; 
-  				//if ((board->piecesOnSquares[shift] != PieceNameNone) && (PC_COLOR(board->piecesOnSquares[shift]) == OPP_COLOR(board->fen->sideToMove))) d |= bit_sq;
   				else if ((board->fen->enPassant == (sqFile + 1)) && (sqRank == pawnRanks[board->fen->sideToMove][1])) {
   					//make sure there is no discover check from a queen or a rook
-  					board->piecesOnSquares[sq] = PieceNameNone; 
-  					board->piecesOnSquares[sq + 1] = PieceNameNone;
-  					if (isEnPassantLegal(board)) d |= bit_sq;
-  					board->piecesOnSquares[sq] = ctx->shiftedColor | Pawn;
-  					board->piecesOnSquares[sq + 1] = ctx->shiftedOpponentColor | Pawn;
+  					board->piecesOnSquares[sq] = PieceNameNone; //temporarily remove moving pawn
+  					board->piecesOnSquares[sq + 1] = PieceNameNone; //temporarily remove en passant pawn
+  					if (enPassantLegalBit(board)) d |= bit_sq;
+  					board->piecesOnSquares[sq] = ctx->shiftedColor | Pawn; //restore moving pawn
+  					board->piecesOnSquares[sq + 1] = ctx->shiftedOpponentColor | Pawn; //restore en passant pawn
   				}
   			}
   			board->movesFromSquares[sq] = d;
@@ -688,7 +664,7 @@ void generateMoves(struct Board * board) {
 	int  pinnedPieceSquare = SquareNone;
 	board->isCheck = false; board->isStaleMate = false; board->isMate = false;
 	//reset enPassantLegalBit
-	board->fen->enPassantLegalBit = 0;
+	//board->fen->enPassantLegalBit = 0;
 
 	struct ChessPiece king;
 	int _king = movesContext.shiftedColor | King;
@@ -709,7 +685,8 @@ void generateMoves(struct Board * board) {
 	//so the rays can light through it
 	//this is necessary to mark the squares behind the king as attacked, 
 	//so that the king under the check of opponent ray piece, cannot step back
-	board->piecesOnSquares[king.square] = PieceNameNone;
+	//board->piecesOnSquares[king.square] = PieceNameNone;
+	//we only xor it out from PieceNameAny occupations array member because only it is passed to get_bishop_moves() and get_root_moves()
 	//board->occupations[_king] = 0;
 	//board->occupations[shiftedColor | PieceTypeAny] ^= kingSq.bit;
 	board->occupations[PieceNameAny] ^= kingSq.bit;
@@ -732,7 +709,7 @@ void generateMoves(struct Board * board) {
 	while (opponentBishops) {
   	sq = lsBit(opponentBishops);
 		//generate opponent bishop moves limited by board boundaries and other pieces regardless of their color 
-		board->movesFromSquares[sq] = generate_bishop_moves(board, sq);
+		board->movesFromSquares[sq] = get_bishop_moves(sq, board->occupations[PieceNameAny]);
 		attackedSquares |= board->movesFromSquares[sq];
 		//find pinned by this bishop pieces
 		//in bishopPinFinder() we move from the board->fen->sideToMove king toward the opponent 
@@ -753,7 +730,7 @@ void generateMoves(struct Board * board) {
 	//repeat the same process as described for opponent bishops, for opponent rooks
   while (opponentRooks) {
   	sq = lsBit(opponentRooks);
-		board->movesFromSquares[sq] = generate_rook_moves(board, sq);
+		board->movesFromSquares[sq] = get_rook_moves(sq, board->occupations[PieceNameAny]);
 		attackedSquares |= board->movesFromSquares[sq];
 		d = rookPinFinder(board, sq, king.square);
 		d &= board->movesFromSquares[sq];
@@ -767,7 +744,7 @@ void generateMoves(struct Board * board) {
 	//repeat the same process as described for opponent bishops, for opponent queens
 	while (opponentQueens) {
   	sq = lsBit(opponentQueens);
-		board->movesFromSquares[sq] = generate_bishop_moves(board, sq) | generate_rook_moves(board, sq);
+		board->movesFromSquares[sq] = get_bishop_moves(sq, board->occupations[PieceNameAny]) | get_rook_moves(sq, board->occupations[PieceNameAny]);
 		attackedSquares |= board->movesFromSquares[sq];
 		d = bishopPinFinder(board, sq, king.square) | rookPinFinder(board, sq, king.square);
 		d &= board->movesFromSquares[sq];
@@ -779,7 +756,7 @@ void generateMoves(struct Board * board) {
 		opponentQueens &= opponentQueens - 1;
 	}
 	//we are done with opponent ray piece attacked squares, now we can restore the king
-	board->piecesOnSquares[king.square] = (movesContext.shiftedColor | King);
+	//board->piecesOnSquares[king.square] = (movesContext.shiftedColor | King);
 	board->occupations[PieceNameAny] |= kingSq.bit;
 
 	//find the squares attacked and defended by opponent pawns
@@ -1613,8 +1590,9 @@ void ff_move(struct Board * board, struct Move * move, const int src, const int 
 	if (mpType == Pawn && !capture) {
   	diff = abs(src - dst);
 		if (diff == 7 || diff == 9) { 
+  	//if ((board->fen->enPassant < FileNone) && board->fen->enPassant + (board->fen->sideToMove == ColorWhite ? Rank6 << 3 : Rank3 << 3) == dst) {
 			capture = true;
-		  move->type |= (MoveTypeCapture && MoveTypeEnPassant);
+		  move->type |= (MoveTypeCapture | MoveTypeEnPassant);
 			const int sign = board->fen->sideToMove == ColorWhite ? -1 : 1;
 			const int capturedPawnSquare = dst + sign * 8;
 			move->capturedPiece = PC(oppColor, Pawn);
@@ -1747,7 +1725,6 @@ void ff_move(struct Board * board, struct Move * move, const int src, const int 
 	//toggle FEN SideToMove
 	if (board->fen->sideToMove == ColorWhite) board->fen->sideToMove = ColorBlack;
 	else board->fen->sideToMove = ColorWhite;
-	reconcile(board); //for debugging
 }
 
 struct Board * cloneBoard(struct Board * src) {

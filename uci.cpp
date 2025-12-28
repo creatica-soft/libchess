@@ -589,7 +589,7 @@ void search_thread_func() {
           return; //no need to query table bases for the opponent
         }        
         best_move[0] = '\0';
-        unsigned int ep = lsBit(board->fen->enPassantLegalBit);
+        const unsigned int ep = lsBit(enPassantLegalBit(board));
         unsigned int result = tb_probe_root(board->occupations[PieceNameWhite], board->occupations[PieceNameBlack], 
             board->occupations[WhiteKing] | board->occupations[BlackKing],
             board->occupations[WhiteQueen] | board->occupations[BlackQueen], board->occupations[WhiteRook] | board->occupations[BlackRook], board->occupations[WhiteBishop] | board->occupations[BlackBishop], board->occupations[WhiteKnight] | board->occupations[BlackKnight], board->occupations[WhitePawn] | board->occupations[BlackPawn],

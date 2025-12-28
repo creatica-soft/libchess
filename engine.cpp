@@ -884,7 +884,7 @@ int engine(struct Engine * engine, const char * engineName) {
     if (!engine->toEngine) {
         fprintf(stderr, "engine() error: _fdopen(toEngine) failed\n");
         _close(fdToEngine);
-		CloseHandle(engine->hPipeFromEngine);
+				CloseHandle(engine->hPipeFromEngine);
         CloseHandle(pi.hProcess);
         return 1;
     }
@@ -1068,12 +1068,14 @@ void releaseChessEngine(struct Engine * chessEngine) {
 	}
 	if (chessEngine->toEngine) {
 		fclose(chessEngine->toEngine);
-		chessEngine->toEngine = nullptr;
+		chessEngine->toEngine = nullptr;		
 	}
 	if (chessEngine->fromEngine) {
 		fclose(chessEngine->fromEngine);
 		chessEngine->fromEngine = nullptr;
 	}
+	remove(chessEngine->namedPipeTo);
+  remove(chessEngine->namedPipeFrom);
 #ifdef _WIN32
 	if (chessEngine->hPipeToEngine != INVALID_HANDLE_VALUE) {
 		CloseHandle(chessEngine->hPipeToEngine);

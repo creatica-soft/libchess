@@ -40,14 +40,14 @@ void cleanup_nnue();
 void init_nnue_context(struct NNUEContext * ctx);
 void free_nnue_context(struct NNUEContext * ctx);
 double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
-void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass);
+void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& move_evals, double prob_mass);
 //double noise = NOISE;
 double temperature = TEMPERATURE;
 double probability_mass = PROBABILITY_MASS;
 double eval_scale = EVAL_SCALE;
 //std::mt19937 rng(std::random_device{}());
 
-int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass) {
+int get_prob(std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& move_evals, double prob_mass) {
     size_t n = move_evals.size();
     if (n == 0) return 0;
     // Loop 1: Find max for stability
@@ -78,10 +78,10 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned lo
 }
  
   double process_check(struct Board * temp_board, struct NNUEContext * ctx) {
-    std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>> move_evals; 
+    std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>> move_evals; 
     //use 1.0 for probability mass to try all moves - when in check, there shouldn't be too many moves
     compute_move_evals(temp_board, ctx, move_evals, 1.0); 
-    return -std::get<4>(move_evals[0]) * 0.01;
+    return -std::get<2>(move_evals[0]) * 0.01;
   }
 
   //called from do_move() and set_root()
@@ -105,7 +105,7 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned lo
         res = evaluate_nnue(chess_board, NULL, ctx);
       }
     } else { //pieceCount <= TB_LARGEST, etc
-      const unsigned int ep = lsBit(chess_board->fen->enPassantLegalBit);
+      const unsigned int ep = lsBit(enPassantLegalBit(chess_board));
       const unsigned int wdl = tb_probe_wdl(chess_board->occupations[PieceNameWhite], chess_board->occupations[PieceNameBlack], chess_board->occupations[WhiteKing] | chess_board->occupations[BlackKing],
         chess_board->occupations[WhiteQueen] | chess_board->occupations[BlackQueen], chess_board->occupations[WhiteRook] | chess_board->occupations[BlackRook], chess_board->occupations[WhiteBishop] | chess_board->occupations[BlackBishop], chess_board->occupations[WhiteKnight] | chess_board->occupations[BlackKnight], chess_board->occupations[WhitePawn] | chess_board->occupations[BlackPawn],
         0, 0, ep == 64 ? 0 : ep, OPP_COLOR(chess_board->fen->sideToMove) == ColorBlack ? 1 : 0);
@@ -131,7 +131,7 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned lo
     return res;
   }
 
-  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, unsigned long long& child_hash2) {
+  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash/*, unsigned long long& child_hash2*/) {
     struct Board * tmp_board = cloneBoard(chess_board);
     struct Move move;
     //init_move(&move, tmp_board, src, dst, promo);
@@ -139,13 +139,13 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned lo
     ff_move(tmp_board, &move, src, dst, promo);
     updateHash(tmp_board, &move);
     child_hash = tmp_board->zh->hash;
-    child_hash2 = tmp_board->zh->hash2;
+    //child_hash2 = tmp_board->zh->hash2;
     double res = position_eval(tmp_board, ctx);
     freeBoard(tmp_board);    
     return -res;
   }
 
-  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>>& move_evals, double prob_mass) {
+  void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& move_evals, double prob_mass) {
         int src, dst;
         double res;
         //std::uniform_real_distribution<double> uniform(-noise, noise);
@@ -156,17 +156,17 @@ int get_prob(std::vector<std::tuple<double, int, unsigned long long, unsigned lo
       	  unsigned long long moves = chess_board->movesFromSquares[src];
       	  while (moves) {
       	    dst = lsBit(moves);
-      	    unsigned long long child_hash = 0, child_hash2 = 0;
+      	    unsigned long long child_hash = 0; //, child_hash2 = 0;
           	int startPiece = PieceTypeNone, endPiece = PieceTypeNone;
           	if (promoMove(chess_board, src, dst)) {
           	  startPiece = Knight;
           	  endPiece = Queen;
           	}
         	  for (int pt = startPiece; pt <= endPiece; pt++) { //loop over promotions if any, Pawn means no promo
-        	    res = do_move(chess_board, src, dst, pt, ctx, child_hash, child_hash2);
+        	    res = do_move(chess_board, src, dst, pt, ctx, child_hash/*, child_hash2*/);
         	    printf("%s%s%c %.4f %llu\n", squareName[src], squareName[dst], uciPromoLetter[pt], res, child_hash);
               //res += res * uniform(rng);
-              move_evals.push_back({res, (src << 9) | (dst << 3) | pt, child_hash, child_hash2, static_cast<int>(-res * 100)});
+              move_evals.push_back({res, (src << 9) | (dst << 3) | pt, static_cast<int>(-res * 100), child_hash/*, child_hash2*/});
         	  }
             moves &= moves - 1;
           }
@@ -221,9 +221,9 @@ int main(int argc, char ** argv) {
 
   generateMoves(&board); //needed for checks such as isMate or isStaleMate as well as for sim_board->movesFromSquares
   if (!board.isMate && !board.isStaleMate) {
-    std::vector<std::tuple<double, int, unsigned long long, unsigned long long, int>> move_evals; //res, move_idx, hash, hash2, scorecp
+    std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>> move_evals; //res, move_idx, scorecp, hash, hash2
     compute_move_evals(&board, &ctx, move_evals, probability_mass);
-    std::cout << "Outcome " << -std::get<4>(move_evals[0]) << " for " << color[board.fen->sideToMove] << std::endl;
+    std::cout << "Outcome " << -std::get<2>(move_evals[0]) << " for " << color[board.fen->sideToMove] << std::endl;
     int effective_branching = move_evals.size();
     for (int i = 0; i < effective_branching; i++) {
       char uci_move[6] = "";
