@@ -628,6 +628,7 @@ void ProcessEvent(const json& event) {
     if (event.contains("type") && (event["type"] == "challenge" || event["type"] == "challengeCanceled" || event["type"] == "challengeDeclined")) {
         std::string type = event["type"];
         std::string challenge_id = event["challenge"]["id"];
+        bool rated = event["challenge"]["rated"];
         std::string challenger_id = event["challenge"]["challenger"]["id"];
         std::string title = event["challenge"]["challenger"].value("title", "");
         std::string variant = event["challenge"]["variant"]["key"];
@@ -655,7 +656,7 @@ void ProcessEvent(const json& event) {
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
             if ((!game_in_progress.load() && variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960") &&
-                (speed == "blitz" || speed == "rapid" || speed == "classical") && challenger_id == "creaticachessbot" /*&& title != "BOT"*/) {
+                (speed == "blitz" || speed == "rapid" || speed == "classical") && challenger_id == "poliakevitch" /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
