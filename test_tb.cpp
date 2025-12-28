@@ -7,6 +7,11 @@
 #include <fstream>
 #include <string>
 #include "tbprobe.h"
+
+#ifdef __GNUC__
+#include <cstring>
+#endif
+
 #include "libchess.h"
 
 #define SYZYGY_PATH "/Users/ap/syzygy"

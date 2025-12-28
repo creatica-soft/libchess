@@ -26,6 +26,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
+#include <condition_variable>
+#include <queue>
 #include <cstdarg>
 #endif
 #include <vector>

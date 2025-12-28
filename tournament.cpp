@@ -9,6 +9,11 @@
 #include <format>
 #include <math.h>
 #include <unordered_map>
+
+#ifdef __GNUC__
+#include <string>
+#endif
+
 #include "libchess.h"
 
 #define CREATICA_PATH "/Users/ap/libchess/creatica"
