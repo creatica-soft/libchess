@@ -10,8 +10,6 @@
 #include <atomic>
 #include <cstdarg>
 #endif
-//#include <fcntl.h>
-//#include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <stdarg.h>
@@ -49,6 +47,9 @@
                         // exp((eval - max_eval)/(temperature/100)) / eval_sum
                         //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
 #define PV_PLIES 16
+#define PONDER false
+#define DISPLAY_INTERMITTENT_INFO_LINES true
+#define DISPLAY_FINAL_INFO_LINES true
 
 // Shared variables
 std::mutex mtx, log_mtx, print_mtx;
@@ -61,8 +62,6 @@ FILE * logfile = nullptr;
 double timeAllocated = 0.0; //ms
 char best_move[6] = "";
 using json = nlohmann::json;
-//std::string prev_fen;
-//std::string prev_moves;
 std::string last_move;
 
 std::unordered_set<unsigned long long> position_history;
@@ -337,8 +336,7 @@ void search_thread_func() {
   
   void handlePieces(void) {
     int numberOfPieces = 0;
-    //if (!prev_fen.empty())
-      numberOfPieces = bitCount(board->occupations[PieceNameAny]);
+    numberOfPieces = bitCount(board->occupations[PieceNameAny]);
     print("%d\n", numberOfPieces);
     log_file("%d\n", numberOfPieces);
   }
@@ -346,8 +344,6 @@ void search_thread_func() {
   void handleNewGame() {
     cleanup();
     position_history.clear();
-    //prev_fen.clear();
-    //prev_moves.clear();
     last_move.clear();
   }
   
@@ -364,8 +360,7 @@ void search_thread_func() {
     else {
       size_t fen_pos = position.find("fen", 9);
       if (fen_pos != std::string::npos) {
-        if (moves_pos != std::string::npos)
-          fen = position.substr(fen_pos + 4, moves_pos - fen_pos - 5);
+        if (moves_pos != std::string::npos) fen = position.substr(fen_pos + 4, moves_pos - fen_pos - 5);
         else fen = position.substr(fen_pos + 4);
       } else {
         log_file("handlePosition() error: neither startpos no fen keyword is present in position command\n");
@@ -373,66 +368,31 @@ void search_thread_func() {
       }
     }
     if (fen.compare(startPos) == 0 && uci_moves.empty()) position_history.clear();
-    //log_file("handlePosition() debug:\nnew fen \'%s\' moves \'%s\'\n", fen.c_str(), uci_moves.c_str());
-    /*if (!uci_moves.empty() && !fen.empty()) {
-      std::string last_moves_str;
-      if (!prev_fen.empty() && fen == prev_fen) {
-        if (!prev_moves.empty() && prev_moves == uci_moves) return;
-        if (!prev_moves.empty() && uci_moves.starts_with(prev_moves) && uci_moves.size() > prev_moves.size() + 4) {
-          new_pos = false;
-          last_moves_str = uci_moves.substr(prev_moves.size() + 1);
-        } else {
-          last_moves_str = uci_moves;
-          last_move.clear();
-        }
-      } else {
-        last_moves_str = uci_moves;
-      }*/
-      while (!uci_moves.empty() && std::isspace(uci_moves.back())) {
-        uci_moves.pop_back(); //trim whitespaces at the end
-      }
-      if (uci_moves.size() >= 4) { //we have at least one new move
-        std::istringstream moves_stream(uci_moves);
-        std::string some_move;
-        while (moves_stream >> some_move) {
-          moves.push_back(some_move);
-        }
-      }
-    //}
-    //if (new_pos) {
-        unsigned long long h = board->zh->hash;
-        strtofen(board->fen, fen.c_str());
-        fentoboard(board->fen, board);
-        getHash(board->zh, board);
-        if (h != board->zh->hash) position_history.insert(board->zh->hash);
-        //log_file("handlePosition(new_pos) debug: repetition count %d, fen %s\n", position_history.count(board->zh->hash), board->fen->fenString);   
-    //}
+    while (!uci_moves.empty() && std::isspace(uci_moves.back())) uci_moves.pop_back();
+    if (uci_moves.size() >= 4) { //we have at least one move
+      std::istringstream moves_stream(uci_moves);
+      std::string some_move;
+      while (moves_stream >> some_move) moves.push_back(some_move);
+    }
+    strtofen(board->fen, fen.c_str());
+    fentoboard(board->fen, board);
+    getHash(board->zh, board);
     if (!moves.empty()) {
       size_t num_moves = moves.size() - 1; //last move should wait till go
-      //log_file("handlePosition() debug: num_moves (expect 0): %d\n", num_moves);
       for (int i = 0; i < num_moves; i++) {
         int src = 0, dst = 0, promo = 0;
         move_to_idx(moves[i].c_str(), &src, &dst, &promo);
         struct Move move;
-        //init_move(&move, board, src, dst, promo);
-        //make_move(&move);
         ff_move(board, &move, src, dst, promo);
         updateFen(board);
-        //log_file("handlePosition() debug: fen after move %s is %s\n", moves[i].c_str(), board->fen->fenString);
         updateHash(board, &move);
         position_history.insert(board->zh->hash);
-        //log_file("handlePosition(%s) debug: repetition count %d, fen %s\n", last_moves[i].c_str(), position_history[board->zh->hash], board->fen->fenString);           
       }
       last_move = moves.back();
-      //log_file("handlePosition() debug: last_move (delayed for go): %s\n", last_move.c_str());
     }
-    //moves.clear();    
-    //prev_fen = fen;
-    //prev_moves = uci_moves;
   }
   
   void handleGo(char * command) {
-      //if (prev_fen.empty()) return;
       chessEngine.wtime = 1e9;
       chessEngine.btime = 1e9;
       chessEngine.winc = 0;
@@ -500,17 +460,9 @@ void search_thread_func() {
         int src = 0, dst = 0, promo = 0;
         move_to_idx(last_move.c_str(), &src, &dst, &promo);
         struct Move move;
-        //init_move(&move, board, src, dst, promo);
-        //log_file("handleGo() debug: executing move %s, fen %s...\n", move.uciMove, board->fen->fenString);
-        //make_move(&move);
-        //log_file("handleGo() debug: fen after move %s is %s...\n", move.uciMove, board->fen->fenString);
-        //log_file("handleGo() debug: fen after the move %s, %s\n", last_move.c_str(), board->fen->fenString);
         ff_move(board, &move, src, dst, promo);
         updateHash(board, &move);
-        //log_file("handleGo() debug: fen after updateHash(): %s\n", board->fen->fenString);
-        //unsigned long long hash = board->zh->hash ^ board->zh->hash2;
         position_history.insert(board->zh->hash);
-        //log_file("handleGo() debug: repetition count %d after move %s, fen %s\n", position_history[board->zh->hash], last_move.c_str(), board->fen->fenString);           
         last_move.clear();
       }
   
@@ -562,19 +514,14 @@ void search_thread_func() {
           std::string uci_move = "";
           if (sendGetRequest(syzygy_tb_url, score_cp, uci_move)) {
               strncpy(best_move, uci_move.c_str(), 6);
-              //log_file("HandleGo() debug: Syzygy TB request sent successfully");
               print("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", score_cp, best_move, best_move);
               log_file("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\nbestmove %s\n", score_cp, best_move, best_move);
               int src = 0, dst = 0, promo = 0;
               move_to_idx(best_move, &src, &dst, &promo);
               struct Move move;
-              //init_move(&move, board, src, dst, promo);
-              //make_move(&move);
               ff_move(board, &move, src, dst, promo);
               updateHash(board, &move);
               position_history.insert(board->zh->hash);
-              //if (!prev_moves.empty()) prev_moves.append(" ");
-              //prev_moves.append(move.uciMove);
           } else {
               log_file("HandleGo() error: failed to send Syzygy TB request to lichess\n");
               std::lock_guard<std::mutex> lock(mtx);
@@ -589,7 +536,8 @@ void search_thread_func() {
           return; //no need to query table bases for the opponent
         }        
         best_move[0] = '\0';
-        const unsigned int ep = lsBit(enPassantLegalBit(board));
+        unsigned int ep = 64; 
+        if (board->fen->enPassant != FileNone) ep = lsBit(enPassantLegalBit(board));     
         unsigned int result = tb_probe_root(board->occupations[PieceNameWhite], board->occupations[PieceNameBlack], 
             board->occupations[WhiteKing] | board->occupations[BlackKing],
             board->occupations[WhiteQueen] | board->occupations[BlackQueen], board->occupations[WhiteRook] | board->occupations[BlackRook], board->occupations[WhiteBishop] | board->occupations[BlackBishop], board->occupations[WhiteKnight] | board->occupations[BlackKnight], board->occupations[WhitePawn] | board->occupations[BlackPawn],
@@ -614,13 +562,9 @@ void search_thread_func() {
         int src = 0, dst = 0, promo = 0;
         move_to_idx(best_move, &src, &dst, &promo);
         struct Move move;
-        //init_move(&move, board, src, dst, promo);
-        //make_move(&move);
         ff_move(board, &move, src, dst, promo);
         updateHash(board, &move);
         position_history.insert(board->zh->hash);
-        //if (!prev_moves.empty()) prev_moves.append(" ");
-        //prev_moves.append(move.uciMove);        
       }          
   }
   
@@ -631,14 +575,11 @@ void search_thread_func() {
       int src = 0, dst = 0, promo = 0;
       move_to_idx(last_move.c_str(), &src, &dst, &promo);
       struct Move move;
-      //init_move(&move, board, src, dst, promo);
-      //make_move(&move);
       ff_move(board, &move, src, dst, promo);
       updateHash(board, &move);
       position_history.insert(board->zh->hash);
       updateFen(board);
       log_file("position fen %s\n", board->fen->fenString);
-      //log_file("handlePonderhit(%s) debug: repetition count %d, fen %s\n", last_move.c_str(), position_history[board->zh->hash], board->fen->fenString);   
       last_move.clear();
     }    
     chessEngine.ponder = false;
@@ -671,13 +612,13 @@ void setEngineOptions() {
 		chessEngine.numberOfStringOptions = 1;
 		chessEngine.numberOfButtonOptions = 0;
 	  strcpy(chessEngine.optionCheck[Ponder].name, "Ponder");
-	  chessEngine.optionCheck[Ponder].defaultValue = false;
+	  chessEngine.optionCheck[Ponder].defaultValue = PONDER;
 	  chessEngine.optionCheck[Ponder].value = chessEngine.optionCheck[Ponder].defaultValue;
 	  strcpy(chessEngine.optionCheck[FinalInfoLines].name, "FinalInfoLines");
-	  chessEngine.optionCheck[FinalInfoLines].defaultValue = true;
+	  chessEngine.optionCheck[FinalInfoLines].defaultValue = DISPLAY_FINAL_INFO_LINES;
 	  chessEngine.optionCheck[FinalInfoLines].value = chessEngine.optionCheck[FinalInfoLines].defaultValue;
 	  strcpy(chessEngine.optionCheck[IntermittentInfoLines].name, "IntermittentInfoLines");
-	  chessEngine.optionCheck[IntermittentInfoLines].defaultValue = true;
+	  chessEngine.optionCheck[IntermittentInfoLines].defaultValue = DISPLAY_INTERMITTENT_INFO_LINES;
 	  chessEngine.optionCheck[IntermittentInfoLines].value = chessEngine.optionCheck[IntermittentInfoLines].defaultValue;
 	  strcpy(chessEngine.optionString[SyzygyPath].name, "SyzygyPath");
 	  strcpy(chessEngine.optionString[SyzygyPath].defaultValue, SYZYGY_PATH_DEFAULT);

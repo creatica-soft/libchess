@@ -1,5 +1,5 @@
 /// 
-/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib bitscanner.cpp board-new.cpp engine-new.cpp fen-new.cpp pgn-new.cpp move-new.cpp tag-new.cpp zobrist-hash-new.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue-new.cpp nnue/position.cpp
+/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib bitscanner.cpp board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
 
 /// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
 
@@ -50,7 +50,7 @@ extern "C" {
 #endif
 
 #include "noise.h"
-#include "noise2.h"
+//#include "noise2.h"
 
 #define MAX_PIPE_NAME_LEN 256
 #define MAX_ENGINE_NAME_LEN 128

@@ -64,6 +64,9 @@
                        //another words, what is considered a definite win or loss in pawns
                        //for example, for an extra queen, result = tanh(9 / 6) = 0.9 - almost a win, it is close to 1
                        //but if eval_scale = 4, then tanh(9 / 4) = ~0.98 - even closer to 1
+#define PONDER false
+#define DISPLAY_INTERMITTENT_INFO_LINES true
+#define DISPLAY_FINAL_INFO_LINES true
 
 double timeAllocated = 10000; //ms
 char best_move[6];
@@ -516,9 +519,6 @@ extern "C" {
     double res;
   	const int pieceCount = bitCount(chess_board->occupations[PieceNameAny]);
   	if (pieceCount > TB_LARGEST || chess_board->fen->halfmoveClock || chess_board->fen->castlingRights) {
-      //evaluate_nnue() returns result in pawns (not centipawns!)
-      //we made the move above, so the eval res is from the perspective of opponent color or chess_board->fen->sideToMove
-      //and must be negated to preserve the perspective of sim_board->fen->sideToMove
       generateMoves(chess_board);
       if (chess_board->isMate) res = -MATE_SCORE * 0.01; //chess_board->fen->sideToMove wins
       else if (chess_board->isStaleMate) {
@@ -527,7 +527,7 @@ extern "C" {
         res = process_check(chess_board, ctx, pos_history);
       } else {
         updateFen(chess_board);
-        res = evaluate_nnue(chess_board, NULL, ctx);
+        res = evaluate_nnue(chess_board, NULL, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
       }
     } else { //pieceCount <= TB_LARGEST, etc
       const unsigned int ep = lsBit(enPassantLegalBit(chess_board));
@@ -544,7 +544,7 @@ extern "C" {
           res = process_check(chess_board, ctx, pos_history);
         } else {
           updateFen(chess_board);
-          res = evaluate_nnue(chess_board, NULL, ctx);
+          res = evaluate_nnue(chess_board, NULL, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
         }
       } else { //tb_probe_wdl() succeeded
         //0 - loss, 4 - win, 1..3 - draw
@@ -563,8 +563,6 @@ extern "C" {
   double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, /*unsigned long long& child_hash2,*/ const std::unordered_set<unsigned long long>& pos_history) {
     struct Board * tmp_board = cloneBoard(chess_board);
     struct Move move;
-    //init_move(&move, tmp_board, src, dst, promo);
-    //make_move(&move);
     ff_move(tmp_board, &move, src, dst, promo);
     updateHash(tmp_board, &move);
     child_hash = tmp_board->zh->hash;
@@ -661,8 +659,6 @@ MCTS implementation follows the four core phases:
       lock.unlock();
       //init edge's move that leads to the child node to update sim_board by making the move
       struct Move move;
-  		//init_move(&move, sim_board, move_idx >> 9, (move_idx >> 3) & 63, move_idx & 7);
-      //make_move(&move); //this updates sim_board
       ff_move(sim_board, &move, move_idx >> 9, (move_idx >> 3) & 63, move_idx & 7);
       //update Zobrist hash (it is needed so that we can call updateHash later instead of getHash)
 			updateHash(sim_board, &move);
@@ -681,13 +677,14 @@ MCTS implementation follows the four core phases:
     if (!repetition) {
       scorecp = node->cp.load(std::memory_order_relaxed);
       result = tanh(scorecp * 0.01 / eval_scale);
-    }
+    } else node->cp.store(scorecp, std::memory_order_relaxed);
     
     // Expansion - add more children - increase the depth of the tree using the model's predictions, NNUE evals or randomly
     // in theory, if children evaluation is noticably different from its parent, 
     // then we need to continue selectively expanding until position is quiet
     // otherwise, this difference gets propagated to the root and may affect selection, leading to suboptimal play
-    if (node->mutex.try_lock()) { //the leaf node in a tree is locked only for expansion
+    // do not expand on repetition
+    if (!repetition && node->mutex.try_lock()) { //the leaf node in a tree is locked only for expansion
                                   //nodes locked in selection phase are not leaf nodes, i.e. nodes without children
                                   //if leaf node is already locked, it means that other thread is expanding it already
       generateMoves(sim_board); //needed for checks such as isMate or isStaleMate as well as for sim_board->movesFromSquares
@@ -703,7 +700,7 @@ MCTS implementation follows the four core phases:
           expand_node(node, move_evals, pos_history);
       } //end of if (!sim_board->isMate && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000)
       node->mutex.unlock();
-    } //if node->mutex.try_lock() 
+    } //end of if (!repetition && node->mutex.try_lock()) 
     
     // Backpropagation: update node visits and results regardless of whether the expansion happened or not
     for (auto n = path.rbegin(); n != path.rend(); ++n) {
@@ -843,17 +840,14 @@ MCTS implementation follows the four core phases:
         search_done.store(false, std::memory_order_relaxed); // Reset
         std::thread output_thread(uci_output_thread);
         for (auto& t : threads) t.join();
-        //print("runMCTS() debug: all search threads terminated\n");
         {
           std::lock_guard<std::mutex> lk(search_done_mtx);
           search_done.store(true, std::memory_order_relaxed); // Signal search complete
         }
         cv_search_done.notify_one();
         output_thread.join();
-        //print("runMCTS() debug: output thread terminated\n");
       } else {
         for (auto& t : threads) t.join();
-        //print("runMCTS() debug: all search threads terminated\n");
       }
       multiPV = select_best_moves(pvs);
       if (chessEngine.optionCheck[FinalInfoLines].value) {    
@@ -874,7 +868,6 @@ MCTS implementation follows the four core phases:
         int src = 0, dst = 0;
         int move_idx = 0;
         int promoPiece = PieceNameNone;
-        //generateMoves(board);
         while (any) {
             src = lsBit(any);
             unsigned long long moves = board->movesFromSquares[src];
@@ -884,8 +877,6 @@ MCTS implementation follows the four core phases:
               	  for (int promo = Queen; promo >= Knight; promo--) {
                     struct Move move;
                     struct Board * tmp_board = cloneBoard(board);
-              	    //init_move(&move, tmp_board, src, dst, promo);
-                    //make_move(&move);
                     ff_move(tmp_board, &move, src, dst, promo);
                     generateMoves(tmp_board);
                     if (tmp_board->isStaleMate) {
@@ -911,11 +902,7 @@ MCTS implementation follows the four core phases:
         init_nnue_context(&ctx);        
         struct Board * tmp_board = cloneBoard(board);
         struct Move move;
-  	    //init_move(&move, tmp_board, src, dst, promoPiece);
-        //make_move(&move);
         ff_move(tmp_board, &move, src, dst, promoPiece);
-        //updateHash(tmp_board, &move);
-        //updateFen(tmp_board);
         generateMoves(tmp_board);
         double res;
         if (tmp_board->isMate) res = MATE_SCORE * 0.01;
@@ -924,7 +911,10 @@ MCTS implementation follows the four core phases:
           std::unordered_set<unsigned long long>pos_history;
           res = -process_check(tmp_board, &ctx, pos_history);
         }
-        else res = -evaluate_nnue(tmp_board, NULL, &ctx);
+        else {
+          updateFen(tmp_board);
+          res = -evaluate_nnue(tmp_board, NULL, &ctx);
+        }
         freeBoard(tmp_board);
         free_nnue_context(&ctx);
         idx_to_move(move_idx, best_move);
@@ -980,13 +970,13 @@ void setEngineOptions() {
 		chessEngine.numberOfStringOptions = 1;
 		chessEngine.numberOfButtonOptions = 0;
 	  strcpy(chessEngine.optionCheck[Ponder].name, "Ponder");
-	  chessEngine.optionCheck[Ponder].defaultValue = false;
+	  chessEngine.optionCheck[Ponder].defaultValue = PONDER;
 	  chessEngine.optionCheck[Ponder].value = chessEngine.optionCheck[Ponder].defaultValue;
 	  strcpy(chessEngine.optionCheck[FinalInfoLines].name, "FinalInfoLines");
-	  chessEngine.optionCheck[FinalInfoLines].defaultValue = true;
+	  chessEngine.optionCheck[FinalInfoLines].defaultValue = DISPLAY_FINAL_INFO_LINES;
 	  chessEngine.optionCheck[FinalInfoLines].value = chessEngine.optionCheck[FinalInfoLines].defaultValue;
 	  strcpy(chessEngine.optionCheck[IntermittentInfoLines].name, "IntermittentInfoLines");
-	  chessEngine.optionCheck[IntermittentInfoLines].defaultValue = true;
+	  chessEngine.optionCheck[IntermittentInfoLines].defaultValue = DISPLAY_INTERMITTENT_INFO_LINES;
 	  chessEngine.optionCheck[IntermittentInfoLines].value = chessEngine.optionCheck[IntermittentInfoLines].defaultValue;
 	  strcpy(chessEngine.optionString[SyzygyPath].name, "SyzygyPath");
 	  strcpy(chessEngine.optionString[SyzygyPath].defaultValue, SYZYGY_PATH_DEFAULT);
@@ -1161,8 +1151,6 @@ int main(int argc, char **argv) {
     if (move_given) {
       printf("searching for position from move %s (from %s to %s (promo %c), idx %d) in MCT...\n", uciMove, squareName[src], squareName[dst], uciPromoLetter[promo], move_idx);
       struct Move move;
-      //init_move(&move, board, src, dst, promo);
-      //make_move(&move);
       ff_move(board, &move, src, dst, promo);
       updateHash(board, &move);
       auto it = search.tree.find(board->zh->hash);

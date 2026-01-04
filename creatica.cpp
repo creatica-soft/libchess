@@ -107,7 +107,7 @@ extern "C" {
       std::atomic<struct Edge *> children {nullptr}; //array of moves and priors leading to next nodes
   };
 
-  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, /*unsigned long long& child_hash2,*/ const std::unordered_set<unsigned long long>& pos_history);//, bool in_playout = false);
+  double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, /*unsigned long long& child_hash2,*/ const std::unordered_set<unsigned long long>& pos_history);
   
   // Custom hasher that uses the key directly
   struct NoOpHash {
@@ -207,9 +207,6 @@ extern "C" {
       root->generation.store(generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
       struct NNUEContext ctx;
       init_nnue_context(&ctx);
-      //updateFen(board);
-      //generateMoves(board); //called in position_eval()
-      //double res = evaluate_nnue(board, NULL, &ctx);
       std::unordered_set<unsigned long long> pos_history;
       double res = position_eval(board, &ctx, pos_history);
       free_nnue_context(&ctx);
@@ -416,7 +413,7 @@ extern "C" {
   //called from mcts_search() in selection phase
   //returns child index with the best PUCT value  
   int select_best_child(struct MCTSNode * parent, int depth) {
-    // 1. Dynamic Exploration Constant - linear decay with depth
+    // Dynamic Exploration Constant - linear decay with depth
     // setting exploration_depth_decay to 0 will make exploration constant static = exploration_max
     // Decay: Start at exploration_constant, then for example drop by 0.05 - 0.1 per ply, floor at 0.25 - all tunable
     double C = std::max(exploration_min, exploration_max - (depth * exploration_depth_decay));
@@ -439,6 +436,7 @@ extern "C" {
       unsigned long long N = child->N.load(std::memory_order_relaxed);
       double W = -child->W.load(std::memory_order_relaxed); //parent perspective
       double Q = N ? W / N : 0.0;
+      //PUCT formula
       double score = Q + C * P * sqrt(static_cast<double>(parent->N.load(std::memory_order_acquire))) / (1.0 + N);
       if (score > best_score) {
         best_score = score;
@@ -516,9 +514,6 @@ extern "C" {
     double res;
   	const int pieceCount = bitCount(chess_board->occupations[PieceNameAny]);
   	if (pieceCount > TB_LARGEST || chess_board->fen->halfmoveClock || chess_board->fen->castlingRights) {
-      //evaluate_nnue() returns result in pawns (not centipawns!)
-      //we made the move above, so the eval res is from the perspective of opponent color or chess_board->fen->sideToMove
-      //and must be negated to preserve the perspective of sim_board->fen->sideToMove
       generateMoves(chess_board);
       if (chess_board->isMate) res = -MATE_SCORE * 0.01; //chess_board->fen->sideToMove wins
       else if (chess_board->isStaleMate) {
@@ -527,10 +522,11 @@ extern "C" {
         res = process_check(chess_board, ctx, pos_history);
       } else {
         updateFen(chess_board);
-        res = evaluate_nnue(chess_board, NULL, ctx);
+        res = evaluate_nnue(chess_board, NULL, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
       }
     } else { //pieceCount <= TB_LARGEST, etc
-      const unsigned int ep = lsBit(enPassantLegalBit(chess_board));
+      unsigned int ep = 64; 
+      if (chess_board->fen->enPassant != FileNone) ep = lsBit(enPassantLegalBit(chess_board));     
       const unsigned int wdl = tb_probe_wdl(chess_board->occupations[PieceNameWhite], chess_board->occupations[PieceNameBlack], chess_board->occupations[WhiteKing] | chess_board->occupations[BlackKing],
         chess_board->occupations[WhiteQueen] | chess_board->occupations[BlackQueen], chess_board->occupations[WhiteRook] | chess_board->occupations[BlackRook], chess_board->occupations[WhiteBishop] | chess_board->occupations[BlackBishop], chess_board->occupations[WhiteKnight] | chess_board->occupations[BlackKnight], chess_board->occupations[WhitePawn] | chess_board->occupations[BlackPawn],
         0, 0, ep == 64 ? 0 : ep, chess_board->fen->sideToMove == ColorWhite ? 1 : 0);
@@ -545,7 +541,7 @@ extern "C" {
           res = process_check(chess_board, ctx, pos_history);
         } else {
           updateFen(chess_board);
-          res = evaluate_nnue(chess_board, NULL, ctx);
+          res = evaluate_nnue(chess_board, NULL, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
         }
       } else { //tb_probe_wdl() succeeded
         //0 - loss, 4 - win, 1..3 - draw
@@ -564,8 +560,6 @@ extern "C" {
   double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash, /*unsigned long long& child_hash2,*/ const std::unordered_set<unsigned long long>& pos_history) {
     struct Board * tmp_board = cloneBoard(chess_board);
     struct Move move;
-    //init_move(&move, tmp_board, src, dst, promo);
-    //make_move(&move);
     ff_move(tmp_board, &move, src, dst, promo);
     updateHash(tmp_board, &move);
     child_hash = tmp_board->zh->hash;
@@ -661,8 +655,6 @@ MCTS implementation follows the four core phases:
       lock.unlock();
       //init and take edge's move that leads to the child node
       struct Move move;
-  		//init_move(&move, sim_board, move_idx >> 9, (move_idx >> 3) & 63, move_idx & 7);
-      //make_move(&move); //this updates sim_board
       ff_move(sim_board, &move, move_idx >> 9, (move_idx >> 3) & 63, move_idx & 7);
       //update Zobrist hash (it is needed so that we can call updateHash() later instead of getHash())
 			updateHash(sim_board, &move);
@@ -682,12 +674,13 @@ MCTS implementation follows the four core phases:
     if (!repetition) {
       scorecp = node->cp.load(std::memory_order_relaxed);
       result = tanh(scorecp * 0.01 / eval_scale);
-    }
+    } else node->cp.store(scorecp, std::memory_order_relaxed);
     // Expansion - add more children - increase the depth of the tree using the model's predictions, NNUE evals or randomly
     // in theory, if children evaluation is noticably different from its parent, 
     // then we need to continue selectively expanding until position is quiet
     // otherwise, this difference gets propagated to the root and may affect selection, leading to suboptimal play
-    if (node->mutex.try_lock()) { //the leaf node in a tree is locked only for expansion
+    // do not expand on repetition
+    if (!repetition && node->mutex.try_lock()) { //the leaf node in a tree is locked only for expansion
                                   //nodes locked in selection phase are not leaf nodes, i.e. nodes without children
                                   //if leaf node is already locked, it means that other thread is expanding it already
       generateMoves(sim_board); //needed for checks such as isMate or isStaleMate as well as compute_move_evals()
@@ -703,8 +696,8 @@ MCTS implementation follows the four core phases:
           expand_node(node, move_evals, pos_history);
       } //end of if (!sim_board->isMate && !sim_board->isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000)
       node->mutex.unlock();
-    } //if node->mutex.try_lock() 
-    // Backpropagation: update node visits and results only if this thread expanded it to avoid inflating N and W
+    } //end of if (!repetition && node->mutex.try_lock())
+    // Backpropagation: update node visits and results regardless of whether we expand the node or not
     for (auto n = path.rbegin(); n != path.rend(); ++n) {
       node = *n;
       node->N.fetch_add(1, std::memory_order_relaxed);
@@ -757,7 +750,7 @@ MCTS implementation follows the four core phases:
       double nps = elapsed > 0 ? nodes / elapsed : 0;
       //depth should be calculated by traversing the most visited nodes similar to select_best_moves()      
       int d = 0;
-      std::unordered_set<unsigned long long> visited;
+      std::unordered_set<unsigned long long> visited; //hash
       std::vector<std::pair<unsigned long long, int>> visits; //N, child_idx
       int num_root_children = current_node->num_children.load(std::memory_order_relaxed);
       while (current_node && d < MAX_DEPTH) {
