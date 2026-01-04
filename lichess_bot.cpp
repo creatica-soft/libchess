@@ -51,7 +51,7 @@
                         //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
 #define PONDER false
 
-const std::string token = "fake_token"; // Replace with real token
+const std::string token = "faked_token"; // Replace with real token
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
 std::atomic<bool> challenge_accepted {false};

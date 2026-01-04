@@ -22,10 +22,10 @@ extern "C" {
 #endif
 
 #define SYZYGY_PATH "/Users/ap/syzygy"
-#define PROBABILITY_MASS 1.0
+#define PROBABILITY_MASS 100
 //#define NOISE 0.03
 #define EVAL_SCALE 6.0
-#define TEMPERATURE 0.6
+#define TEMPERATURE 60
 
 
 struct NNUEContext {
@@ -42,8 +42,8 @@ void free_nnue_context(struct NNUEContext * ctx);
 double evaluate_nnue(struct Board * board, struct Move * move, struct NNUEContext * ctx);
 void compute_move_evals(struct Board * chess_board, struct NNUEContext * ctx, std::vector<std::tuple<double, int, int, unsigned long long/*, unsigned long long*/>>& move_evals, double prob_mass);
 //double noise = NOISE;
-double temperature = TEMPERATURE;
-double probability_mass = PROBABILITY_MASS;
+double temperature = TEMPERATURE * 0.01;
+double probability_mass = PROBABILITY_MASS * 0.01;
 double eval_scale = EVAL_SCALE;
 //std::mt19937 rng(std::random_device{}());
 
@@ -134,8 +134,6 @@ int get_prob(std::vector<std::tuple<double, int, int, unsigned long long/*, unsi
   double do_move(struct Board * chess_board, const int src, const int dst, const int promo, struct NNUEContext * ctx, unsigned long long& child_hash/*, unsigned long long& child_hash2*/) {
     struct Board * tmp_board = cloneBoard(chess_board);
     struct Move move;
-    //init_move(&move, tmp_board, src, dst, promo);
-    //make_move(&move);
     ff_move(tmp_board, &move, src, dst, promo);
     updateHash(tmp_board, &move);
     child_hash = tmp_board->zh->hash;
