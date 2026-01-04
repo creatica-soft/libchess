@@ -60,7 +60,7 @@ unsigned long lsBit(unsigned long long b) {
 #endif
 	// there is no difference in performance between gcc built-in function
 	// and the table lookup (at least on armv8 it is not a factor)
-	//return (enum SquareName)__builtin_ctzl(b);
+	//return (enum SquareName)__builtin_ctzll(b);
 	//return (enum SquareName)magicTable[((unsigned long long)((long long)b & -(long long)b) * magic) >> 58];
 }
 

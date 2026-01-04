@@ -264,18 +264,6 @@ unsigned long long enPassantLegalBit(struct Board * board) {
   return SQ_BIT(SQ(enPassantRank, board->fen->enPassant)); //en passant move is legal
 }
 
-//these two functions are based on the modern ray piece move generation technique 
-//known as magic bitboards (see magic_bitboards.c)
-//to use them, they must be initialized by calling init_magic_bitboards();
-//and freed at the end by calling cleanup_magic_bitboards();
-//we call get_bishop_moves() and get_root_moves() directly without these wrappers
-//unsigned long long generate_bishop_moves(struct Board * board, int  sn) {
-//  return get_bishop_moves(sn, board->occupations[PieceNameAny]);
-//}
-//unsigned long long generate_rook_moves(struct Board * board, int  sn) {
-//  return get_rook_moves(sn, board->occupations[PieceNameAny]);
-//}
-
 //generates knight moves from a given square limited by board boundaries only
 unsigned long long generateKnightMoves(struct Board * board, const int sq) {
   unsigned long long moves = 0;
@@ -407,9 +395,9 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
 		int sq = lsBit(occupation);
 		const int sqFile = SQ_FILE(sq);
 		const int sqRank = SQ_RANK(sq);
-		const int sqDiag = SQ_DIAG(sq);
-		const int sqAntidiag = SQ_ANTIDIAG(sq);
-		const unsigned long long sqBit = SQ_BIT(sq);
+		const int sqDiag = 7 + sqRank - sqFile;
+		const int sqAntidiag = sqFile + sqRank;
+		const unsigned long long sqBit = 1ULL << sq;
 		unsigned long long d = 0;
 		if (ctx->pinnedPieces & sqBit) {
  			d = ctx->pinningPieces;
@@ -417,8 +405,8 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
  				int p = lsBit(d);
  				const int pFile = SQ_FILE(p);
  				const int pRank = SQ_RANK(p);
- 				const int pDiag = SQ_DIAG(p);
- 				const int pAntidiag = SQ_ANTIDIAG(p);
+ 				const int pDiag = 7 + pRank - pFile;
+ 				const int pAntidiag = pFile + pRank;
  				if ((pFile == sqFile && pFile == king->file) || (pRank == sqRank && pRank == king->rank) || (pDiag == sqDiag && pDiag == king->diag) || (pAntidiag == sqAntidiag && pAntidiag == king->antidiag)) {
  				  pinnedBy = p;
  				  break;
@@ -436,16 +424,14 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
   			}
   			//if pinned on a file or rank, then the bishop cannot move
 			  d = pinnedBishopMoves(board, sq, pinnedBy);
-			}
-			else if (pieceType == Rook) {
+			} else if (pieceType == Rook) {
   			//if check or the rook is pinned on a diagonal or anti-diagonal, then it cannot move
   			if (board->isCheck || SQ_DIAG(pinnedBy) == sqDiag || SQ_ANTIDIAG(pinnedBy) == sqAntidiag) {
   				occupation &= occupation - 1;
   				continue;
   			}
 			  d = pinnedRookMoves(board, sq, pinnedBy);
-			}
-			else if (pieceType == Queen) {
+			} else if (pieceType == Queen) {
   			if (board->isCheck) {
   				occupation &= occupation - 1;
   				continue;
@@ -455,7 +441,6 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
   			//if pinned on a file or rank, then the queen can only move like a rook along this file or rank
   			else d = pinnedRookMoves(board, sq, pinnedBy);
 			} else if (pieceType == Pawn) {
-			  //d = 0;
   			if (board->isCheck) {// this pawn can't do much
   			  occupation &= occupation - 1;
   			  continue;
@@ -492,14 +477,14 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
   					}
   				}
   			}
-  			else if (SQ_RANK(pinnedBy) == sqRank) { //goto next; //not much can be done
+  			else if (SQ_RANK(pinnedBy) == sqRank) { //not much can be done
   			  occupation &= occupation - 1;
   			  continue;
         }
   		} //end of if (pawn is pinned); if knight is pinned, it has no moves
 			board->movesFromSquares[sq] = d;
 		} //end of if (pinned)
-		//generate bishop moves from square <cp> limited by board boundaries and other chess pieces regardless of their color
+		//generate bishop/rook/queen/pawn moves from square <cp> limited by board boundaries and other chess pieces regardless of their color
 		else {
    		d = 0;
 		  if (pieceType == Bishop)
@@ -510,7 +495,6 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
 			  d = get_bishop_moves(sq, board->occupations[PieceNameAny]);
 			  d |= get_rook_moves(sq, board->occupations[PieceNameAny]);			  
 			} else if (pieceType == Pawn) {
-			  //d = 0;
   			//normal pawn moves (non-capturing)
   			shift = sq + pawnShifts[board->fen->sideToMove][0]; //N or S
   			if (board->piecesOnSquares[shift] == PieceNameNone) {
@@ -571,54 +555,15 @@ void piece_moves(int pieceType, unsigned long long occupation, struct MovesConte
 	}
 }
 
-//generates legal moves
-void generateMoves(struct Board * board) {
+unsigned long long getAttackedSquares(struct Board * board, struct MovesContext * movesContext, const int kingSquare) {
 	unsigned long long d = 0, attackedSquares = 0;
 	int sq;
-	board->moves = 0;
-	memset(board->movesFromSquares, 0, sizeof board->movesFromSquares);
-	struct MovesContext movesContext;
-	movesContext.shiftedColor = board->fen->sideToMove << 3;
-	movesContext.shiftedOpponentColor = OPP_COLOR(board->fen->sideToMove) << 3;
-	movesContext.checker = 0;
-	movesContext.pinnedPieces = 0;
-	movesContext.pinningPieces = 0;
-	movesContext.blockingSquares = 0;
-	board->isCheck = false; board->isStaleMate = false; board->isMate = false;
-
-	struct ChessPiece king;
-	int _king = movesContext.shiftedColor | King;
-	int kingSquare = lsBit(board->occupations[_king]);
-	struct Square kingSq;
-	kingSq.file = SQ_FILE(kingSquare);
-	kingSq.rank = SQ_RANK(kingSquare);
-	kingSq.diag = SQ_DIAG(kingSquare);
-	kingSq.antidiag = SQ_ANTIDIAG(kingSquare);
-	kingSq.bit = SQ_BIT(kingSquare);
-	PC_INIT(&king, _king, kingSquare);
-	struct ChessPiece opponentKing;
-	int _oking = movesContext.shiftedOpponentColor | King;
-	int opponentKingSquare = lsBit(board->occupations[_oking]);
-	PC_INIT(&opponentKing, _oking, opponentKingSquare);
-	//for opponent color sliding piece moves we need to temporary remove the king, 
-	//so the rays can light through it
-	//this is necessary to mark the squares behind the king as attacked, 
-	//so that the king under the check of opponent ray piece, cannot step back
-	//we only xor it out from PieceNameAny occupations array member because only it is passed to get_bishop_moves() and get_root_moves()
-	board->occupations[PieceNameAny] ^= kingSq.bit;
-
-	unsigned long long opponentBishops = board->occupations[movesContext.shiftedOpponentColor | Bishop];
-	unsigned long long opponentRooks = board->occupations[movesContext.shiftedOpponentColor | Rook];
-	unsigned long long opponentQueens = board->occupations[movesContext.shiftedOpponentColor | Queen];
-	unsigned long long opponentPawns = board->occupations[movesContext.shiftedOpponentColor | Pawn];
-	unsigned long long opponentKnights = board->occupations[movesContext.shiftedOpponentColor | Knight];
-	unsigned long long opponentAny = board->occupations[movesContext.shiftedOpponentColor | PieceTypeAny];
-	unsigned long long bishops = board->occupations[movesContext.shiftedColor | Bishop];
-	unsigned long long rooks = board->occupations[movesContext.shiftedColor | Rook];
-	unsigned long long queens = board->occupations[movesContext.shiftedColor | Queen];
-	unsigned long long pawns = board->occupations[movesContext.shiftedColor | Pawn];
-	unsigned long long knights = board->occupations[movesContext.shiftedColor | Knight];
-	unsigned long long any = board->occupations[movesContext.shiftedColor | PieceTypeAny];
+	unsigned long long opponentBishops = board->occupations[movesContext->shiftedOpponentColor | Bishop];
+	unsigned long long opponentRooks = board->occupations[movesContext->shiftedOpponentColor | Rook];
+	unsigned long long opponentQueens = board->occupations[movesContext->shiftedOpponentColor | Queen];
+	unsigned long long opponentPawns = board->occupations[movesContext->shiftedOpponentColor | Pawn];
+	unsigned long long opponentKnights = board->occupations[movesContext->shiftedOpponentColor | Knight];
+	int opponentKingSquare = lsBit(board->occupations[movesContext->shiftedOpponentColor | King]);
 
 	//find the squares attacked and defended by opponent bishops
 	//and see if they pin anything against the king
@@ -628,9 +573,9 @@ void generateMoves(struct Board * board) {
 		board->movesFromSquares[sq] = get_bishop_moves(sq, board->occupations[PieceNameAny]);
 		attackedSquares |= board->movesFromSquares[sq];
 		//find pinned by this bishop pieces
-		if ((d = bishopPinFinder(board, sq, king.square))) {
-      movesContext.pinnedPieces |= d;
-   		movesContext.pinningPieces |= (1ULL << sq); //SQ_BIT macro does an extra check for sq != SquareNone, here we don't need it
+		if ((d = bishopPinFinder(board, sq, kingSquare))) {
+      movesContext->pinnedPieces |= d;
+   		movesContext->pinningPieces |= (1ULL << sq); //SQ_BIT macro does an extra check for sq != SquareNone, here we don't need it
 		}
 		opponentBishops &= opponentBishops - 1;
 	}
@@ -639,9 +584,9 @@ void generateMoves(struct Board * board) {
   	sq = lsBit(opponentRooks);
 		board->movesFromSquares[sq] = get_rook_moves(sq, board->occupations[PieceNameAny]);
 		attackedSquares |= board->movesFromSquares[sq];
-		if ((d = rookPinFinder(board, sq, king.square))) {
-      movesContext.pinnedPieces |= d;
-   		movesContext.pinningPieces |= (1ULL << sq);			
+		if ((d = rookPinFinder(board, sq, kingSquare))) {
+      movesContext->pinnedPieces |= d;
+   		movesContext->pinningPieces |= (1ULL << sq);			
 		}
 		opponentRooks &= opponentRooks - 1;
 	}
@@ -650,14 +595,12 @@ void generateMoves(struct Board * board) {
   	sq = lsBit(opponentQueens);
 		board->movesFromSquares[sq] = get_bishop_moves(sq, board->occupations[PieceNameAny]) | get_rook_moves(sq, board->occupations[PieceNameAny]);
 		attackedSquares |= board->movesFromSquares[sq];
-		if ((d = bishopPinFinder(board, sq, king.square) | rookPinFinder(board, sq, king.square))) {
-      movesContext.pinnedPieces |= d;
-   		movesContext.pinningPieces |= (1ULL << sq);			
+		if ((d = bishopPinFinder(board, sq, kingSquare) | rookPinFinder(board, sq, kingSquare))) {
+      movesContext->pinnedPieces |= d;
+   		movesContext->pinningPieces |= (1ULL << sq);			
 		}
 		opponentQueens &= opponentQueens - 1;
 	}
-	//we are done with opponent ray piece attacked squares, now we can restore the king
-	board->occupations[PieceNameAny] |= kingSq.bit;
 
 	//find the squares attacked and defended by opponent pawns
 	const char pawnCapturingMoves[2][2] = { { 7, 9 }, { -9, -7 } };
@@ -682,17 +625,57 @@ void generateMoves(struct Board * board) {
 	while (opponentKnights) {
 		sq = lsBit(opponentKnights);
 		//generate opponent knight moves limited by board boudaries only
-		unsigned long long knight_moves = generateKnightMoves(board, sq);
-		board->movesFromSquares[sq] = knight_moves;
-		attackedSquares |= knight_moves;
+		board->movesFromSquares[sq] = generateKnightMoves(board, sq);
+		attackedSquares |= board->movesFromSquares[sq];
 		opponentKnights &= opponentKnights - 1;
 	}
 
 	//generate opponent king moves limited by board boundaries only
-	unsigned long long opponentKingMoves = generateKingMoves(board, opponentKing.square);
-	board->movesFromSquares[opponentKing.square] = opponentKingMoves;
-  attackedSquares |= opponentKingMoves;
-  
+	board->movesFromSquares[opponentKingSquare] = generateKingMoves(board, opponentKingSquare);
+  attackedSquares |= board->movesFromSquares[opponentKingSquare];
+  return attackedSquares;
+}
+
+//generates legal moves
+void generateMoves(struct Board * board) {
+	unsigned long long d = 0;
+	int sq;
+	board->moves = 0;
+	memset(board->movesFromSquares, 0, sizeof board->movesFromSquares);
+	struct MovesContext movesContext;
+	movesContext.shiftedColor = board->fen->sideToMove << 3;
+	movesContext.shiftedOpponentColor = OPP_COLOR(board->fen->sideToMove) << 3;
+	movesContext.checker = 0;
+	movesContext.pinnedPieces = 0;
+	movesContext.pinningPieces = 0;
+	movesContext.blockingSquares = 0;
+	board->isCheck = false; board->isStaleMate = false; board->isMate = false;
+
+	int kingSquare = lsBit(board->occupations[movesContext.shiftedColor | King]);
+	struct Square kingSq;
+	kingSq.file = SQ_FILE(kingSquare);
+	kingSq.rank = SQ_RANK(kingSquare);
+	kingSq.diag = 7 + kingSq.rank - kingSq.file;
+	kingSq.antidiag = kingSq.rank + kingSq.file;
+	kingSq.bit = 1ULL << kingSquare;
+
+	unsigned long long opponentAny = board->occupations[movesContext.shiftedOpponentColor | PieceTypeAny];
+	unsigned long long bishops = board->occupations[movesContext.shiftedColor | Bishop];
+	unsigned long long rooks = board->occupations[movesContext.shiftedColor | Rook];
+	unsigned long long queens = board->occupations[movesContext.shiftedColor | Queen];
+	unsigned long long pawns = board->occupations[movesContext.shiftedColor | Pawn];
+	unsigned long long knights = board->occupations[movesContext.shiftedColor | Knight];
+
+	//for opponent color sliding piece moves we need to temporary remove the king, 
+	//so the rays can light through it
+	//this is necessary to mark the squares behind the king as attacked, 
+	//so that the king under the check of opponent ray piece, cannot step back
+	//we only xor it out from PieceNameAny occupations array member because only it is passed to get_bishop_moves() and get_root_moves()
+	board->occupations[PieceNameAny] ^= kingSq.bit;
+  unsigned long long attackedSquares = getAttackedSquares(board, &movesContext, kingSquare);
+	//we are done with opponent ray piece attacked squares, now we can restore the king
+	board->occupations[PieceNameAny] |= kingSq.bit;
+
   //this is from the opponent point of view, meaning its defended pieces and the pieces that it attacks
   //opponent defended pieces are used in calculation of sideToMove king moves in terms of
   //whether it can capture opponent's piece or not
@@ -712,14 +695,14 @@ void generateMoves(struct Board * board) {
 	}
 	
 	//generate king moves limited by board boundaries only
-	board->movesFromSquares[king.square] = generateKingMoves(board, king.square);
+	board->movesFromSquares[kingSquare] = generateKingMoves(board, kingSquare);
 	//filter these moves to find the legal ones: 
 	//the king cannot capture defended opponent's pieces
 	//it can't go to a square occupied by other pieces of its color
 	//and it can't go to a square attacked by opponent piece(s)
-	board->movesFromSquares[king.square] ^= board->movesFromSquares[king.square] & (defendedPieces | board->occupations[movesContext.shiftedColor | PieceTypeAny] | attackedSquares);
+	board->movesFromSquares[kingSquare] ^= board->movesFromSquares[kingSquare] & (defendedPieces | board->occupations[movesContext.shiftedColor | PieceTypeAny] | attackedSquares);
 	
-	board->moves |= board->movesFromSquares[king.square];
+	board->moves |= board->movesFromSquares[kingSquare];
 	//is king checked?
 	if ((board->isCheck = board->occupations[movesContext.shiftedColor | King] & attackedSquares)) {
 		//if double check, no other moves rather than the king's move are possible
@@ -730,7 +713,7 @@ void generateMoves(struct Board * board) {
 			//if not checked by knight or pawn, calculate blocking squares
 			if ((board->piecesOnSquares[movesContext.checkerSquare] != (movesContext.shiftedOpponentColor | Knight)) && board->piecesOnSquares[movesContext.checkerSquare] != (movesContext.shiftedOpponentColor | Pawn)) {
 				if (kingSq.diag == SQ_DIAG(movesContext.checkerSquare)) {
-					if (king.square > movesContext.checkerSquare) {
+					if (kingSquare > movesContext.checkerSquare) {
 						unsigned long long bitSq = 1ULL << movesContext.checkerSquare;
 						movesContext.blockingSquares = board->occupations[PieceNameNone] & diag_bb[kingSq.diag] & ((kingSq.bit - 1) ^ (bitSq | (bitSq - 1)));
 					}
@@ -739,7 +722,7 @@ void generateMoves(struct Board * board) {
 					}
 				}
 				else if (kingSq.antidiag == SQ_ANTIDIAG(movesContext.checkerSquare)) {
-					if (king.square > movesContext.checkerSquare) {
+					if (kingSquare > movesContext.checkerSquare) {
 						unsigned long long bitSq = 1ULL << movesContext.checkerSquare;
 						movesContext.blockingSquares = board->occupations[PieceNameNone] & antidiag_bb[kingSq.antidiag] & ((kingSq.bit - 1) ^ (bitSq | (bitSq - 1)));							
 					}
@@ -748,7 +731,7 @@ void generateMoves(struct Board * board) {
 					}
 				}
 				else if (kingSq.file == SQ_FILE(movesContext.checkerSquare)) {
-					if (king.square > movesContext.checkerSquare) {
+					if (kingSquare > movesContext.checkerSquare) {
 						unsigned long long bitSq = 1ULL << movesContext.checkerSquare;
 						movesContext.blockingSquares = board->occupations[PieceNameNone] & files_bb[kingSq.file] & ((kingSq.bit - 1) ^ (bitSq | (bitSq - 1)));
 					}
@@ -757,7 +740,7 @@ void generateMoves(struct Board * board) {
 					}
 				}
 				else if (kingSq.rank == SQ_RANK(movesContext.checkerSquare)) {
-					if (king.square > movesContext.checkerSquare) {
+					if (kingSquare > movesContext.checkerSquare) {
 						unsigned long long bitSq = 1ULL << movesContext.checkerSquare;
 						movesContext.blockingSquares = board->occupations[PieceNameNone] & ranks_bb[kingSq.rank] & ((kingSq.bit - 1) ^ (bitSq | (bitSq - 1)));
 					}
@@ -782,8 +765,8 @@ void generateMoves(struct Board * board) {
 			//squares between the rook and its destination (for short castling f1 or f8) should be vacant (except the king and short castling rook for chess 960)
 			occupations ^= (kingSq.bit | shortCastlingRookSquareBit);
 			if ((shortKingSquares & attackedSquares) == 0 && (shortKingSquares & occupations) == 0 && (shortRookSquares & occupations) == 0) {
-				if (board->fen->isChess960) board->movesFromSquares[king.square] |= shortCastlingRookSquareBit;
-				else board->movesFromSquares[king.square] |= SQ_BIT(castlingKingSquare[0][board->fen->sideToMove]);
+				if (board->fen->isChess960) board->movesFromSquares[kingSquare] |= shortCastlingRookSquareBit;
+				else board->movesFromSquares[kingSquare] |= SQ_BIT(castlingKingSquare[0][board->fen->sideToMove]);
 			}
 		}
 		//long castling moves
@@ -796,11 +779,11 @@ void generateMoves(struct Board * board) {
 			//squares between the rook and its destination (for long castling d1 or d8) should be vacant (except the king and long castling rook for chess 960)
 			occupations ^= (kingSq.bit | longCastlingRookSquareBit);
 			if ((longKingSquares & attackedSquares) == 0 && (longKingSquares & occupations) == 0 && (longRookSquares & occupations) == 0) {
-				if (board->fen->isChess960) board->movesFromSquares[king.square] |= longCastlingRookSquareBit;
-				else board->movesFromSquares[king.square] |= SQ_BIT(castlingKingSquare[1][board->fen->sideToMove]);
+				if (board->fen->isChess960) board->movesFromSquares[kingSquare] |= longCastlingRookSquareBit;
+				else board->movesFromSquares[kingSquare] |= SQ_BIT(castlingKingSquare[1][board->fen->sideToMove]);
 			}
 		}
-		board->moves |= board->movesFromSquares[king.square];
+		board->moves |= board->movesFromSquares[kingSquare];
   }
   
 	//legal other moves
