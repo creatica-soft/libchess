@@ -1,4 +1,4 @@
-static const unsigned long long bitStrings2[841] = {
+static const unsigned long long bitStrings2[825] = {
 0xacee99bbb6376a54ULL,
 0x2883fdf4d67c273eULL,
 0x3bbd03d74709414aULL,
@@ -823,22 +823,22 @@ static const unsigned long long bitStrings2[841] = {
 0x8f44bf8b5ec81389ULL,
 0x4ea58df23f8800b1ULL,
 0x06df2072f656965eULL,
-0x70dbed5d65d9ec02ULL,
-0xf61fd623a9298d22ULL,
-0x1de95a1ea48e45b3ULL,
-0x7490004c69a98a5bULL,
-0x139164b8b934a487ULL,
-0x46d3c7d7889c1a4eULL,
-0x1e5b0c48a75ce272ULL,
-0xbcd948daa55cd956ULL,
-0x7c5ed7622308f364ULL,
-0x5f07fab12a41b177ULL,
-0xd69fcc7139ea543cULL,
-0x4733780510574fb5ULL,
-0x8976c3f6ce1ec0f7ULL,
-0xcf440e8df1941e93ULL,
-0xa9ff62bc422ff351ULL,
-0xc6f5b18796c13ccbULL,
-0xfcb0c6efd0fae6a8ULL
+0x70dbed5d65d9ec02ULL
+//0xf61fd623a9298d22ULL,
+//0x1de95a1ea48e45b3ULL,
+//0x7490004c69a98a5bULL,
+//0x139164b8b934a487ULL,
+//0x46d3c7d7889c1a4eULL,
+//0x1e5b0c48a75ce272ULL,
+//0xbcd948daa55cd956ULL,
+//0x7c5ed7622308f364ULL,
+//0x5f07fab12a41b177ULL,
+//0xd69fcc7139ea543cULL,
+//0x4733780510574fb5ULL,
+//0x8976c3f6ce1ec0f7ULL,
+//0xcf440e8df1941e93ULL,
+//0xa9ff62bc422ff351ULL,
+//0xc6f5b18796c13ccbULL,
+//0xfcb0c6efd0fae6a8ULL
 };
 

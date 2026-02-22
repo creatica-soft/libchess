@@ -30,12 +30,12 @@
 #define NNUE_EMBEDDING_OFF
 
 #include "../incbin/incbin.h"
-
+#include "../types.h"
 #include "../evaluate.h"
 #include "../memory.h"
 #include "../misc.h"
-#include "../position.h"
-#include "../types.h"
+//#include "../position.h"
+//#include "../types.h"
 #include "nnue_architecture.h"
 #include "nnue_common.h"
 #include "nnue_misc.h"
@@ -209,7 +209,7 @@ bool Network<Arch, Transformer>::save(const std::optional<std::string>& filename
 }
 
 
-template<typename Arch, typename Transformer>
+/*template<typename Arch, typename Transformer>
 NetworkOutput
 Network<Arch, Transformer>::evaluate(const Position&                         pos,
                                      AccumulatorStack&                       accumulatorStack,
@@ -227,11 +227,37 @@ Network<Arch, Transformer>::evaluate(const Position&                         pos
       featureTransformer->transform(pos, accumulatorStack, cache, transformedFeatures, bucket);
     const auto positional = network[bucket].propagate(transformedFeatures);
     return {static_cast<Value>(psqt / OutputScale), static_cast<Value>(positional / OutputScale)};
+}*/
+
+unsigned long long bitCount(unsigned long long value) {
+#ifdef _MSC_VER
+	return __popcnt64(value); // equivalent to __builtin_popcountl
+#else
+  return __builtin_popcountll(value);
+#endif
 }
 
+template<typename Arch, typename Transformer>
+NetworkOutput
+Network<Arch, Transformer>::evaluate(const Board& board, AccumulatorStack& accumulatorStack, AccumulatorCaches::Cache<FTDimensions>* cache) const {
+
+    constexpr uint64_t alignment = CacheLineSize;
+
+    alignas(alignment)
+      TransformedFeatureType transformedFeatures[FeatureTransformer<FTDimensions>::BufferSize];
+
+    ASSERT_ALIGNED(transformedFeatures, alignment);
+    
+    int num_pieces = bitCount(board.side[WHITE] | board.side[BLACK]);
+
+    const int  bucket = (num_pieces - 1) / 4;
+    const auto psqt = featureTransformer->transform(board, accumulatorStack, cache, transformedFeatures, bucket);
+    const auto positional = network[bucket].propagate(transformedFeatures);
+    return {static_cast<Value>(psqt / OutputScale), static_cast<Value>(positional / OutputScale)};
+}
 
 template<typename Arch, typename Transformer>
-void Network<Arch, Transformer>::verify(std::string                                  evalfilePath,
+void Network<Arch, Transformer>::verify(std::string evalfilePath,
                                         const std::function<void(std::string_view)>& f) const {
     if (evalfilePath.empty())
         evalfilePath = evalFile.defaultName;
@@ -271,7 +297,7 @@ void Network<Arch, Transformer>::verify(std::string                             
 }
 
 
-template<typename Arch, typename Transformer>
+/*template<typename Arch, typename Transformer>
 NnueEvalTrace
 Network<Arch, Transformer>::trace_evaluate(const Position&                         pos,
                                            AccumulatorStack&                       accumulatorStack,
@@ -294,6 +320,33 @@ Network<Arch, Transformer>::trace_evaluate(const Position&                      
 
         t.psqt[bucket]       = static_cast<Value>(materialist / OutputScale);
         t.positional[bucket] = static_cast<Value>(positional / OutputScale);
+    }
+
+    return t;
+}*/
+
+template<typename Arch, typename Transformer>
+NnueEvalTrace
+Network<Arch, Transformer>::trace_evaluate(const Board& board,
+                                           AccumulatorStack& accumulatorStack,
+                                           AccumulatorCaches::Cache<FTDimensions>* cache) const {
+
+    constexpr uint64_t alignment = CacheLineSize;
+
+    alignas(alignment)
+      TransformedFeatureType transformedFeatures[FeatureTransformer<FTDimensions>::BufferSize];
+
+    ASSERT_ALIGNED(transformedFeatures, alignment);
+
+    int num_pieces = bitCount(board.side[WHITE] | board.side[BLACK]);
+    NnueEvalTrace t{};
+    t.correctBucket = (num_pieces - 1) / 4;
+    for (IndexType bucket = 0; bucket < LayerStacks; ++bucket) {
+      const auto materialist = featureTransformer->transform(board, accumulatorStack, cache, transformedFeatures, bucket);
+      const auto positional = network[bucket].propagate(transformedFeatures);
+
+      t.psqt[bucket] = static_cast<Value>(materialist / OutputScale);
+      t.positional[bucket] = static_cast<Value>(positional / OutputScale);
     }
 
     return t;

@@ -36,9 +36,9 @@
 #include "nnue_feature_transformer.h"
 #include "nnue_misc.h"
 
-namespace Stockfish {
-class Position;
-}
+//namespace Stockfish {
+//class Position;
+//}
 
 namespace Stockfish::Eval::NNUE {
 
@@ -71,14 +71,22 @@ class Network {
     void load(const std::string& rootDirectory, std::string evalfilePath);
     bool save(const std::optional<std::string>& filename) const;
 
-    NetworkOutput evaluate(const Position&                         pos,
+    /*NetworkOutput evaluate(const Position&                         pos,
                            AccumulatorStack&                       accumulatorStack,
+                           AccumulatorCaches::Cache<FTDimensions>* cache) const;*/
+
+    NetworkOutput evaluate(const Board& board,
+                           AccumulatorStack& accumulatorStack,
                            AccumulatorCaches::Cache<FTDimensions>* cache) const;
 
 
     void verify(std::string evalfilePath, const std::function<void(std::string_view)>&) const;
-    NnueEvalTrace trace_evaluate(const Position&                         pos,
+    /*NnueEvalTrace trace_evaluate(const Position&                         pos,
                                  AccumulatorStack&                       accumulatorStack,
+                                 AccumulatorCaches::Cache<FTDimensions>* cache) const;*/
+
+    NnueEvalTrace trace_evaluate(const Board& board,
+                                 AccumulatorStack& accumulatorStack,
                                  AccumulatorCaches::Cache<FTDimensions>* cache) const;
 
    private:
@@ -87,7 +95,7 @@ class Network {
 
     void initialize();
 
-    bool                       save(std::ostream&, const std::string&, const std::string&) const;
+    bool save(std::ostream&, const std::string&, const std::string&) const;
     std::optional<std::string> load(std::istream&);
 
     bool read_header(std::istream&, std::uint32_t*, std::string*) const;
@@ -102,7 +110,7 @@ class Network {
     // Evaluation function
     AlignedPtr<Arch[]> network;
 
-    EvalFile         evalFile;
+    EvalFile evalFile;
     EmbeddedNNUEType embeddedType;
 
     // Hash value of evaluation function structure
@@ -116,20 +124,17 @@ class Network {
 
 // Definitions of the network types
 using SmallFeatureTransformer = FeatureTransformer<TransformedFeatureDimensionsSmall>;
-using SmallNetworkArchitecture =
-  NetworkArchitecture<TransformedFeatureDimensionsSmall, L2Small, L3Small>;
+using SmallNetworkArchitecture = NetworkArchitecture<TransformedFeatureDimensionsSmall, L2Small, L3Small>;
 
-using BigFeatureTransformer  = FeatureTransformer<TransformedFeatureDimensionsBig>;
+using BigFeatureTransformer = FeatureTransformer<TransformedFeatureDimensionsBig>;
 using BigNetworkArchitecture = NetworkArchitecture<TransformedFeatureDimensionsBig, L2Big, L3Big>;
 
-using NetworkBig   = Network<BigNetworkArchitecture, BigFeatureTransformer>;
+using NetworkBig = Network<BigNetworkArchitecture, BigFeatureTransformer>;
 using NetworkSmall = Network<SmallNetworkArchitecture, SmallFeatureTransformer>;
 
 
 struct Networks {
-    Networks(NetworkBig&& nB, NetworkSmall&& nS) :
-        big(std::move(nB)),
-        small(std::move(nS)) {}
+    Networks(NetworkBig&& nB, NetworkSmall&& nS) : big(std::move(nB)), small(std::move(nS)) {}
 
     NetworkBig   big;
     NetworkSmall small;

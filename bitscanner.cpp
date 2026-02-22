@@ -11,19 +11,19 @@
 #include <intrin.h>
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+//#ifdef __cplusplus
+//extern "C" {
+//#endif
 
 /// <summary>
 /// Count the number of bits set to 1 in a unsigned long long, probably the best substitution to POPCNT processor instruction 
 /// </summary>
 /// <returns>The number of bits set to one</returns>
-unsigned long long bitCount(unsigned long long value) {
+uint8_t bitCount(unsigned long long value) {
 #ifdef _MSC_VER
-	return __popcnt64(value); // equivalent to __builtin_popcountl
+	return (uint8_t)__popcnt64(value); // equivalent to __builtin_popcountl
 #else
-  return __builtin_popcountll(value);
+  return (uint8_t)__builtin_popcountll(value);
 #endif
   /*
 	unsigned long long result = value - ((value >> 1) & 0x5555555555555555ULL);
@@ -49,14 +49,15 @@ unsigned char magicTable[] = {
 /// </summary>
 /// <param name="b">64-bit unsigned positive integer</param>
 /// <returns>Zero-based least significant bit, or 64 for zero argument</returns>
-unsigned long lsBit(unsigned long long b) {
-	if (b == 0) return SquareNone;
+Square lsBit(unsigned long long b) {
+  assert(b);
+	//if (b == 0) return SquareNone;
 #ifdef _MSC_VER
 	unsigned long index;
 	_BitScanForward64(&index, b); // equivalent to __builtin_ctzl
-	return index;
+	return (Square)index;
 #else
-	return __builtin_ctzll(b);
+	return (Square)__builtin_ctzll(b);
 #endif
 	// there is no difference in performance between gcc built-in function
 	// and the table lookup (at least on armv8 it is not a factor)
@@ -81,6 +82,6 @@ void unpack_bits(unsigned long long number, float * bit_array) {
         }
     }
 }*/
-#ifdef __cplusplus
-}
-#endif
+//#ifdef __cplusplus
+//}
+//#endif

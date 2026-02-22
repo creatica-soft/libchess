@@ -190,14 +190,14 @@ constexpr Value QueenValue  = 2538;
 
 // clang-format off
 enum PieceType : std::int8_t {
-    NO_PIECE_TYPE, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING,
+    NO_PIECE_TYPE, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING, TYPE_NONE, 
     ALL_PIECES = 0,
     PIECE_TYPE_NB = 8
 };
 
 enum Piece : std::int8_t {
     NO_PIECE,
-    W_PAWN = PAWN,     W_KNIGHT, W_BISHOP, W_ROOK, W_QUEEN, W_KING,
+    W_PAWN = PAWN,     W_KNIGHT, W_BISHOP, W_ROOK, W_QUEEN, W_KING, PIECE_NONE, 
     B_PAWN = PAWN + 8, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
     PIECE_NB = 16
 };
@@ -444,3 +444,5 @@ constexpr auto is_all_same_v = is_all_same<Ts...>::value;
 #endif  // #ifndef TYPES_H_INCLUDED
 
 #include "tune.h"  // Global visibility to tuning setup
+//#include "board.h"
+

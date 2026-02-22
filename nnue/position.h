@@ -168,11 +168,17 @@ class Position {
 
     void put_piece(Piece pc, Square s);
     void remove_piece(Square s);
+    
+    //moved from private
+    StateInfo* st;
+    int        gamePly;
+    Color      sideToMove;
+    bool       chess960;
+    void set_castling_right(Color c, Square rfrom);
+    void set_state() const;
 
    private:
     // Initialization helpers (used while setting up a position)
-    void set_castling_right(Color c, Square rfrom);
-    void set_state() const;
     void set_check_info() const;
 
     // Other helpers
@@ -195,10 +201,6 @@ class Position {
     int        castlingRightsMask[SQUARE_NB];
     Square     castlingRookSquare[CASTLING_RIGHT_NB];
     Bitboard   castlingPath[CASTLING_RIGHT_NB];
-    StateInfo* st;
-    int        gamePly;
-    Color      sideToMove;
-    bool       chess960;
 };
 
 std::ostream& operator<<(std::ostream& os, const Position& pos);

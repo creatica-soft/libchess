@@ -24,10 +24,11 @@
 
 #include "../types.h"
 #include "nnue_architecture.h"
+#include "../board.h"
 
 namespace Stockfish {
 
-class Position;
+//class Position;
 
 namespace Eval::NNUE {
 
@@ -53,7 +54,7 @@ struct NnueEvalTrace {
 struct Networks;
 struct AccumulatorCaches;
 
-std::string trace(Position& pos, const Networks& networks, AccumulatorCaches& caches);
+std::string trace(Board& board, const Networks& networks, AccumulatorCaches& caches);
 
 }  // namespace Stockfish::Eval::NNUE
 }  // namespace Stockfish
