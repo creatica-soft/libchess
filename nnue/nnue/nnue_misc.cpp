@@ -30,7 +30,7 @@
 #include <string_view>
 #include <tuple>
 
-#include "../position.h"
+//#include "../position.h"
 #include "../types.h"
 #include "../uci.h"
 #include "network.h"
@@ -46,7 +46,7 @@ constexpr std::string_view PieceToChar(" PNBRQK  pnbrqk");
 namespace {
 // Converts a Value into (centi)pawns and writes it in a buffer.
 // The buffer must have capacity for at least 5 chars.
-void format_cp_compact(Value v, char* buffer, const Position& pos) {
+/*void format_cp_compact(Value v, char* buffer, const Position& pos) {
 
     buffer[0] = (v < 0 ? '-' : v > 0 ? '+' : ' ');
 
@@ -78,11 +78,44 @@ void format_cp_compact(Value v, char* buffer, const Position& pos) {
         cp %= 10;
         buffer[4] = '0' + cp / 1;
     }
+}*/
+
+void format_cp_compact(Value v, char* buffer, const Board& board) {
+
+    buffer[0] = (v < 0 ? '-' : v > 0 ? '+' : ' ');
+
+    int cp = std::abs(Stockfish::to_cp(v, board));
+    if (cp >= 10000)
+    {
+        buffer[1] = '0' + cp / 10000;
+        cp %= 10000;
+        buffer[2] = '0' + cp / 1000;
+        cp %= 1000;
+        buffer[3] = '0' + cp / 100;
+        buffer[4] = ' ';
+    }
+    else if (cp >= 1000)
+    {
+        buffer[1] = '0' + cp / 1000;
+        cp %= 1000;
+        buffer[2] = '0' + cp / 100;
+        cp %= 100;
+        buffer[3] = '.';
+        buffer[4] = '0' + cp / 10;
+    }
+    else
+    {
+        buffer[1] = '0' + cp / 100;
+        cp %= 100;
+        buffer[2] = '.';
+        buffer[3] = '0' + cp / 10;
+        cp %= 10;
+        buffer[4] = '0' + cp / 1;
+    }
 }
 
-
 // Converts a Value into pawns, always keeping two decimals
-void format_cp_aligned_dot(Value v, std::stringstream& stream, const Position& pos) {
+/*void format_cp_aligned_dot(Value v, std::stringstream& stream, const Position& pos) {
 
     const double pawns = std::abs(0.01 * Stockfish::to_cp(v, pos));
 
@@ -90,13 +123,24 @@ void format_cp_aligned_dot(Value v, std::stringstream& stream, const Position& p
                : v > 0 ? '+'
                        : ' ')
            << std::setiosflags(std::ios::fixed) << std::setw(6) << std::setprecision(2) << pawns;
+}*/
+
+void format_cp_aligned_dot(Value v, std::stringstream& stream, const Board& board) {
+
+    const double pawns = std::abs(0.01 * Stockfish::to_cp(v, board));
+
+    stream << (v < 0   ? '-'
+               : v > 0 ? '+'
+                       : ' ')
+           << std::setiosflags(std::ios::fixed) << std::setw(6) << std::setprecision(2) << pawns;
 }
+
 }
 
 
 // Returns a string with the value of each piece on a board,
 // and a table for (PSQT, Layers) values bucket by bucket.
-std::string
+/*std::string
 trace(Position& pos, const Eval::NNUE::Networks& networks, Eval::NNUE::AccumulatorCaches& caches) {
 
     std::stringstream ss;
@@ -178,6 +222,107 @@ trace(Position& pos, const Eval::NNUE::Networks& networks, Eval::NNUE::Accumulat
         ss << "  "  //
            << " |  ";
         format_cp_aligned_dot(t.psqt[bucket] + t.positional[bucket], ss, pos);
+        ss << "  "  //
+           << " |";
+        if (bucket == t.correctBucket)
+            ss << " <-- this bucket is used";
+        ss << '\n';
+    }
+
+    ss << "+------------+------------+------------+------------+\n";
+
+    return ss.str();
+}*/
+
+std::string
+trace(Board& chess_board, const Eval::NNUE::Networks& networks, Eval::NNUE::AccumulatorCaches& caches) {
+
+    std::stringstream ss;
+
+    char board[3 * 8 + 1][8 * 8 + 2];
+    std::memset(board, ' ', sizeof(board));
+    for (int row = 0; row < 3 * 8 + 1; ++row)
+        board[row][8 * 8 + 1] = '\0';
+
+    // A lambda to output one box of the board
+    auto writeSquare = [&board, &chess_board](File file, Rank rank, Piece pc, Value value) {
+        const int x = int(file) * 8;
+        const int y = (7 - int(rank)) * 3;
+        for (int i = 1; i < 8; ++i)
+            board[y][x + i] = board[y + 3][x + i] = '-';
+        for (int i = 1; i < 3; ++i)
+            board[y + i][x] = board[y + i][x + 8] = '|';
+        board[y][x] = board[y][x + 8] = board[y + 3][x + 8] = board[y + 3][x] = '+';
+        if (pc != PIECE_NONE)
+            board[y + 1][x + 4] = PieceToChar[pc];
+        if (is_valid(value))
+            format_cp_compact(value, &board[y + 2][x + 2], chess_board);
+    };
+
+    AccumulatorStack accumulators;
+
+    // We estimate the value of each piece by doing a differential evaluation from
+    // the current base eval, simulating the removal of the piece from its square.
+    auto [psqt, positional] = networks.big.evaluate(chess_board, accumulators, &caches.big);
+    Value base = psqt + positional;
+    base = chess_board.sideToMove == WHITE ? base : -base;
+    //printf("trace() debug: base eval %d\n", base);
+
+    for (File f = FILE_A; f <= FILE_H; ++f)
+        for (Rank r = RANK_1; r <= RANK_8; ++r)
+        {
+            Square sq = make_square(f, r);
+            Piece  pc = (Piece)chess_board.piecesOnSquares[sq];
+            Value  v  = VALUE_NONE;
+            //printf("trace() debug: pc %d on sq %d\n", pc, sq);
+            if (pc != PIECE_NONE && type_of(pc) != KING)
+            {
+                chess_board.piecesOnSquares[sq] = PIECE_NONE;
+                chess_board.side[(pc >> 3) & 1] ^= (1ULL << sq);
+                chess_board.pieceTypes[(pc & 7) - 1] ^= (1ULL << sq);
+
+                accumulators.reset();
+                std::tie(psqt, positional) = networks.big.evaluate(chess_board, accumulators, &caches.big);
+                Value eval                 = psqt + positional;
+                eval                       = chess_board.sideToMove == WHITE ? eval : -eval;
+                //printf("trace() debug: eval without piece %d\n", eval);
+                v                          = base - eval;
+                //printf("trace() debug: pc %d on sq %d value %d\n", pc, sq, v);
+
+                chess_board.piecesOnSquares[sq] = pc;
+                chess_board.side[(pc >> 3) & 1] |= (1ULL << sq);
+                chess_board.pieceTypes[(pc & 7) - 1] |= (1ULL << sq);
+            }
+
+            writeSquare(f, r, pc, v);
+        }
+
+    ss << " NNUE derived piece values:\n";
+    for (int row = 0; row < 3 * 8 + 1; ++row)
+        ss << board[row] << '\n';
+    ss << '\n';
+
+    accumulators.reset();
+    auto t = networks.big.trace_evaluate(chess_board, accumulators, &caches.big);
+
+    ss << " NNUE network contributions "
+       << (chess_board.sideToMove == WHITE ? "(White to move)" : "(Black to move)") << std::endl
+       << "+------------+------------+------------+------------+\n"
+       << "|   Bucket   |  Material  | Positional |   Total    |\n"
+       << "|            |   (PSQT)   |  (Layers)  |            |\n"
+       << "+------------+------------+------------+------------+\n";
+
+    for (std::size_t bucket = 0; bucket < LayerStacks; ++bucket)
+    {
+        ss << "|  " << bucket << "        "  //
+           << " |  ";
+        format_cp_aligned_dot(t.psqt[bucket], ss, chess_board);
+        ss << "  "  //
+           << " |  ";
+        format_cp_aligned_dot(t.positional[bucket], ss, chess_board);
+        ss << "  "  //
+           << " |  ";
+        format_cp_aligned_dot(t.psqt[bucket] + t.positional[bucket], ss, chess_board);
         ss << "  "  //
            << " |";
         if (bucket == t.correctBucket)

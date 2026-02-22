@@ -8,9 +8,9 @@
 #include <stdlib.h>
 #include "libchess.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+//#ifdef __cplusplus
+//extern "C" {
+//#endif
 
 /// <summary>
 /// Parses the tag line into tag array indexed by enum Tags
@@ -60,6 +60,6 @@ int strtoecotag(EcoTag tag, const char * tagString) {
 	}
 	return 0;
 }
-#ifdef __cplusplus
-}
-#endif
+//#ifdef __cplusplus
+//}
+//#endif

@@ -30,10 +30,11 @@
 #include "../types.h"
 #include "nnue_architecture.h"
 #include "nnue_common.h"
+#include "../board.h"
 
-namespace Stockfish {
-class Position;
-}
+//namespace Stockfish {
+//class Position;
+//}
 
 namespace Stockfish::Eval::NNUE {
 
@@ -152,29 +153,49 @@ class AccumulatorStack {
     void push(const DirtyPiece& dirtyPiece) noexcept;
     void pop() noexcept;
 
-    template<IndexType Dimensions>
+    /*template<IndexType Dimensions>
     void evaluate(const Position&                       pos,
+                  const FeatureTransformer<Dimensions>& featureTransformer,
+                  AccumulatorCaches::Cache<Dimensions>& cache) noexcept;*/
+
+    template<IndexType Dimensions>
+    void evaluate(const Board&                       board,
                   const FeatureTransformer<Dimensions>& featureTransformer,
                   AccumulatorCaches::Cache<Dimensions>& cache) noexcept;
 
    private:
     [[nodiscard]] AccumulatorState& mut_latest() noexcept;
 
-    template<Color Perspective, IndexType Dimensions>
+    /*template<Color Perspective, IndexType Dimensions>
     void evaluate_side(const Position&                       pos,
+                       const FeatureTransformer<Dimensions>& featureTransformer,
+                       AccumulatorCaches::Cache<Dimensions>& cache) noexcept;*/
+
+    template<Color Perspective, IndexType Dimensions>
+    void evaluate_side(const Board&                       board,
                        const FeatureTransformer<Dimensions>& featureTransformer,
                        AccumulatorCaches::Cache<Dimensions>& cache) noexcept;
 
     template<Color Perspective, IndexType Dimensions>
     [[nodiscard]] std::size_t find_last_usable_accumulator() const noexcept;
 
-    template<Color Perspective, IndexType Dimensions>
+    /*template<Color Perspective, IndexType Dimensions>
     void forward_update_incremental(const Position&                       pos,
+                                    const FeatureTransformer<Dimensions>& featureTransformer,
+                                    const std::size_t                     begin) noexcept;*/
+
+    template<Color Perspective, IndexType Dimensions>
+    void forward_update_incremental(const Board&                       board,
                                     const FeatureTransformer<Dimensions>& featureTransformer,
                                     const std::size_t                     begin) noexcept;
 
-    template<Color Perspective, IndexType Dimensions>
+    /*template<Color Perspective, IndexType Dimensions>
     void backward_update_incremental(const Position&                       pos,
+                                     const FeatureTransformer<Dimensions>& featureTransformer,
+                                     const std::size_t                     end) noexcept;*/
+
+    template<Color Perspective, IndexType Dimensions>
+    void backward_update_incremental(const Board&                       board,
                                      const FeatureTransformer<Dimensions>& featureTransformer,
                                      const std::size_t                     end) noexcept;
 

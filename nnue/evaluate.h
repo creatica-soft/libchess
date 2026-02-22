@@ -22,6 +22,7 @@
 #include <string>
 
 #include "types.h"
+#include "board.h"
 
 namespace Stockfish {
 
@@ -42,15 +43,17 @@ struct AccumulatorCaches;
 class AccumulatorStack;
 }
 
-std::string trace(Position& pos, const Eval::NNUE::Networks& networks);
+//std::string trace(Position& pos, const Eval::NNUE::Networks& networks);
+std::string trace(Board& board, const Eval::NNUE::Networks& networks);
 
-int   simple_eval(const Position& pos);
-bool  use_smallnet(const Position& pos);
-Value evaluate(const NNUE::Networks&          networks,
-               const Position&                pos,
-               Eval::NNUE::AccumulatorStack&  accumulators,
-               Eval::NNUE::AccumulatorCaches& caches,
-               int                            optimism);
+//int   simple_eval(const Position& pos);
+int   simple_eval(const Board& board);
+//bool  use_smallnet(const Position& pos);
+bool  use_smallnet(const Board& board);
+/*Value evaluate(const NNUE::Networks& networks, const Position& pos, Eval::NNUE::AccumulatorStack&  accumulators,
+                 Eval::NNUE::AccumulatorCaches& caches, int optimism);*/
+Value evaluate(const NNUE::Networks& networks, const Board& board, Eval::NNUE::AccumulatorStack&  accumulators,
+               Eval::NNUE::AccumulatorCaches& caches, int optimism);
 }  // namespace Eval
 
 struct WinRateParams {
@@ -58,9 +61,12 @@ struct WinRateParams {
     double b;
 };
 
-WinRateParams win_rate_params(const Position& pos);
-int win_rate_model(Value v, const Position& pos);
-Value to_cp(Value v, const Position& pos);
+//WinRateParams win_rate_params(const Position& pos);
+WinRateParams win_rate_params(const Board& board);
+//int win_rate_model(Value v, const Position& pos);
+int win_rate_model(Value v, const Board& board);
+//Value to_cp(Value v, const Position& pos);
+Value to_cp(Value v, const Board& pos);
 
 }  // namespace Stockfish
 

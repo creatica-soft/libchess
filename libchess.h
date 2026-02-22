@@ -1,5 +1,5 @@
 /// 
-/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib bitscanner.cpp board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
+/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib bitscanner.cpp board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp magic_bitboards.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
 
 /// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
 
@@ -45,9 +45,9 @@
 #ifndef LIBCHESS_H
 #define LIBCHESS_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+//#ifdef __cplusplus
+//extern "C" {
+//#endif
 
 #include "noise.h"
 //#include "noise2.h"
@@ -162,70 +162,33 @@ extern "C" {
 #define ADIAG_G8H7 0x4080000000000000ULL
 #define ADIAG_H8H8 0x8000000000000000ULL
 
-// Macros for on-fly computation (inline-able, zero cost)
-#define SQ(rank, file) (((rank) << 3) | (file))
-#define SQ_FILE(sq) ((sq) & 7)
-#define SQ_RANK(sq) ((sq) >> 3)
-#define SQ_BIT(sq)  ((sq) == SquareNone ? 0 : (1ULL << (sq)))
-#define SQ_DIAG(sq) (7 + SQ_RANK(sq) - SQ_FILE(sq))
-#define SQ_ANTIDIAG(sq) (SQ_FILE(sq) + SQ_RANK(sq))
-#define SQ_COLOR(sq) (((SQ_FILE(sq) ^ SQ_RANK(sq)) & 1) ? ColorWhite : ColorBlack)
+static const uint64_t files_bb[] = { FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H };
+static const uint64_t ranks_bb[] = { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
+static const uint64_t diag_bb[] = { DIAG_H1H1, DIAG_G1H2, DIAG_F1H3, DIAG_E1H4, DIAG_D1H5, DIAG_C1H6, DIAG_B1H7, DIAG_A1H8, 
+                                    DIAG_A2G8, DIAG_A3F8, DIAG_A4E8, DIAG_A5D8, DIAG_A6C8, DIAG_A7B8, DIAG_A8A8 };
+static const uint64_t antidiag_bb[] = { ADIAG_A1A1, ADIAG_A2B1, ADIAG_A3C1, ADIAG_A4D1, ADIAG_A5E1, ADIAG_A6F1, ADIAG_A7G1, 
+                                        ADIAG_A8H1, ADIAG_B8H2, ADIAG_C8H3, ADIAG_D8H4, ADIAG_E8H5, ADIAG_F8H6, ADIAG_G8H7, ADIAG_H8H8 };
 
-#define PC_TYPE(pc) ((pc) & 7)
-#define PC_COLOR(pc) ((pc) >> 3)
-#define PC(color, type) (((color) << 3) | (type))
-#define PC_INIT(pc, pcName, sq) do { (pc)->name = (pcName); (pc)->square = (sq); } while (0)
+enum Castling : uint8_t { CastlingNone, CastlingKingside, CastlingQueenside, CastlingBoth };
 
-#define OPP_COLOR(color) ((color) ^ 1)  // White=0, Black=1
-#define PLY_NUM(fen) (((fen)->moveNumber - 1) * 2 + ((fen)->sideToMove == ColorBlack)) //for white move 1, ply is 0
-
-static unsigned long long files_bb[] = { FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H };
-static unsigned long long ranks_bb[] = { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
-static unsigned long long diag_bb[] = { DIAG_H1H1, DIAG_G1H2, DIAG_F1H3, DIAG_E1H4, DIAG_D1H5, DIAG_C1H6, DIAG_B1H7, DIAG_A1H8, DIAG_A2G8, DIAG_A3F8, DIAG_A4E8, DIAG_A5D8, DIAG_A6C8, DIAG_A7B8, DIAG_A8A8 };
-static unsigned long long antidiag_bb[] = { ADIAG_A1A1, ADIAG_A2B1, ADIAG_A3C1, ADIAG_A4D1, ADIAG_A5E1, ADIAG_A6F1, ADIAG_A7G1, ADIAG_A8H1, ADIAG_B8H2, ADIAG_C8H3, ADIAG_D8H4, ADIAG_E8H5, ADIAG_F8H6, ADIAG_G8H7, ADIAG_H8H8 };
-
-enum CastlingSide { CastlingSideNone, CastlingSideKingside, CastlingSideQueenside, CastlingSideBoth };
-
-/// <summary>
-/// Enumeration of castling rights: lowest two bits for white, highest - for black
-/// </summary>
-enum CastlingRightsEnum {
-	CastlingRightsWhiteNoneBlackNone = CastlingSideNone,
-	CastlingRightsWhiteNoneBlackKingside = CastlingSideKingside << 2,
-	CastlingRightsWhiteNoneBlackQueenside = CastlingSideQueenside << 2,
-	CastlingRightsWhiteNoneBlackBoth = CastlingSideBoth << 2,
-	CastlingRightsWhiteKingsideBlackNone = CastlingSideKingside,
-	CastlingRightsWhiteQueensideBlackNone = CastlingSideQueenside,
-	CastlingRightsWhiteBothBlackNone = CastlingSideBoth,
-	CastlingRightsWhiteKingsideBlackKingside = CastlingSideKingside | (CastlingSideKingside << 2),
-	CastlingRightsWhiteQueensideBlackKingside = CastlingSideQueenside | (CastlingSideKingside << 2),
-	CastlingRightsWhiteBothBlackKingside = CastlingSideBoth | (CastlingSideKingside << 2),
-	CastlingRightsWhiteKingsideBlackQueenside = CastlingSideKingside | (CastlingSideQueenside << 2),
-	CastlingRightsWhiteQueensideBlackQueenside = CastlingSideQueenside | (CastlingSideQueenside << 2),
-	CastlingRightsWhiteBothBlackQueenside = CastlingSideBoth | (CastlingSideQueenside << 2),
-	CastlingRightsWhiteKingsideBlackBoth = CastlingSideKingside | (CastlingSideBoth << 2),
-	CastlingRightsWhiteQueensideBlackBoth = CastlingSideQueenside | (CastlingSideBoth << 2),
-	CastlingRightsWhiteBothBlackBoth = CastlingSideBoth | (CastlingSideBoth << 2)
-};
-
-enum Color { ColorWhite, ColorBlack };
+enum Color : uint8_t { ColorWhite, ColorBlack, Color_NB };
 
 static const char * color[] = { "white", "black" };
 static const char fenColor[] = { 'w', 'b' };
 
-enum Files {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone};
+enum File : uint8_t {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone, File_NB = 8};
 static const char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
-enum Ranks {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone};
+enum Rank : uint8_t {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone, Rank_NB = 8};
 static const char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
 //redifinition of files_bb[] and ranks_bb[] above
-//static unsigned long long bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
-//static unsigned long long bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
+//static uint64_t bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
+//static uint64_t bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
 
 // rank = square / 8, same as rank = square >> 3
 // file = square % 8, same as file = square & 7
 // square = rank * 8 + file, same as square = (rank << 3) | file
-enum SquareName {
+enum Square : uint8_t {
 	SquareA1, SquareB1, SquareC1, SquareD1, SquareE1, SquareF1, SquareG1, SquareH1,
 	SquareA2, SquareB2, SquareC2, SquareD2, SquareE2, SquareF2, SquareG2, SquareH2,
 	SquareA3, SquareB3, SquareC3, SquareD3, SquareE3, SquareF3, SquareG3, SquareH3,
@@ -233,10 +196,10 @@ enum SquareName {
 	SquareA5, SquareB5, SquareC5, SquareD5, SquareE5, SquareF5, SquareG5, SquareH5,
 	SquareA6, SquareB6, SquareC6, SquareD6, SquareE6, SquareF6, SquareG6, SquareH6,
 	SquareA7, SquareB7, SquareC7, SquareD7, SquareE7, SquareF7, SquareG7, SquareH7,
-	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone
+	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone, Square_NB = 64, PawnSquare_NB = 48
 };
 
-static const char * squareName[] = {
+static const char * square[] = {
 	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
 	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
 	"a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
@@ -249,174 +212,217 @@ static const char * squareName[] = {
 
 //int squareColor(int sqName); //use SQ_COLOR(sq) macro instead
 
-enum Diagonals {
+enum Diagonal : uint8_t {
 	DiagonalH1H1, DiagonalG1H2, DiagonalF1H3, DiagonalE1H4, DiagonalD1H5,
 	DiagonalC1H6, DiagonalB1H7, DiagonalA1H8, DiagonalA2G8, DiagonalA3F8, 
-	DiagonalA4E8, DiagonalA5D8, DiagonalA6C8, DiagonalA7B8, DiagonalA8A8, DiagonalNone
+	DiagonalA4E8, DiagonalA5D8, DiagonalA6C8, DiagonalA7B8, DiagonalA8A8, DiagonalNone, Diagonal_NB = 15
 };
 
-enum Antidiagonals {
+enum Antidiagonal : uint8_t {
 	AntidiagonalA1A1, AntidiagonalA2B1, AntidiagonalA3C1, AntidiagonalA4D1, AntidiagonalA5E1,
 	AntidiagonalA6F1, AntidiagonalA7G1, AntidiagonalA8H1, AntidiagonalB8H2, AntidiagonalC8H3,
-	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone
+	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone, Antidiag_NB = 15
 };
+enum PieceType : uint8_t { PieceTypeAny, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeNone, PieceType_NB = 6, NonPawnType_NB = 5 };
+static const char * pieceType[] = {"any", "pawn", "knight", "bishop", "rook", "queen", "king", "none"};
 
-enum PieceType {PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny};
-static const char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
-
-static float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
-static float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
+static const float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
+static const float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
 
 // Piece enumeration: first three bits are used to encode the type, fourth bit defines the color, total 16 pieces
-// Shifting PieceName by 3 to the right gives PieceColor: color = piece >> 3
+// Shifting Piece by 3 to the right gives PieceColor: color = piece >> 3
 // Masking 3 lowest bits returns the PieceType: type = piece & 7
-// PieceNameAny is an exception to the rules above (its color is black and type none)
-// To overcome this exception, we could encode color as 2 bits but this would mean occupations array size will be 32
-enum PieceName {
-	PieceNameNone,
-	WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNameWhite, PieceNameAny,
-	BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, PieceNameBlack
+// PieceNone is exception to the above rules
+// PieceNone has color white and type PieceTypeNone
+enum Piece : uint8_t {
+	PieceWhite, WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNone,
+	PieceBlack, BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, Piece_NB = 12, NonPawn_NB = 10
 };
 
-static const char * pieceName[] = {
-	"none", 
-	"white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "whites", "any",
-	"black pawn", "black knight", "black bishop", "black rook", "black queen", "black king", "blacks"
+static const char * piece[] = {
+	"whites", "white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "none",
+	"blacks", "black pawn", "black knight", "black bishop", "black rook", "black queen", "black king"
 };
 
-static const char pieceLetter[] = {' ', 'P', 'N', 'B', 'R', 'Q', 'K', 'C', '*', 'p', 'n', 'b', 'r', 'q', 'k', 'c'};
-
-enum PieceLetter { 
+/*enum PieceLetter : uint8_t { 
 	PieceLetter_e, PieceLetter_P, PieceLetter_N, PieceLetter_B, PieceLetter_R, 
 	PieceLetter_Q, PieceLetter_K, PieceLetter_X, PieceLetter_O, PieceLetter_p, PieceLetter_n,
 	PieceLetter_b, PieceLetter_r, PieceLetter_q, PieceLetter_k, PieceLetter_x
-};
+};*/
+static const char pieceLetter[] = {'C', 'P', 'N', 'B', 'R', 'Q', 'K', ' ', 'c', 'p', 'n', 'b', 'r', 'q', 'k', '*'};
 
 // UCI promo letters, for SAN moves should be converted to uppercase
-enum PromoLetter { PromoLetter_n = 2, PromoLetter_b, PromoLetter_r, PromoLetter_q};
+/*enum PromoLetter : uint8_t { PromoLetter_n = 2, PromoLetter_b, PromoLetter_r, PromoLetter_q};*/
+static const char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q', '\0', '\0' };
+static const char uciPromoLetter[] = { '\0', '\0', 'n', 'b', 'r', 'q', '\0', '\0' };
 
-static const char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q' };
-static const char uciPromoLetter[] = { '\0', '\0', 'n', 'b', 'r', 'q', '\0' };
+//Move could be encoded as 15-bit int (promo << 12 | src << 6 | dst)
+//or as 18-bit number (move_type << 15 | promo << 12 | src << 6 | dst)
+//promo has 3 bits and uses 5 PieceType enum values {PieceTypeNone = 0, Knight = 2, Bishop, Rook or Queen}
+//move_type has 3 bits
+enum MoveType : uint8_t {MoveTypeNormal, MoveTypeCastlingKingside, MoveTypeCastlingQueenside, MoveTypeCapture, MoveTypeEnPassant, MoveTypeEnPassantCapture, MoveTypeNull};
+static const char * moveType[] = { "normal", "castling kingside", "castling queenside", "capture", "en passant", "en passant capture", "null" };
 
-enum MoveType {
-	MoveTypeNormal, MoveTypeValid, MoveTypeCapture, MoveTypeCastlingKingside = 4, 
-	MoveTypeCastlingQueenside = 8, MoveTypePromotion = 16, MoveTypeEnPassant = 32, 
-	MoveTypeNull = 64
-};
+enum ProblemType : uint8_t { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
 
-static const char * moveType[] = {
-	"normal", "valid", "capture", "castling kingside", 
-	"castling queenside", "promotion", "en passant", "null"
-};
-
-enum ProblemType { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
-
-enum GameStage { OpeningGame, MiddleGame, EndGame, FullGame };
+enum GameStage : uint8_t { OpeningGame, MiddleGame, EndGame, FullGame };
 static const char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
 
 static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-static const unsigned long long STARTPOS_HASH = 0x958ee7dbd87b2d0aULL;
-static const unsigned long long STARTPOS_HASH2 = 0x4ed9a976a0f95be5ULL;
-static const unsigned long long STARTPOS_CASTLING_RIGHTS = 0x85a2e5d9b69ed995ULL;
-static const unsigned long long STARTPOS_CASTLING_RIGHTS2 = 0x8057e61321fd55e8ULL;
 
-// Forthys-Edwards Notation for the position preceding a move 
-struct Fen {
-    int sideToMove = ColorWhite;
-    int castlingRights = CastlingRightsWhiteBothBlackBoth;
-    int enPassant = FileNone; //rank can be derived from sideToMove: 3 for white and 6 for black, and hence, the square
-//    unsigned long long enPassantLegalBit = SquareNone; //use enPassantLegalBit() instead
-    int halfmoveClock = 0; //50-move draw counter (no pawn advance and no capture)
-    int moveNumber = 0;
-    bool isChess960 = false;
-    int castlingRook[2][2] = { { FileH, FileA }, { FileH, FileA } }; //needed for chess960
-//    unsigned long long castlingBits = 0x8100000000000081ULL;
-    char fenString[MAX_FEN_STRING_LEN] = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-};
+// Macros for on-fly computation (inline-able, zero cost)
+#define SQ(rank, file) (Square(((rank) << 3) | (file)))
+#define SQ_FILE(sq) (File((sq) & 7))
+#define SQ_RANK(sq) (Rank((sq) >> 3))
+//#define SQ_BIT(sq)  ((sq) == SquareNone ? 0 : (1ULL << (sq)))
+#define SQ_BIT(sq)  (1ULL << (sq))
+#define SQ_DIAG(sq) (Diagonal(7 + SQ_RANK(sq) - SQ_FILE(sq)))
+#define SQ_ANTIDIAG(sq) (Antidiagonal(SQ_FILE(sq) + SQ_RANK(sq)))
+#define SQ_COLOR(sq) (Color(((SQ_FILE(sq) ^ SQ_RANK(sq)) & 1) ? ColorWhite : ColorBlack))
+
+#define PC_TYPE(pc) (PieceType((pc) & 7))
+#define PC_COLOR(pc) (Color((pc) >> 3))
+#define PC(color, type) (Piece(((color) << 3) | (type)))
+#define PC_INIT(pc, pcName, sq) do { (pc)->name = (pcName); (pc)->square = (sq); } while (0)
+
+#define OPP_COLOR(color) ((Color)((color) ^ 1))  // White=0, Black=1
+#define PLY_NUM(board) (((board)->moveNumber - 1) * 2 + ((board)->sideToMove == ColorBlack)) //for white move 1, ply is 0
 
 //having two hashes and verifying the second one when the first is the same for two positions,
-//I've never seen a hash collision, so perhaps, one hash is enough, re-enable if needed and update zobrist-hash.cpp file
+//I've never seen a hash collision, so perhaps, one hash is enough
 struct ZobristHash {
-    unsigned long long hash = 0;
-    //unsigned long long hash2 = 0;
-    unsigned long long blackMove = 0;
-    //unsigned long long blackMove2 = 0;
-    unsigned long long prevCastlingRights = 0;
-    //unsigned long long prevCastlingRights2 = 0;
-    unsigned long long prevEnPassant = 0;
-    //unsigned long long prevEnPassant2 = 0;
-    unsigned long long castling[16] = {};
-    //unsigned long long castling2[16] = {};
-    unsigned long long enPassant[8] = {};
-    //unsigned long long enPassant2[8] = {};
-    unsigned long long piecesAtSquares[13][64] = {};
-    //unsigned long long piecesAtSquares2[13][64] = {};
+    uint64_t hash = 0;
+    uint64_t prevCastlingRights = 0;
+    uint64_t prevEnPassant = 0;
+    //uint64_t prevHash = 0; //for debuging
+    //24 bytes
 };
 
-/*struct Square {
-    int name = SquareNone;
-    unsigned long long bitSquare = 0;
-    int file = FileNone;
-    int rank = RankNone;
-    int diag = DiagonalNone;
-    int antiDiag = AntidiagonalNone;
-};*/
+//825 random 8-byte numbers from atmospheric noise
+struct Zobrist {
+    uint64_t blackMove = 0;
+    uint64_t castling[16] = {0};
+    uint64_t enPassant[File_NB] = {0};
+    uint64_t emptySquares[Square_NB] = {0};
+    uint64_t pawns[Color_NB][PawnSquare_NB]; //96 8-byte numbers
+    uint64_t nonPawns[Color_NB][NonPawnType_NB][Square_NB] = {}; //640 8-byte numbers
+    //6,600 bytes
+};
 
 struct ChessPiece {
-    int name = PieceNameNone;
-    int square = SquareNone;
+    Piece name = PieceNone;
+    Square square = SquareNone;
 };
 
+struct KingSquare {
+  File file = FileNone;
+  Rank rank = RankNone;
+  Diagonal diag = DiagonalNone;
+  Antidiagonal antidiag = AntidiagonalNone;
+  uint64_t bit = 0;
+};
+
+//the smallest compact board representation could be as following:
+//10 bits per piece at square (color << 9 | type << 6 | square) x 32 pieces = 320 bits or 40 bytes
+//4 bits for castling, 4 bits for en passant (one byte)
+//side to move 1 bit + half move clock 7 bits (one byte)
+//move number one (for up to 256 moves) or two bytes for many more
+//total 43 or 44 bytes
+//is it practical to use it and unpack it to more convinient occupation bitboards every time?
+//piecesOnSquares is redundant and can be derived from occupation bitboards in no more than 8 boolean ops
+//movesFromSquares could be replaced with more compact array pieceMoves[32]
+//the rest (moves, isCheck, isStaleMate, isMate) can be calculated from above
+#ifndef BOARD_INCLUDED
 struct Board {
-    unsigned long long occupations[16] = {};  // Bitboards per PieceName
-    int piecesOnSquares[64] = {PieceNameNone};             // PieceName at sq (keep for fast lookup; sync with occupations)
-    unsigned long long moves = 0;            // Union of all legal moves
-    unsigned long long movesFromSquares[64] = {};  // Legal moves from each sq
+    //these booleans are not strictly needed except maybe isChess960
     bool isCheck = false;
     bool isStaleMate = false;
     bool isMate = false;
-    struct Fen * fen = nullptr;
-    struct ZobristHash * zh = nullptr;
+    bool isChess960 = false;
+    Color sideToMove = ColorWhite;
+    File enPassant = FileNone;
+    uint8_t halfmoveClock = 0;
+    uint8_t num_moves = 0; //not necessary but good for 8-byte alignment on 64-bit systems
+    //8 bytes up to here
+    int moveNumber = 1; //may be unsigned short but will be padded 2 bytes anyway
+    uint8_t castlingRook[Color_NB][2] = {{FileNone, FileNone}, {FileNone, FileNone}};
+    //16 bytes up to here
+    //the rest is aligned on 8-byte boundary
+    Piece piecesOnSquares[Square_NB] = {PieceNone}; //64 bytes
+    //uint64_t occupations[2][7] = {0}; //[color][pieceType] 14 8-byte bitboards
+    //alternative compact representation has only 8 8-byte bitboards - much better!
+    //for example, white knights = side[ColorWhite] & pieceTypes[Knight] - trade off between memory and cpu
+    uint64_t side[Color_NB] = {0}; //all white and all black
+    uint64_t pieceTypes[PieceType_NB] = {0}; //all pawns, knights, bishops, rooks, queens and kings
+    //would be just 16 + 64 + 64 = 144 bytes instead of 192
+    //192 bytes total
+};
+#endif
+//history should be preserved in a separate stack
+struct StateInfo {
+    File enPassant = FileNone;
+    uint8_t halfmoveClock = 0;
+    MoveType type = MoveTypeNormal;
+    PieceType capturedType = PieceTypeNone;
+    File castlingRook[Color_NB][2] = {{FileNone, FileNone}, {FileNone, FileNone}};
+    bool isCheck = false;
+    // Pointers to previous state allow for repetition detection
+    //StateInfo* previous; //currently not used
 };
 
+// Keep track of what a move changes on the board (used by NNUE)
+#ifndef TYPES_H_INCLUDED
+namespace Stockfish {
+struct DirtyPiece {
+    Piece pc = PieceNone;        // this is never allowed to be NO_PIECE
+    Square from = SquareNone;
+    Square to = SquareNone;  // to should be SQ_NONE for promotions
+
+    // if {add,remove}_sq is SQ_NONE, {add,remove}_pc is allowed to be
+    // uninitialized
+    // castling uses add_sq and remove_sq to remove and add the rook
+    Square remove_sq = SquareNone;
+    Square add_sq = SquareNone;
+    Piece remove_pc = PieceNone;
+    Piece add_pc = PieceNone;
+};
+}
+#endif
+
+
+//Perhaps, we can wrap src, dst, promoType, type and capturedType and things for undo move in a 4-byte struct
 struct Move {
-    char sanMove[12] = "";
-    char uciMove[6] = "";
-    //next 7 are used in undoMove() and updateHash()
-    int type = MoveTypeNormal;
-    int src = SquareNone;
-    int dst = SquareNone;
-    int movingPiece = PieceNameNone;
-    int capturedPiece = PieceNameNone;
-    int promoPiece = PieceNameNone;
-    int castlingRook = FileNone;
-    //last 5 are used in undoMove() only
-    int otherCastlingRook = FileNone;  
-    int prevCastlingRights = CastlingRightsWhiteNoneBlackNone;
-    int prevEnPassant = FileNone;
-    int prevHalfmoveClock = 0;
-    int prevCastlingRook = FileNone;
-    struct Board * chessBoard = nullptr;
+  Square src = SquareNone;
+  Square dst = SquareNone;
+  PieceType promoType = PieceTypeNone;
+  MoveType type = MoveTypeNormal;
 };
 
-enum EngineSpinOptions {Hash, Threads, MultiPV, ProbabilityMass, ExplorationMin, ExplorationMax, ExplorationDepthDecay, VirtualLoss, PVPlies, EvalScale, Temperature};
-enum EngineStringOptions {SyzygyPath};
-enum EngineCheckOptions {Ponder, FinalInfoLines, IntermittentInfoLines};
+struct MovesContext {
+  int num_checkers = 0;
+  Square checkerSquare = SquareNone; //used if num_checkers = 1
+  uint64_t pinnedPieces = 0;
+  uint64_t pinningPieces = 0;
+  uint64_t blockingSquares = 0;
+};
 
-enum OptionType {
+enum EngineSpinOptions : uint8_t {Hash, Threads, MultiPV, ExplorationMin, ExplorationMax, ExplorationDepthDecay, VirtualLoss, PVPlies, EvalScale, Temperature, ProbabilityMass, NegamaxDepth};
+enum EngineStringOptions : uint8_t {SyzygyPath};
+enum EngineCheckOptions : uint8_t {Ponder, FinalInfoLines, IntermittentInfoLines};
+
+enum OptionType : uint8_t {
 	Button, Check, Combo, Spin, String
 };
-
 static const char * optionTypes[] = {
 	"button", "check", "combo", "spin", "string"
 };
 
 struct OptionSpin {
 	char name[MAX_UCI_OPTION_NAME_LEN] = {};
-	long long defaultValue = 0;
-	long long value = 0;
-	long long min = 0;
-	long long max = 0;
+	int64_t defaultValue = 0;
+	int64_t value = 0;
+	int64_t min = 0;
+	int64_t max = 0;
 };
 
 struct OptionCheck {
@@ -447,11 +453,11 @@ struct Engine {
 	char id[MAX_UCI_OPTION_STRING_LEN] = {};
 	char authors[2 * MAX_UCI_OPTION_STRING_LEN] = {};
 	int numberOfCheckOptions = 0, numberOfComboOptions = 0, numberOfSpinOptions = 0, numberOfStringOptions = 0, numberOfButtonOptions = 0;
-	struct OptionCheck optionCheck[MAX_UCI_OPTION_CHECK_NUM] = {};
-	struct OptionCombo optionCombo[MAX_UCI_OPTION_COMBO_NUM] = {};
-	struct OptionSpin optionSpin[MAX_UCI_OPTION_SPIN_NUM] = {};
-	struct OptionString optionString[MAX_UCI_OPTION_STRING_NUM] = {};
-	struct OptionButton optionButton[MAX_UCI_OPTION_BUTTON_NUM] = {};
+	OptionCheck optionCheck[MAX_UCI_OPTION_CHECK_NUM] = {};
+	OptionCombo optionCombo[MAX_UCI_OPTION_COMBO_NUM] = {};
+	OptionSpin optionSpin[MAX_UCI_OPTION_SPIN_NUM] = {};
+	OptionString optionString[MAX_UCI_OPTION_STRING_NUM] = {};
+	OptionButton optionButton[MAX_UCI_OPTION_BUTTON_NUM] = {};
 	char engineName[255] = {};
 	char namedPipeTo[255] = {};
 	char namedPipeFrom[255] = {};
@@ -464,22 +470,20 @@ struct Engine {
 	char moves[MAX_UCI_MOVES_LEN] = {}; //UCI moves
 	FILE * logfile = nullptr;
 	//go() arguments
-	long long movetime = 0;
+	int64_t movetime = 0;
 	int depth = 0;
-	unsigned long long nodes = 0;
+	uint64_t nodes = 0;
 	int mate = 0;
 	bool ponder = false;
 	bool infinite = false;
-	long long wtime = 0;
-	long long btime = 0;
-	long long winc = 0;
-	long long binc = 0;
+	int64_t wtime = 0;
+	int64_t btime = 0;
+	int64_t winc = 0;
+	int64_t binc = 0;
 	int movestogo = 0;
 	char * searchmoves = nullptr;
 	FILE * toEngine = nullptr;
 	FILE * fromEngine = nullptr;
-  //int seldepth = 0;
-	//int tbhits = 0;
 };
 
 struct Evaluation {
@@ -489,47 +493,23 @@ struct Evaluation {
 	int multipv = 0;
 	int scorecp = 0;
 	int matein = 0; //mate in <moves>, not <plies>
-	unsigned long long nodes = 0;
-	unsigned long long nps = 0;
+	uint64_t nodes = 0;
+	uint64_t nps = 0;
 	int hashful = 0; //permill (per thousand)
 	int tbhits = 0;
-	unsigned long long time = 0; //ms
+	uint64_t time = 0; //ms
 	char pv[1024] = {};
 	char bestmove[6] = {};
 	char ponder[6] = {};
 	int nag = 0;
 };
 
-/// <summary>
-///  Converts FEN string to struct fen
-/// </summary>
-CHESS_API int strtofen(struct Fen *, const char *);
-
-/// <summary>
-///  Updates fenString in Fen struct
-/// </summary>
-int fentostr(struct Fen *);
-
-/*
-struct MoveScoreGames {
-  char move[6]; //uci move
-  int score; //position score, i.e. sum of wins and losses by making this move
-  unsigned int games;
-  int scorecp; // evaluated by a chess engine but negative values meaning black winning, positive - white
-};
-
-struct MoveScores {
-  char move[6]; //uci move
-  double score; //weighted score, i.e. score / total number of games in NextMoves.db for a given position
-  int scorecp;
-};*/
-
-enum Tags {
+enum Tags : uint8_t {
 	UnknownTag, Event, Site, Date, Round, White, Black, Result,
 	Annotator, PlyCount, TimeControl, Time, Termination, Mode, FEN, SetUp, Opening, Variation, Variant, WhiteElo, BlackElo, ECO
 };
 
-enum EcoTags {
+enum EcoTags : uint8_t {
 	eECO, eOpening, eVariation
 };
 
@@ -542,7 +522,7 @@ static const char * ecotags[] = {
 	"ECO", "Opening", "Variation"
 };
 
-enum Variant {
+enum Variant : uint8_t {
 	Standard, Chess960
 };
 
@@ -568,300 +548,89 @@ struct EcoLine {
 	EcoTag tags = {}; // Chess eco header tag array
 };
 
-CHESS_API char * idx_to_move(const int move_idx, char * uci_move);
-CHESS_API int move_to_idx(const char * uci_move, int * src, int * dst, int * promo);
-CHESS_API struct Board * cloneBoard(struct Board * src);
-CHESS_API void freeBoard(struct Board * board);
-///<summary>
-/// Generates unbiased random random number from inclusive range [min, max]
-/// The first argument is min, the second is max
-///</summary>
 CHESS_API int randomNumber(const int, const int);
 
-///<summary>
-/// initializes a ZobristHash struct
-///</summary>
-CHESS_API void zobristHash(struct ZobristHash *);
+CHESS_API int fen2board(Board& board, const char * fenstr);
+CHESS_API char * board2fen(const Board& board, char * fenString);
+CHESS_API uint64_t getAttackedSquares(const Board& board, MovesContext& movesContext);
+CHESS_API uint64_t getAttackedSquaresOnly(const Board& board);
+CHESS_API Square getKingSquare(const Board& board, KingSquare& kingSq);
+CHESS_API uint64_t kingMoves(Board& board, const Square kingSquare, const KingSquare& kingSq, MovesContext& movesContext, const uint64_t attackedSquares);
+CHESS_API uint64_t piece_moves(const PieceType pieceType, const Square sq, const MovesContext& ctx, const KingSquare& kingSq, Board& board);
+//CHESS_API uint64_t * generateMoves(struct Board * board, struct MovesContext * movesContext, const uint64_t attackedSquares, uint64_t * movesFromSquares);
+CHESS_API void isCheckMateStaleMate(Board& board);
+//CHESS_API void generateMoves(Board& board, uint64_t * movesFromSquares);
+CHESS_API int uci2move_idx(const char * uci_move, Move& move);
+CHESS_API char * idx2uci(const int move_idx, char * uci_move);
+CHESS_API Move& idx2move(const int move_idx, Move& move);
+CHESS_API int san2move(Board& board, const char * san_move, Move& move);
+CHESS_API char * move2san(Board& board, const Move& move, char * sanMove);
+CHESS_API bool promoMove(const Board& board, const Move& move);
+//CHESS_API int initMove(Board * board, const char * moveString, uint64_t * movesFromSquares);
+//fast-forward a valid uci move on a given board without init_move(), returns moveType enum
+CHESS_API PieceType ff_move(Board& board, Move& move);
+//CHESS_API void makeMove(Board * board, const int move);
+CHESS_API PieceType do_move(Board& board, Move& move, StateInfo& state);
+CHESS_API PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::DirtyPiece& dp);
+CHESS_API void undo_move(Board& board, const Move& move, const StateInfo& state);
 
-///<summary>
-/// calculates Zobrist hash from a Board struct and updates
-/// ZobristHash struct, which should be initialized first
-///<summary>
-CHESS_API void getHash(struct ZobristHash *, struct Board *);
+CHESS_API void zobristHash(Zobrist& z);
+CHESS_API void getHash(ZobristHash& hash, const Board& board, const Zobrist& z);
+CHESS_API void updateHash(ZobristHash& zh, const Board& board, const Move& move, const int capturedType, const Zobrist& z);
 
-///<summary>
-/// resets ZobristHash struct to initial game position
-///</summary>
-CHESS_API void resetHash(struct ZobristHash *);
+//returns en passant square (dst sq) if en passant capture from sq is legal or 0 otherwise
+CHESS_API Square enPassantMoveLegal(Board& board, const Square sq);
 
-///<summary>
-/// updates ZobristHash of a given Board after a given move
-///</summary>
-CHESS_API void updateHash(struct Board *, struct Move *);
-
-///<summary>
-/// fills Square struct from SquareName enum
-///</summary>
-//CHESS_API void square(struct Square *, int squareName);
-
-///<summary>
-/// fills ChessPiece struct from a given Square and a PieceName
-///</summary>
-//CHESS_API void piece(struct Square *, struct ChessPiece *, int pieceName);
-
-///<summary>
-/// makes a Board struct from a Fen one including legal moves generation stored in Board->movesFromSquares
-///</summary>
-CHESS_API int fentoboard(struct Fen *, struct Board *);
-
-//returns en passant bit square if it is legal or 0 otherwise
-CHESS_API unsigned long long enPassantLegalBit(struct Board * board);
+//returns en passant square (dst sq) if en passant capture is legal or 0 otherwise
+CHESS_API Square enPassantLegal(Board& board);
 
 // two standard bit manupulation functions
-CHESS_API unsigned long long bitCount(unsigned long long);
-CHESS_API unsigned long lsBit(unsigned long long);
-//CHESS_API void unpack_bits(unsigned long long number, float * bit_array);
+CHESS_API uint8_t bitCount(uint64_t);
+CHESS_API Square lsBit(uint64_t);
 
-///<summary>
-/// This function strips game result from SAN moves string
-///</summary>
-CHESS_API void stripGameResult(struct Game *);
+CHESS_API void stripGameResult(Game& game);
+CHESS_API int normalizeMoves(char * moves);
+CHESS_API int movesOnly(char * moves);
 
-///<summary>
-/// This function strips comments, variations and NAGs from SAN moves string
-///</summary>
-CHESS_API int normalizeMoves(char *);
-
-///<summary>
-/// This function removes move numbers from normalized SAN moves string
-///</summary>
-CHESS_API int movesOnly(char *);
-
-///<summary>
-/// generates all legal moves on a given board
-/// stored in movesFromSquares array of the Board struct
-///</summary>
-CHESS_API void generateMoves(struct Board *);
-
-///<summary>
-/// This function generates board position given an array of enum PieceName[] and its size (the second argument)
-/// as well as sideToMove (third argument), castlingRights (fourth argument) and enPassant (fifth argument)
-/// The board should be passed by reference in the last argument
-///<summary>
-CHESS_API void generateEndGame(int * pieceName, int numberOfPieces, int sideToMove, int castlingRights, int enPassant, struct Board *);
-
-CHESS_API int generateEndGames(int maxGameNumber, int maxPieceNumber, char * dataset, char * engine, long long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool writedebug, int threads);
-
-///<summary>
-/// validates a UCI or SAN move given by the last argument
-/// and initializes the Move struct on a given board
-///</summary>
-CHESS_API void initMove(struct Move * move, struct Board * board, const char * moveString);
-//lightweight version of initMove() without move validation
-CHESS_API void init_move(struct Move * move, struct Board * board, int src, int dst, int promo);
-//fast-forward a valid uci move on a given board without init_move(), move will be set for updateHash() to work
-CHESS_API void ff_move(struct Board * board, struct Move * move, const int src, const int dst, const int promo);
-CHESS_API bool promoMove(struct Board * board, int src, int dst);
-
-///<summary>
-/// makes a given Move on board and updates Board and Fen struct
-///</summary>
-CHESS_API void makeMove(struct Move * move);
-CHESS_API void undoMove(struct Move * move);
-
-CHESS_API void make_move(struct Move * move); //does not handle null move, update FEN and generate moves
-CHESS_API void undo_move(struct Move * move); //does not handle null move, update FEN and generate moves
-CHESS_API void updateFen(struct Board * board); //updates just board->fen->fenString
-
-/// <summary>
-/// Parses the line into tag name and tag value
-/// and fills the given Tag array
-/// </summary>
 CHESS_API int strtotag(Tag tag, const char * tagString);
-
-/// <summary>
-/// Parses the line into tag name and tag value
-/// and fills the given EcoTag array
-/// </summary>
 CHESS_API int strtoecotag(EcoTag, const char * tagString);
-
-///<summary>
-/// Count number of games, which begin with a string specified by the second argument
-/// from a FILE stream and index them by a game start position in the array long long[].
-/// The last argument is the number of games
-///</summary>
-CHESS_API unsigned long long countGames(FILE *, const char *, unsigned long long gameStartPositions[], unsigned long long maxNumberOfGames);
-
-///<summary>
-/// Reads PGN game tags for a first game pointed by a file stream
-/// and fills the provided array of typedef Tag
-/// returns 0 on success, non-zero on error
-///</summary>
 CHESS_API int gTags(Tag, FILE *);
-
-///<summary>
-/// Reads eco file tags for a first eco line pointed by a file stream
-/// and fills the provided array of typedef EcoTag
-/// returns 0 on success, non-zero on error
-///</summary>
 CHESS_API int eTags(EcoTag, FILE *);
 
-///<summary>
-/// Plays multiple pgn games from a given pgn file
-///</summary>
-//unsigned long long openGamesFromPGNfile(char * fileName, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int maxEloDiff, int minMoves, int numberOfGames, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV, bool logging);
+CHESS_API uint64_t countGames(FILE *, const char *, uint64_t gameStartPositions[], uint64_t maxNumberOfGames);
 
-///<summary>
-/// This function is similar to playGames() with a difference that it takes a list of PGN
-/// files and each thread is given the entire file from the list
-/// It saves time by begining to play games one by one from the start of a file
-/// eliminating the need to index them in the file first, which is time consuming for large PGN files
-/// The first arg is an array of file names, the second arg is the number of of files in this array
-/// The rest are the same as in pgnGames()
-///</summary>
-//unsigned long long openGamesFromPGNfiles(char * fileNames[], int numberOfFiles, int gameThreads, int sqlThreads, char * ecoFileName, int minElo, int numberOfGames, int maxEloDiff, int minMoves, bool generateZobristHash, bool updateDb, bool createDataset, char * dataset, bool eval, char * engine, long long movetime, int depth, int hashSize, int engineThreads, char * syzygyPath, int multiPV, bool logging);
-
-//functions for fast data loading in AI model training
-//int initGamesFromPGNs(char * fileNames[], int numberOfFiles, int minElo, int maxEloDiff);
-//CHESS_API struct BMPR * dequeueBMPR();
-//CHESS_API void * getGame(void * context);
-//CHESS_API void * getGameCsv(void * context);
-//CHESS_API void getGame_detached(char ** fileNames, const int numberOfFiles, const int minElo, const int maxEloDiff, const int minMoves, const int numberOfChannels, const int numberOfSamples, const int bmprQueueLen, const int gameStage, const unsigned long long steps);
-//CHESS_API void free_bmpr(struct BMPR * bmpr);
-//CHESS_API int boardLegalMoves(float * boards_legal_moves, int sample, int channels, struct Board * board);
-//CHESS_API int getStage(struct Board * board);
-//float materialBalance(struct Board * board); //from the view of side to move
 CHESS_API void cleanup_magic_bitboards(void);
 CHESS_API void init_magic_bitboards(void);
 
-///<summary>
-/// This function initializes Game struct from a stream position given by FILE
-/// It returns 0 on success and 1 on the EOF
-///</summary>
-CHESS_API int initGame(struct Game *, FILE *);
+CHESS_API int initGame(Game& game, FILE *);
+int playGame(Game& game);
 
-///<summary>
-/// Plays a game given its struct
-///</summary
-int playGame(struct Game *);
-
-/// <summary>
-/// draws a chessboard
-/// if the second argument is true, then also all legal moves for each piece 
-/// </summary>
-CHESS_API void writeDebug(const struct Board *, bool);
-
-///<summary>
-/// draws a board with just a specified piece name such as white pawns, for example
-/// filling other squares with '0' or 'o' regardless if it is occupied by other piece or not
-///</summary>
-//void drawBoard(struct Board *, int pieceName);
-
-///<summary>
-/// draws moves from a given square sq
-/// it is called from writeDebug
-///</summary>
-//void drawMoves(struct Board *, int squareName);
-
-///<summary>
-/// returns 0 if occupations reconcile with piecesOnSquares,
-/// otherwise, non-zero error code
-///</summary>
-CHESS_API int reconcile(struct Board *);
-
-///<summary>
-/// returns string representation in the first argument
-/// of a bit field move type given in the second argument
-///</summary>
+CHESS_API void writeDebug(const Board& board);
+CHESS_API void drawMoves(const Board& board, const Square sq, const uint64_t * movesFromSquares);
+CHESS_API int reconcile(const Board& board);
 CHESS_API void getMoveType(char *, unsigned int);
 
-///<summary>
-/// ECO classificator for a chess game (first argument)
-/// second argument - array of ecoLines
-/// third argument - the number of ecoLines
-///</summary>
-CHESS_API void ecoClassify(struct Game *, struct EcoLine **, int);
+CHESS_API void ecoClassify(Game& game, EcoLine **, int);
 
-///<summary>
-/// runs a chess engine in a child process
-/// The second arg is engine binary path
-///</summary>
-CHESS_API int engine(struct Engine *, const char *);
+CHESS_API int engine(Engine& engine, const char * path);
+CHESS_API void initChessEngine(Engine& chessEngine, const char * engineName, const int64_t movetime, const int depth, const int hashSize, const int threadNumber, const char * syzygyPath, const int multiPV, const bool logging, const bool limitStrength, const int elo);
+CHESS_API void releaseChessEngine(Engine& chessEngine);
+CHESS_API int nametoindex(const Engine& engine, const char * option, OptionType optionType);
+CHESS_API int getOptions(Engine& engine);
+CHESS_API int setOption(const Engine& engine, const char * option, OptionType optionType, void *);
+CHESS_API void setOptions(const Engine& engine);
+CHESS_API bool isReady(const Engine& engine);
+CHESS_API bool newGame(const Engine& engine);
+CHESS_API void stop(const Engine& engine);
+CHESS_API void quit(const Engine& engine);
+CHESS_API bool position(const Engine& engine);
+CHESS_API int go(const Engine& engine, Evaluation **);
+CHESS_API float eval(const Engine& engine);
+CHESS_API int getPV(const Engine& engine, Evaluation ** eval, const int multiPV);
+CHESS_API int pieces(const Engine& engine); //non-standard UCI command pieces - returns the number of pieces on board
 
-CHESS_API struct Engine * initChessEngine(char * engineName, long long movetime, int depth, int hashSize, int threadNumber, char * syzygyPath, int multiPV, bool logging, bool limitStrength, int elo);
-
-CHESS_API void releaseChessEngine(struct Engine * chessEngine);
-
-///<summary>
-/// returns chess engine option index for a given name and type
-///</summary>
-CHESS_API int nametoindex(struct Engine *, const char *, int optionType);
-
-///<summary>
-/// gets chess engine options
-///</summary>
-//int getOptions(char *, struct Engine *);
-CHESS_API int getOptions(struct Engine *);
-
-CHESS_API int setOption(struct Engine *, const char *, int optionType, void *);
-CHESS_API void setOptions(struct Engine *);
-
-CHESS_API bool isReady(struct Engine *);
-CHESS_API bool newGame(struct Engine *);
-CHESS_API void stop(struct Engine *);
-CHESS_API void quit(struct Engine *);
-CHESS_API bool position(struct Engine *);
-//void go(long long, int, int, int, char *, bool, bool, long long, long long, long long, long long, int, struct Engine *, struct Evaluation **);
-CHESS_API int go(struct Engine *, struct Evaluation **);
-CHESS_API float eval(struct Engine *);
-CHESS_API int getPV(struct Engine * engine, struct Evaluation ** eval, int multiPV);
-CHESS_API int pieces(struct Engine * engine); //non-standard UCI command pieces - returns the number of pieces on board
-//CHESS_API unsigned long long md5(char *);
-
-///<summary>
-/// This function returns the number of moves for a given Zobrist hash and 
-/// the array of struct MoveScoreGames[MAX_NUMBER_OF_NEXT_MOVES] from NextMovesX.db files
-/// where X is the number encoded by the number of most significant bits of the hash
-/// The number of bits usually corresponds to sqlThreads (the last arg), which
-/// can be 1, 2, 4 or 8. Therefore, X ranges from 0 to 7, i.e. 0 for 1 thread, 0 to 1 for 2 threads,
-/// 0 to 3 for 4 threads and 0 to 7 for 8 threads
-///</summary>
-//CHESS_API int nextMoves(unsigned long long, struct MoveScoreGames **, int);
-
-///<summary>
-/// This function is similar to nextMoves except it returns the sorted array of moveScores
-/// Sorting is done by weighted absolute scores from the highest to the lowest, 
-/// where score = score / totalNumberOfGames for a given position
-/// The last arg is the number of sql threads, which should be 1, 2, 4 or 8 depending on how many db files you have
-///</summary>
-//CHESS_API int bestMoves(unsigned long long, int color, struct MoveScores *, int);
-
-/*
-void libchess_init_nnue(const char * nnue_file);
-void libchess_init_nnue_context(struct NNUEContext * ctx);
-void libchess_free_nnue_context(struct NNUEContext * ctx);
-int libchess_evaluate_nnue(const struct Board * board, struct NNUEContext * ctx);
-int libchess_evaluate_nnue_incremental(const struct Board * board, const struct Board * prev_board, struct Move * move, struct NNUEContext * ctx);
-void libchess_evaluate_dataset(struct Board * boards, struct Move * moves, int * scores, int n_positions);
-*/
-
-/*
-int openDb(const char *, sqlite3 *);
-int closeDb(sqlite3 *);
-int getNextMoves(sqlite3 *, sqlite3_int64, struct MoveScoreGames **);
-int getNextMove(sqlite3 *, sqlite3_int64, const char *, struct MoveScoreGames *);
-int updateNextMove(sqlite3 *, sqlite3_int64, const char *, int);
-*/
-
-///<summary>
-/// naive chess piece (except pawns) move generator
-/// moves are limited by board boundary only
-/// may be used at the start to populate move arrays[64] of unsigned long long
-///<summary>
-//unsigned long long moveGenerator(int pieceType, struct Square *);
-//unsigned long long moveGenerator(int pieceType, int squareName);
-#ifdef __cplusplus
-}
-#endif
+//#ifdef __cplusplus
+//}
+//#endif
 #endif
 

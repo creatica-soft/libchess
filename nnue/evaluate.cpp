@@ -30,7 +30,7 @@
 
 #include "nnue/network.h"
 #include "nnue/nnue_misc.h"
-#include "position.h"
+//#include "position.h"
 #include "types.h"
 #include "uci.h"
 #include "nnue/nnue_accumulator.h"
@@ -40,17 +40,59 @@ namespace Stockfish {
 // Returns a static, purely materialistic evaluation of the position from
 // the point of view of the side to move. It can be divided by PawnValue to get
 // an approximation of the material advantage on the board in terms of pawns.
-int Eval::simple_eval(const Position& pos) {
+/*int Eval::simple_eval(const Position& pos) {
     Color c = pos.side_to_move();
     return PawnValue * (pos.count<PAWN>(c) - pos.count<PAWN>(~c))
          + (pos.non_pawn_material(c) - pos.non_pawn_material(~c));
+}*/
+
+unsigned long lsBit(unsigned long long b) {
+	if (b == 0) return 64;
+#ifdef _MSC_VER
+	unsigned long index;
+	_BitScanForward64(&index, b); // equivalent to __builtin_ctzl
+	return index;
+#else
+	return __builtin_ctzll(b);
+#endif
 }
 
-bool Eval::use_smallnet(const Position& pos) { return std::abs(simple_eval(pos)) > 962; }
+unsigned long long bitCount(unsigned long long value) {
+#ifdef _MSC_VER
+	return __popcnt64(value); // equivalent to __builtin_popcountl
+#else
+  return __builtin_popcountll(value);
+#endif
+}
+
+
+int Eval::simple_eval(const Board& board) {
+    int c = board.sideToMove;
+    int pawns = bitCount(board.pieceTypes[PAWN - 1] & board.side[c]);
+    int opp_pawns = bitCount(board.pieceTypes[PAWN - 1] & board.side[c ^ 1]);
+    unsigned long long non_pawns = (board.side[c]) ^ board.pieceTypes[PAWN - 1];
+    int np = 0;
+    while (non_pawns) {
+      int sq = lsBit(non_pawns);
+      np += PieceValue[board.piecesOnSquares[sq]];
+      non_pawns &= non_pawns - 1;
+    }
+    unsigned long long opp_non_pawns = (board.side[c ^ 1]) ^ board.pieceTypes[PAWN - 1];
+    int opp_np = 0;
+    while (opp_non_pawns) {
+      int sq = lsBit(opp_non_pawns);
+      opp_np += PieceValue[board.piecesOnSquares[sq]];
+      opp_non_pawns &= opp_non_pawns - 1;
+    }
+    return PawnValue * (pawns - opp_pawns) + (np - opp_np);
+}
+
+//bool Eval::use_smallnet(const Position& pos) { return std::abs(simple_eval(pos)) > 962; }
+bool Eval::use_smallnet(const Board& board) { return std::abs(simple_eval(board)) > 962; }
 
 // Evaluate is the evaluator for the outer world. It returns a static evaluation
 // of the position from the point of view of the side to move.
-Value Eval::evaluate(const Eval::NNUE::Networks&    networks,
+/*Value Eval::evaluate(const Eval::NNUE::Networks&    networks,
                      const Position&                pos,
                      Eval::NNUE::AccumulatorStack&  accumulators,
                      Eval::NNUE::AccumulatorCaches& caches,
@@ -87,9 +129,56 @@ Value Eval::evaluate(const Eval::NNUE::Networks&    networks,
     v = std::clamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 
     return v;
+}*/
+
+Value Eval::evaluate(const Eval::NNUE::Networks& networks,
+                     const Board& board,
+                     Eval::NNUE::AccumulatorStack& accumulators,
+                     Eval::NNUE::AccumulatorCaches& caches,
+                     int optimism) {
+
+    if (board.isCheck) return 0;
+
+    bool smallNet = use_smallnet(board);
+    auto [psqt, positional] = smallNet ? networks.small.evaluate(board, accumulators, &caches.small)
+                                       : networks.big.evaluate(board, accumulators, &caches.big);
+
+    Value nnue = (125 * psqt + 131 * positional) / 128; //scaled nnue
+
+    // Re-evaluate the position when higher eval accuracy is worth the time spent
+    if (smallNet && (std::abs(nnue) < 236))
+    {
+        std::tie(psqt, positional) = networks.big.evaluate(board, accumulators, &caches.big);
+        nnue                       = (125 * psqt + 131 * positional) / 128; //scaled nnue
+        smallNet                   = false;
+    }
+
+    // Blend optimism and eval with nnue complexity
+    int nnueComplexity = std::abs(psqt - positional);
+    optimism += optimism * nnueComplexity / 468;
+    nnue -= nnue * nnueComplexity / 18000;
+
+    int pawns = bitCount(board.pieceTypes[PAWN - 1]);
+    unsigned long long non_pawns = ((board.side[WHITE] | board.side[BLACK])) ^ board.pieceTypes[PAWN - 1];
+    int np = 0;
+    while (non_pawns) {
+      int sq = lsBit(non_pawns);
+      np += PieceValue[board.piecesOnSquares[sq]];
+      non_pawns &= non_pawns - 1;
+    }
+    int material = 535 * pawns + np;
+    int v = (nnue * (77777 + material) + optimism * (7777 + material)) / 77777;
+
+    // Damp down the evaluation linearly when shuffling
+    v -= v * board.halfmoveClock / 212;
+
+    // Guarantee evaluation does not hit the tablebase range
+    v = std::clamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
+
+    return v;
 }
 
-WinRateParams win_rate_params(const Position& pos) {
+/*WinRateParams win_rate_params(const Position& pos) {
     int material = pos.count<PAWN>() + 3 * pos.count<KNIGHT>() + 3 * pos.count<BISHOP>() + 5 * pos.count<ROOK>() + 9 * pos.count<QUEEN>();
 
     // The fitted model only uses data for material counts in [17, 78], and is anchored at count 58.
@@ -103,21 +192,51 @@ WinRateParams win_rate_params(const Position& pos) {
     double b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
 
     return {a, b};
+}*/
+
+WinRateParams win_rate_params(const Board& board) {
+    int pawns = bitCount(board.pieceTypes[PAWN - 1]); 
+    int knights = bitCount(board.pieceTypes[KNIGHT - 1]);
+    int bishops = bitCount(board.pieceTypes[BISHOP - 1]);
+    int rooks = bitCount(board.pieceTypes[ROOK - 1]);
+    int queens = bitCount(board.pieceTypes[QUEEN - 1]);
+    int material = pawns + 3 * knights + 3 * bishops + 5 * rooks + 9 * queens;
+    //printf("win_rate_params() debug: pawns %d, knights %d, bishops %d, rooks %d, queens %d, total material %d\n", pawns, knights, bishops, rooks, queens, material);
+
+    // The fitted model only uses data for material counts in [17, 78], and is anchored at count 58.
+    double m = std::clamp(material, 17, 78) / 58.0;
+    //printf("win_rate_params() debug: clamped material %f\n", m);
+
+    // Return a = p_a(material) and b = p_b(material), see github.com/official-stockfish/WDL_model
+    constexpr double as[] = {-13.50030198, 40.92780883, -36.82753545, 386.83004070};
+    constexpr double bs[] = {96.53354896, -165.79058388, 90.89679019, 49.29561889};
+
+    double a = (((as[0] * m + as[1]) * m + as[2]) * m) + as[3];
+    double b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
+    //printf("win_rate_params() debug: a %f, b %f\n", a, b);
+
+    return {a, b};
 }
 
 // The win rate model is 1 / (1 + exp((a - eval) / b)), where a = p_a(material) and b = p_b(material).
 // It fits the LTC fishtest statistics rather accurately.
-int win_rate_model(Value v, const Position& pos) {
+/*int win_rate_model(Value v, const Position& pos) {
 
     auto [a, b] = win_rate_params(pos);
 
     // Return the win rate in per mille units, rounded to the nearest integer.
     return int(0.5 + 1000 / (1 + std::exp((a - double(v)) / b)));
-}
+}*/
+int win_rate_model(Value v, const Board& board) {
 
+    auto [a, b] = win_rate_params(board);
+
+    // Return the win rate in per mille units, rounded to the nearest integer.
+    return int(0.5 + 1000 / (1 + std::exp((a - double(v)) / b)));
+}
 // Turns a Value to an integer centipawn number,
 // without treatment of mate and similar special scores.
-Value to_cp(Value v, const Position& pos) {
+/*Value to_cp(Value v, const Position& pos) {
 
     // In general, the score can be defined via the WDL as
     // (log(1/L - 1) - log(1/W - 1)) / (log(1/L - 1) + log(1/W - 1)).
@@ -126,13 +245,18 @@ Value to_cp(Value v, const Position& pos) {
     auto [a, b] = win_rate_params(pos);
 
     return std::round(100 * int(v) / a);
+}*/
+
+Value to_cp(Value v, const Board& board) {
+    auto [a, b] = win_rate_params(board);
+    return std::round(100 * int(v) / a);
 }
 
 // Like evaluate(), but instead of returning a value, it returns
 // a string (suitable for outputting to stdout) that contains the detailed
 // descriptions and values of each evaluation term. Useful for debugging.
 // Trace scores are from white's point of view
-std::string Eval::trace(Position& pos, const Eval::NNUE::Networks& networks) {
+/*std::string Eval::trace(Position& pos, const Eval::NNUE::Networks& networks) {
 
     if (pos.checkers())
         return "Final evaluation: none (in check)";
@@ -154,6 +278,30 @@ std::string Eval::trace(Position& pos, const Eval::NNUE::Networks& networks) {
     v = evaluate(networks, pos, accumulators, *caches, VALUE_ZERO);
     v = pos.side_to_move() == WHITE ? v : -v;
     ss << "Final evaluation       " << 0.01 * to_cp(v, pos) << " (white side) [with scaled NNUE]\n";
+
+    return ss.str();
+}*/
+
+std::string Eval::trace(Board& board, const Eval::NNUE::Networks& networks) {
+    if (board.isCheck) return "Final evaluation: none (in check)";
+
+    Eval::NNUE::AccumulatorStack accumulators;
+    auto caches = std::make_unique<Eval::NNUE::AccumulatorCaches>(networks);
+
+    std::stringstream ss;
+    ss << std::showpoint << std::noshowpos << std::fixed << std::setprecision(2);
+    ss << '\n' << NNUE::trace(board, networks, *caches) << '\n';
+
+    ss << std::showpoint << std::showpos << std::fixed << std::setprecision(2) << std::setw(15);
+
+    auto [psqt, positional] = networks.big.evaluate(board, accumulators, &caches->big);
+    Value v                 = psqt + positional; //unscaled nnue
+    v                       = board.sideToMove == WHITE ? v : -v;
+    ss << "NNUE evaluation        " << 0.01 * to_cp(v, board) << " (white side) [with unscaled NNUE]\n";
+
+    v = evaluate(networks, board, accumulators, *caches, VALUE_ZERO);
+    v = board.sideToMove == WHITE ? v : -v;
+    ss << "Final evaluation       " << 0.01 * to_cp(v, board) << " (white side) [with scaled NNUE]\n";
 
     return ss.str();
 }

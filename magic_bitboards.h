@@ -97,19 +97,19 @@ static const int bishop_relevant_bits[SQUARE_COUNT] = {
     6, 5, 5, 5, 5, 5, 5, 6
 };
 
-#ifdef __cplusplus
-extern "C" {
+//#ifdef __cplusplus
+//extern "C" {
   // Initialize magic bitboards
-  CHESS_API void init_magic_bitboards(void);
+  //CHESS_API void init_magic_bitboards(void);
   
   // Cleanup move tables
-  CHESS_API void cleanup_magic_bitboards(void);
+  //CHESS_API void cleanup_magic_bitboards(void);
   
   // Get moves for sliding pieces
-  unsigned long long get_rook_moves(int square, unsigned long long occupancy);
-  unsigned long long get_bishop_moves(int square, unsigned long long occupancy);
-}
-#else
+  //unsigned long long get_rook_moves(int square, unsigned long long occupancy);
+  //unsigned long long get_bishop_moves(int square, unsigned long long occupancy);
+//}
+//#else
 // Initialize magic bitboards
 CHESS_API void init_magic_bitboards(void);
 
@@ -119,5 +119,5 @@ CHESS_API void cleanup_magic_bitboards(void);
 // Get moves for sliding pieces
 unsigned long long get_rook_moves(int square, unsigned long long occupancy);
 unsigned long long get_bishop_moves(int square, unsigned long long occupancy);
-#endif
+//#endif
 #endif

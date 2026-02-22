@@ -27,31 +27,30 @@
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
 #define DRAW_CP 30 //accept draw if score cp is less than this value in centipawns
-#define MIN_ELO 2000
-#define MAX_ELO 2300
-#define ELO_CREATICA 2000
+#define MIN_ELO 2200
+#define MAX_ELO 2600
+#define ELO_CREATICA 2300
 #define CLOCK_LIMIT 180 //seconds
 #define CLOCK_INCREMENT 3 //seconds
 #define NUMBER_OF_BOTS 50 //number of online bots to return from the list
 #define MULTI_PV 1 //number of PVs
 #define PV_PLIES 2 //number of plies in PV
-#define EXPLORATION_MIN 40 // used in formular for exploration constant decay with depth
-#define EXPLORATION_MAX 120 //smaller value favor exploitation, i.e. deeper tree vs wider tree
+#define EXPLORATION_MIN 60 // used in formular for exploration constant decay with depth
+#define EXPLORATION_MAX 150 //smaller value favor exploitation, i.e. deeper tree vs wider tree
 #define EXPLORATION_DEPTH_DECAY 6 //linear decay of EXPLORATION CONSTANT with depth using formula:
                       // C * 100 = max(EXPLORATION_MIN, (EXPLORATION_MAX - seldepth * EXPLORATION_DEPTH_DECAY))
-#define PROBABILITY_MASS 100 //% - cumulative probability - how many moves we consider - varies per thread [0.5..0.99]
-//#define MAX_NOISE 3 //% - default noise applied to move NNUE evaluations relative to their values, ie eval += eval * noise
-                     // where noise is sampled randomly from a uniform distribution [-MAX_NOISE/100..MAX_NOISE/100]
-#define VIRTUAL_LOSS 4 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
-#define EVAL_SCALE 6 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
+//#define PROBABILITY_MASS 100 //% - cumulative probability - how many moves we consider
+#define VIRTUAL_LOSS 40 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
+#define EVAL_SCALE 62 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
-#define TEMPERATURE 60 //used in calculating probabilities for moves in get_prob() using softmax:
+#define TEMPERATURE 58 //used in calculating probabilities for moves in get_prob() using softmax:
                         // exp((eval - max_eval)/(temperature/100)) / eval_sum
-                        //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
+                        //can be tuned so that values < 100 sharpen the distribution and values > 100 flatten it
+                        //another words, the cooler the temperature, the more distant move probabilities, and vice versa
 #define PONDER false
 
-const std::string token = "faked_token"; // Replace with real token
+const std::string token = "fake_token"; // Replace with real token
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
 std::atomic<bool> challenge_accepted {false};
@@ -64,7 +63,7 @@ std::condition_variable game_cv, challenge_cv;
 int nb = NUMBER_OF_BOTS;
 using json = nlohmann::json;
 std::mt19937 rng;
-struct Engine * creatica = nullptr;
+struct Engine creatica;
 struct Evaluation * evaluations[MULTI_PV] = { nullptr };
 //enum GameStateStatus { created, started, aborted, mate, resign, stalemate, timeout, draw, outoftime, cheat, noStart, unknownFinish, insufficientMaterialClaim, variantEnd };
 enum GameStateStatus { unknown, created, started, aborted, mate, resign, stalemate, timeout, draw, outoftime, cheat, noStart, unknownFinish, insufficientMaterialClaim, variantEnd };
@@ -88,19 +87,19 @@ struct StreamState {
 };
 
 void setEngineOptions() {
-	  creatica->optionSpin[MultiPV].value = MULTI_PV;
-	  creatica->optionSpin[PVPlies].value = PV_PLIES;
-	  creatica->optionSpin[ProbabilityMass].value = PROBABILITY_MASS;
-	  creatica->optionSpin[ExplorationMin].value = EXPLORATION_MIN;
-	  creatica->optionSpin[ExplorationMax].value = EXPLORATION_MAX;
-	  creatica->optionSpin[ExplorationDepthDecay].value = EXPLORATION_DEPTH_DECAY;
-	  //creatica->optionSpin[Noise].value = MAX_NOISE;
-	  creatica->optionSpin[VirtualLoss].value = VIRTUAL_LOSS;
-	  creatica->optionSpin[EvalScale].value = EVAL_SCALE;
-	  creatica->optionSpin[Temperature].value = TEMPERATURE;
-	  creatica->optionCheck[FinalInfoLines].value = FINAL_INFO_LINES;
-	  creatica->optionCheck[IntermittentInfoLines].value = INTERMITTENT_INFO_LINES;
-	  creatica->optionCheck[Ponder].value = PONDER;
+	  creatica.optionSpin[MultiPV].value = MULTI_PV;
+	  creatica.optionSpin[PVPlies].value = PV_PLIES;
+	  //creatica.optionSpin[ProbabilityMass].value = PROBABILITY_MASS;
+	  creatica.optionSpin[ExplorationMin].value = EXPLORATION_MIN;
+	  creatica.optionSpin[ExplorationMax].value = EXPLORATION_MAX;
+	  creatica.optionSpin[ExplorationDepthDecay].value = EXPLORATION_DEPTH_DECAY;
+	  //creatica.optionSpin[Noise].value = MAX_NOISE;
+	  creatica.optionSpin[VirtualLoss].value = VIRTUAL_LOSS;
+	  creatica.optionSpin[EvalScale].value = EVAL_SCALE;
+	  creatica.optionSpin[Temperature].value = TEMPERATURE;
+	  creatica.optionCheck[FinalInfoLines].value = FINAL_INFO_LINES;
+	  creatica.optionCheck[IntermittentInfoLines].value = INTERMITTENT_INFO_LINES;
+	  creatica.optionCheck[Ponder].value = PONDER;
 	  setOptions(creatica);
 }
 
@@ -265,7 +264,15 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
       }
       std::cout << "CreateChallenge(): Challenge " <<  challengeId << " sent to " << opponent << " successfully" << std::endl;      
     } else {
-      std::cerr << "CreateChallenge(): Failed to send challenge to " << opponent << std::endl;
+      std::string error;
+      try {
+        json data = json::parse(response);
+        if (data.contains("error")) error = data.value("error", "");
+      } catch (const std::exception& e) {
+          std::cerr << "CreateChallenge(): JSON parse error: " << e.what() << " - data: " << response << std::endl;
+          return false;
+      }
+      std::cerr << "CreateChallenge(): Failed to send challenge to " << opponent << "Error: " << error << std::endl;
     }
     return success;
 }
@@ -420,9 +427,9 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
       return;
     }
     if (gss == started) {
-        if (creatica->ponder) {
-          creatica->infinite = false;
-          creatica->ponder = false;
+        if (creatica.ponder) {
+          creatica.infinite = false;
+          creatica.ponder = false;
           //std::cout << "ComputeAndPostMove() debug: stopping pondering..." << std::endl; 
           stop(creatica);
           //std::cout << "ComputeAndPostMove() debug: and getting PV..." << std::endl; 
@@ -430,65 +437,52 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
             std::cerr << "ComputeAndPostMove() error: getPV(creatica, evaluations, MULTI_PV) returned non-zero code, restarting..." << std::endl;
             releaseChessEngine(creatica);
             //exit(-1); //temp exit for debugging
-            creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
-            if (!creatica) {
-              std::cerr << "ComputeAndPostMove() error: failed to restart chessEngine" << std::endl;
-              exit(-1);
-            }
-            //else fprintf(stderr, "initilized chess engine %s for creatica\n", creatica->id);
+            initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
             setEngineOptions();
           } //end of if (getPV())
         } //end of if (ponder)
         //std::cout << "ComputeAndPostMove() debug: and getting PV..." << std::endl; 
-        strncpy(creatica->position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
+        strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
         if (!moves.empty()) {
-          strncpy(creatica->moves, moves.c_str(), MAX_UCI_MOVES_LEN);
+          strncpy(creatica.moves, moves.c_str(), MAX_UCI_MOVES_LEN);
           //uci GUIs use last move as a ponder move for "go ponder" command
           //lichess last move in position command has already been played, hence we need to play it, 
           //otherwise, the engine will ponder on it!
           //actually, it is easier to just append our ponder move to lichess moves - the engine does not care what it is anyway
           if (PONDER && !our_turn && strcmp(evaluations[0]->ponder, "") != 0) {
-            strcat(creatica->moves, " ");
-            strcat(creatica->moves, evaluations[0]->ponder);
+            strcat(creatica.moves, " ");
+            strcat(creatica.moves, evaluations[0]->ponder);
           }
-        } else creatica->moves[0] = '\0';
+        } else creatica.moves[0] = '\0';
 try_pos: if (!position(creatica)) {
-          fprintf(stderr, "ComputeAndPostMove() error: position() returned false, fen %s\n", creatica->position);
+          fprintf(stderr, "ComputeAndPostMove() error: position() returned false, fen %s\n", creatica.position);
           exit(-1);
-          creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
-          if (!creatica) {
-            std::cerr << "ComputeAndPostMove() error: failed to restart chessEngine" << std::endl;
-            exit(-1);
-          }
+          initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
           setEngineOptions();
-          strncpy(creatica->position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
+          strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
           goto try_pos;
         }
         int numberOfPieces = pieces(creatica);
-        creatica->wtime = wtime;
-        creatica->btime = btime;
-        creatica->winc = winc;
-        creatica->binc = binc;
+        creatica.wtime = wtime;
+        creatica.btime = btime;
+        creatica.winc = winc;
+        creatica.binc = binc;
         if (our_turn) {
 try_again:  if (go(creatica, evaluations)) {
               std::cerr << "ComputeAndPostMove() error: go(creatica, evaluations) returned non-zero code, restarting..." << std::endl;
               releaseChessEngine(creatica);
-              creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
-              if (!creatica) {
-                std::cerr << "ComputeAndPostMove() error: failed to restart chessEngine" << std::endl;
-                exit(-1);
-              }
+              initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
               setEngineOptions();
-              strncpy(creatica->position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
-              strncpy(creatica->moves, moves.c_str(), MAX_UCI_MOVES_LEN);
+              strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
+              strncpy(creatica.moves, moves.c_str(), MAX_UCI_MOVES_LEN);
               if (!position(creatica)) {
-                fprintf(stderr, "ComputeAndPostMove() error: position() returned false, fen %s\n", creatica->position);
+                fprintf(stderr, "ComputeAndPostMove() error: position() returned false, fen %s\n", creatica.position);
                 exit(-1);
               }
-              creatica->wtime = wtime;
-              creatica->btime = btime;
-              creatica->winc = winc;
-              creatica->binc = binc;
+              creatica.wtime = wtime;
+              creatica.btime = btime;
+              creatica.winc = winc;
+              creatica.binc = binc;
               goto try_again;
             } //end of if (go())
             if (draw_offer) {
@@ -511,8 +505,8 @@ try_again:  if (go(creatica, evaluations)) {
             std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "... done" << std::endl;
         } else { // Not our turn
             if (numberOfPieces > 7 && PONDER) {
-              creatica->infinite = true;
-              creatica->ponder = true;
+              creatica.infinite = true;
+              creatica.ponder = true;
               go(creatica, evaluations);
             }
         }
@@ -524,8 +518,8 @@ void HandleGame(const std::string& game_id) {
     newGame(creatica);
     bool is_white = false;  // To be set in gameFull
     std::string initial_fen;  // To be set in gameFull
-    creatica->ponder = false;
-    creatica->infinite = false;
+    creatica.ponder = false;
+    creatica.infinite = false;
     
     // Stream game state - game-specific stream, which is separate from the main events one
     // It has its own ProcessEvent() lambda function used by libcurl once the game state (lines) is parsed by nlohmann json library into json state object 
@@ -737,18 +731,14 @@ void signal_handler(int sig) {
 }
 
 int main() {
-  int multiPV = MULTI_PV;
+  const int multiPV = MULTI_PV;
   std::signal(SIGINT, signal_handler);  // Set up Ctrl-C handler
   init_magic_bitboards();
   rng.seed(static_cast<unsigned int>(std::random_device{}()));
 
   //start chess engine process and communicate with it over stdin, stdout redirected to named pipes internally
-  creatica = initChessEngine(CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
-  if (!creatica) {
-    fprintf(stderr, "tournament main() error: failed to init chessEngine %s for creatica\n", CREATICA_PATH);
-    return -1;
-  }
-  //else fprintf(stderr, "initilized chess engine %s for creatica\n", creatica->id);
+  initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
+  //else fprintf(stderr, "initilized chess engine %s for creatica\n", creatica.id);
   setEngineOptions();
   for (int i = 0; i < multiPV; i++) {
     evaluations[i] = new Evaluation;

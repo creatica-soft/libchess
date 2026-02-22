@@ -1,4 +1,10 @@
-static const unsigned long long bitStrings[841] = {
+//random 825 8-byte numbers from atmospheric noise
+//1 for black's move
+//64 for empty squares
+//12 x 62 for occupied squares - 4 x 8 for pawns on rank 1 and rank 8 = 736
+//16 for casling rights
+//8 for en passant
+static const unsigned long long bitStrings[825] = {
 0x062dc8e13de2be60ULL,
 0x4ba6b0e17985a479ULL,
 0xc52620cf61252423ULL,
@@ -823,22 +829,22 @@ static const unsigned long long bitStrings[841] = {
 0x4deb3f5a026defb4ULL,
 0xe5b4c3bbf610d3fcULL,
 0xddfda204ade5eb76ULL,
-0xd7c1f8fc1faf2526ULL,
-0x89cda155bb4e9555ULL,
-0x01d2150a3c315737ULL,
-0xc8fc488ee5dd7723ULL,
-0x8cbdee64ca871b84ULL,
-0x783d186bce6ebed4ULL,
-0x06cda8cd453ef77aULL,
-0x138def6b3a42afb5ULL,
-0xdd42a7192bab224dULL,
-0x3cd0fc27aa79612bULL,
-0xd087835e77145421ULL,
-0x9033efe65d230d20ULL,
-0x13cc62321d1cadc5ULL,
-0xc87149fa58553ba7ULL,
-0x4284ec184b81c783ULL,
-0x0e4ec20895ca34f0ULL,
-0x8ba28c7d56c346a1ULL
+0xd7c1f8fc1faf2526ULL
+//0x89cda155bb4e9555ULL,
+//0x01d2150a3c315737ULL,
+//0xc8fc488ee5dd7723ULL,
+//0x8cbdee64ca871b84ULL,
+//0x783d186bce6ebed4ULL,
+//0x06cda8cd453ef77aULL,
+//0x138def6b3a42afb5ULL,
+//0xdd42a7192bab224dULL,
+//0x3cd0fc27aa79612bULL,
+//0xd087835e77145421ULL,
+//0x9033efe65d230d20ULL,
+//0x13cc62321d1cadc5ULL,
+//0xc87149fa58553ba7ULL,
+//0x4284ec184b81c783ULL,
+//0x0e4ec20895ca34f0ULL,
+//0x8ba28c7d56c346a1ULL
 };
 
