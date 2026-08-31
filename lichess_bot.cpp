@@ -57,13 +57,10 @@
 //Keep it outside the repository and export it before starting the bot, e.g.
 //  export LICHESS_TOKEN="$(cat ~/.config/creatica/lichess_token)"
 static std::string load_lichess_token() {
+    //Do NOT exit from here: this runs as a global initializer, before main(), so bailing
+    //out made even --help impossible without a token. main() checks it after parsing args.
     const char * t = std::getenv("LICHESS_TOKEN");
-    if (!t || !*t) {
-        fprintf(stderr, "lichess_bot: LICHESS_TOKEN is not set.\n"
-                        "  export LICHESS_TOKEN=\"$(cat ~/.config/creatica/lichess_token)\"\n");
-        std::exit(1);
-    }
-    return std::string(t);
+    return (t && *t) ? std::string(t) : std::string();
 }
 const std::string token = load_lichess_token();
 std::string current_game_id = "";
@@ -106,7 +103,29 @@ struct Bot {
 struct StreamState {
     std::string partial_line;
     std::function<void(const json&)> process_line;
+    //When bytes last arrived, including a bare keep-alive newline. CURLOPT_LOW_SPEED_LIMIT
+    //cannot express this: lichess sends roughly one newline every 6 s, i.e. ~0.17 bytes/s,
+    //so ANY integer limit >= 1 aborts a perfectly healthy idle stream. Track liveness
+    //ourselves instead and let the progress callback decide.
+    std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
 };
+
+#define STREAM_SILENCE_TIMEOUT_S 60
+//Aborts a transfer that has gone genuinely silent. curl calls this about once a second
+//once CURLOPT_NOPROGRESS is off, and returning non-zero ends the transfer.
+static int StreamProgress(void * clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    if (!playing.load()) return 1;
+    StreamState * st = static_cast<StreamState *>(clientp);
+    if (!st) return 0;
+    auto quiet = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::steady_clock::now() - st->last_activity).count();
+    if (quiet >= STREAM_SILENCE_TIMEOUT_S) {
+        std::cerr << "StreamAndProcess() error: no data for " << quiet
+                  << "s (keep-alive is ~6s) - treating the connection as dead" << std::endl;
+        return 1;
+    }
+    return 0;
+}
 
 void setEngineOptions() {
 	  creatica.optionSpin[MultiPV].value = MULTI_PV;
@@ -129,6 +148,7 @@ void setEngineOptions() {
 size_t WriteCallback(void * contents, size_t size, size_t nmemb, void * userp) {
     if (!playing.load()) return 0; //exit streaming if ctrl-c is pressed - common way to abort streaming is to return 0
     StreamState * state = static_cast<StreamState *>(userp);
+    state->last_activity = std::chrono::steady_clock::now(); //keep-alive newlines count
     std::string data((char *)contents, size * nmemb);
     //std::cout << "WriteCallback() debug: received chunk: " << data << std::endl;
     size_t pos = 0;
@@ -442,8 +462,9 @@ void StreamAndProcess(const std::string& url, std::function<void(const json&)> p
     //NAT table eviction) left curl_easy_perform blocked indefinitely - macOS only starts
     //probing after 2 hours - and the bot never saw another event. The comment above says
     //a keep-alive newline arrives at least every 7 s, so 30 s of silence means it is dead.
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, StreamProgress);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &state);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
@@ -797,7 +818,28 @@ void signal_handler(int sig) {
     game_cv.notify_one();
 }
 
-int main() {
+int main(int argc, char ** argv) {
+  //--no-challenge lets the bot answer incoming challenges without hunting for opponents,
+  //which is what you want while verifying it by challenging it yourself. Previously this
+  //meant commenting out the thread and rebuilding.
+  bool no_challenge = false;
+  for (int i = 1; i < argc; i++) {
+    const std::string arg = argv[i];
+    if (arg == "--no-challenge") no_challenge = true;
+    else if (arg == "-h" || arg == "--help") {
+      printf("usage: %s [--no-challenge]\n"
+             "  --no-challenge   do not challenge other bots; only respond to incoming challenges\n", argv[0]);
+      return 0;
+    } else {
+      fprintf(stderr, "%s: unknown argument '%s' (try --help)\n", argv[0], argv[i]);
+      return 1;
+    }
+  }
+  if (token.empty()) {
+    fprintf(stderr, "lichess_bot: LICHESS_TOKEN is not set.\n"
+                    "  export LICHESS_TOKEN=\"$(cat ~/.config/creatica/lichess_token)\"\n");
+    return 1;
+  }
   const int multiPV = MULTI_PV;
   std::signal(SIGINT, signal_handler);  // Set up Ctrl-C handler
   //A write to a dead engine's pipe raises SIGPIPE, whose default action terminates the
@@ -817,14 +859,16 @@ int main() {
   }
 
   curl_global_init(CURL_GLOBAL_DEFAULT);
-  std::thread challenge(GetAndProcessBots, nb);
+  std::thread challenge;
+  if (no_challenge) std::cout << "main(): --no-challenge, so we will not challenge anyone" << std::endl;
+  else challenge = std::thread(GetAndProcessBots, nb);
   std::string event_url = "https://lichess.org/api/stream/event";
   while (playing.load()) {  // Main loop: Keep streaming events
       StreamAndProcess(event_url, ProcessEvent);
       std::cerr << "main() debug: stream ended; reconnecting in 3s..." << std::endl;
       std::this_thread::sleep_for(std::chrono::seconds(3));
   }
-  challenge.join();
+  if (challenge.joinable()) challenge.join();
   quit(creatica);
   releaseChessEngine(creatica);
   for (int i = 0; i < multiPV; i++) delete evaluations[i];
