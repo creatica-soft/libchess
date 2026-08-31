@@ -573,7 +573,20 @@ void HandleGame(const std::string& game_id) {
     // It has its own ProcessEvent() lambda function used by libcurl once the game state (lines) is parsed by nlohmann json library into json state object 
     std::string stream_url = "https://lichess.org/api/bot/game/stream/" + game_id;
     int gss = gameStateStatus.load();
-    while (game_in_progress.load() && (gss == created || gss != started)) {
+    //Reconnect until the game actually FINISHES. The old condition was
+    //(gss == created || gss != started), which reduces to just `gss != started` - so the
+    //loop exited exactly when the game was still LIVE and the stream had merely dropped,
+    //abandoning a rated game to its clock, and kept looping once the game was over.
+    //In GameStateStatus everything from `aborted` (3) upwards is terminal; unknown(0),
+    //created(1) and started(2) all mean "still going, keep streaming".
+    int stream_attempts = 0;
+    while (game_in_progress.load() && gss < aborted) {
+        if (stream_attempts++) {
+          std::cout << "HandleGame() debug: game " << game_id << " stream ended with status "
+                    << gameSS[gss] << " but the game is not over - reconnecting (attempt "
+                    << stream_attempts << ")" << std::endl;
+          std::this_thread::sleep_for(std::chrono::seconds(2)); //do not hammer lichess
+        }
         StreamAndProcess(stream_url, [game_id, &is_white, &initial_fen, &gss](const json& state) { //this is process_line() function for game-specific events
             if (state.contains("type") && state["type"] == "gameFull") {
                 // Determine color (use value() for safety if key missing)
