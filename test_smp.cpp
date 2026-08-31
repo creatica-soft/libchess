@@ -105,7 +105,7 @@ struct MCTSNode {
     std::atomic<int> cp {NO_MATE_SCORE}; //position evaluation in centipawns 
     std::atomic<int> num_children{0};
     std::atomic<int> generation{0};
-    std::shared_mutex mutex;  // For protecting children expansion
+    std::atomic<uint8_t> expanding{0};  // expansion gate (test-and-set try-lock): exchange(1, acquire) == 0 acquires it, store(0, release) releases it
     std::atomic<struct Edge *> children {nullptr};
 };
 
@@ -202,7 +202,7 @@ struct TempEdge {
 //called from mcts_search() and next_moves()
 //calls make_child()
 void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, int, uint64_t>>& top_moves, const std::unordered_set<uint64_t>& pos_history) {
-  //parent is locked for the expansion with unique_lock in caller - mcts_search()
+  //parent's expansion gate is held by the caller - mcts_search() or process_check()
   if (parent->num_children.load(std::memory_order_relaxed) > 0) return; //already expanded by other threads, perhaps
   int num_moves = top_moves.size();
   assert(num_moves > 0);
@@ -215,12 +215,19 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
       children[i].child.store(child, std::memory_order_relaxed);        
   }
   total_children.fetch_add(num_moves, std::memory_order_relaxed); //update total_children counter
-  //below are two separate atomic operations: first - for the children pointer, second - for num_children
-  //we need to remember this when processing children in other threads!
-  //for instance, children might be a valid pointer but num_children might be 0!
-  //so checking for num_children > 0 means that children is not null, right?
-  parent->children.store(children, std::memory_order_release);
-  parent->num_children.store(num_moves, std::memory_order_release);    
+  //Publish with a CAS, not a bare store. process_check() -> eval_and_expand() reaches
+  //here WITHOUT holding the expansion gate (see the note above), so two threads can both
+  //pass the num_children guard and both allocate; a plain store let the loser's array
+  //leak. Now exactly one array is ever published and the loser frees its own. The child
+  //MCTSNodes themselves are shared via the tree map, so they must NOT be freed here.
+  Edge * expected = nullptr;
+  if (!parent->children.compare_exchange_strong(expected, children,
+        std::memory_order_release, std::memory_order_relaxed)) {
+    total_children.fetch_sub(num_moves, std::memory_order_relaxed);
+    delete[] children;
+    return;
+  }
+  parent->num_children.store(num_moves, std::memory_order_release);
 }
 
 //no locking, call only when search threads finished
@@ -334,10 +341,8 @@ int select_best_child(MCTSNode * parent, int depth) {
   double best_score = -INFINITY;
   int selected;
   for (int i = 0; i < num_children; i++) {
-    parent->mutex.lock_shared();
     double P = children[i].P.load(std::memory_order_relaxed);
     MCTSNode * child = children[i].child.load(std::memory_order_acquire);
-    parent->mutex.unlock_shared();
     uint64_t N = child->N.load(std::memory_order_relaxed);
     double W = -child->W.load(std::memory_order_relaxed); //parent perspective
     double Q = N ? W / N : 0.0;
@@ -349,9 +354,7 @@ int select_best_child(MCTSNode * parent, int depth) {
   }
   // Apply virtual loss to selected child to avoid contention among threads for the same node
   //children = parent->children.load(std::memory_order_acquire);
-  parent->mutex.lock_shared();
   MCTSNode * child = children[selected].child.load(std::memory_order_acquire);
-  parent->mutex.unlock_shared();
   child->N.fetch_add(1, std::memory_order_release);
   child->W.fetch_sub(virtual_loss, std::memory_order_release);
   return selected;
@@ -400,12 +403,14 @@ double process_check(Board& temp_board, ZobristHash& board_hash, NNUEContext& ct
     node->cp.store(cp, std::memory_order_relaxed);
     node->N.store(1, std::memory_order_relaxed);
     node->W.store(tanh(cp * 0.01 / eval_scale), std::memory_order_relaxed);
-    if (node->mutex.try_lock()) { //this should always return true because the node is new
+    if (node->expanding.exchange(1, std::memory_order_acquire) == 0) { //this should always succeed because the node is new
       expand_node(node, move_evals, pos_history); //preserve move_evals in the tree to avoid costly repeat of evaluate_nnue()
-      node->mutex.unlock();
+      node->expanding.store(0, std::memory_order_release);
     }
     return cp * 0.01;
-  } else return -stored_cp * 0.01;
+  } else return stored_cp * 0.01; //was -stored_cp: the fresh branch above returns cp, so the
+                                   //cached branch inverted it, making a winning check evaluate as
+                                   //losing on every revisit. creatica-shared-root.cpp:394 is correct.
 }
 
 //called from do_move()
@@ -546,12 +551,10 @@ void mcts_search(ThreadParams * params, NNUEContext& ctx) {
     //it also adds virtual loss to the node to reduce contention for the same node in multi-threaded engine
     int idx = select_best_child(node, params->seldepth);
     Edge * children = node->children.load(std::memory_order_acquire);
-    std::shared_lock lock(node->mutex);
     int move_idx = children[idx].move.load(std::memory_order_relaxed);
     path.push_back(node);  // Add parent node to path (the move is made, so the node is a parent one)
     //continue iterating down the tree by getting next node until no more children
     node = children[idx].child.load(std::memory_order_acquire);
-    lock.unlock();
     //for debugging only
     //char fen[MAX_FEN_STRING_LEN];
     //board2fen(sim_board, fen);
@@ -586,9 +589,10 @@ void mcts_search(ThreadParams * params, NNUEContext& ctx) {
     // do not expand on repetition, just set its eval to draw
     node->cp.store(scorecp, std::memory_order_relaxed);
   } else {
-    if (node->mutex.try_lock()) { //the leaf node in a tree is locked only for expansion
-                                //nodes locked in selection phase are not leaf nodes, i.e. nodes without children
-                                //if leaf node is already locked, it means that other thread is expanding it already
+    if (node->expanding.exchange(1, std::memory_order_acquire) == 0) { //the leaf node is gated only for expansion
+                                //nodes traversed in the selection phase are not leaf nodes, i.e. nodes without children
+                                //if the gate is already taken, another thread is expanding this node right now
+                                //(unlike try_lock(), an atomic exchange cannot fail spuriously and cannot be blocked by readers)
   		//isCheckMateStaleMate(sim_board);
       //if (!sim_board.isMate && !sim_board.isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000) {
       if (hash_full.load(std::memory_order_relaxed) < 1000) {  
@@ -625,8 +629,8 @@ void mcts_search(ThreadParams * params, NNUEContext& ctx) {
           }
         }
       } //end of if (!sim_board.isMate && !sim_board.isStaleMate && hash_full.load(std::memory_order_relaxed) < 1000)
-      node->mutex.unlock();
-    } //end of if (node->mutex.try_lock())
+      node->expanding.store(0, std::memory_order_release);
+    } //end of if (node->expanding.exchange(1, acquire) == 0)
     else {
       scorecp = node->cp.load(std::memory_order_relaxed);
       if (scorecp == NO_MATE_SCORE) { //node has not been evaluated yet, return without a backprop (a bit of a waste)
@@ -822,7 +826,14 @@ void runMCTS() {
           	  startPiece = Knight;
           	  endPiece = Queen;
           	}
-        	  for (move.promoType = startPiece; move.promoType <= endPiece && move_idx == 0; move.promoType = (PieceType)(move.promoType + 1)) { //loop over promotions if any
+        	  //This loop has two exit states, so the chosen promotion must be captured inside the
+        	  //body - the pattern already used at line 511 and in test_pos.cpp:154. For a plain move
+        	  //startPiece == endPiece == PieceTypeNone (7) and the final increment would leave
+        	  //move.promoType == 8, making do_move() write board.pieceTypes[7] past the end of Board;
+        	  //for a real promotion the move_idx == 0 guard would exit one piece past the one that
+        	  //move_idx was actually built with (Bishop, while the GUI is told "n").
+        	  for (PieceType promo = startPiece; promo <= endPiece && move_idx == 0; promo = (PieceType)(promo + 1)) { //loop over promotions if any
+          	    move.promoType = promo;
           	    move_idx = (move.promoType << 12) | (move.src << 6) | move.dst;
         	  }
             moves &= moves - 1;

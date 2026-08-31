@@ -446,6 +446,12 @@ uint64_t piece_moves(Board& board, const PieceType pt, const Square sq, const Sq
 	if (pinned & SQ_BIT(sq)) moves &= Stockfish::LineBB[kingSq][sq];
   if (pt == Pawn) moves &= (check_mask | ep_mask);
   else moves &= check_mask;
+  //A pawn landing on the promotion rank is FOUR legal moves (N, B, R, Q); expanding them is the
+  //caller's job (test_pos.cpp:154, expand() in test_smp.cpp / creatica-shared-root.cpp), so the
+  //extra three have to be added here. Without this a position whose only legal move is a
+  //promotion reports num_moves == 1 and the "forced move" branch auto-plays an unsearched
+  //promotion instead of running MCTS over the four choices.
+  if (pt == Pawn) board.num_moves += 3 * bitCount(moves & base_rank_bb[OPP_COLOR(board.sideToMove)]);
   board.num_moves += bitCount(moves);
   return moves;
 }
@@ -1097,10 +1103,6 @@ void update_piece_threats(Board& board, Piece pc, Square s, DirtyThreats * const
             //const Bitboard ray = RayFrom[sliderSq][s] & ~LineBetween[sliderSq][s];
             //const Bitboard ray = rayFrom & ~lineBetween;
             const Bitboard discovered = ray & (rAttacks | bAttacks) & occupied;
-            //two lines for debugging - remove later
-            char fen[MAX_FEN_STRING_LEN];
-            board2fen(board, fen);
-            //end of debugging
             assert(bitCount(discovered) <= 1);
             if (discovered && (Stockfish::RayPassBB[sliderSq][s] & noRaysContaining) != noRaysContaining) {
                 const Square threatenedSq = lsb(discovered);

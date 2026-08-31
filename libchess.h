@@ -50,6 +50,12 @@
 #define LIBCHESS_H
 
 #include "noise.h"
+// enum Color, File, Square, PieceType and Piece, and struct Board, now have
+// exactly ONE definition and it lives in chess_types.h. That header is shared
+// with the vendored Stockfish fork (nnue/board.h forwards to it), which is why
+// it is deliberately tiny: see the notes at the top of chess_types.h before
+// moving anything else into it.
+#include "chess_types.h"
 //#include "noise2.h"
 
 #define MAX_PIPE_NAME_LEN 256
@@ -81,7 +87,7 @@
 #define MAX_SAN_MOVES_LEN 4096
 #define MAX_UCI_MOVES_LEN 4096
 #define MAX_ECO_MOVES_LEN 1024
-#define MAX_FEN_STRING_LEN 90
+#define MAX_FEN_STRING_LEN 128 //was 90; a maximal legal FEN plus NUL exceeds 90, and board2fen could overrun it
 #define MAX_UCI_OPTION_NAME_LEN 32
 #define MAX_UCI_OPTION_TYPE_LEN 8
 #define MAX_UCI_OPTION_TYPE_NUM 5
@@ -112,14 +118,17 @@
 #define NNUE_CHECK 0.00001 //special value for check
 #define STALE_MATE -0.00001 //special value for stalemate
 
-#define FILE_A 0x0101010101010101ULL
-#define FILE_B 0x0202020202020202ULL
-#define FILE_C 0x0404040404040404ULL
-#define FILE_D 0x0808080808080808ULL
-#define FILE_E 0x1010101010101010ULL
-#define FILE_F 0x2020202020202020ULL
-#define FILE_G 0x4040404040404040ULL
-#define FILE_H 0x8080808080808080ULL
+// NOT FILE_A..FILE_H: those names are enumerators of Stockfish::File in
+// nnue/types.h, and as macros they silently miscompile nnue/bitboard.h's
+// edge_distance() in any TU that sees libchess.h first.
+#define FILE_A_BB 0x0101010101010101ULL
+#define FILE_B_BB 0x0202020202020202ULL
+#define FILE_C_BB 0x0404040404040404ULL
+#define FILE_D_BB 0x0808080808080808ULL
+#define FILE_E_BB 0x1010101010101010ULL
+#define FILE_F_BB 0x2020202020202020ULL
+#define FILE_G_BB 0x4040404040404040ULL
+#define FILE_H_BB 0x8080808080808080ULL
 
 #define RANK1 0x00000000000000FFULL
 #define RANK2 0x000000000000FF00ULL
@@ -162,10 +171,10 @@
 #define ADIAG_G8H7 0x4080000000000000ULL
 #define ADIAG_H8H8 0x8000000000000000ULL
 
-inline constexpr uint64_t files_bb[] = { FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H };
+inline constexpr uint64_t files_bb[] = { FILE_A_BB, FILE_B_BB, FILE_C_BB, FILE_D_BB, FILE_E_BB, FILE_F_BB, FILE_G_BB, FILE_H_BB };
 inline constexpr uint64_t ranks_bb[] = { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
 inline constexpr uint64_t en_passant_ranks[] = { RANK4, RANK5 };
-inline constexpr uint64_t en_passant_files[] = {FILE_B, FILE_A | FILE_C, FILE_B | FILE_D, FILE_C | FILE_E, FILE_D | FILE_F, FILE_E | FILE_G, FILE_F | FILE_H, FILE_G };
+inline constexpr uint64_t en_passant_files[] = {FILE_B_BB, FILE_A_BB | FILE_C_BB, FILE_B_BB | FILE_D_BB, FILE_C_BB | FILE_E_BB, FILE_D_BB | FILE_F_BB, FILE_E_BB | FILE_G_BB, FILE_F_BB | FILE_H_BB, FILE_G_BB };
 inline constexpr uint64_t base_rank_bb[] = { RANK1, RANK8 };
 inline constexpr uint64_t diag_bb[] = { DIAG_H1H1, DIAG_G1H2, DIAG_F1H3, DIAG_E1H4, DIAG_D1H5, DIAG_C1H6, DIAG_B1H7, DIAG_A1H8, 
                                     DIAG_A2G8, DIAG_A3F8, DIAG_A4E8, DIAG_A5D8, DIAG_A6C8, DIAG_A7B8, DIAG_A8A8 };
@@ -174,28 +183,13 @@ inline constexpr uint64_t antidiag_bb[] = { ADIAG_A1A1, ADIAG_A2B1, ADIAG_A3C1, 
 
 enum Castling : uint8_t { CastlingNone, CastlingKingside, CastlingQueenside, CastlingBoth };
 
-enum Color : uint8_t { ColorWhite, ColorBlack, Color_NB };
 inline constexpr char * color[] = { "white", "black" };
 inline constexpr char fenColor[] = { 'w', 'b' };
 
-enum File : uint8_t {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone, File_NB = 8};
 inline constexpr char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
 enum Rank : uint8_t {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone, Rank_NB = 8};
 inline constexpr char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
-// rank = square / 8, same as rank = square >> 3
-// file = square % 8, same as file = square & 7
-// square = rank * 8 + file, same as square = (rank << 3) | file
-enum Square : uint8_t {
-	SquareA1, SquareB1, SquareC1, SquareD1, SquareE1, SquareF1, SquareG1, SquareH1,
-	SquareA2, SquareB2, SquareC2, SquareD2, SquareE2, SquareF2, SquareG2, SquareH2,
-	SquareA3, SquareB3, SquareC3, SquareD3, SquareE3, SquareF3, SquareG3, SquareH3,
-	SquareA4, SquareB4, SquareC4, SquareD4, SquareE4, SquareF4, SquareG4, SquareH4,
-	SquareA5, SquareB5, SquareC5, SquareD5, SquareE5, SquareF5, SquareG5, SquareH5,
-	SquareA6, SquareB6, SquareC6, SquareD6, SquareE6, SquareF6, SquareG6, SquareH6,
-	SquareA7, SquareB7, SquareC7, SquareD7, SquareE7, SquareF7, SquareG7, SquareH7,
-	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone, Square_NB = 64, PawnSquare_NB = 48
-};
 inline constexpr char * square[] = {
 	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
 	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
@@ -218,8 +212,6 @@ enum Antidiagonal : uint8_t {
 	AntidiagonalA6F1, AntidiagonalA7G1, AntidiagonalA8H1, AntidiagonalB8H2, AntidiagonalC8H3,
 	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone, Antidiag_NB = 15
 };
-enum PieceType : uint8_t { PieceTypeAny, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeNone, PieceType_NB = 6, NonPawnType_NB = 5 };
-//enum PieceType : uint8_t { PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny, PieceType_NB = 6, NonPawnType_NB = 5 };
 inline constexpr char * pieceType[] = {"any", "pawn", "knight", "bishop", "rook", "queen", "king", "none"};
 //inline constexpr char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
 inline constexpr float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
@@ -235,16 +227,6 @@ inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
     {0, 100, 200, 300, 400, 500, 600}  // King attacking - last value is illegal, of course, king cannot attack king
 };    
 
-// Piece enumeration: first three bits are used to encode the type, fourth bit defines the color, total 16 pieces
-// Shifting Piece by 3 to the right gives PieceColor: color = piece >> 3
-// Masking 3 lowest bits returns the PieceType: type = piece & 7
-// PieceNone is exception to the above rules
-// PieceNone has color white and type PieceTypeNone
-enum Piece : uint8_t {
-	PieceWhite, WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNone,
-	//PieceNone, WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceWhite,
-	PieceBlack, BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, Piece_NB = 12, NonPawn_NB = 10
-};
 inline constexpr char * piece[] = {
 	"whites", "white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "none",
 	"blacks", "black pawn", "black knight", "black bishop", "black rook", "black queen", "black king", "none"
@@ -446,110 +428,17 @@ inline constexpr Square popMSB(uint64_t& b) {
 //piecesOnSquares is redundant and can be derived from occupation bitboards in no more than 8 boolean ops
 //movesFromSquares could be replaced with more compact array pieceMoves[32]
 //the rest (moves, isCheck, isStaleMate, isMate) can be calculated from above
-#ifndef BOARD_INCLUDED
-struct Board {
-    //these booleans are not strictly needed except maybe isChess960
-    bool isCheck = false;
-    bool isStaleMate = false;
-    bool isMate = false;
-    bool isChess960 = false;
-    Color sideToMove = ColorWhite;
-    File enPassant = FileNone;
-    uint8_t halfmoveClock = 0;
-    uint8_t num_moves = 0; //not necessary but good for 8-byte alignment on 64-bit systems
-    //8 bytes up to here
-    int moveNumber = 1;
-    uint8_t castlingRights = 0xf;
-    //is it 16 bytes?
-    //the rest is aligned on 8-byte boundary
-    uint64_t castlingRooks = 0; //8 bytes
-    Piece piecesOnSquares[Square_NB] = {PieceNone}; //64 bytes
-    uint64_t side[Color_NB] = {0}; //all white and all black - 16 bytes
-    uint64_t pieceTypes[PieceType_NB] = {0}; //all pawns, knights, bishops, rooks, queens, kings - 48 bytes
-    //total 152 bytes?
-};
-#endif
 
-// Keep track of what a move changes on the board (used by NNUE)
-namespace Stockfish {
+// Keep track of what a move changes on the board (used by NNUE).
+// libchess.h is NOT self-contained: everything below needs Stockfish::Piece,
+// Square, Color, Bitboard, DirtyPiece and DirtyThreats from nnue/types.h.
+// Every translation unit must therefore include an nnue/ header (in practice
+// "nnue/bitboard.h") BEFORE "libchess.h". That was already true - it was held
+// up by a stale fallback copy of those types that never actually compiled.
 #ifndef TYPES_H_INCLUDED
-struct DirtyPiece {
-    Piece pc = PieceNone;        // this is never allowed to be NO_PIECE
-    Square from = SquareNone;
-    Square to = SquareNone;  // to should be SQ_NONE for promotions
-
-    // if {add,remove}_sq is SQ_NONE, {add,remove}_pc is allowed to be
-    // uninitialized
-    // castling uses add_sq and remove_sq to remove and add the rook
-    Square remove_sq = SquareNone;
-    Square add_sq = SquareNone;
-    Piece remove_pc = PieceNone;
-    Piece add_pc = PieceNone;
-};
-struct DirtyThreat {
-    static constexpr int PcSqOffset         = 0;
-    static constexpr int ThreatenedSqOffset = 8;
-    static constexpr int ThreatenedPcOffset = 16;
-    static constexpr int PcOffset           = 20;
-
-    DirtyThreat() { /* don't initialize data */ }
-    DirtyThreat(uint32_t raw) :
-        data(raw) {}
-    DirtyThreat(Piece pc, Piece threatened_pc, Square pc_sq, Square threatened_sq, bool add) {
-        data = (uint32_t(add) << 31) | (pc << PcOffset) | (threatened_pc << ThreatenedPcOffset)
-             | (threatened_sq << ThreatenedSqOffset) | (pc_sq << PcSqOffset);
-    }
-
-    Piece  pc() const { return static_cast<Piece>(data >> PcOffset & 0xf); }
-    Piece  threatened_pc() const { return static_cast<Piece>(data >> ThreatenedPcOffset & 0xf); }
-    Square threatened_sq() const { return static_cast<Square>(data >> ThreatenedSqOffset & 0xff); }
-    Square pc_sq() const { return static_cast<Square>(data >> PcSqOffset & 0xff); }
-    bool   add() const { return data >> 31; }
-    uint32_t raw() const { return data; }
-
-   private:
-    uint32_t data;
-};
-// A piece can be involved in at most 8 outgoing attacks and 16 incoming attacks.
-// Moving a piece also can reveal at most 8 discovered attacks.
-// This implies that a non-castling move can change at most (8 + 16) * 3 + 8 = 80 features.
-// By similar logic, a castling move can change at most (5 + 1 + 3 + 9) * 2 = 36 features.
-// Thus, 80 should work as an upper bound. Finally, 16 entries are added to accommodate
-// unmasked vector stores near the end of the list.
-
-template<typename T, std::size_t MaxSize>
-class ValueList {
-   public:
-    std::size_t size() const { return size_; }
-    int         ssize() const { return int(size_); }
-    void        push_back(const T& value) {
-        assert(size_ < MaxSize);
-        values_[size_++] = value;
-    }
-    const T* begin() const { return values_; }
-    const T* end() const { return values_ + size_; }
-    const T& operator[](int index) const { return values_[index]; }
-    T* make_space(size_t count) {
-        T* result = &values_[size_];
-        size_ += count;
-        assert(size_ <= MaxSize);
-        return result;
-    }
-   private:
-    T values_[MaxSize];
-    std::size_t size_ = 0;
-};
-using Bitboard = uint64_t;
-using DirtyThreatList = ValueList<DirtyThreat, 96>;
-
-struct DirtyThreats {
-    DirtyThreatList list;
-    Color           us;
-    Square          prevKsq, ksq;
-
-    Bitboard threatenedSqs, threateningSqs;
-};
+  #error "libchess.h requires nnue/types.h first -- put #include \"nnue/bitboard.h\" above #include \"libchess.h\"."
 #endif
+namespace Stockfish {
 
 template<bool PutPiece>
 inline void add_dirty_threat(

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "nnue/bitboard.h"
 #include "creatica-shared-root.hpp"
 
@@ -458,7 +459,12 @@ void handleGo(char * command) {
       timeAllocated *= CRITICAL_TIME_FACTOR; //1.5
     }
     if (remainingTime < MIN_TIME_THRESHOLD) { //10000 ms
-      timeAllocated = remainingTime * 0.5;
+      //CAP, do not assign. Assigning made the allocation non-monotonic in the clock:
+      //at 14999 ms remaining it handed out 5000 ms - a third of the whole clock on a
+      //single move - while at 15001 ms it handed out 100 ms. More time bought LESS
+      //thinking, at 30 separate points across the clock sweep. std::min can only ever
+      //lower the figure, so this cannot spend more time than before on any input.
+      timeAllocated = std::min(timeAllocated, remainingTime * 0.5);
     }
     if (timeAllocated < 3000) {
       timeAllocated = 100;
@@ -515,7 +521,15 @@ void handleGo(char * command) {
     unsigned int result = tb_probe_root(board.side[ColorWhite], board.side[ColorBlack], board.pieceTypes[King - 1], board.pieceTypes[Queen - 1], board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1], board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1], board.halfmoveClock, 0, ep == SquareNone ? 0 : ep, (board.sideToMove ^ 1) == ColorBlack ? 1 : 0, NULL);
     if (result == TB_RESULT_FAILED) {
       log_file("handleGo() error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, numberOfPieces %u\n", TB_LARGEST, numberOfPieces);
-      exit(-1);
+      //A failed ROOT probe is not fatal. tb_probe_root is stricter than tb_probe_wdl,
+      //so one missing, unreadable or rejected table used to kill the whole process
+      //mid-game - on lichess that is a forfeit. Fall back to the normal search, the
+      //same way the numberOfPieces > 7 branch above starts it.
+      std::lock_guard<std::mutex> lock(mtx);
+      searchFlag.store(true);
+      stopFlag.store(false);
+      cv.notify_all(); // Start search
+      return;
     }
     unsigned int wdl = TB_GET_WDL(result); //0 - loss, 4 - win, 1..3 - draw
     int scorecp = 0;

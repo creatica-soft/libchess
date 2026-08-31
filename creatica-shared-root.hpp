@@ -68,7 +68,7 @@ struct MCTSNode {
     std::atomic<int> num_children{0};
     std::atomic<int> generation{0};
     std::atomic<int> terminal{0}; //0 (not terminal), 1 (mate), 2 (stalemate), 3 (repetition), -1 (check)
-    std::shared_mutex mutex;  // For protecting children expansion
+    std::atomic<uint8_t> expanding{0};  // expansion gate (test-and-set try-lock): exchange(1, acquire) == 0 acquires it, store(0, release) releases it
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
 };
 // Custom hasher that uses the key directly

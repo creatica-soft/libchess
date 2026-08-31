@@ -262,11 +262,11 @@ std::string Eval::trace(Board& board, const Eval::NNUE::Networks& networks) {
     auto [psqt, positional] = networks.big.evaluate(board, *accumulators, caches->big);
     //printf("Eval::trace() debug: network.big.evaluate() return psqt %d and positional %d\n", psqt, positional);
     Value v                 = psqt + positional;
-    v                       = board.sideToMove == WHITE ? v : -v;
+    v                       = static_cast<Color>(board.sideToMove) == WHITE ? v : -v;
     ss << "NNUE evaluation        " << 0.01 * to_cp(v, board) << " (white side)\n";
 
     v = evaluate(networks, board, *accumulators, *caches, VALUE_ZERO); //more complex eval function that uses the above nnue eval as a starting point
-    v = board.sideToMove == WHITE ? v : -v;
+    v = static_cast<Color>(board.sideToMove) == WHITE ? v : -v;
     ss << "Final evaluation       " << 0.01 * to_cp(v, board) << " (white side)";
     ss << " [with scaled NNUE, ...]";
     ss << "\n";

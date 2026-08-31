@@ -7,7 +7,9 @@
 #endif
 
 #include "types.h"
-#include "position.h"
+//#include "position.h" //not used: Stockfish::Position is never referenced here,
+                        //and this was the last thing pulling Stockfish::StateInfo
+                        //into a TU that also has libchess's own StateInfo in scope.
 #include "evaluate.h"
 #include "nnue/nnue_common.h"
 #include "nnue/network.h"

@@ -1,4 +1,4 @@
-// c++ -Wno-writable-strings -std=c++20 -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot.cpp -o lichess_bot
+//c++ -Wno-writable-strings -std=c++20 -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot2.cpp -o lichess_bot2
 
 #include <functional>
 #include <iostream>
@@ -16,34 +16,34 @@
 #include <csignal>
 #include <random>       // For RNG in GetAndProcessBots
 #include "json.hpp"     // https://github.com/nlohmann/json
-#include "nnue/bitboard.h"
+#include "nnue/bitboard.h"   // must precede libchess.h: it supplies Stockfish::types
 #include "libchess.h"
 
 #define INTERMITTENT_INFO_LINES false
 #define FINAL_INFO_LINES false
-#define CREATICA_PATH "/Users/ap/libchess/creatica-shared-root"
+#define CREATICA_PATH "/Users/ap/libchess/creatica-shared-root-quiescence"
 #define DEPTH 0
 #define MOVETIME 0
 #define HASH 2048
 #define THREADS 8
 #define SYZYGY_PATH "/Users/ap/syzygy"
-#define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
+#define BOT_USERNAME "creaticachessbot2"  // Lowercase, as per API IDs
 #define DRAW_CP 30 //accept draw if score cp is less than this value in centipawns
-#define MIN_ELO 2100
-#define MAX_ELO 2800
+#define MIN_ELO 2200
+#define MAX_ELO 2600
 #define ELO_CREATICA 2300
 #define CLOCK_LIMIT 180 //seconds
 #define CLOCK_INCREMENT 3 //seconds
 #define NUMBER_OF_BOTS 50 //number of online bots to return from the list
 #define MULTI_PV 1 //number of PVs
 #define PV_PLIES 2 //number of plies in PV
-#define EXPLORATION_MIN 65 // used in formular for exploration constant decay with depth
-#define EXPLORATION_MAX 160 //smaller value favor exploitation, i.e. deeper tree vs wider tree
+#define EXPLORATION_MIN 60 // used in formular for exploration constant decay with depth
+#define EXPLORATION_MAX 150 //smaller value favor exploitation, i.e. deeper tree vs wider tree
 #define EXPLORATION_DEPTH_DECAY 5 //linear decay of EXPLORATION CONSTANT with depth using formula:
                       // C * 100 = max(EXPLORATION_MIN, (EXPLORATION_MAX - seldepth * EXPLORATION_DEPTH_DECAY))
 //#define PROBABILITY_MASS 100 //% - cumulative probability - how many moves we consider
-#define VIRTUAL_LOSS 36 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
-#define EVAL_SCALE 61 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
+#define VIRTUAL_LOSS 40 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
+#define EVAL_SCALE 62 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
 #define TEMPERATURE 58 //used in calculating probabilities for moves in get_prob() using softmax:
@@ -320,7 +320,7 @@ void GetAndProcessBots(int nb) {
                           if (BOT_USERNAME == data.value("username", "")) continue; //don't challenge itself
                           if (data.contains("perfs") && data["perfs"].contains("blitz")) {
                               int rating = data["perfs"]["blitz"].value("rating", 0);
-                              if ((rating > MIN_ELO && rating < MAX_ELO) || data.value("username", "") == "creaticachessbot2") {
+                              if ((rating > MIN_ELO && rating < MAX_ELO) || data.value("username", "") == "creaticachessbot") {
                                   Bot bot;
                                   bot.botname = data.value("username", "");
                                   bot.games = data["perfs"]["blitz"].value("games", 0);
@@ -664,7 +664,7 @@ void ProcessEvent(const json& event) {
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
             if ((!game_in_progress.load() && (variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960")) &&
-                (speed == "blitz" || speed == "rapid" || speed == "classical") && (challenger_id == "poliakevitch" || challenger_id == "creaticachessbot2") /*&& title != "BOT"*/) {
+                (speed == "blitz" || speed == "rapid" || speed == "classical") && (challenger_id == "poliakevitch" || challenger_id == "creaticachessbot") /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -747,8 +747,7 @@ void signal_handler(int sig) {
 int main() {
   const int multiPV = MULTI_PV;
   std::signal(SIGINT, signal_handler);  // Set up Ctrl-C handler
-  //init_magic_bitboards();
-  Stockfish::Bitboards::init();
+  init_magic_bitboards();
   rng.seed(static_cast<unsigned int>(std::random_device{}()));
 
   //start chess engine process and communicate with it over stdin, stdout redirected to named pipes internally
@@ -761,19 +760,19 @@ int main() {
   }
 
   curl_global_init(CURL_GLOBAL_DEFAULT);
-  std::thread challenge(GetAndProcessBots, nb);
+  //std::thread challenge(GetAndProcessBots, nb);
   std::string event_url = "https://lichess.org/api/stream/event";
   while (playing.load()) {  // Main loop: Keep streaming events
       StreamAndProcess(event_url, ProcessEvent);
       std::cerr << "main() debug: stream ended; reconnecting in 3s..." << std::endl;
       std::this_thread::sleep_for(std::chrono::seconds(3));
   }
-  challenge.join();
+  //challenge.join();
   quit(creatica);
   releaseChessEngine(creatica);
   for (int i = 0; i < multiPV; i++) delete evaluations[i];
   curl_global_cleanup();
-  //cleanup_magic_bitboards();
+  cleanup_magic_bitboards();
   return 0;
 }
 

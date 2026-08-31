@@ -58,9 +58,9 @@ init_nnue_context(ctx);         // one NNUEContext per search thread
 
 ## Architecture
 
-**`struct Board`** (`libchess.h:450`) — bitboards `side[2]` and `pieceTypes[6]`, plus a redundant `piecesOnSquares[64]` mailbox, castling rights/rooks, en passant file, side to move, and cached `isCheck`/`isMate`/`isStaleMate`. About 152 bytes and **carries no move history**; the caller owns the `StateInfo` stack.
+**`struct Board`** (`chess_types.h:76`) — bitboards `side[2]` and `pieceTypes[6]`, plus a redundant `piecesOnSquares[64]` mailbox, castling rights/rooks, en passant file, side to move, and cached `isCheck`/`isMate`/`isStaleMate`. About 152 bytes and **carries no move history**; the caller owns the `StateInfo` stack.
 
-`Board` is defined **twice**: in `libchess.h` with the project's enums, and in `nnue/board.h` with plain integral types (`#ifndef BOARD_INCLUDED` guards let whichever is included first win). The vendored Stockfish code includes `nnue/board.h`. The two layouts must stay byte-identical — change one, change the other.
+`Board` has exactly **one** definition, in `chess_types.h`, together with the five enums it needs (`Color`, `File`, `Square`, `PieceType`, `Piece`) and the `static_assert`s pinning its layout. `libchess.h` includes it; `nnue/board.h` is a one-line forwarder that keeps its name so the vendored tree's ten `#include "../board.h"` lines stay byte-identical and re-syncable from upstream. Do not re-introduce a second definition — it was duplicated until 2026-08-31, both copies mangled as `4Board`, so the linker could not tell them apart and a one-sided field change would have silently produced wrong evaluations with no diagnostic.
 
 **Move generation** (`board.cpp`) is staged, pin-aware and legal-only; there is no pseudo-legal filtering pass. The canonical loop, as written in `test_pos.cpp` and `test_smp.cpp`:
 
