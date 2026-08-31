@@ -4,7 +4,9 @@
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
-//#include <sys/wait.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
 #include <assert.h>
 #include <errno.h>
 #include <ctype.h>
@@ -14,6 +16,32 @@
 #include <stdlib.h>
 #include <math.h>
 #include <thread>
+
+//Every read from the engine used to be an unbounded fgets(), so a wedged or half-dead
+//engine hung the calling thread forever. For the bot that means a rated game silently
+//running out of clock with no error raised anywhere. poll() the descriptor first and
+//give up after ENGINE_READ_TIMEOUT_MS; callers already treat a failed read as engine
+//death and restart it. fromEngine is opened unbuffered so poll() cannot miss a line
+//that stdio has already pulled into its own buffer.
+#define ENGINE_READ_TIMEOUT_MS 60000
+static char * engineFgets(char * buf, int size, FILE * f) {
+	if (!f) return nullptr;
+	for (;;) {
+		struct pollfd pfd;
+		pfd.fd = fileno(f);
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		int r = poll(&pfd, 1, ENGINE_READ_TIMEOUT_MS);
+		if (r > 0) return fgets(buf, size, f);
+		if (r == 0) {
+			fprintf(stderr, "engineFgets() error: engine produced nothing for %d ms - treating it as dead\n", ENGINE_READ_TIMEOUT_MS);
+			return nullptr;
+		}
+		if (errno == EINTR) continue; //a signal, not a failure
+		fprintf(stderr, "engineFgets() error: poll(): %s\n", strerror(errno));
+		return nullptr;
+	}
+}
 #include "nnue/bitboard.h"
 #include "libchess.h"
 
@@ -62,7 +90,7 @@ int getOptions(Engine& engine) {
 	engine.numberOfStringOptions = 0;
 	engine.numberOfButtonOptions = 0;
 	char * lineMod = NULL, * tmp = NULL;
-	while (fgets(line, sizeof(line), engine.fromEngine)) {
+	while (engineFgets(line, sizeof(line), engine.fromEngine)) {
 		if (engine.logfile) {
 			fprintf(engine.logfile, "%s", line);
 			fflush(engine.logfile);
@@ -345,7 +373,7 @@ bool isReady(const Engine& engine) {
 		fprintf(engine.logfile, "isready\n");
 		fflush(engine.logfile);
 	}
-	while (fgets(line, sizeof(line), engine.fromEngine)) {
+	while (engineFgets(line, sizeof(line), engine.fromEngine)) {
 		if (engine.logfile) {
 			fprintf(engine.logfile, "%s", line);
 			fflush(engine.logfile);
@@ -383,7 +411,7 @@ int pieces(const Engine& engine) {
 	}
 	char line[256];	
 	int pieceNumber = 0;
-	while (fgets(line, sizeof(line), engine.fromEngine)) {
+	while (engineFgets(line, sizeof(line), engine.fromEngine)) {
 		if (engine.logfile) {
 			fprintf(engine.logfile, "%s", line);
 			fflush(engine.logfile);
@@ -459,7 +487,7 @@ int getPV(const Engine& engine, struct Evaluation ** eval, const int multiPV) {
   }
 	enum Color sideToMove;
 	sideToMove = strchr(engine.position, 'w') ? ColorWhite : ColorBlack;
-	while (fgets(line, sizeof(line), engine.fromEngine)) {
+	while (engineFgets(line, sizeof(line), engine.fromEngine)) {
 		if (engine.logfile) {
 			fprintf(engine.logfile, "%s", line);
 			fflush(engine.logfile);
@@ -705,7 +733,7 @@ float getEval(const Engine& engine) {
 	char line[2048];
 	//char * tmpLine;
 	float score = 0;
-	while (fgets(line, sizeof(line), engine.fromEngine)) {
+	while (engineFgets(line, sizeof(line), engine.fromEngine)) {
 		if (engine.logfile) {
 			fprintf(engine.logfile, "%s", line);
 			fflush(engine.logfile);
@@ -965,6 +993,7 @@ int engine(Engine& engine, const char * engineName) {
             remove(engine.namedPipeFrom);
             return 1;
         }
+        engine.enginePid = (int)enginePid; //so releaseChessEngine can reap and kill it
         if ((engine.fromEngine = fopen(engine.namedPipeFrom, "r")) == NULL) {
             fprintf(stderr, "engine() parent error: fopen(%s, r): %s\n", engine.namedPipeFrom, strerror(errno));
             fclose(engine.toEngine);
@@ -972,6 +1001,10 @@ int engine(Engine& engine, const char * engineName) {
             remove(engine.namedPipeFrom);
             return 1;
         }
+        //Unbuffered, so poll() in engineFgets() is authoritative: with stdio buffering,
+        //poll could report "nothing to read" while a complete line already sat in the
+        //FILE buffer, and the timed read would time out spuriously.
+        setvbuf(engine.fromEngine, NULL, _IONBF, 0);
     }
     //printf("Created pipes: toEngine=%s, fromEngine=%s\n", engine.namedPipeTo, engine.namedPipeFrom);
 #endif
@@ -1058,6 +1091,13 @@ void initChessEngine(Engine& chessEngine, const char * engineName, const long lo
 }
 
 void releaseChessEngine(Engine& chessEngine) {
+	//Ask the engine to leave BEFORE the pipe it listens on is closed. Previously no
+	//'quit' was ever sent and the child was never reaped, so every restart left a live
+	//multi-threaded engine behind - on an 8 GB machine a few of those are fatal.
+	if (chessEngine.toEngine) {
+		fprintf(chessEngine.toEngine, "quit\n");
+		fflush(chessEngine.toEngine);
+	}
 	if (chessEngine.logfile) {
 		fclose(chessEngine.logfile);
 		chessEngine.logfile = nullptr;
@@ -1072,6 +1112,25 @@ void releaseChessEngine(Engine& chessEngine) {
 	}
 	remove(chessEngine.namedPipeTo);
   remove(chessEngine.namedPipeFrom);
+#ifndef _WIN32
+	//Reap the child. Give it a moment to act on 'quit', then insist. Without this the
+	//process lingers as a zombie at best and a running engine at worst.
+	if (chessEngine.enginePid > 0) {
+		int status = 0;
+		bool reaped = false;
+		for (int i = 0; i < 20; ++i) { //up to ~2 s
+			pid_t r = waitpid((pid_t)chessEngine.enginePid, &status, WNOHANG);
+			if (r == (pid_t)chessEngine.enginePid || (r == -1 && errno == ECHILD)) { reaped = true; break; }
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+		if (!reaped) {
+			fprintf(stderr, "releaseChessEngine(): engine pid %d did not exit on quit; killing it\n", chessEngine.enginePid);
+			kill((pid_t)chessEngine.enginePid, SIGKILL);
+			waitpid((pid_t)chessEngine.enginePid, &status, 0);
+		}
+		chessEngine.enginePid = -1;
+	}
+#endif
 #ifdef _WIN32
 	if (chessEngine.hPipeToEngine != INVALID_HANDLE_VALUE) {
 		CloseHandle(chessEngine.hPipeToEngine);

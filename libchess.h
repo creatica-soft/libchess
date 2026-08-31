@@ -672,6 +672,11 @@ struct Engine {
 	HANDLE hPipeToEngine = INVALID_HANDLE_VALUE;   // Add these to store pipe handles
 	HANDLE hPipeFromEngine = INVALID_HANDLE_VALUE;
 	HANDLE hProcess = INVALID_HANDLE_VALUE;
+#else
+	//The forked child was previously discarded, so the engine could be neither reaped
+	//nor killed: every restart left a live 8-thread process behind. Plain int rather
+	//than pid_t so this public header needs no extra include.
+	int enginePid = -1;
 #endif
 	char position[MAX_FEN_STRING_LEN] = {}; //FEN string
 	char moves[MAX_UCI_MOVES_LEN] = {}; //UCI moves
