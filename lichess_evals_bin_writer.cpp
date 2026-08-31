@@ -1,4 +1,4 @@
-// c++ -std=c++20 -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess lichess_evals_bin_writer.cpp -o lichess_evals_bin_writer
+// c++ -std=c++20 -Wno-writable-strings -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess lichess_evals_bin_writer.cpp -o lichess_evals_bin_writer
 //lichess_db_eval.jsonl contains at least 3,003,377 illegal positions out of 288,977,589 
 //such as rnbqk1nr/1pp2ppp/pbnp4/3Pp3/B3P3/2P2N2/PP3PPP/RNBQKBNR b KQkq - 0 1
 //so we need to take care of at least skipping positions with more than 32 pieces and we should check for other things too!
@@ -11,42 +11,49 @@
 #include <cstdint>
 #include <algorithm>
 #include <unordered_set>
+#include "nnue/bitboard.h"
 #include "json.hpp"
 #include "libchess.h"
 // --- Binary Format Spec ---
 // [5 bits] Num Pieces; to allow 32 pieces, we subtract 1 on encoding and add 1 on decoding
-// [10 bits] Per Piece: Square(6) | Color(1) | Type(3)
+// [10 bits] Per Piece: Square(6) | Color(1) | Type(3) x number of pieces (max 32)!
 // --- followed by 25 bits ---
 // [1 bit] Side to Move (0=White, 1=Black)
 // [4 bits] Castling (KQkq)
 // [4 bits] En Passant File (0-7, 8=None)
-// [16 bits] Eval CP (Two's complement int16)
-// [Padding] Zero bits to reach next byte boundary
+// [16 bits] Eval CP for PV1 (Two's complement int16)
+// [2 bits] num_pvs - 1 (so 0=1PV, 1=2PVs, 2=3PVs)
+// For each PV:
+//   [6 bits] from_sq
+//   [6 bits] to_sq  
+//   [2 bits] promo (0=none,1=N,2=B,3=Q) - could skip this and use q promo as default
+//   [16 bits] cp score  <- skip for PV1 since already written above
+// [Padding] Zero bits to reach byte boundary
 const bool unique_positions = false;
 uint64_t skipped = 0, duplicate = 0;
 constexpr size_t NUM_PARTITIONS = 256;
-constexpr size_t BITS = 8;  // 2^3 = 8
+constexpr size_t BITS = 8;
 std::array<std::unordered_set<uint64_t>, NUM_PARTITIONS> positions;
 
 const int mate_score = 20000;
 Zobrist z = {};
 
-// Function to get partition index from hash (top 3 bits)
-size_t get_partition(uint64_t hash) {
-    return (hash >> (64 - BITS)) & (NUM_PARTITIONS - 1);  // Bits 63,62,61
-}
+// Function to get partition index from hash (top BITS bits)
+//inline constexpr size_t get_partition(uint64_t hash) {
+//    return (hash >> (64 - BITS)) & (NUM_PARTITIONS - 1);  // Bits 63,62,61
+//}
 
 // To insert (only if not exists, for dedup)
-void insert(uint64_t hash) {
-    size_t part = get_partition(hash);
-    auto& set = positions[part];
+void insert(const uint64_t hash) {
+    //size_t part = get_partition(hash);
+    auto& set = positions[(hash >> (64 - BITS)) & (NUM_PARTITIONS - 1)];
     set.insert(hash);
 }
 
 // To check existence
-bool contains(uint64_t hash) {
-    size_t part = get_partition(hash);
-    return positions[part].contains(hash);  // Or find() != end()
+bool contains(const uint64_t hash) {
+    //size_t part = get_partition(hash);
+    return positions[(hash >> (64 - BITS)) & (NUM_PARTITIONS - 1)].contains(hash);  // Or find() != end()
 }
 
 struct ParsedFen {
@@ -60,10 +67,11 @@ struct ParsedFen {
     int castling_rights; // Bitmask: qkQK (4 bits)
     int ep_file; // 0-7, 8 if none
 };
+
 class BitStream {
 private:
     std::ofstream& out;
-    uint64_t accumulator; //max 64 bits!
+    uint64_t accumulator; //max 64 bits! The position is only 31 bits + 1 bit padding
     int bits_in_buffer;
 public:
     BitStream(std::ofstream& o) : out(o), accumulator(0), bits_in_buffer(0) {}
@@ -98,21 +106,14 @@ bool is_legal(const ParsedFen& p_fen) {
   Board board = {};
   board.sideToMove = (Color)p_fen.side_to_move;
   board.enPassant = (File)p_fen.ep_file;
-  if (p_fen.castling_rights & 1) board.castlingRook[0][0] = FileH;
-  else board.castlingRook[0][0] = FileNone;
-  if (p_fen.castling_rights & 2) board.castlingRook[0][1] = FileA;
-  else board.castlingRook[0][1] = FileNone;
-  if (p_fen.castling_rights & 4) board.castlingRook[1][0] = FileH;
-  else board.castlingRook[1][0] = FileNone;
-  if (p_fen.castling_rights & 8) board.castlingRook[1][1] = FileA;
-  else board.castlingRook[1][1] = FileNone;
-
+  board.castlingRights = p_fen.castling_rights;
+  
   int white_pawns = 0, black_pawns = 0, white_knights = 0, black_knights = 0, white_bishops = 0, black_bishops = 0, white_rooks = 0, black_rooks = 0, white_queens = 0, black_queens = 0, white_king = 0, black_king = 0;
   int white_king_sq = SquareNone, black_king_sq = SquareNone, rank = RankNone;
   for (const auto& p : p_fen.pieces) {
     switch (p.type) {
     case Pawn:
-      rank = SQ_RANK(p.square);
+      rank = p.square >> 3;
       if (rank == 0 || rank == 7) {
         const std::string color = p.color == ColorWhite ? "white" : "black";
         //std::cerr << color << " pawn on first or last rank\n";
@@ -148,10 +149,15 @@ bool is_legal(const ParsedFen& p_fen) {
       }
       break;
     }          
-    board.piecesOnSquares[p.square] = PC(p.color, p.type);
+    board.piecesOnSquares[p.square] = static_cast<Piece>((p.color << 3) | p.type);
     board.pieceTypes[p.type - 1] |= (1ULL << p.square);
     board.side[p.color] |= (1ULL << p.square);
   }
+  if (p_fen.castling_rights & 1) board.castlingRooks |= msBit(board.side[ColorWhite] & board.pieceTypes[Rook - 1]);
+  if (p_fen.castling_rights & 2) board.castlingRooks |= lsBit(board.side[ColorWhite] & board.pieceTypes[Rook - 1]);
+  if (p_fen.castling_rights & 4) board.castlingRooks |= msBit(board.side[ColorBlack] & board.pieceTypes[Rook - 1]);
+  if (p_fen.castling_rights & 8) board.castlingRooks |= lsBit(board.side[ColorBlack] & board.pieceTypes[Rook - 1]);
+
   if (white_king == 0) {
     //std::cerr << "missing white king\n";
     return false;
@@ -206,7 +212,7 @@ bool is_legal(const ParsedFen& p_fen) {
   //bool ep_legal = false;
   if (p_fen.ep_file < FileNone) { //en passant is set
     int ep_rank = (p_fen.side_to_move == ColorWhite) ? Rank6 : Rank3;
-    int ep_square = SQ(ep_rank, p_fen.ep_file);
+    int ep_square = (ep_rank << 3) | p_fen.ep_file;
     int victim_square = (p_fen.side_to_move == ColorWhite) ? ep_square - 8 : ep_square + 8;
     int expected_victim = (p_fen.side_to_move == ColorWhite) ? BlackPawn : WhitePawn;
 
@@ -246,7 +252,7 @@ bool is_legal(const ParsedFen& p_fen) {
   //check if side to move gives check
 	if (board.sideToMove == ColorWhite) {
 	  board.sideToMove = ColorBlack;
-	  uint64_t whiteAttacks = getAttackedSquaresOnly(&board); //returns squares attacked by white
+	  uint64_t whiteAttacks = getAttackedSquaresOnly(board); //returns squares attacked by white
 	  if (whiteAttacks & board.pieceTypes[King - 1] & board.side[ColorBlack]) {
 	    //std::cerr << "white is to move but white give check!\n";
 	    return false;
@@ -254,7 +260,7 @@ bool is_legal(const ParsedFen& p_fen) {
 	  board.sideToMove = ColorWhite;
 	} else {
 	  board.sideToMove = ColorWhite;
-	  uint64_t blackAttacks = getAttackedSquaresOnly(&board); //returns squares attacked by black
+	  uint64_t blackAttacks = getAttackedSquaresOnly(board); //returns squares attacked by black
 	  if (blackAttacks & board.pieceTypes[King - 1] & board.side[ColorWhite]) {
 	    //std::cerr << "black is to move but black give check!\n";
 	    return false;
@@ -335,6 +341,30 @@ ParsedFen parse_fen_string(const std::string& fen) {
     return res;
 }
 
+bool parse_uci_move(const std::string& line, int& from_sq, int& to_sq, int& promo) {
+    if (line.size() < 4) return false;
+    const std::string& move = line.substr(0, line.find(' ')); // first move only
+    if (move.size() < 4) return false;
+    int from_file = move[0] - 'a';
+    int from_rank = move[1] - '1';
+    int to_file   = move[2] - 'a';
+    int to_rank   = move[3] - '1';
+    if (from_file < 0 || from_file > 7 || from_rank < 0 || from_rank > 7) return false;
+    if (to_file   < 0 || to_file   > 7 || to_rank   < 0 || to_rank   > 7) return false;
+    from_sq = from_rank * 8 + from_file;
+    to_sq   = to_rank   * 8 + to_file;
+    promo = 0;
+    if (move.size() >= 5) {
+        switch (move[4]) {
+            case 'n': promo = 1; break;
+            case 'b': promo = 2; break;
+            case 'r': promo = 3; break;
+            case 'q': promo = 0; break; 
+        }
+    }
+    return true;
+}
+
 uint64_t getHash(ParsedFen& p_fen) {	
 	uint64_t hash = 0;
 	std::unordered_set<int> occupied_squares(32);
@@ -359,7 +389,15 @@ private:
     std::string fen;
     int max_depth;
    
-    struct PV { int cp; bool is_mate; std::string line; };
+    //struct PV { int cp; bool is_mate; std::string line; };
+    struct PV { 
+        int cp; 
+        bool is_mate; 
+        std::string line; 
+        int from_sq = -1;
+        int to_sq = -1;
+        int promo = 0; // 0=Q,1=N,2=B,3=R
+    };
     struct Eval { std::vector<PV> pvs; std::int64_t knodes; int depth; };
    
     Eval best_eval;
@@ -442,7 +480,7 @@ public:
             }
         }
        
-        if (object_level == 1) {
+        /*if (object_level == 1) {
             // Write to Binary Stream
             if (max_depth != -1 && !best_eval.pvs.empty()) {
                 ParsedFen p_fen = parse_fen_string(fen);
@@ -482,7 +520,67 @@ public:
                
                 stream.align();
             }
-        }
+        }*/
+        
+        if (object_level == 1) {
+            if (max_depth != -1 && !best_eval.pvs.empty()) {
+                ParsedFen p_fen = parse_fen_string(fen);
+                if (!is_legal(p_fen)) { skipped++; --object_level; return true; }
+                if (unique_positions) {
+                    uint64_t hash = getHash(p_fen);
+                    if (contains(hash)) { duplicate++; --object_level; return true; }
+                    else insert(hash);
+                }
+        
+                // Parse moves for all PVs
+                std::vector<PV> pvs = best_eval.pvs;
+                // Cap at 3, filter out PVs with unparseable moves
+                std::vector<PV> valid_pvs;
+                for (auto& pv : pvs) {
+                    int from_sq, to_sq, promo;
+                    if (parse_uci_move(pv.line, from_sq, to_sq, promo)) {
+                        pv.from_sq = from_sq;
+                        pv.to_sq   = to_sq;
+                        pv.promo   = promo;
+                        valid_pvs.push_back(pv);
+                    }
+                    if (valid_pvs.size() == 3) break;
+                }
+                if (valid_pvs.empty()) { skipped++; --object_level; return true; }
+        
+                // Write pieces
+                stream.write(p_fen.pieces.size() - 1, 5);
+                for (const auto& p : p_fen.pieces) {
+                    stream.write(p.square, 6);
+                    stream.write(p.color, 1);
+                    stream.write(p.type, 3);
+                }
+        
+                // Write board state
+                stream.write(p_fen.side_to_move, 1);
+                stream.write(p_fen.castling_rights, 4);
+                stream.write(p_fen.ep_file, 4);
+        
+                // Write PV1 cp (backward compatible)
+                stream.write(static_cast<uint16_t>(static_cast<int16_t>(valid_pvs[0].cp)), 16);
+        
+                // Write num_pvs - 1 (2 bits: 0,1,2 for 1,2,3 PVs)
+                stream.write(valid_pvs.size() - 1, 2);
+        
+                // Write each PV's move + cp (cp skipped for PV1 since already written)
+                for (size_t i = 0; i < valid_pvs.size(); i++) {
+                    stream.write(valid_pvs[i].from_sq, 6);
+                    stream.write(valid_pvs[i].to_sq, 6);
+                    stream.write(valid_pvs[i].promo, 2);
+                    if (i > 0) {
+                        stream.write(static_cast<uint16_t>(static_cast<int16_t>(valid_pvs[i].cp)), 16);
+                    }
+                }
+        
+                stream.align();
+            }
+        }        
+        
         --object_level;
         return true;
     }
@@ -537,11 +635,11 @@ int main(int argc, char** argv) {
     bitStream.emplace(out);
     if (unique_positions) {
       for (auto& set : positions) {
-          set.reserve(290000000 / NUM_PARTITIONS + 1000000);  // Add buffer for skew
+          set.reserve(290000000 / NUM_PARTITIONS + 100000);  // Add buffer for skew
       }
     }
-    zobristHash(&z);
-    init_magic_bitboards();
+    zobristHash(z);
+    Stockfish::Bitboards::init();
     // Read line by line
     std::string line;
     long long line_count = 0;
@@ -584,6 +682,5 @@ int main(int argc, char** argv) {
     std::cout << "Finished processing " << line_count << " lines." << std::endl;
     std::cout << "Illegal positions: " << skipped << "\n";
     if (unique_positions) std::cout << "Duplicate positions: " << duplicate << "\n";
-    cleanup_magic_bitboards();
     return 0;
 }

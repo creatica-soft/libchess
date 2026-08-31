@@ -1,4 +1,4 @@
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess tbcore.c tbprobe.c test_smp.cpp -o test_smp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess tbcore.c tbprobe.c test_smp.cpp -o test_smp
 
 #include "nnue/types.h"
 #include "nnue/nnue/nnue_accumulator.h"
@@ -26,6 +26,7 @@
 #include <math.h>
 #include <iostream>
 #include "tbprobe.h"
+#include "nnue/bitboard.h"
 #include "libchess.h"
 //8/5p2/7p/2p1n2P/1k2N3/1P2P3/2K5/8 b - - 1 62
 #define MULTI_PV 5
@@ -66,12 +67,12 @@ struct NNUEContext {
     Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack = nullptr;
     Stockfish::Eval::NNUE::AccumulatorCaches * caches = nullptr;    
 };
-void init_nnue(const char * nnue_file_big, const char * nnue_file_small);
+void init_nnue();
 void cleanup_nnue();
 void init_nnue_context(NNUEContext& ctx);
 void free_nnue_context(NNUEContext& ctx);
 double evaluate_nnue(const Board& chess_board, NNUEContext& ctx);
-void accumulator_stack_push(NNUEContext& ctx, Stockfish::DirtyPiece& dp);
+std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
 void accumulator_stack_pop(NNUEContext& ctx);
 void accumulator_stack_reset(NNUEContext& ctx);
 void compute_move_evals(Board& chess_board, const ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, std::vector<std::tuple<double, int, int, uint64_t>>& move_evals);
@@ -302,7 +303,7 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
       N = child->N.load(std::memory_order_relaxed);
       W = -child->W.load(std::memory_order_relaxed);
       Q = W / N;
-      U = std::max(exploration_min, exploration_max - (depth * exploration_depth_decay)) * exploration_max * prior * sqrt(parent_N) / (1 + N);
+      U = std::max(exploration_min, exploration_max - (depth * exploration_depth_decay)) * prior * sqrt(parent_N) / (1 + N);
       pv2 += " (" + std::to_string(N) + ", " + std::to_string(llround(W)) + ", " + std::to_string(cp) + ", " + std::to_string(Q) + " + " + std::to_string(U) + " = " + std::to_string(Q + U) + ")";
       children2 = child->children.load(std::memory_order_relaxed);
       num_children = child->num_children.load(std::memory_order_relaxed);
@@ -414,7 +415,7 @@ double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& c
   double res;
 	const int pieceCount = bitCount(chess_board.side[ColorWhite] | chess_board.side[ColorBlack]);
 	isCheckMateStaleMate(chess_board);
-	if (pieceCount > TB_LARGEST || ((unsigned int *)chess_board.castlingRook)[0] != 0x08080808) {
+	if (pieceCount > TB_LARGEST || chess_board.castlingRights) {
 		//debug
 		//char fen[MAX_FEN_STRING_LEN];
 		//board2fen(chess_board, fen);
@@ -432,7 +433,7 @@ double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& c
       res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
     }
   } else { //pieceCount <= TB_LARGEST, etc
-    unsigned int ep = enPassantLegal(chess_board);     
+    unsigned int ep = legalEnPassantMove(chess_board);     
     const unsigned int wdl = tb_probe_wdl(chess_board.side[ColorWhite], chess_board.side[ColorBlack], chess_board.pieceTypes[King - 1], chess_board.pieceTypes[Queen - 1], chess_board.pieceTypes[Rook - 1], chess_board.pieceTypes[Bishop - 1], chess_board.pieceTypes[Knight - 1], chess_board.pieceTypes[Pawn - 1], 0, 0, ep == SquareNone ? 0 : ep, chess_board.sideToMove == ColorWhite ? 1 : 0);
     if (wdl == TB_RESULT_FAILED) {
       char fen[MAX_FEN_STRING_LEN];
@@ -463,14 +464,14 @@ double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& c
 double make_move(Board& chess_board, const ZobristHash& board_hash, Move& move, NNUEContext& ctx, uint64_t& child_hash, const std::unordered_set<uint64_t>& pos_history) {
   ZobristHash tmp_hash = board_hash;
   StateInfo state = {};
-  Stockfish::DirtyPiece dp;
-  updateHash(tmp_hash, chess_board, move, do_move_dp(chess_board, move, state, dp), z);
+  auto [dp, dts] = accumulator_stack_push(ctx);
+  updateHash(tmp_hash, chess_board, move, do_move_dp(chess_board, move, state, dp, dts), z);
   child_hash = tmp_hash.hash;
   if (pos_history.count(child_hash) > 0) {
     undo_move(chess_board, move, state);
+    accumulator_stack_pop(ctx); //this early return used to leak one stack level per repetition
     return 0.0; 
   }
-  accumulator_stack_push(ctx, dp);
   double res = position_eval(chess_board, tmp_hash, ctx, pos_history); //evaluate the position
   undo_move(chess_board, move, state);
   accumulator_stack_pop(ctx);
@@ -482,12 +483,10 @@ double make_move(Board& chess_board, const ZobristHash& board_hash, Move& move, 
 //computes and returns move_evals tuple given chess_board, prob_mass and pos_history
 void compute_move_evals(Board& chess_board, const ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, std::vector<std::tuple<double, int, int, uint64_t>>& move_evals) {
       double res;
-      Move move = {};
-    	MovesContext movesContext = {};
-     	KingSquare kingSq;
-     	move.src = getKingSquare(chess_board, kingSq);
-     	uint64_t attackedSquares = getAttackedSquares(chess_board, movesContext);
-  	  uint64_t moves = kingMoves(chess_board, move.src, kingSq, movesContext, attackedSquares);
+      Move move;
+      auto [moves, pinned, pinning, checkers, kingSquare] = kingMoves(chess_board);
+      move.src = kingSquare;
+      move.promoType = PieceTypeNone;
   	  while (moves) {
   	    move.dst = lsBit(moves);
   	    uint64_t child_hash = 0;
@@ -495,34 +494,31 @@ void compute_move_evals(Board& chess_board, const ZobristHash& board_hash, NNUEC
         move_evals.push_back({res, (move.promoType << 12) | (move.src << 6) | move.dst, static_cast<int>(-res * 100), child_hash});
         moves &= moves - 1;
       }
-      if (movesContext.num_checkers > 1) {
-        //if (chess_board.num_moves == 0) chess_board.isMate = true;
-        goto sort;
-      }
-      
-      for (PieceType pt = Queen; pt >= Pawn; pt = (PieceType)(pt - 1)) {
-      	uint64_t occupations = chess_board.side[chess_board.sideToMove] & chess_board.pieceTypes[pt - 1]; 
-      	while (occupations) {
-      	  move.src = lsBit(occupations);
-  	      moves = piece_moves(pt, move.src, movesContext, kingSq, chess_board);
-      	  while (moves) {
-      	    move.dst = lsBit(moves);
-          	PieceType startPiece = PieceTypeNone, endPiece = PieceTypeNone;
-          	if (promoMove(chess_board, move)) {
-          	  startPiece = Knight;
-          	  endPiece = Queen;
-          	}
-        	  for (move.promoType = startPiece; move.promoType <= endPiece; move.promoType = (PieceType)(move.promoType + 1)) { //loop over promotions if any
-        	    uint64_t child_hash = 0;
-        	    res = make_move(chess_board, board_hash, move, ctx, child_hash, pos_history);
-              move_evals.push_back({res, (move.promoType << 12) | (move.src << 6) | move.dst, static_cast<int>(-res * 100), child_hash});
-        	  }
-            moves &= moves - 1;
+      if (bitCount(checkers) <= 1) {
+        auto [check_mask, ep_mask] = checkers ? checkMask(chess_board, kingSquare, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL);
+        for (PieceType pt = Queen; pt >= Pawn; pt = (PieceType)(pt - 1)) {
+        	uint64_t occupations = chess_board.side[chess_board.sideToMove] & chess_board.pieceTypes[pt - 1]; 
+        	while (occupations) {
+        	  move.src = lsBit(occupations);
+    	      moves = piece_moves(chess_board, pt, move.src, kingSquare, pinned, pinning, check_mask, ep_mask);
+        	  while (moves) {
+        	    move.dst = lsBit(moves);
+            	PieceType startPiece = PieceTypeNone, endPiece = PieceTypeNone;
+            	if (promoMove(chess_board, move)) {
+            	  startPiece = Knight;
+            	  endPiece = Queen;
+            	}
+          	  for (move.promoType = startPiece; move.promoType <= endPiece; move.promoType = (PieceType)(move.promoType + 1)) { //loop over promotions if any
+          	    uint64_t child_hash = 0;
+          	    res = make_move(chess_board, board_hash, move, ctx, child_hash, pos_history);
+                move_evals.push_back({res, (move.promoType << 12) | (move.src << 6) | move.dst, static_cast<int>(-res * 100), child_hash});
+          	  }
+              moves &= moves - 1;
+            }
+            occupations &= occupations - 1;
           }
-          occupations &= occupations - 1;
         }
       }
-sort:
       // Sort by res descending
       std::sort(move_evals.begin(), move_evals.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b);});
       get_prob(move_evals);
@@ -756,11 +752,8 @@ void runMCTS() {
   int hashfull = 0;
   std::vector<std::pair<int, std::string>> pvs;
   int multiPV = 1;
-  //MovesContext movesContext = {};
-  //uint64_t movesFromSquares[64] = {0};
-	//generateMoves(board, movesFromSquares);
-	isCheckMateStaleMate(board);
 
+	isCheckMateStaleMate(board);
   if (board.num_moves > 1) {
     tbhits.store(0, std::memory_order_relaxed);
     std::vector<ThreadParams> thread_params(chessEngine.optionSpin[Threads].value);
@@ -807,21 +800,21 @@ void runMCTS() {
   } else if (board.num_moves == 1) {
       auto iter_start = std::chrono::steady_clock::now();
       int move_idx = 0;
-      Move move = {};
-      MovesContext movesContext = {};
-     	KingSquare kingSq;
-     	move.src = getKingSquare(board, kingSq);
-  	  uint64_t moves = kingMoves(board, move.src, kingSq, movesContext, getAttackedSquares(board, movesContext));
+      Move move;
+      auto [moves, pinned, pinning, checkers, kingSquare] = kingMoves(board);
+      move.src = kingSquare;
+      move.promoType = PieceTypeNone;
   	  while (moves && move_idx == 0) {
   	    move.dst = lsBit(moves);
   	    move_idx = (move.promoType << 12) | (move.src << 6) | move.dst;
         moves &= moves - 1;
       }
+      auto [check_mask, ep_mask] = checkers ? checkMask(board, kingSquare, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL);      
       for (PieceType pt = Queen; pt >= Pawn && move_idx == 0; pt = (PieceType)(pt - 1)) {
       	uint64_t occupations = board.side[board.sideToMove] & board.pieceTypes[pt - 1]; 
       	while (occupations && move_idx == 0) {
       	  move.src = lsBit(occupations);
-  	      moves = piece_moves(pt, move.src, movesContext, kingSq, board);
+  	      moves = piece_moves(board, pt, move.src, kingSquare, pinned, pinning, check_mask, ep_mask);
       	  while (moves && move_idx == 0) {
       	    move.dst = lsBit(moves);
           	PieceType startPiece = PieceTypeNone, endPiece = PieceTypeNone;
@@ -1012,8 +1005,8 @@ void setEngineOptions() {
 int main(int argc, char **argv) {
     TB_LARGEST = 0;
     zobristHash(z);
-    init_magic_bitboards();
-    init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
+    Stockfish::Bitboards::init();
+    init_nnue();
     setEngineOptions();
     char fenString[MAX_FEN_STRING_LEN] = "";
     char uciMove[6] = "";
@@ -1056,6 +1049,11 @@ int main(int argc, char **argv) {
     if (move_given) {
       move_idx = uci2move_idx(uciMove, move);
       printf("searching for move %s (from %s to %s (promo %c), idx %d) in root's children...\n", uciMove, square[move.src], square[move.dst], uciPromoLetter[move.promoType], move_idx);
+    }
+    if (board.num_moves <= 1) {
+      cleanup();
+      cleanup_nnue();
+      return 0;
     }
     int num_children = search.root->num_children.load(std::memory_order_relaxed);
     Edge * children = search.root->children.load(std::memory_order_relaxed);
@@ -1103,6 +1101,5 @@ int main(int argc, char **argv) {
     }
     cleanup();
     cleanup_nnue();
-    cleanup_magic_bitboards();
     return 0;
 }

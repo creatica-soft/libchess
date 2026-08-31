@@ -11,7 +11,7 @@
 #ifdef __GNUC__
 #include <cstring>
 #endif
-
+#include "nnue/bitboard.h"
 #include "libchess.h"
 
 #define SYZYGY_PATH "/Users/ap/syzygy"
@@ -27,7 +27,7 @@
   	    strcat(fenString, " ");
   	   }
   	} 
-  	init_magic_bitboards();
+  	Stockfish::Bitboards::init();
   	if (fen2board(board, fenString)) {
   		printf("test_nnue error: fen2board() failed; FEN %s\n", fenString);
   		return 1;
@@ -40,7 +40,7 @@
       printf("info string successfully initialized tablebases in %s. Max number of pieces %d\n", SYZYGY_PATH, TB_LARGEST);
     }
     
-    const unsigned int ep = enPassantLegal(board);
+    const unsigned int ep = legalEnPassantMove(board);
     unsigned int res = tb_probe_root(board.side[ColorWhite], board.side[ColorBlack], board.pieceTypes[King - 1], board.pieceTypes[Queen - 1], board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1], board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1],
         board.halfmoveClock, 0, ep == SquareNone ? 0 : ep, board.sideToMove == ColorWhite ? 1 : 0, NULL);
         char fen[MAX_FEN_STRING_LEN];
@@ -55,5 +55,4 @@
     unsigned int dst = TB_GET_TO(res);
     unsigned int promotes = TB_GET_PROMOTES(res);
     printf("result %.0f, uci_move %s%s%c\n", result, square[src], square[dst], uciPromoLetter[6 - promotes]);
-    cleanup_magic_bitboards();
   }

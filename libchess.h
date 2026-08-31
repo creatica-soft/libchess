@@ -1,20 +1,20 @@
 /// 
-/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib bitscanner.cpp board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp magic_bitboards.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
+/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -DUSE_PTHREADS -DNDEBUG -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -DUSE_NEON_DOTPROD -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
 
 /// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
 
 /// use -O0 -g for debugging with lldb or gdb instead of -O3 (lldb ./test, then run, and if crashes, bt)
 
 /// To compile on alpine linux, run:
-/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -Wno-strncat-size -fPIC -O3 -o libchess.so bitscanner.cpp board.cpp engine.cpp fen.cpp pgn.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
+/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -Wno-strncat-size -fPIC -O3 -o libchess.so  board.cpp engine.cpp fen.cpp pgn.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp
 /// 
 
 
 /// To build for Windows using mingw
-/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -fPIC -O3 -o libchess.dll bitscanner.cpp board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
+/// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -fPIC -O3 -o libchess.dll board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
 /// 
 /// or in MSYS2 MINGW with clang
-/// clang++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -o libchess.dll bitscanner.cpp board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
+/// clang++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -o libchess.dll board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
 /// 
 
 /// To build python bindings, use:
@@ -38,16 +38,16 @@
 #endif
 
 
-#include <stdbool.h>
+//#include <stdbool.h>
+#include <type_traits>
+#include <utility>
+#include <array>
+#include <assert.h>
 //#include <wchar.h>
 //#include <stdio.h>
 
 #ifndef LIBCHESS_H
 #define LIBCHESS_H
-
-//#ifdef __cplusplus
-//extern "C" {
-//#endif
 
 #include "noise.h"
 //#include "noise2.h"
@@ -162,28 +162,26 @@
 #define ADIAG_G8H7 0x4080000000000000ULL
 #define ADIAG_H8H8 0x8000000000000000ULL
 
-static const uint64_t files_bb[] = { FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H };
-static const uint64_t ranks_bb[] = { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
-static const uint64_t diag_bb[] = { DIAG_H1H1, DIAG_G1H2, DIAG_F1H3, DIAG_E1H4, DIAG_D1H5, DIAG_C1H6, DIAG_B1H7, DIAG_A1H8, 
+inline constexpr uint64_t files_bb[] = { FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H };
+inline constexpr uint64_t ranks_bb[] = { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
+inline constexpr uint64_t en_passant_ranks[] = { RANK4, RANK5 };
+inline constexpr uint64_t en_passant_files[] = {FILE_B, FILE_A | FILE_C, FILE_B | FILE_D, FILE_C | FILE_E, FILE_D | FILE_F, FILE_E | FILE_G, FILE_F | FILE_H, FILE_G };
+inline constexpr uint64_t base_rank_bb[] = { RANK1, RANK8 };
+inline constexpr uint64_t diag_bb[] = { DIAG_H1H1, DIAG_G1H2, DIAG_F1H3, DIAG_E1H4, DIAG_D1H5, DIAG_C1H6, DIAG_B1H7, DIAG_A1H8, 
                                     DIAG_A2G8, DIAG_A3F8, DIAG_A4E8, DIAG_A5D8, DIAG_A6C8, DIAG_A7B8, DIAG_A8A8 };
-static const uint64_t antidiag_bb[] = { ADIAG_A1A1, ADIAG_A2B1, ADIAG_A3C1, ADIAG_A4D1, ADIAG_A5E1, ADIAG_A6F1, ADIAG_A7G1, 
+inline constexpr uint64_t antidiag_bb[] = { ADIAG_A1A1, ADIAG_A2B1, ADIAG_A3C1, ADIAG_A4D1, ADIAG_A5E1, ADIAG_A6F1, ADIAG_A7G1, 
                                         ADIAG_A8H1, ADIAG_B8H2, ADIAG_C8H3, ADIAG_D8H4, ADIAG_E8H5, ADIAG_F8H6, ADIAG_G8H7, ADIAG_H8H8 };
 
 enum Castling : uint8_t { CastlingNone, CastlingKingside, CastlingQueenside, CastlingBoth };
 
 enum Color : uint8_t { ColorWhite, ColorBlack, Color_NB };
-
-static const char * color[] = { "white", "black" };
-static const char fenColor[] = { 'w', 'b' };
+inline constexpr char * color[] = { "white", "black" };
+inline constexpr char fenColor[] = { 'w', 'b' };
 
 enum File : uint8_t {FileA, FileB, FileC, FileD, FileE, FileF, FileG, FileH, FileNone, File_NB = 8};
-static const char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
+inline constexpr char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
 enum Rank : uint8_t {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone, Rank_NB = 8};
-static const char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
-
-//redifinition of files_bb[] and ranks_bb[] above
-//static uint64_t bitFiles[] = {FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H};
-//static uint64_t bitRanks[] = {RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8};
+inline constexpr char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
 // rank = square / 8, same as rank = square >> 3
 // file = square % 8, same as file = square & 7
@@ -198,8 +196,7 @@ enum Square : uint8_t {
 	SquareA7, SquareB7, SquareC7, SquareD7, SquareE7, SquareF7, SquareG7, SquareH7,
 	SquareA8, SquareB8, SquareC8, SquareD8, SquareE8, SquareF8, SquareG8, SquareH8, SquareNone, Square_NB = 64, PawnSquare_NB = 48
 };
-
-static const char * square[] = {
+inline constexpr char * square[] = {
 	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
 	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
 	"a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
@@ -209,8 +206,6 @@ static const char * square[] = {
 	"a7", "b7", "c7", "d7", "e7", "f7", "g7", "h7",
 	"a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8", "none"
 };
-
-//int squareColor(int sqName); //use SQ_COLOR(sq) macro instead
 
 enum Diagonal : uint8_t {
 	DiagonalH1H1, DiagonalG1H2, DiagonalF1H3, DiagonalE1H4, DiagonalD1H5,
@@ -224,10 +219,21 @@ enum Antidiagonal : uint8_t {
 	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone, Antidiag_NB = 15
 };
 enum PieceType : uint8_t { PieceTypeAny, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeNone, PieceType_NB = 6, NonPawnType_NB = 5 };
-static const char * pieceType[] = {"any", "pawn", "knight", "bishop", "rook", "queen", "king", "none"};
-
-static const float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
-static const float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
+//enum PieceType : uint8_t { PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny, PieceType_NB = 6, NonPawnType_NB = 5 };
+inline constexpr char * pieceType[] = {"any", "pawn", "knight", "bishop", "rook", "queen", "king", "none"};
+//inline constexpr char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
+inline constexpr float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
+inline constexpr int pieceValueCP[] = { 0, 100, 300, 320, 500, 900, 10000 };
+inline constexpr float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
+inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
+    {0, 0, 0, 0, 0, 0, 0},       // None
+    {0, 105, 205, 305, 405, 505, 605}, // Pawn attacking
+    {0, 104, 204, 304, 404, 504, 604}, // Knight attacking
+    {0, 103, 203, 303, 403, 503, 603}, // Bishop attacking
+    {0, 102, 202, 302, 402, 502, 602}, // Rook attacking
+    {0, 101, 201, 301, 401, 501, 601}, // Queen attacking
+    {0, 100, 200, 300, 400, 500, 600}  // King attacking - last value is illegal, of course, king cannot attack king
+};    
 
 // Piece enumeration: first three bits are used to encode the type, fourth bit defines the color, total 16 pieces
 // Shifting Piece by 3 to the right gives PieceColor: color = piece >> 3
@@ -236,91 +242,199 @@ static const float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.
 // PieceNone has color white and type PieceTypeNone
 enum Piece : uint8_t {
 	PieceWhite, WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNone,
+	//PieceNone, WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceWhite,
 	PieceBlack, BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, Piece_NB = 12, NonPawn_NB = 10
 };
-
-static const char * piece[] = {
+inline constexpr char * piece[] = {
 	"whites", "white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "none",
-	"blacks", "black pawn", "black knight", "black bishop", "black rook", "black queen", "black king"
+	"blacks", "black pawn", "black knight", "black bishop", "black rook", "black queen", "black king", "none"
 };
 
-/*enum PieceLetter : uint8_t { 
-	PieceLetter_e, PieceLetter_P, PieceLetter_N, PieceLetter_B, PieceLetter_R, 
-	PieceLetter_Q, PieceLetter_K, PieceLetter_X, PieceLetter_O, PieceLetter_p, PieceLetter_n,
-	PieceLetter_b, PieceLetter_r, PieceLetter_q, PieceLetter_k, PieceLetter_x
-};*/
-static const char pieceLetter[] = {'C', 'P', 'N', 'B', 'R', 'Q', 'K', ' ', 'c', 'p', 'n', 'b', 'r', 'q', 'k', '*'};
+inline constexpr char pieceLetter[] = {'C', 'P', 'N', 'B', 'R', 'Q', 'K', ' ', 'c', 'p', 'n', 'b', 'r', 'q', 'k', ' '};
 
 // UCI promo letters, for SAN moves should be converted to uppercase
 /*enum PromoLetter : uint8_t { PromoLetter_n = 2, PromoLetter_b, PromoLetter_r, PromoLetter_q};*/
-static const char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q', '\0', '\0' };
-static const char uciPromoLetter[] = { '\0', '\0', 'n', 'b', 'r', 'q', '\0', '\0' };
+inline constexpr char promoLetter[] = { '\0', '\0', 'N', 'B', 'R', 'Q', '\0', '\0' };
+inline constexpr char uciPromoLetter[] = { '\0', '\0', 'n', 'b', 'r', 'q', '\0', '\0' };
 
 //Move could be encoded as 15-bit int (promo << 12 | src << 6 | dst)
 //or as 18-bit number (move_type << 15 | promo << 12 | src << 6 | dst)
 //promo has 3 bits and uses 5 PieceType enum values {PieceTypeNone = 0, Knight = 2, Bishop, Rook or Queen}
 //move_type has 3 bits
-enum MoveType : uint8_t {MoveTypeNormal, MoveTypeCastlingKingside, MoveTypeCastlingQueenside, MoveTypeCapture, MoveTypeEnPassant, MoveTypeEnPassantCapture, MoveTypeNull};
-static const char * moveType[] = { "normal", "castling kingside", "castling queenside", "capture", "en passant", "en passant capture", "null" };
+enum MoveType : uint8_t {MoveTypeEnPassantCapture, MoveTypeCastlingKingside, MoveTypeCastlingQueenside, MoveTypeNormal, MoveTypeCapture, MoveTypeEnPassant, MoveTypeNull};
+inline constexpr char * moveType[] = { "en passant capture", "castling kingside", "castling queenside", "normal", "capture", "en passant", "null" };
 
 enum ProblemType : uint8_t { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
 
 enum GameStage : uint8_t { OpeningGame, MiddleGame, EndGame, FullGame };
-static const char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
+inline constexpr char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
 
-static const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+inline constexpr char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
-// Macros for on-fly computation (inline-able, zero cost)
-#define SQ(rank, file) (Square(((rank) << 3) | (file)))
-#define SQ_FILE(sq) (File((sq) & 7))
-#define SQ_RANK(sq) (Rank((sq) >> 3))
-//#define SQ_BIT(sq)  ((sq) == SquareNone ? 0 : (1ULL << (sq)))
-#define SQ_BIT(sq)  (1ULL << (sq))
-#define SQ_DIAG(sq) (Diagonal(7 + SQ_RANK(sq) - SQ_FILE(sq)))
-#define SQ_ANTIDIAG(sq) (Antidiagonal(SQ_FILE(sq) + SQ_RANK(sq)))
-#define SQ_COLOR(sq) (Color(((SQ_FILE(sq) ^ SQ_RANK(sq)) & 1) ? ColorWhite : ColorBlack))
+inline constexpr Square castlingKingSquare[Color_NB][2] = { { SquareG1, SquareC1 }, { SquareG8, SquareC8 } };
+inline constexpr Square castlingRookSquare[Color_NB][2] = { { SquareF1, SquareD1 }, { SquareF8, SquareD8 } };
+inline constexpr Square initialRookSquare[Color_NB][2] = { { SquareH1, SquareA1 }, { SquareH8, SquareA8 } };
+inline constexpr Piece castlingRook[Color_NB] = { WhiteRook, BlackRook };
 
-#define PC_TYPE(pc) (PieceType((pc) & 7))
-#define PC_COLOR(pc) (Color((pc) >> 3))
-#define PC(color, type) (Piece(((color) << 3) | (type)))
-#define PC_INIT(pc, pcName, sq) do { (pc)->name = (pcName); (pc)->square = (sq); } while (0)
-
-#define OPP_COLOR(color) ((Color)((color) ^ 1))  // White=0, Black=1
-#define PLY_NUM(board) (((board)->moveNumber - 1) * 2 + ((board)->sideToMove == ColorBlack)) //for white move 1, ply is 0
-
-//having two hashes and verifying the second one when the first is the same for two positions,
-//I've never seen a hash collision, so perhaps, one hash is enough
-struct ZobristHash {
-    uint64_t hash = 0;
-    uint64_t prevCastlingRights = 0;
-    uint64_t prevEnPassant = 0;
-    //uint64_t prevHash = 0; //for debuging
-    //24 bytes
-};
-
-//825 random 8-byte numbers from atmospheric noise
-struct Zobrist {
-    uint64_t blackMove = 0;
-    uint64_t castling[16] = {0};
-    uint64_t enPassant[File_NB] = {0};
-    uint64_t emptySquares[Square_NB] = {0};
-    uint64_t pawns[Color_NB][PawnSquare_NB]; //96 8-byte numbers
-    uint64_t nonPawns[Color_NB][NonPawnType_NB][Square_NB] = {}; //640 8-byte numbers
-    //6,600 bytes
-};
-
+inline constexpr Square SQ(Rank r, File f) {
+    return static_cast<Square>((static_cast<int>(r) << 3) | static_cast<int>(f));
+}
+inline constexpr File SQ_FILE(Square sq) {
+    return static_cast<File>(static_cast<int>(sq) & 7);
+}
+inline constexpr Rank SQ_RANK(Square sq) {
+    return static_cast<Rank>(static_cast<int>(sq) >> 3);
+}
+inline constexpr uint64_t SQ_BIT(Square sq) {
+    return 1ULL << static_cast<int>(sq);
+}
+inline constexpr uint64_t SQ_BIT(int sq) {
+    return 1ULL << sq;
+}
+inline constexpr Diagonal SQ_DIAG(Square sq) {
+    return static_cast<Diagonal>(7 + SQ_RANK(sq) - SQ_FILE(sq));
+}
+inline constexpr Antidiagonal SQ_ANTIDIAG(Square sq) {
+    return static_cast<Antidiagonal>(SQ_FILE(sq) + SQ_RANK(sq));
+}
+inline constexpr PieceType PC_TYPE(Piece pc) {
+    return static_cast<PieceType>(static_cast<int>(pc) & 7);
+}
+inline constexpr Color PC_COLOR(Piece pc) {
+    return static_cast<Color>(static_cast<int>(pc) >> 3);
+}
+inline constexpr Piece PC(Color c, PieceType pt) {
+    return static_cast<Piece>(static_cast<int>(c) << 3 | static_cast<int>(pt));
+}
+inline constexpr Color OPP_COLOR(Color c) {
+    return static_cast<Color>(static_cast<int>(c) ^ 1);
+}
 struct ChessPiece {
     Piece name = PieceNone;
     Square square = SquareNone;
 };
+inline constexpr void pc_init(ChessPiece * chess_piece, Piece pc, Square sq) {
+    chess_piece->name = pc;
+    chess_piece->square = sq;
+}
+inline constexpr Color SQ_COLOR(Square sq) {
+    // (File ^ Rank) & 1 returns 0 for dark squares, 1 for light (or vice versa)
+    // No 'if' statements means no branch mispredictions!
+    return static_cast<Color>((static_cast<int>(SQ_FILE(sq)) ^ static_cast<int>(SQ_RANK(sq))) & 1);
+}
 
-struct KingSquare {
-  File file = FileNone;
-  Rank rank = RankNone;
-  Diagonal diag = DiagonalNone;
-  Antidiagonal antidiag = AntidiagonalNone;
-  uint64_t bit = 0;
-};
+// A helper to get the underlying integer value of any enum
+template<typename T>
+inline constexpr typename std::underlying_type<T>::type to_underlying(T e) {
+    return static_cast<typename std::underlying_type<T>::type>(e);
+}
+// 1. Prefix Increment: ++sq, ++pt
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr T& operator++(T& e) {
+    return e = static_cast<T>(to_underlying(e) + 1);
+}
+// 1. Postfix Increment: sq++, pt++
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr T& operator++(T& e, int) {
+    T temp = e;
+    ++e;
+    return e = static_cast<T>(to_underlying(temp));
+}
+// 2. Prefix Decrement: --sq, --pt
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr T& operator--(T& e) {
+    return e = static_cast<T>(to_underlying(e) - 1);
+}
+// 3. Addition: sq + 8
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr T operator+(T e, int i) {
+    return static_cast<T>(to_underlying(e) + i);
+}
+// 4. Subtraction: sq - 8
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr int operator-(T e, int i) {
+    return static_cast<int>(to_underlying(e) - i);
+}
+// &
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr T operator&(T e, int i) {
+    return static_cast<T>(to_underlying(e) & 1);
+}
+// 1. Addition Assignment: sq += 8
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr T& operator+=(T& e, int i) {
+    return e = static_cast<T>(to_underlying(e) + i);
+}
+// 2. Subtraction Assignment: sq -= 8
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr int operator-=(T& e, int i) {
+    return e = static_cast<int>(to_underlying(e) - i);
+}
+// Difference: Square - Square -> returns SIGNED int
+template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
+inline constexpr int operator-(T s1, T s2) {
+    // We cast both to int BEFORE subtracting to prevent unsigned wrap-around
+    return static_cast<int>(to_underlying(s1)) - static_cast<int>(to_underlying(s2));
+}
+
+
+inline constexpr uint8_t bitCount(unsigned long long value) {
+#ifdef _MSC_VER
+	return static_cast<uint8_t>(__popcnt64(value)); // equivalent to __builtin_popcountl
+#else
+  return static_cast<uint8_t>(__builtin_popcountll(value));
+#endif
+}
+
+inline constexpr Square lsBit(uint64_t b) {
+  assert(b);
+	//if (b == 0) return SquareNone;
+#ifdef _MSC_VER
+	unsigned long index;
+	_BitScanForward64(&index, b); // equivalent to __builtin_ctzl
+	return static_cast<Square>(index);
+#else
+	return static_cast<Square>(__builtin_ctzll(b));
+#endif
+}
+
+inline constexpr Square msBit(uint64_t b) {
+  assert(b);
+	//if (b == 0) return SquareNone;
+#ifdef _MSC_VER
+	unsigned long index;
+	_BitScanReverse64(&index, b); // equivalent to __builtin_ctzl
+	return static_cast<Square>(index);
+#else
+  return static_cast<Square>(63 - __builtin_clzll(b));
+#endif
+}
+
+inline constexpr Square popLSB(uint64_t& b) {
+  assert(b);
+	//if (b == 0) return SquareNone;
+	unsigned long index;
+#ifdef _MSC_VER
+	_BitScanForward64(&index, b); // equivalent to __builtin_ctzl
+#else
+	index = __builtin_ctzll(b);
+#endif
+  b &= b - 1; 
+	return static_cast<Square>(index);
+}
+
+inline constexpr Square popMSB(uint64_t& b) {
+  assert(b);
+	//if (b == 0) return SquareNone;
+	unsigned long index;
+#ifdef _MSC_VER
+	_BitScanReverse64(&index, b); // equivalent to __builtin_ctzl
+#else
+  index = (63 - __builtin_clzll(b));
+#endif
+  b ^= SQ_BIT(index); 
+	return static_cast<Square>(index);
+}
 
 //the smallest compact board representation could be as following:
 //10 bits per piece at square (color << 9 | type << 6 | square) x 32 pieces = 320 bits or 40 bytes
@@ -344,35 +458,21 @@ struct Board {
     uint8_t halfmoveClock = 0;
     uint8_t num_moves = 0; //not necessary but good for 8-byte alignment on 64-bit systems
     //8 bytes up to here
-    int moveNumber = 1; //may be unsigned short but will be padded 2 bytes anyway
-    uint8_t castlingRook[Color_NB][2] = {{FileNone, FileNone}, {FileNone, FileNone}};
-    //16 bytes up to here
+    int moveNumber = 1;
+    uint8_t castlingRights = 0xf;
+    //is it 16 bytes?
     //the rest is aligned on 8-byte boundary
+    uint64_t castlingRooks = 0; //8 bytes
     Piece piecesOnSquares[Square_NB] = {PieceNone}; //64 bytes
-    //uint64_t occupations[2][7] = {0}; //[color][pieceType] 14 8-byte bitboards
-    //alternative compact representation has only 8 8-byte bitboards - much better!
-    //for example, white knights = side[ColorWhite] & pieceTypes[Knight] - trade off between memory and cpu
-    uint64_t side[Color_NB] = {0}; //all white and all black
-    uint64_t pieceTypes[PieceType_NB] = {0}; //all pawns, knights, bishops, rooks, queens and kings
-    //would be just 16 + 64 + 64 = 144 bytes instead of 192
-    //192 bytes total
+    uint64_t side[Color_NB] = {0}; //all white and all black - 16 bytes
+    uint64_t pieceTypes[PieceType_NB] = {0}; //all pawns, knights, bishops, rooks, queens, kings - 48 bytes
+    //total 152 bytes?
 };
 #endif
-//history should be preserved in a separate stack
-struct StateInfo {
-    File enPassant = FileNone;
-    uint8_t halfmoveClock = 0;
-    MoveType type = MoveTypeNormal;
-    PieceType capturedType = PieceTypeNone;
-    File castlingRook[Color_NB][2] = {{FileNone, FileNone}, {FileNone, FileNone}};
-    bool isCheck = false;
-    // Pointers to previous state allow for repetition detection
-    //StateInfo* previous; //currently not used
-};
 
 // Keep track of what a move changes on the board (used by NNUE)
-#ifndef TYPES_H_INCLUDED
 namespace Stockfish {
+#ifndef TYPES_H_INCLUDED
 struct DirtyPiece {
     Piece pc = PieceNone;        // this is never allowed to be NO_PIECE
     Square from = SquareNone;
@@ -386,9 +486,221 @@ struct DirtyPiece {
     Piece remove_pc = PieceNone;
     Piece add_pc = PieceNone;
 };
-}
+struct DirtyThreat {
+    static constexpr int PcSqOffset         = 0;
+    static constexpr int ThreatenedSqOffset = 8;
+    static constexpr int ThreatenedPcOffset = 16;
+    static constexpr int PcOffset           = 20;
+
+    DirtyThreat() { /* don't initialize data */ }
+    DirtyThreat(uint32_t raw) :
+        data(raw) {}
+    DirtyThreat(Piece pc, Piece threatened_pc, Square pc_sq, Square threatened_sq, bool add) {
+        data = (uint32_t(add) << 31) | (pc << PcOffset) | (threatened_pc << ThreatenedPcOffset)
+             | (threatened_sq << ThreatenedSqOffset) | (pc_sq << PcSqOffset);
+    }
+
+    Piece  pc() const { return static_cast<Piece>(data >> PcOffset & 0xf); }
+    Piece  threatened_pc() const { return static_cast<Piece>(data >> ThreatenedPcOffset & 0xf); }
+    Square threatened_sq() const { return static_cast<Square>(data >> ThreatenedSqOffset & 0xff); }
+    Square pc_sq() const { return static_cast<Square>(data >> PcSqOffset & 0xff); }
+    bool   add() const { return data >> 31; }
+    uint32_t raw() const { return data; }
+
+   private:
+    uint32_t data;
+};
+// A piece can be involved in at most 8 outgoing attacks and 16 incoming attacks.
+// Moving a piece also can reveal at most 8 discovered attacks.
+// This implies that a non-castling move can change at most (8 + 16) * 3 + 8 = 80 features.
+// By similar logic, a castling move can change at most (5 + 1 + 3 + 9) * 2 = 36 features.
+// Thus, 80 should work as an upper bound. Finally, 16 entries are added to accommodate
+// unmasked vector stores near the end of the list.
+
+template<typename T, std::size_t MaxSize>
+class ValueList {
+   public:
+    std::size_t size() const { return size_; }
+    int         ssize() const { return int(size_); }
+    void        push_back(const T& value) {
+        assert(size_ < MaxSize);
+        values_[size_++] = value;
+    }
+    const T* begin() const { return values_; }
+    const T* end() const { return values_ + size_; }
+    const T& operator[](int index) const { return values_[index]; }
+    T* make_space(size_t count) {
+        T* result = &values_[size_];
+        size_ += count;
+        assert(size_ <= MaxSize);
+        return result;
+    }
+   private:
+    T values_[MaxSize];
+    std::size_t size_ = 0;
+};
+using Bitboard = uint64_t;
+using DirtyThreatList = ValueList<DirtyThreat, 96>;
+
+struct DirtyThreats {
+    DirtyThreatList list;
+    Color           us;
+    Square          prevKsq, ksq;
+
+    Bitboard threatenedSqs, threateningSqs;
+};
 #endif
 
+template<bool PutPiece>
+inline void add_dirty_threat(
+  DirtyThreats* const dts, Piece pc, Piece threatened, Square s, Square threatenedSq) {
+    if (PutPiece) {
+        dts->threatenedSqs |= SQ_BIT(threatenedSq);
+        dts->threateningSqs |= SQ_BIT(s);
+    }
+    dts->list.push_back({pc, threatened, s, threatenedSq, PutPiece});
+}
+
+template<bool PutPiece, bool ComputeRay = true>
+void update_piece_threats(Board& board, Piece pc, Square s, DirtyThreats * const dts, Bitboard noRaysContaining = -1ULL);
+
+inline void put_piece(Board& board, Piece pc, Square s, DirtyThreats* const dts = nullptr) {
+    board.piecesOnSquares[s] = static_cast<::Piece>(pc);
+    uint64_t bitSq = SQ_BIT(s);
+    board.side[PC_COLOR(static_cast<::Piece>(pc))] |= bitSq;
+    board.pieceTypes[PC_TYPE(static_cast<::Piece>(pc)) - 1] |= bitSq;
+    if (dts) update_piece_threats<true>(board, pc, s, dts);
+}
+
+inline void remove_piece(Board& board, const Square s, DirtyThreats* const dts = nullptr) {
+    Piece pc = static_cast<Stockfish::Piece>(board.piecesOnSquares[s]);
+    if (dts) update_piece_threats<false>(board, pc, s, dts);
+
+    uint64_t bitSq = SQ_BIT(static_cast<Square>(s));
+    board.side[PC_COLOR(static_cast<::Piece>(pc))] ^= bitSq;
+    board.pieceTypes[PC_TYPE(static_cast<::Piece>(pc)) - 1] ^= bitSq;
+    board.piecesOnSquares[s] = PieceNone;
+}
+
+inline void move_piece(Board& board, Square from, Square to, DirtyThreats* const dts) {
+    Piece pc = static_cast<Stockfish::Piece>(board.piecesOnSquares[from]);
+    uint64_t fromTo = SQ_BIT(from) | SQ_BIT(to);
+    update_piece_threats<false>(board, pc, from, dts, fromTo);
+
+    board.side[PC_COLOR(static_cast<::Piece>(pc))] ^= fromTo;
+    board.pieceTypes[PC_TYPE(static_cast<::Piece>(pc)) - 1] ^= fromTo;
+    board.piecesOnSquares[from] = PieceNone;
+    board.piecesOnSquares[to] = static_cast<::Piece>(pc);
+    update_piece_threats<true>(board, pc, to, dts, fromTo);
+}
+
+inline void swap_piece(Board& board, Square s, Piece pc, Stockfish::DirtyThreats* const dts) {
+    Piece old = static_cast<Stockfish::Piece>(board.piecesOnSquares[s]);
+    remove_piece(board, s);
+    update_piece_threats<false, false>(board, old, s, dts);
+    put_piece(board, pc, s);
+    update_piece_threats<true, false>(board, pc, s, dts);
+}
+
+} //end of namespace Stockfish
+
+
+constexpr std::array<std::pair<Rank, Rank>, 2> ep_ranks = [] { //pawnRank, enPassantRank;
+  	std::array<std::pair<Rank, Rank>, 2> arr{};
+  	arr[0] = std::make_pair(Rank5, Rank6);
+  	arr[1] = std::make_pair(Rank4, Rank3);
+  	return arr;
+}();
+  
+//a line from sq1 to sq2 excludes sq1 and includes sq2 (same as Stockfish::BetweenBB[s1][s2])
+/*constexpr std::array<std::array<uint64_t, 64>, 64> LineBetween = [] {
+  auto my_abs = [](int x) { return x < 0 ? -x : x; };
+  std::array<std::array<uint64_t, 64>, 64> arr{};
+  for (Square s1 = SquareA1; s1 < SquareNone; ++s1) {
+    for (Square s2 = SquareA1; s2 < SquareNone; ++s2) {
+      arr[s1][s2] = 0;
+      
+      int r1 = SQ_RANK(s1), f1 = SQ_FILE(s1);
+      int r2 = SQ_RANK(s2), f2 = SQ_FILE(s2);
+      int dr = (r2 > r1) ? 1 : (r2 < r1) ? -1 : 0;
+      int df = (f2 > f1) ? 1 : (f2 < f1) ? -1 : 0;
+
+      // Only generate if they are on a line (Rank, File, or Diagonal)
+      if (dr == 0 || df == 0 || my_abs(dr) == my_abs(df)) {
+        Square curr = s1;
+        while (curr != s2) {
+					int new_r = SQ_RANK(curr) + dr;
+	        int new_f = SQ_FILE(curr) + df;
+	
+	        // If we step off the 8x8 grid, stop immediately
+	        if (new_r < 0 || new_r > 7 || new_f < 0 || new_f > 7) break;
+	
+	        curr = static_cast<Square>(new_r * 8 + new_f);
+	        arr[s1][s2] |= SQ_BIT(curr);
+	      }
+      }
+    }
+  }
+  return arr;
+}();*/
+
+struct CastlingData {
+    uint64_t path;      // Must be vacant
+    uint64_t checkZone; // Must not be attacked
+};
+
+extern CastlingData CastlingPath[Color_NB][2]; // [Color][0: Kingside, 1: Queenside]
+extern uint8_t  CastlingRights[64]; 
+extern uint64_t CastlingRooks[64];  
+extern uint64_t LineThrough[64][64];
+
+//having two hashes and verifying the second one when the first is the same for two positions,
+//I've never seen a hash collision, so perhaps, one hash is enough
+struct ZobristHash {
+    uint64_t hash = 0;
+    uint64_t prevCastlingRights = 0;
+    uint64_t prevEnPassant = 0;
+    //uint64_t prevHash = 0; //for debuging
+    //24 bytes
+};
+
+//825 random 8-byte numbers from atmospheric noise
+struct Zobrist {
+    uint64_t blackMove = 0;
+    uint64_t castling[16] = {0};
+    uint64_t enPassant[File_NB] = {0};
+    uint64_t emptySquares[Square_NB] = {0};
+    uint64_t pawns[Color_NB][PawnSquare_NB]; //96 8-byte numbers
+    uint64_t nonPawns[Color_NB][NonPawnType_NB][Square_NB] = {}; //640 8-byte numbers
+    //6,600 bytes
+};
+
+/*struct KingSquare {
+  File file = FileNone;
+  Rank rank = RankNone;
+  Diagonal diag = DiagonalNone;
+  Antidiagonal antidiag = AntidiagonalNone;
+  uint64_t bit = 0;
+};*/
+
+inline constexpr Rank baseRank[Color_NB] = { Rank1, Rank8 };
+inline constexpr uint64_t occupations(const Board& board) { return board.side[ColorWhite] | board.side[ColorBlack];};
+inline constexpr Square kingSquare(const Board& board, const Color color) { return lsBit(board.side[color] & board.pieceTypes[King - 1]);};
+
+//history should be preserved in a separate stack
+struct StateInfo {
+    File enPassant = FileNone;
+    uint8_t halfmoveClock = 0;
+    MoveType type = MoveTypeNormal;
+    PieceType capturedType = PieceTypeNone;
+    //File castlingRook[Color_NB][2] = {{FileNone, FileNone}, {FileNone, FileNone}};
+    uint8_t castlingRights;
+    uint64_t castlingRooks;
+    bool isCheck = false;
+    uint8_t num_moves = 0;
+    // Pointers to previous state allow for repetition detection
+    //StateInfo* previous; //currently not used
+};
 
 //Perhaps, we can wrap src, dst, promoType, type and capturedType and things for undo move in a 4-byte struct
 struct Move {
@@ -406,14 +718,14 @@ struct MovesContext {
   uint64_t blockingSquares = 0;
 };
 
-enum EngineSpinOptions : uint8_t {Hash, Threads, MultiPV, ExplorationMin, ExplorationMax, ExplorationDepthDecay, VirtualLoss, PVPlies, EvalScale, Temperature, ProbabilityMass, NegamaxDepth};
+enum EngineSpinOptions : uint8_t {Hash, Threads, MultiPV, ExplorationMin, ExplorationMax, ExplorationDepthDecay, PVPlies, Temperature, VirtualLoss, ProbabilityMass, EvalScale, EvalDepth, MaxNodes, NegamaxDepth};
 enum EngineStringOptions : uint8_t {SyzygyPath};
-enum EngineCheckOptions : uint8_t {Ponder, FinalInfoLines, IntermittentInfoLines};
+enum EngineCheckOptions : uint8_t {FinalInfoLines, IntermittentInfoLines, Ponder};
 
 enum OptionType : uint8_t {
 	Button, Check, Combo, Spin, String
 };
-static const char * optionTypes[] = {
+constexpr char * optionTypes[] = {
 	"button", "check", "combo", "spin", "string"
 };
 
@@ -513,12 +825,12 @@ enum EcoTags : uint8_t {
 	eECO, eOpening, eVariation
 };
 
-static const char * tags[] = {
+constexpr char * tags[] = {
 	"Unknown", "Event", "Site", "Date", "Round", "White", "Black", "Result",
 	"Annotator", "PlyCount", "TimeControl", "Time", "Termination", "Mode", "FEN", "SetUp", "Opening", "Variation", "Variant", "WhiteElo", "BlackElo", "ECO"
 };
 
-static const char * ecotags[] = {
+constexpr char * ecotags[] = {
 	"ECO", "Opening", "Variation"
 };
 
@@ -526,7 +838,7 @@ enum Variant : uint8_t {
 	Standard, Chess960
 };
 
-static const char * variant[] = {
+constexpr char * variant[] = {
 	"Standard", "chess 960"
 };
 
@@ -549,17 +861,19 @@ struct EcoLine {
 };
 
 CHESS_API int randomNumber(const int, const int);
-
 CHESS_API int fen2board(Board& board, const char * fenstr);
 CHESS_API char * board2fen(const Board& board, char * fenString);
-CHESS_API uint64_t getAttackedSquares(const Board& board, MovesContext& movesContext);
 CHESS_API uint64_t getAttackedSquaresOnly(const Board& board);
-CHESS_API Square getKingSquare(const Board& board, KingSquare& kingSq);
-CHESS_API uint64_t kingMoves(Board& board, const Square kingSquare, const KingSquare& kingSq, MovesContext& movesContext, const uint64_t attackedSquares);
-CHESS_API uint64_t piece_moves(const PieceType pieceType, const Square sq, const MovesContext& ctx, const KingSquare& kingSq, Board& board);
-//CHESS_API uint64_t * generateMoves(struct Board * board, struct MovesContext * movesContext, const uint64_t attackedSquares, uint64_t * movesFromSquares);
+//returns king_moves, pinned, pinning, checkers, kingSquare
+CHESS_API std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, Square> kingMoves(Board& board);
+//this is fast for determining multiple checkers instead of bitcount
+CHESS_API std::pair<uint64_t, uint64_t> checkMask(const Board& board, Square kingSq, uint64_t checkers);
+CHESS_API uint64_t getCheckers(const Board& board, const Square kingSq);
+CHESS_API std::pair<uint64_t, uint64_t> pinFinder(const Board& board, const Square kingSq);
+CHESS_API uint64_t piece_moves(Board& board, const PieceType pt, const Square sq, const Square kingSq, const uint64_t pinned, uint64_t pinning, const uint64_t check_mask, const uint64_t ep_mask);
 CHESS_API void isCheckMateStaleMate(Board& board);
-//CHESS_API void generateMoves(Board& board, uint64_t * movesFromSquares);
+//CHESS_API int get_see(const Board& board, const Move move, const PieceType capturedType); //move has been made
+//CHESS_API int get_see(const Board& board, Move move); //overload for above when the move has not been made
 CHESS_API int uci2move_idx(const char * uci_move, Move& move);
 CHESS_API char * idx2uci(const int move_idx, char * uci_move);
 CHESS_API Move& idx2move(const int move_idx, Move& move);
@@ -571,7 +885,8 @@ CHESS_API bool promoMove(const Board& board, const Move& move);
 CHESS_API PieceType ff_move(Board& board, Move& move);
 //CHESS_API void makeMove(Board * board, const int move);
 CHESS_API PieceType do_move(Board& board, Move& move, StateInfo& state);
-CHESS_API PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::DirtyPiece& dp);
+//CHESS_API PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::DirtyPiece& dp);
+CHESS_API PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::DirtyPiece& dp, Stockfish::DirtyThreats& dts);
 CHESS_API void undo_move(Board& board, const Move& move, const StateInfo& state);
 
 CHESS_API void zobristHash(Zobrist& z);
@@ -579,14 +894,11 @@ CHESS_API void getHash(ZobristHash& hash, const Board& board, const Zobrist& z);
 CHESS_API void updateHash(ZobristHash& zh, const Board& board, const Move& move, const int capturedType, const Zobrist& z);
 
 //returns en passant square (dst sq) if en passant capture from sq is legal or 0 otherwise
-CHESS_API Square enPassantMoveLegal(Board& board, const Square sq);
+CHESS_API Square legalEnPassantMoveFromSq(const Board& board, const Square sq);
 
 //returns en passant square (dst sq) if en passant capture is legal or 0 otherwise
-CHESS_API Square enPassantLegal(Board& board);
+CHESS_API Square legalEnPassantMove(const Board& board);
 
-// two standard bit manupulation functions
-CHESS_API uint8_t bitCount(uint64_t);
-CHESS_API Square lsBit(uint64_t);
 
 CHESS_API void stripGameResult(Game& game);
 CHESS_API int normalizeMoves(char * moves);
@@ -606,7 +918,7 @@ CHESS_API int initGame(Game& game, FILE *);
 int playGame(Game& game);
 
 CHESS_API void writeDebug(const Board& board);
-CHESS_API void drawMoves(const Board& board, const Square sq, const uint64_t * movesFromSquares);
+CHESS_API void drawMoves(const Board& board, const Square sq, uint64_t moves);
 CHESS_API int reconcile(const Board& board);
 CHESS_API void getMoveType(char *, unsigned int);
 
@@ -629,8 +941,5 @@ CHESS_API float eval(const Engine& engine);
 CHESS_API int getPV(const Engine& engine, Evaluation ** eval, const int multiPV);
 CHESS_API int pieces(const Engine& engine); //non-standard UCI command pieces - returns the number of pieces on board
 
-//#ifdef __cplusplus
-//}
-//#endif
 #endif
 

@@ -1,6 +1,7 @@
 //compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess play_games.cpp -o play_games
 #include <string>
 #include <cstdio>
+#include <chrono>
 #include "libchess.h"
 
 int main(int argc, char ** argv) {
@@ -19,6 +20,7 @@ int main(int argc, char ** argv) {
   init_magic_bitboards();
   struct Game game;
   unsigned long long game_number = 0;
+  auto start = std::chrono::high_resolution_clock::now();
   while(!feof(file)) {
     game_number++;
     int res = initGame(game, file);
@@ -32,8 +34,10 @@ int main(int argc, char ** argv) {
       fprintf(stderr, "main() error: playGame() returned %d\n", res);
       exit(res);
     }
-    printf("%llu\n", game_number);
+    //printf("%llu\n", game_number);
   }
+  double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
+  printf("time spent %f sec for playing %llu games\n", elapsed, game_number);
   cleanup_magic_bitboards();
   fclose(file);
 }

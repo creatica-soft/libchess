@@ -1,4 +1,4 @@
-//c++ -std=c++20 -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o pgn_parser pgn_parser.cpp
+// c++ -std=c++20 -Wno-writable-strings -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o pgn_parser pgn_parser.cpp
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -146,6 +146,7 @@ private:
     bool isMoveNumber(const std::string& s) {
         // Simple check: ends with '.' or contains digit+dot
         if (s.back() == '.') return true; // "1."
+        if (s.find(".-") != std::string::npos) return true; // "1.-"
         if (s.find("...") != std::string::npos) return true; // "1..."
         return isdigit(s[0]); // Catches "1." if split weirdly
     }
@@ -209,14 +210,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    std::string base(argv[2]);
+    size_t dot_pos = base.rfind('.');
+    std::string prefix, ext;
+    if (dot_pos != std::string::npos) {
+        prefix = base.substr(0, dot_pos);
+        ext = base.substr(dot_pos);
+    } else {
+        prefix = base;
+        ext = "";
+    }
+  
+    int part = 0;
     std::ofstream out;
-    const std::string filename = argv[2];
+    std::string filename = base; // First file uses the provided output name
     out.open(filename, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!out) {
-        std::cerr << "Could open output file: " << filename << std::endl;
+        std::cerr << "Cannot open output file: " << filename << std::endl;
         return 1;
     }
-    BitStream stream(out);
+    std::optional<BitStream> stream;
+    stream.emplace(out);
+    //BitStream stream(out);
 
     PgnParser parser;
     PgnGame game;
@@ -224,76 +239,95 @@ int main(int argc, char ** argv) {
     uint64_t positions = 0;
     uint64_t skipped = 0;
     uint64_t duplicate = 0;
-    std::unordered_set<uint64_t> unique_positions(4000000);
+    std::unordered_set<uint64_t> unique_positions(50000000);
     init_magic_bitboards();
     Zobrist z = {};
-    zobristHash(&z);
+    zobristHash(z);
     while (parser.nextGame(file, game)) {
-        if (game.tags["Variant"] != "Standard") continue;
-        //std::cout << "Game " << ++count << ": " << game.tags["White"] << " vs " << game.tags["Black"] << ". Variant " << game.tags["Variant"] << ". Fen " << game.tags["FEN"] << "\n";
-        ++count;
-        if (count % 10000 == 0) std::cout << "Processed " << count << " games\n" << std::flush;
-        //std::cout << "Parsed " << game.moves.size() << " moves.\n";
-        Board board = {};
-        ZobristHash zh = {};
-        if (game.tags["Variant"] == "Chess960") board.isChess960 = true;
-        if (game.tags["FEN"].empty())
-          fen2board(&board, startPos);
-        else {
-          if (strncmp(game.tags["FEN"].c_str(), startPos, strlen(startPos)) != 0) continue;
-          fen2board(&board, game.tags["FEN"].c_str());
+      if (game.tags["Variant"] != "Standard") continue;
+      //std::cout << "Game " << ++count << ": " << game.tags["White"] << " vs " << game.tags["Black"] << ". Variant " << game.tags["Variant"] << ". Fen " << game.tags["FEN"] << "\n";
+      ++count;
+      if (count % 10000 == 0) std::cout << "Processed " << count << " games\n" << std::flush;
+      //std::cout << "Parsed " << game.moves.size() << " moves.\n";
+      Board board = {};
+      ZobristHash zh = {};
+      if (game.tags["Variant"] == "Chess960") board.isChess960 = true;
+      if (game.tags["FEN"].empty())
+        fen2board(board, startPos);
+      else {
+        if (strncmp(game.tags["FEN"].c_str(), startPos, strlen(startPos)) != 0) continue;
+        fen2board(board, game.tags["FEN"].c_str());
+      }
+      getHash(zh, board, z);
+      for (const auto& m : game.moves) {
+        //std::cout << "  " << m.move << "\n";
+        Move move = {};
+    		if (san2move(board, m.move.c_str(), move)) {
+    		  std::cerr << "san2move() returned non-zero code. Move " << m.move << "; " << game.tags["White"] << " vs " << game.tags["Black"] << ". Variant " << game.tags["Variant"] << ". Fen " << game.tags["FEN"] << "\n";
+    		  //cleanup_magic_bitboards();
+    		  //exit(1);
+    		  skipped++;
+    		  break;
+    		}
+        PieceType pt = ff_move(board, move);
+        if (__builtin_popcountll(board.side[0] | board.side[1]) < 6) {
+          skipped++;
+          break; //use Syzygy tables
         }
-        getHash(&zh, &board, &z);
-        for (const auto& m : game.moves) {
-            //std::cout << "  " << m.move;
-            Move move = {};
-            MovesContext movesContext;
-        		uint64_t movesFromSquares[64] = {0};
-        		generateMoves(&board, &movesContext, getAttackedSquares(&board, &movesContext), movesFromSquares);
-        		if (!san2move(&board, m.move.c_str(), &move, movesFromSquares)) {
-        		  std::cerr << "san2move() returned NULL. move " << m.move << game.tags["White"] << " vs " << game.tags["Black"] << ". Variant " << game.tags["Variant"] << ". Fen " << game.tags["FEN"] << "\n";
-        		  cleanup_magic_bitboards();
-        		  exit(1);
-        		}
-            PieceType pt = ff_move(&board, &move);
-            if (m.has_eval) {
-              updateHash(&zh, &board, &move, pt, &z);
-              if (unique_positions.contains(zh.hash)) {
-                duplicate++;
-              } else {
-                unique_positions.insert(zh.hash);
-                positions++;
-                // [6 bits] Num Pieces
-                uint64_t pieces = board.side[ColorWhite] | board.side[ColorBlack];
-                stream.write(__builtin_popcountll(pieces) - 1, 5);
-               
-                // [10 bits per piece]
-                while (pieces) {
-                    int square = __builtin_ctzll(pieces);
-                    stream.write(square, 6);
-                    stream.write(PC_COLOR(board.piecesOnSquares[square]), 1);
-                    stream.write(PC_TYPE(board.piecesOnSquares[square]), 3);
-                    pieces &= pieces - 1;
-                }
-               
-                // Global State
-                stream.write(board.sideToMove, 1);
-                const int castlingRights = (board.castlingRook[0][0] != FileNone) | ((board.castlingRook[0][1] != FileNone) << 1) | ((board.castlingRook[1][0] != FileNone) << 2) | ((board.castlingRook[1][1] != FileNone) << 3);	
-                stream.write(castlingRights, 4);
-                stream.write(board.enPassant, 4);
-               
-                // [16 bits] Eval CP
-                stream.write(static_cast<uint16_t>(static_cast<int16_t>(m.eval * 100)), 16);
-               
-                stream.align();
-                
-                //std::cout << " (Eval: " << m.eval << ")\n";
-              }
-            } else skipped++;
+        if (m.has_eval) {
+          updateHash(zh, board, move, pt, z);
+          if (unique_positions.contains(zh.hash)) {
+            duplicate++;
+          } else {
+            unique_positions.insert(zh.hash);
+            positions++;
+            // [6 bits] Num Pieces
+            uint64_t pieces = board.side[ColorWhite] | board.side[ColorBlack];
+            stream->write(__builtin_popcountll(pieces) - 1, 5);
+           
+            // [10 bits per piece]
+            while (pieces) {
+                int square = __builtin_ctzll(pieces);
+                stream->write(square, 6);
+                stream->write(PC_COLOR(board.piecesOnSquares[square]), 1);
+                stream->write(PC_TYPE(board.piecesOnSquares[square]), 3);
+                pieces &= pieces - 1;
+            }
+           
+            // Global State
+            stream->write(board.sideToMove, 1);
+            const int castlingRights = board.castlingRights;	
+            stream->write(castlingRights, 4);
+            stream->write(board.enPassant, 4);
+           
+            // [16 bits] Eval CP
+            stream->write(static_cast<uint16_t>(static_cast<int16_t>(m.eval * 100)), 16);
+           
+            stream->align();
+            
+            //std::cout << " (Eval: " << m.eval << ")\n";
+          } //end of unique
+        } //end of if (has eval) 
+        else skipped++;
+        if (positions % 10000000 == 0) {
+          stream->align();
+          stream.reset();
+          out.close();
+          std::cout << "Finished processing " << positions << " positions." << std::endl;
+          //return 0;
+          part++;
+          filename = prefix + "_" + std::to_string(part) + ext; // e.g., output_1.bin
+          out.open(filename, std::ios::out | std::ios::binary | std::ios::trunc);
+          if (!out) {
+              std::cerr << "Cannot open output file: " << filename << std::endl;
+              return 1;
+          }
+          stream.emplace(out);        
         }
-    }
+      } //end of moves loop
+    } //end of games loop
     out.close();
-    std::cout << "Finished processing " << positions << " positions. Duplicate " << duplicate << ". Skipped " << skipped + duplicate << ". Stored " << positions - skipped - duplicate << std::endl;    
+    std::cout << "Finished processing " << positions + skipped + duplicate << " positions. Duplicate " << duplicate << ". No eval info " << skipped << ". Stored " << positions << std::endl;    
     cleanup_magic_bitboards();
     return 0;
 }

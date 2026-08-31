@@ -1,14 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include "magic_bitboards.h"
-
-//#ifdef __cplusplus
-//extern "C" {
-//#endif
-
-//struct MagicEntry rook_magics[SQUARE_COUNT];
-//struct MagicEntry bishop_magics[SQUARE_COUNT];
-uint64_t bitCount(uint64_t value);
+#include "libchess.h"
 
 // Generate attack mask for rook
 static uint64_t get_rook_attack_mask(int square) {
@@ -104,6 +97,29 @@ static void generate_occupancy_variations(uint64_t mask, uint64_t *variations, i
   }
 }
 
+uint64_t LineThrough[64][64];
+
+void initLineThrough() {
+  for (Square sq1 = SquareA1; sq1 < SquareNone; ++sq1) {
+    for (Square sq2 = SquareA1; sq2 < SquareNone; ++sq2) {
+      LineThrough[sq1][sq2] = 0; // Default to 0 if not on the same line
+      if (sq1 == sq2) continue;
+
+      uint64_t bit1 = SQ_BIT(sq1);
+      uint64_t bit2 = SQ_BIT(sq2);
+
+      // Are they on a straight line (rank or file)?
+      if (get_rook_moves(sq1, 0) & bit2) {
+        LineThrough[sq1][sq2] = (get_rook_moves(sq1, 0) & get_rook_moves(sq2, 0)) | bit1 | bit2;
+      }
+      // Are they on a diagonal?
+      else if (get_bishop_moves(sq1, 0) & bit2) {
+        LineThrough[sq1][sq2] = (get_bishop_moves(sq1, 0) & get_bishop_moves(sq2, 0)) | bit1 | bit2;
+      }
+    }
+  }
+}
+
 void init_magic_bitboards(void) {
   for (int square = 0; square < SQUARE_COUNT; square++) {
     // Initialize rook magics
@@ -149,6 +165,7 @@ void init_magic_bitboards(void) {
       bishop_magics[square].move_table[index] = moves;
     }
   }
+  initLineThrough();
 }
 
 void cleanup_magic_bitboards(void) {
@@ -169,7 +186,3 @@ uint64_t get_bishop_moves(int square, uint64_t occupancy) {
   uint64_t index = ((occupancy & magic->attack_mask) * magic->magic_number) >> (64 - magic->relevant_bits);
   return magic->move_table[index];
 }
-
-//#ifdef __cplusplus
-//}
-//#endif

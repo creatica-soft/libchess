@@ -1,7 +1,7 @@
 #include "creatica.hpp"
 
-extern std::mutex mtx, log_mtx, print_mtx, pool_mutex, search_done_mtx, probe_mutex;
-extern std::shared_mutex map_mutex;
+extern std::mutex mtx, log_mtx, print_mtx, pool_mutex, search_done_mtx;//, nnue_cache_mutex;
+//extern std::shared_mutex map_mutex;
 extern std::condition_variable cv, pool_cv, pool_done_cv, cv_search_done;
 extern std::atomic<bool> searchFlag;
 extern std::atomic<bool> stopFlag;
@@ -26,9 +26,10 @@ extern double exploration_min;
 extern double exploration_max;
 extern double exploration_depth_decay;
 //extern double probability_mass;
-extern double virtual_loss;
+//extern double virtual_loss;
 extern double eval_scale;
 extern double temperature;
+//extern std::unordered_map<uint64_t, double> nnue_cache; //too much waste because of contention
 
 extern std::string last_move;
 extern std::unordered_set<unsigned long long> position_history;
@@ -36,9 +37,9 @@ extern Board board;
 extern ZobristHash zh;
 extern Zobrist z;
 extern Engine chessEngine;
-extern MCTSSearch search;
+//extern MCTSSearch search;
 extern std::vector<std::thread> pool_threads;
-extern std::vector<ThreadParams> pool_params;
+extern std::vector<ThreadParams *> pool_params;
 using json = nlohmann::json;
 
 void log_file(const char * message, ...) {
@@ -133,7 +134,9 @@ void search_thread_func() {
         cv.wait(lock, [] { return searchFlag.load() || quitFlag.load(); }); // Wait for "go" or "quit"
         lock.unlock();
         if (quitFlag.load()) {
-          cleanup();
+          for (int i = 0; i < chessEngine.optionSpin[Threads].value; i++) {
+            cleanup(i);
+          }
           position_history.clear();
           break;
         }
@@ -266,8 +269,9 @@ void handleOption(char * command) {
               //case ProbabilityMass:
               //  probability_mass = static_cast<double>(chessEngine.optionSpin[ProbabilityMass].value) * 0.01;
               //  break;
-              case VirtualLoss:
-                virtual_loss = static_cast<double>(chessEngine.optionSpin[VirtualLoss].value) * 0.1;
+              case Threads:
+                shutdown_thread_pool();
+                init_thread_pool(chessEngine.optionSpin[Threads].value);
                 break;
               case EvalScale:
                 eval_scale = static_cast<double>(chessEngine.optionSpin[EvalScale].value) * 0.1;
@@ -319,7 +323,9 @@ void handleEval(void) {
 }
 
 void handleNewGame() {
-  cleanup();
+  for (int i = 0; i < chessEngine.optionSpin[Threads].value; i++) {
+    cleanup(i);
+  }
   position_history.clear();
   last_move.clear();
 }
@@ -504,8 +510,8 @@ void handleGo(char * command) {
         return; //no need to query table bases for the opponent
       }        
       best_move[0] = '\0';
-      unsigned int ep = enPassantLegal(board);     
-      unsigned int result = tb_probe_root(board.side[ColorWhite], board.side[ColorBlack], board.pieceTypes[King - 1], board.pieceTypes[Queen - 1], board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1], board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1], board.halfmoveClock, 0, ep == SquareNone ? 0 : ep, OPP_COLOR(board.sideToMove) == ColorBlack ? 1 : 0, NULL);
+      unsigned int ep = legalEnPassantMove(board);     
+      unsigned int result = tb_probe_root(board.side[ColorWhite], board.side[ColorBlack], board.pieceTypes[King - 1], board.pieceTypes[Queen - 1], board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1], board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1], board.halfmoveClock, 0, ep == SquareNone ? 0 : ep, (board.sideToMove ^ 1) == ColorBlack ? 1 : 0, NULL);
       if (result == TB_RESULT_FAILED) {
           log_file("handleGo() error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, numberOfPieces %u\n", TB_LARGEST, numberOfPieces);
           exit(-1);
@@ -563,11 +569,11 @@ void handleQuit(void) {
 }
 
 void setEngineOptions() {
-    strcpy(chessEngine.id, "Creatica Chess Engine 1.0");
+    strcpy(chessEngine.id, "Creatica (MCT Parallel Roots)");
     strcpy(chessEngine.authors, "Arkadi Poliakevitch");
     chessEngine.numberOfCheckOptions = 3;
 	  chessEngine.numberOfComboOptions = 0;
-	  chessEngine.numberOfSpinOptions = 10;
+	  chessEngine.numberOfSpinOptions = 9;
 		chessEngine.numberOfStringOptions = 1;
 		chessEngine.numberOfButtonOptions = 0;
 	  strcpy(chessEngine.optionCheck[Ponder].name, "Ponder");
@@ -628,11 +634,11 @@ void setEngineOptions() {
 	  chessEngine.optionSpin[ExplorationDepthDecay].value = chessEngine.optionSpin[ExplorationDepthDecay].defaultValue;
 	  chessEngine.optionSpin[ExplorationDepthDecay].min = 0;
 	  chessEngine.optionSpin[ExplorationDepthDecay].max = 10;
-	  strcpy(chessEngine.optionSpin[VirtualLoss].name, "VirtualLoss");
-	  chessEngine.optionSpin[VirtualLoss].defaultValue = VIRTUAL_LOSS;
-	  chessEngine.optionSpin[VirtualLoss].value = chessEngine.optionSpin[VirtualLoss].defaultValue;
-	  chessEngine.optionSpin[VirtualLoss].min = 0;
-	  chessEngine.optionSpin[VirtualLoss].max = 100;
+	  //strcpy(chessEngine.optionSpin[VirtualLoss].name, "VirtualLoss");
+	  //chessEngine.optionSpin[VirtualLoss].defaultValue = VIRTUAL_LOSS;
+	  //chessEngine.optionSpin[VirtualLoss].value = chessEngine.optionSpin[VirtualLoss].defaultValue;
+	  //chessEngine.optionSpin[VirtualLoss].min = 0;
+	  //chessEngine.optionSpin[VirtualLoss].max = 100;
 	  strcpy(chessEngine.optionSpin[PVPlies].name, "PVPlies");
 	  chessEngine.optionSpin[PVPlies].defaultValue = PV_PLIES;
 	  chessEngine.optionSpin[PVPlies].value = chessEngine.optionSpin[PVPlies].defaultValue;
@@ -662,7 +668,7 @@ void setEngineOptions() {
     exploration_max = static_cast<double>(chessEngine.optionSpin[ExplorationMax].value) * 0.01;
     exploration_depth_decay = static_cast<double>(chessEngine.optionSpin[ExplorationDepthDecay].value) * 0.01;
     //probability_mass = static_cast<double>(chessEngine.optionSpin[ProbabilityMass].value) * 0.01;
-    virtual_loss = static_cast<double>(chessEngine.optionSpin[VirtualLoss].value) * 0.1;
+    //virtual_loss = static_cast<double>(chessEngine.optionSpin[VirtualLoss].value) * 0.1;
     eval_scale = static_cast<double>(chessEngine.optionSpin[EvalScale].value) * 0.1;
     temperature = static_cast<double>(chessEngine.optionSpin[Temperature].value) * 0.01; //used in calculating probabilities for moves in softmax exp((eval - max_eval)/temperature) / eval_sum
                           //can be tuned so that values < 1.0 sharpen the distribution and values > 1.0 flatten it
@@ -671,9 +677,12 @@ void setEngineOptions() {
 void shutdown_thread_pool() {
     pool_quit.store(true);
     pool_cv.notify_all(); // Wake everyone up so they see the quit flag
+    int thread_id = 0;
     for (auto& t : pool_threads) {
         if (t.joinable()) t.join();
+        delete pool_params[thread_id++];
     }
+    pool_params.clear();
     pool_threads.clear();
 }
 
@@ -694,27 +703,20 @@ void persistent_worker_func(int thread_id) {
         if (pool_quit.load()) break;
         if (pool_generation.load() == local_generation) continue;
         local_generation = pool_generation.load();
-        ThreadParams params = pool_params[thread_id];
+        ThreadParams * params = pool_params[thread_id];
         auto iter_start = std::chrono::steady_clock::now();
         double elapsed = 0.0;
-        //std::unordered_set<unsigned long long> pos_history;
-        //Board tmp_board = *board;
-        //ZobristHash tmp_hash = *zh;
-        //double res = position_eval(&tmp_board, &tmp_hash, &ctx, pos_history);
-        //search.root.cp.store(static_cast<int>(res * 100), std::memory_order_relaxed);
-        //search.root.N.store(1, std::memory_order_relaxed);
-        //search.root.W.store(tanh(res / eval_scale), std::memory_order_relaxed);      
                 
         while (depth.load(std::memory_order_relaxed) < chessEngine.depth &&
-              elapsed < (params.time_alloc * 0.001) &&
+              elapsed < (params->time_alloc * 0.001) &&
               !stopFlag.load(std::memory_order_relaxed) &&
               hash_full.load(std::memory_order_relaxed) < 1000) {
       
-            mcts_search(params, ctx); 
+            mcts_search(thread_id, ctx); 
             int expected = seldepth.load(std::memory_order_relaxed);
-            while (params.seldepth > expected && !seldepth.compare_exchange_strong(expected, params.seldepth, std::memory_order_relaxed)) expected = seldepth.load(std::memory_order_relaxed);
+            while (params->seldepth > expected && !seldepth.compare_exchange_strong(expected, params->seldepth, std::memory_order_relaxed)) expected = seldepth.load(std::memory_order_relaxed);
             if ((chessEngine.depth && depth.load(std::memory_order_relaxed) >= chessEngine.depth) || 
-                (chessEngine.nodes && search.root->N.load(std::memory_order_relaxed) >= chessEngine.nodes)) {
+                (chessEngine.nodes && params->nodes[0].N >= chessEngine.nodes)) {
                  break;
             }
             elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
@@ -724,16 +726,20 @@ void persistent_worker_func(int thread_id) {
     free_nnue_context(ctx);
 }
 
-void init_thread_pool(int num_threads) {
+void init_thread_pool(const int num_threads) {
     // Stop existing threads if any
     shutdown_thread_pool();
 
     pool_quit.store(false);
     pool_generation.store(0);
-    pool_params.resize(num_threads);
 
-    for (int i = 0; i < num_threads; ++i) 
+    for (int i = 0; i < num_threads; ++i) {
+      ThreadParams * params = new ThreadParams();
+      params->nodes.reserve(MAX_NODES);
+      params->nnue_cache.reserve(1000000);
+      pool_params.push_back(params);
       pool_threads.emplace_back(persistent_worker_func, i);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -744,12 +750,26 @@ int main(int argc, char **argv) {
     init_magic_bitboards();
     init_nnue("nn-1c0000000000.nnue", "nn-37f18f62d772.nnue");
     //init_nnue("nn-1111cefa1111.nnue", "nn-37f18f62d772.nnue");
+    //nnue_cache.reserve(1000000);
     setEngineOptions();
     curl_global_init(CURL_GLOBAL_DEFAULT);
     init_thread_pool(chessEngine.optionSpin[Threads].value);
 
     std::thread search_thread(search_thread_func);
-    uciLoop();
+ 
+    if (argc == 2 && std::string(argv[1]) == "bench") {
+      char pos[18] = "position startpos";
+      handlePosition(pos);
+      char go[18] = "go movetime 30000";
+      handleGo(go);
+      if (searchFlag.load()) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [] { return !searchFlag.load(); }); // Wait for search to stop
+      }      
+      handleQuit();
+    } else {
+      uciLoop();
+    }
     search_thread.join();
     
     shutdown_thread_pool();

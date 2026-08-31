@@ -1,6 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
+  Copyright (C) 2004-2026 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -26,7 +26,7 @@
 
 namespace Stockfish {
 
-class Position;
+//class Position;
 
 namespace Eval {
 
@@ -34,7 +34,7 @@ namespace Eval {
 // for the build process (profile-build and fishtest) to work. Do not change the
 // name of the macro or the location where this macro is defined, as it is used
 // in the Makefile/Fishtest.
-#define EvalFileDefaultNameBig "nn-1c0000000000.nnue"
+#define EvalFileDefaultNameBig "nn-c288c895ea92.nnue"
 #define EvalFileDefaultNameSmall "nn-37f18f62d772.nnue"
 
 namespace NNUE {
@@ -46,27 +46,29 @@ class AccumulatorStack;
 //std::string trace(Position& pos, const Eval::NNUE::Networks& networks);
 std::string trace(Board& board, const Eval::NNUE::Networks& networks);
 
-//int   simple_eval(const Position& pos);
-int   simple_eval(const Board& board);
-//bool  use_smallnet(const Position& pos);
+/*int   simple_eval(const Position& pos);
+bool  use_smallnet(const Position& pos);
+Value evaluate(const NNUE::Networks&          networks,
+               const Position&                pos,
+               Eval::NNUE::AccumulatorStack&  accumulators,
+               Eval::NNUE::AccumulatorCaches& caches,
+               int                            optimism);*/
+int simple_eval(const Board& board);               
 bool  use_smallnet(const Board& board);
-/*Value evaluate(const NNUE::Networks& networks, const Position& pos, Eval::NNUE::AccumulatorStack&  accumulators,
-                 Eval::NNUE::AccumulatorCaches& caches, int optimism);*/
-Value evaluate(const NNUE::Networks& networks, const Board& board, Eval::NNUE::AccumulatorStack&  accumulators,
-               Eval::NNUE::AccumulatorCaches& caches, int optimism);
-}  // namespace Eval
+Value evaluate(const NNUE::Networks&          networks,
+               const Board&                board,
+               Eval::NNUE::AccumulatorStack&  accumulators,
+               Eval::NNUE::AccumulatorCaches& caches,
+               int                            optimism);      
 
 struct WinRateParams {
     double a;
     double b;
 };
 
-//WinRateParams win_rate_params(const Position& pos);
-WinRateParams win_rate_params(const Board& board);
-//int win_rate_model(Value v, const Position& pos);
-int win_rate_model(Value v, const Board& board);
-//Value to_cp(Value v, const Position& pos);
-Value to_cp(Value v, const Board& pos);
+Value to_cp(Value v, const Board& board);
+         
+}  // namespace Eval
 
 }  // namespace Stockfish
 
