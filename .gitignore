@@ -26,6 +26,8 @@ Makefile
 /test_smp
 /test_tb
 /tournament
+/bench_priors
+/bench_encode
 
 # ---- nets, models, datasets, logs (large, regenerable or external) ----
 *.nnue
