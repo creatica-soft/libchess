@@ -1,6 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
+  Copyright (C) 2004-2026 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -32,8 +32,9 @@
 #include "nnue/nnue_misc.h"
 //#include "position.h"
 #include "types.h"
-#include "uci.h"
+//#include "uci.h"
 #include "nnue/nnue_accumulator.h"
+#include "board.h"
 
 namespace Stockfish {
 
@@ -42,47 +43,25 @@ namespace Stockfish {
 // an approximation of the material advantage on the board in terms of pawns.
 /*int Eval::simple_eval(const Position& pos) {
     Color c = pos.side_to_move();
-    return PawnValue * (pos.count<PAWN>(c) - pos.count<PAWN>(~c))
-         + (pos.non_pawn_material(c) - pos.non_pawn_material(~c));
+    return PawnValue * (pos.count<PAWN>(c) - pos.count<PAWN>(~c)) + pos.non_pawn_material(c)
+         - pos.non_pawn_material(~c);
 }*/
-
-unsigned long lsBit(unsigned long long b) {
-	if (b == 0) return 64;
-#ifdef _MSC_VER
-	unsigned long index;
-	_BitScanForward64(&index, b); // equivalent to __builtin_ctzl
-	return index;
-#else
-	return __builtin_ctzll(b);
-#endif
-}
-
-unsigned long long bitCount(unsigned long long value) {
-#ifdef _MSC_VER
-	return __popcnt64(value); // equivalent to __builtin_popcountl
-#else
-  return __builtin_popcountll(value);
-#endif
-}
-
 
 int Eval::simple_eval(const Board& board) {
     int c = board.sideToMove;
-    int pawns = bitCount(board.pieceTypes[PAWN - 1] & board.side[c]);
-    int opp_pawns = bitCount(board.pieceTypes[PAWN - 1] & board.side[c ^ 1]);
+    int pawns = popcount(board.pieceTypes[PAWN - 1] & board.side[c]);
+    int opp_pawns = popcount(board.pieceTypes[PAWN - 1] & board.side[c ^ 1]);
     unsigned long long non_pawns = (board.side[c]) ^ board.pieceTypes[PAWN - 1];
     int np = 0;
     while (non_pawns) {
-      int sq = lsBit(non_pawns);
+      int sq = pop_lsb(non_pawns);
       np += PieceValue[board.piecesOnSquares[sq]];
-      non_pawns &= non_pawns - 1;
     }
     unsigned long long opp_non_pawns = (board.side[c ^ 1]) ^ board.pieceTypes[PAWN - 1];
     int opp_np = 0;
     while (opp_non_pawns) {
-      int sq = lsBit(opp_non_pawns);
+      int sq = pop_lsb(opp_non_pawns);
       opp_np += PieceValue[board.piecesOnSquares[sq]];
-      opp_non_pawns &= opp_non_pawns - 1;
     }
     return PawnValue * (pawns - opp_pawns) + (np - opp_np);
 }
@@ -98,32 +77,32 @@ bool Eval::use_smallnet(const Board& board) { return std::abs(simple_eval(board)
                      Eval::NNUE::AccumulatorCaches& caches,
                      int                            optimism) {
 
-    if (pos.checkers()) return 0;
+    assert(!pos.checkers());
 
     bool smallNet           = use_smallnet(pos);
-    auto [psqt, positional] = smallNet ? networks.small.evaluate(pos, accumulators, &caches.small)
-                                       : networks.big.evaluate(pos, accumulators, &caches.big);
+    auto [psqt, positional] = smallNet ? networks.small.evaluate(pos, accumulators, caches.small)
+                                       : networks.big.evaluate(pos, accumulators, caches.big);
 
-    Value nnue = (125 * psqt + 131 * positional) / 128; //scaled nnue
+    Value nnue = (125 * psqt + 131 * positional) / 128;
 
     // Re-evaluate the position when higher eval accuracy is worth the time spent
-    if (smallNet && (std::abs(nnue) < 236))
+    if (smallNet && (std::abs(nnue) < 277))
     {
-        std::tie(psqt, positional) = networks.big.evaluate(pos, accumulators, &caches.big);
-        nnue                       = (125 * psqt + 131 * positional) / 128; //scaled nnue
+        std::tie(psqt, positional) = networks.big.evaluate(pos, accumulators, caches.big);
+        nnue                       = (125 * psqt + 131 * positional) / 128;
         smallNet                   = false;
     }
 
     // Blend optimism and eval with nnue complexity
     int nnueComplexity = std::abs(psqt - positional);
-    optimism += optimism * nnueComplexity / 468;
-    nnue -= nnue * nnueComplexity / 18000;
+    optimism += optimism * nnueComplexity / 476;
+    nnue -= nnue * nnueComplexity / 18236;
 
-    int material = 535 * pos.count<PAWN>() + pos.non_pawn_material();
-    int v        = (nnue * (77777 + material) + optimism * (7777 + material)) / 77777;
+    int material = 534 * pos.count<PAWN>() + pos.non_pawn_material();
+    int v        = (nnue * (77871 + material) + optimism * (7191 + material)) / 77871;
 
     // Damp down the evaluation linearly when shuffling
-    v -= v * pos.rule50_count() / 212;
+    v -= v * pos.rule50_count() / 199;
 
     // Guarantee evaluation does not hit the tablebase range
     v = std::clamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
@@ -131,75 +110,56 @@ bool Eval::use_smallnet(const Board& board) { return std::abs(simple_eval(board)
     return v;
 }*/
 
-Value Eval::evaluate(const Eval::NNUE::Networks& networks,
-                     const Board& board,
-                     Eval::NNUE::AccumulatorStack& accumulators,
-                     Eval::NNUE::AccumulatorCaches& caches,
-                     int optimism) {
+Value Eval::evaluate(const Eval::NNUE::Networks& networks, const Board& board, Eval::NNUE::AccumulatorStack&  accumulators, Eval::NNUE::AccumulatorCaches& caches, int optimism) {
 
-    if (board.isCheck) return 0;
+    //assert(!pos.checkers());
+    assert(!board.isCheck);
 
     bool smallNet = use_smallnet(board);
-    auto [psqt, positional] = smallNet ? networks.small.evaluate(board, accumulators, &caches.small)
-                                       : networks.big.evaluate(board, accumulators, &caches.big);
+    auto [psqt, positional] = smallNet ? networks.small.evaluate(board, accumulators, caches.small) : networks.big.evaluate(board, accumulators, caches.big);
 
-    Value nnue = (125 * psqt + 131 * positional) / 128; //scaled nnue
+    Value nnue = (125 * psqt + 131 * positional) / 128; //uses different weigths compared to trace where v = psqt + positional
 
     // Re-evaluate the position when higher eval accuracy is worth the time spent
-    if (smallNet && (std::abs(nnue) < 236))
-    {
-        std::tie(psqt, positional) = networks.big.evaluate(board, accumulators, &caches.big);
-        nnue                       = (125 * psqt + 131 * positional) / 128; //scaled nnue
-        smallNet                   = false;
+    if (smallNet && (std::abs(nnue) < 277)) {
+        std::tie(psqt, positional) = networks.big.evaluate(board, accumulators, caches.big);
+        nnue = (125 * psqt + 131 * positional) / 128;
+        smallNet = false;
     }
 
     // Blend optimism and eval with nnue complexity
     int nnueComplexity = std::abs(psqt - positional);
-    optimism += optimism * nnueComplexity / 468;
-    nnue -= nnue * nnueComplexity / 18000;
+    optimism += optimism * nnueComplexity / 476;
+    nnue -= nnue * nnueComplexity / 18236; //I guess some kind of conservative measure proportional to complexity
 
-    int pawns = bitCount(board.pieceTypes[PAWN - 1]);
+    //int material = 534 * pos.count<PAWN>() + pos.non_pawn_material();
+    int pawns = popcount(board.pieceTypes[PAWN - 1]);
     unsigned long long non_pawns = ((board.side[WHITE] | board.side[BLACK])) ^ board.pieceTypes[PAWN - 1];
     int np = 0;
     while (non_pawns) {
-      int sq = lsBit(non_pawns);
+      int sq = pop_lsb(non_pawns);
       np += PieceValue[board.piecesOnSquares[sq]];
-      non_pawns &= non_pawns - 1;
     }
-    int material = 535 * pawns + np;
-    int v = (nnue * (77777 + material) + optimism * (7777 + material)) / 77777;
+    int material = 534 * pawns + np;
+    //printf("Eval::evaluate() debug: material %d\n", material);
+    int v = (nnue * (77871 + material) + optimism * (7191 + material)) / 77871; //adding material to nnue eval
 
     // Damp down the evaluation linearly when shuffling
-    v -= v * board.halfmoveClock / 212;
-
+    //v -= v * pos.rule50_count() / 199;
+    v -= v * board.halfmoveClock / 199;
+    
     // Guarantee evaluation does not hit the tablebase range
     v = std::clamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 
     return v;
 }
 
-/*WinRateParams win_rate_params(const Position& pos) {
-    int material = pos.count<PAWN>() + 3 * pos.count<KNIGHT>() + 3 * pos.count<BISHOP>() + 5 * pos.count<ROOK>() + 9 * pos.count<QUEEN>();
-
-    // The fitted model only uses data for material counts in [17, 78], and is anchored at count 58.
-    double m = std::clamp(material, 17, 78) / 58.0;
-
-    // Return a = p_a(material) and b = p_b(material), see github.com/official-stockfish/WDL_model
-    constexpr double as[] = {-13.50030198, 40.92780883, -36.82753545, 386.83004070};
-    constexpr double bs[] = {96.53354896, -165.79058388, 90.89679019, 49.29561889};
-
-    double a = (((as[0] * m + as[1]) * m + as[2]) * m) + as[3];
-    double b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
-
-    return {a, b};
-}*/
-
-WinRateParams win_rate_params(const Board& board) {
-    int pawns = bitCount(board.pieceTypes[PAWN - 1]); 
-    int knights = bitCount(board.pieceTypes[KNIGHT - 1]);
-    int bishops = bitCount(board.pieceTypes[BISHOP - 1]);
-    int rooks = bitCount(board.pieceTypes[ROOK - 1]);
-    int queens = bitCount(board.pieceTypes[QUEEN - 1]);
+Eval::WinRateParams win_rate_params(const Board& board) {
+    int pawns = popcount(board.pieceTypes[PAWN - 1]); 
+    int knights = popcount(board.pieceTypes[KNIGHT - 1]);
+    int bishops = popcount(board.pieceTypes[BISHOP - 1]);
+    int rooks = popcount(board.pieceTypes[ROOK - 1]);
+    int queens = popcount(board.pieceTypes[QUEEN - 1]);
     int material = pawns + 3 * knights + 3 * bishops + 5 * rooks + 9 * queens;
     //printf("win_rate_params() debug: pawns %d, knights %d, bishops %d, rooks %d, queens %d, total material %d\n", pawns, knights, bishops, rooks, queens, material);
 
@@ -247,10 +207,11 @@ int win_rate_model(Value v, const Board& board) {
     return std::round(100 * int(v) / a);
 }*/
 
-Value to_cp(Value v, const Board& board) {
+Value Eval::to_cp(Value v, const Board& board) {
     auto [a, b] = win_rate_params(board);
     return std::round(100 * int(v) / a);
 }
+
 
 // Like evaluate(), but instead of returning a value, it returns
 // a string (suitable for outputting to stdout) that contains the detailed
@@ -261,8 +222,8 @@ Value to_cp(Value v, const Board& board) {
     if (pos.checkers())
         return "Final evaluation: none (in check)";
 
-    Eval::NNUE::AccumulatorStack accumulators;
-    auto  caches = std::make_unique<Eval::NNUE::AccumulatorCaches>(networks);
+    auto accumulators = std::make_unique<Eval::NNUE::AccumulatorStack>();
+    auto caches       = std::make_unique<Eval::NNUE::AccumulatorCaches>(networks);
 
     std::stringstream ss;
     ss << std::showpoint << std::noshowpos << std::fixed << std::setprecision(2);
@@ -270,38 +231,45 @@ Value to_cp(Value v, const Board& board) {
 
     ss << std::showpoint << std::showpos << std::fixed << std::setprecision(2) << std::setw(15);
 
-    auto [psqt, positional] = networks.big.evaluate(pos, accumulators, &caches->big);
-    Value v                 = psqt + positional; //unscaled nnue
+    auto [psqt, positional] = networks.big.evaluate(pos, *accumulators, caches->big);
+    Value v                 = psqt + positional;
     v                       = pos.side_to_move() == WHITE ? v : -v;
-    ss << "NNUE evaluation        " << 0.01 * to_cp(v, pos) << " (white side) [with unscaled NNUE]\n";
+    ss << "NNUE evaluation        " << 0.01 * UCIEngine::to_cp(v, pos) << " (white side)\n";
 
-    v = evaluate(networks, pos, accumulators, *caches, VALUE_ZERO);
+    v = evaluate(networks, pos, *accumulators, *caches, VALUE_ZERO);
     v = pos.side_to_move() == WHITE ? v : -v;
-    ss << "Final evaluation       " << 0.01 * to_cp(v, pos) << " (white side) [with scaled NNUE]\n";
+    ss << "Final evaluation       " << 0.01 * UCIEngine::to_cp(v, pos) << " (white side)";
+    ss << " [with scaled NNUE, ...]";
+    ss << "\n";
 
     return ss.str();
 }*/
 
 std::string Eval::trace(Board& board, const Eval::NNUE::Networks& networks) {
-    if (board.isCheck) return "Final evaluation: none (in check)";
 
-    Eval::NNUE::AccumulatorStack accumulators;
-    auto caches = std::make_unique<Eval::NNUE::AccumulatorCaches>(networks);
+    if (board.isCheck)
+        return "Final evaluation: none (in check)";
+
+    auto accumulators = std::make_unique<Eval::NNUE::AccumulatorStack>();
+    auto caches       = std::make_unique<Eval::NNUE::AccumulatorCaches>(networks);
 
     std::stringstream ss;
     ss << std::showpoint << std::noshowpos << std::fixed << std::setprecision(2);
-    ss << '\n' << NNUE::trace(board, networks, *caches) << '\n';
+    ss << '\n' << NNUE::trace(board, networks, *caches) << '\n'; //see nnue_misc.cpp
 
     ss << std::showpoint << std::showpos << std::fixed << std::setprecision(2) << std::setw(15);
 
-    auto [psqt, positional] = networks.big.evaluate(board, accumulators, &caches->big);
-    Value v                 = psqt + positional; //unscaled nnue
+    auto [psqt, positional] = networks.big.evaluate(board, *accumulators, caches->big);
+    //printf("Eval::trace() debug: network.big.evaluate() return psqt %d and positional %d\n", psqt, positional);
+    Value v                 = psqt + positional;
     v                       = board.sideToMove == WHITE ? v : -v;
-    ss << "NNUE evaluation        " << 0.01 * to_cp(v, board) << " (white side) [with unscaled NNUE]\n";
+    ss << "NNUE evaluation        " << 0.01 * to_cp(v, board) << " (white side)\n";
 
-    v = evaluate(networks, board, accumulators, *caches, VALUE_ZERO);
+    v = evaluate(networks, board, *accumulators, *caches, VALUE_ZERO); //more complex eval function that uses the above nnue eval as a starting point
     v = board.sideToMove == WHITE ? v : -v;
-    ss << "Final evaluation       " << 0.01 * to_cp(v, board) << " (white side) [with scaled NNUE]\n";
+    ss << "Final evaluation       " << 0.01 * to_cp(v, board) << " (white side)";
+    ss << " [with scaled NNUE, ...]";
+    ss << "\n";
 
     return ss.str();
 }

@@ -1,10 +1,11 @@
-//c++ -Wno-writable-strings -std=c++20 -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot.cpp -o lichess_bot
+// c++ -Wno-writable-strings -std=c++20 -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot.cpp -o lichess_bot
 
 #include <functional>
 #include <iostream>
 #include <string>
 #include <sstream>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -15,11 +16,12 @@
 #include <csignal>
 #include <random>       // For RNG in GetAndProcessBots
 #include "json.hpp"     // https://github.com/nlohmann/json
+#include "nnue/bitboard.h"
 #include "libchess.h"
 
 #define INTERMITTENT_INFO_LINES false
 #define FINAL_INFO_LINES false
-#define CREATICA_PATH "/Users/ap/libchess/creatica"
+#define CREATICA_PATH "/Users/ap/libchess/creatica-shared-root"
 #define DEPTH 0
 #define MOVETIME 0
 #define HASH 2048
@@ -27,21 +29,21 @@
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
 #define DRAW_CP 30 //accept draw if score cp is less than this value in centipawns
-#define MIN_ELO 2200
-#define MAX_ELO 2600
+#define MIN_ELO 2100
+#define MAX_ELO 2800
 #define ELO_CREATICA 2300
 #define CLOCK_LIMIT 180 //seconds
 #define CLOCK_INCREMENT 3 //seconds
 #define NUMBER_OF_BOTS 50 //number of online bots to return from the list
 #define MULTI_PV 1 //number of PVs
 #define PV_PLIES 2 //number of plies in PV
-#define EXPLORATION_MIN 60 // used in formular for exploration constant decay with depth
-#define EXPLORATION_MAX 150 //smaller value favor exploitation, i.e. deeper tree vs wider tree
-#define EXPLORATION_DEPTH_DECAY 6 //linear decay of EXPLORATION CONSTANT with depth using formula:
+#define EXPLORATION_MIN 65 // used in formular for exploration constant decay with depth
+#define EXPLORATION_MAX 160 //smaller value favor exploitation, i.e. deeper tree vs wider tree
+#define EXPLORATION_DEPTH_DECAY 5 //linear decay of EXPLORATION CONSTANT with depth using formula:
                       // C * 100 = max(EXPLORATION_MIN, (EXPLORATION_MAX - seldepth * EXPLORATION_DEPTH_DECAY))
 //#define PROBABILITY_MASS 100 //% - cumulative probability - how many moves we consider
-#define VIRTUAL_LOSS 40 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
-#define EVAL_SCALE 62 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
+#define VIRTUAL_LOSS 36 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
+#define EVAL_SCALE 61 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
 #define TEMPERATURE 58 //used in calculating probabilities for moves in get_prob() using softmax:
@@ -50,7 +52,19 @@
                         //another words, the cooler the temperature, the more distant move probabilities, and vice versa
 #define PONDER false
 
-const std::string token = "fake_token"; // Replace with real token
+//The API token is read from the environment so that it never lives in the source tree.
+//Keep it outside the repository and export it before starting the bot, e.g.
+//  export LICHESS_TOKEN="$(cat ~/.config/creatica/lichess_token)"
+static std::string load_lichess_token() {
+    const char * t = std::getenv("LICHESS_TOKEN");
+    if (!t || !*t) {
+        fprintf(stderr, "lichess_bot: LICHESS_TOKEN is not set.\n"
+                        "  export LICHESS_TOKEN=\"$(cat ~/.config/creatica/lichess_token)\"\n");
+        std::exit(1);
+    }
+    return std::string(t);
+}
+const std::string token = load_lichess_token();
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
 std::atomic<bool> challenge_accepted {false};
@@ -306,7 +320,7 @@ void GetAndProcessBots(int nb) {
                           if (BOT_USERNAME == data.value("username", "")) continue; //don't challenge itself
                           if (data.contains("perfs") && data["perfs"].contains("blitz")) {
                               int rating = data["perfs"]["blitz"].value("rating", 0);
-                              if (rating > MIN_ELO && rating < MAX_ELO) {
+                              if ((rating > MIN_ELO && rating < MAX_ELO) || data.value("username", "") == "creaticachessbot2") {
                                   Bot bot;
                                   bot.botname = data.value("username", "");
                                   bot.games = data["perfs"]["blitz"].value("games", 0);
@@ -650,7 +664,7 @@ void ProcessEvent(const json& event) {
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
             if ((!game_in_progress.load() && variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960") &&
-                (speed == "blitz" || speed == "rapid" || speed == "classical") && challenger_id == "poliakevitch" /*&& title != "BOT"*/) {
+                (speed == "blitz" || speed == "rapid" || speed == "classical") && (challenger_id == "poliakevitch" || challenger_id == "creaticachessbot2") /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -733,7 +747,8 @@ void signal_handler(int sig) {
 int main() {
   const int multiPV = MULTI_PV;
   std::signal(SIGINT, signal_handler);  // Set up Ctrl-C handler
-  init_magic_bitboards();
+  //init_magic_bitboards();
+  Stockfish::Bitboards::init();
   rng.seed(static_cast<unsigned int>(std::random_device{}()));
 
   //start chess engine process and communicate with it over stdin, stdout redirected to named pipes internally
@@ -758,7 +773,7 @@ int main() {
   releaseChessEngine(creatica);
   for (int i = 0; i < multiPV; i++) delete evaluations[i];
   curl_global_cleanup();
-  cleanup_magic_bitboards();
+  //cleanup_magic_bitboards();
   return 0;
 }
 

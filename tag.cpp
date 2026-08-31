@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "nnue/bitboard.h"
 #include "libchess.h"
 
 //#ifdef __cplusplus

@@ -1,12 +1,10 @@
-//#ifdef __cplusplus
-//extern "C" {
-//#endif
 #include <assert.h>
 #include <errno.h>
 #include <ctype.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "nnue/bitboard.h"
 #include "libchess.h"
 
 bool isEmptyLine(const char * line) {
@@ -365,10 +363,6 @@ int initGame(Game& game, FILE * file) {
 int playGame(Game& game) {
   int numberOfPlies = 0;
 	struct Board board;
-	//struct Fen fen;
-	//struct ZobristHash zh;//, zh2;
-	//zobristHash(&zh);
-	//zobristHash(&zh2); //for debugging
 	char fenString[MAX_FEN_STRING_LEN];
 	if (game.tags[FEN][0] == '\0') strcpy(fenString, startPos);
 	else strncpy(fenString, game.tags[FEN],MAX_FEN_STRING_LEN);
@@ -385,19 +379,18 @@ int playGame(Game& game) {
 	char * saveptr;
 	char * token = strtok_r(sanMoves, " ", &saveptr);
 	while (token) {
-		//uint64_t movesFromSquares[64] = {};
-    //MovesContext movesContext;
-  	//generateMoves(&board, &movesContext, getAttackedSquares(&board, &movesContext), movesFromSquares);
-  	//generateMoves(board, movesFromSquares);
+		if (strcmp(token, "1.") == 0) {
+			free(sanMoves); 
+			return 0;
+		}
     Move move = {};
-    san2move(board, token, move);
+    int err = 0;
+    if ((err = san2move(board, token, move))) {
+    	printf("playGame() error: san2move() returned error %d\n", err);
+    	exit(1);
+    }
+    isCheckMateStaleMate(board); //move generation to measure the performance of libchess
 		ff_move(board, move);
-		//updateHash(&board, &move);
-		//uint64_t hash = board.zh.hash;
-		//uint64_t hash2 = board.zh.hash2;
-		//getHash(&zh2, &board);
-		//assert(hash != board.zh.hash || hash2 != board.zh.hash2);
-		//reconcile(&board);
 		token = strtok_r(NULL, " ", &saveptr);
 		numberOfPlies++;
 	}
@@ -406,7 +399,3 @@ int playGame(Game& game) {
 	  printf("playGame() error: numberOfPlies (%d) != game.numberOfPlies (%d), SAN moves %s\n", numberOfPlies, game.numberOfPlies, game.sanMoves);
 	return 0;
 }
-
-//#ifdef __cplusplus
-//}
-//#endif

@@ -1,0 +1,46 @@
+# ---- secrets: never commit an API token again ----
+*token*.txt
+*_token*
+.env
+
+# ---- in-source CMake build artifacts ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.d
+*.a
+*.dylib
+*.so
+*.dSYM/
+
+# ---- built binaries ----
+/creatica
+/creatica-*
+!/creatica-*.cpp
+!/creatica-*.hpp
+/lichess_bot
+/test_nnue
+/test_pos
+/test_smp
+/test_tb
+/tournament
+
+# ---- nets, models, datasets, logs (large, regenerable or external) ----
+*.nnue
+*.pt
+*.bin
+*.pgn
+!/eco.pgn
+!/test.pgn
+*.log
+*.mlmodel
+*.mlpackage/
+
+# ---- python ----
+__pycache__/
+*.pyc
+
+# ---- macOS ----
+.DS_Store

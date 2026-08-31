@@ -1,4 +1,4 @@
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I /Users/ap/Downloads/libtorch2/include -I /Users/ap/Downloads/libtorch2/include/torch/csrc/api/include -L /Users/ap/Downloads/libtorch2/lib -L /Users/ap/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch2/lib,-rpath,/Users/ap/libchess -o simple_cnn_train simple_cnn_train.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I /Users/ap/Downloads/libtorch2/include -I /Users/ap/Downloads/libtorch2/include/torch/csrc/api/include -L /Users/ap/Downloads/libtorch2/lib -L /Users/ap/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch2/lib,-rpath,/Users/ap/libchess -o simple_cnn_train simple_cnn_train.cpp
 
 #include <torch/torch.h>
 #include <vector>
@@ -8,63 +8,96 @@
 #include <cstdint>
 #include <iomanip>
 #include <random>
+#include <chrono>
+#include "nnue/bitboard.h"
 #include "libchess.h"
-const float eval_scale = 620.0f; // conversion scale from cp to cnn target and back to cp from cnn output
+const float eval_scale = 600.0f; // conversion scale from cp to cnn target and back to cp from cnn output
 //target = tanh(cp / eval_scale);
 //cp = eval_scale * atanh(cnn_output);
 
-// Define a simple, fast CNN module
-struct SimpleCNNImpl : torch::nn::Module {
-    // Layers
+struct ResBlockImpl : torch::nn::Module {
     torch::nn::Conv2d conv1{nullptr};
     torch::nn::BatchNorm2d bn1{nullptr};
     torch::nn::Conv2d conv2{nullptr};
     torch::nn::BatchNorm2d bn2{nullptr};
-    torch::nn::Conv2d conv3{nullptr};
-    torch::nn::BatchNorm2d bn3{nullptr};
-    torch::nn::Linear fc1{nullptr};
-    torch::nn::Linear fc_out{nullptr};
 
-    SimpleCNNImpl() {
-        // Input channels: 15 (12 pieces + 2 attack maps + 1 legal moves)
-        // Output channels: 64 filters
-        // Kernel: 3x3, Padding: 1 (to keep 8x8 size)
-        conv1 = register_module("conv1", torch::nn::Conv2d(torch::nn::Conv2dOptions(15, 64, 3).padding(1)));
-        bn1 = register_module("bn1", torch::nn::BatchNorm2d(64));
-
-        // Layer 2: 64 -> 128 filters
-        conv2 = register_module("conv2", torch::nn::Conv2d(torch::nn::Conv2dOptions(64, 128, 3).padding(1)));
-        bn2 = register_module("bn2", torch::nn::BatchNorm2d(128));
-        
-        //Compression filter 128 -> 64
-        conv3 = register_module("conv3", torch::nn::Conv2d(torch::nn::Conv2dOptions(128, 64, 1))); 
-        bn3 = register_module("bn3", torch::nn::BatchNorm2d(64));
-
-        // Fully Connected Head
-        // Input size: 64 channels * 8 * 8 board = 4096 features, output 64, tried with 128 - was not stable
-        fc1 = register_module("fc1", torch::nn::Linear(64 * 8 * 8, 64));
-        fc_out = register_module("fc_out", torch::nn::Linear(64, 1));
+    ResBlockImpl(int channels) {
+        // 3x3 convolutions that maintain the 8x8 spatial size
+        conv1 = register_module("conv1", torch::nn::Conv2d(torch::nn::Conv2dOptions(channels, channels, 3).padding(1)));
+        bn1 = register_module("bn1", torch::nn::BatchNorm2d(channels));
+        conv2 = register_module("conv2", torch::nn::Conv2d(torch::nn::Conv2dOptions(channels, channels, 3).padding(1)));
+        bn2 = register_module("bn2", torch::nn::BatchNorm2d(channels));
     }
 
     torch::Tensor forward(torch::Tensor x) {
-        // x shape: [BatchSize, 15, 8, 8]
+        torch::Tensor identity = x; // Save the input
         
-        // Block 1: Conv -> BN -> ReLU
-        x = torch::relu(bn1(conv1(x)));
+        torch::Tensor out = torch::relu(bn1(conv1(x)));
+        out = bn2(conv2(out));
         
-        // Block 2: Conv -> BN -> ReLU
-        x = torch::relu(bn2(conv2(x)));
-        
-        // Compression
-        x = torch::relu(bn3(conv3(x)));
+        out += identity; // The "Skip Connection" - crucial for stability
+        out = torch::relu(out);
+        return out;
+    }
+};
+TORCH_MODULE(ResBlock);
 
-        // Flatten: [Batch, 64, 8, 8] -> [Batch, 4096]
+struct SimpleCNNImpl : torch::nn::Module {
+    // Initial convolution
+    torch::nn::Conv2d conv_input{nullptr};
+    torch::nn::BatchNorm2d bn_input{nullptr};
+
+    // Residual Trunk (Stacking blocks)
+    //torch::nn::Sequential res_trunk{nullptr};
+
+    // Value Head (Compression -> Flatten -> Dense)
+    torch::nn::Conv2d value_conv{nullptr};
+    torch::nn::BatchNorm2d value_bn{nullptr};
+    torch::nn::Linear value_fc1{nullptr};
+    torch::nn::Linear value_fc2{nullptr};
+
+    SimpleCNNImpl() {
+        int filters = 128; // The "width" of the network
+        //int num_blocks = 5; // The "depth" of the network
+
+        // 1. Input Block: 15 channels -> 128 channels
+        conv_input = register_module("conv_input", torch::nn::Conv2d(torch::nn::Conv2dOptions(15, filters, 7).padding(3)));
+        bn_input = register_module("bn_input", torch::nn::BatchNorm2d(filters));
+
+        // 2. Residual Trunk: 5 blocks of 128 channels
+        //res_trunk = register_module("res_trunk", torch::nn::Sequential());
+        //for (int i = 0; i < num_blocks; ++i) {
+        //    res_trunk->push_back(ResBlock(filters));
+        //}
+
+        // 3. Value Head
+        // Compress 128 channels down to 32 using a 1x1 convolution
+        // This solves your instability! It drastically reduces parameters before flattening.
+        value_conv = register_module("value_conv", torch::nn::Conv2d(torch::nn::Conv2dOptions(filters, 32, 1)));
+        value_bn = register_module("value_bn", torch::nn::BatchNorm2d(32));
+        
+        // Flatten size: 32 channels * 8 * 8 = 2048
+        value_fc1 = register_module("value_fc1", torch::nn::Linear(2048, 32));
+        value_fc2 = register_module("value_fc2", torch::nn::Linear(32, 1));
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        // Input processing
+        x = torch::relu(bn_input(conv_input(x)));
+
+        // Pass through the deep residual trunk
+        //x = res_trunk->forward(x);
+
+        // Value Head compression
+        x = torch::relu(value_bn(value_conv(x)));
+
+        // Flatten: [Batch, 32, 8, 8] -> [Batch, 2048]
         x = x.view({x.size(0), -1});
-        
-        // Dense Layers
-        x = torch::relu(fc1(x));
-        x = torch::tanh(fc_out(x)); // Output between -1 (Loss) and 1 (Win)
-        
+
+        // Dense evaluation
+        x = torch::relu(value_fc1(x));
+        x = torch::tanh(value_fc2(x)); 
+
         return x;
     }
 };
@@ -74,15 +107,15 @@ void init_resnet_weights(SimpleCNN& model) {
     torch::NoGradGuard no_grad;
 
     // 1. Initialize Input Layer
-    torch::nn::init::kaiming_normal_(model->conv2->weight, 0.0, torch::kFanIn, torch::kReLU);
+    torch::nn::init::kaiming_normal_(model->value_conv->weight, 0.0, torch::kFanIn, torch::kReLU);
     // 2. Initialize Value Head
-    torch::nn::init::kaiming_normal_(model->conv2->weight, 0.0, torch::kFanIn, torch::kReLU);
-    torch::nn::init::kaiming_normal_(model->fc1->weight);
+    torch::nn::init::kaiming_normal_(model->value_conv->weight, 0.0, torch::kFanIn, torch::kReLU);
+    torch::nn::init::kaiming_normal_(model->value_fc1->weight);
     //model->fc1->weight.data().mul_(0.01); // Scale down by 100x
     //torch::nn::init::constant_(model->fc1->bias, 0.0);
     // Xavier uniform for the final tanh-bound output
-    torch::nn::init::xavier_uniform_(model->fc_out->weight);
-    torch::nn::init::constant_(model->fc_out->bias, 0.0);
+    torch::nn::init::xavier_uniform_(model->value_fc2->weight);
+    torch::nn::init::constant_(model->value_fc2->bias, 0.0);
 }
 
 
@@ -138,7 +171,7 @@ bool read_next_position(BitReader& reader, CompressedPosition& pos) {
     if (reader.eof()) return false;
 
     // 1. Clear the board
-    std::fill(std::begin(pos.piecesOnSquares), std::end(pos.piecesOnSquares), 0);
+    std::fill(std::begin(pos.piecesOnSquares), std::end(pos.piecesOnSquares), 7); //PieceNone
 
     // 2. Read Number of Pieces (5 bits); we subtracted 1 during encoding to allow 32 pieces using 5 bits, here we need to add 1
     int num_pieces = reader.read(5) + 1;
@@ -148,7 +181,7 @@ bool read_next_position(BitReader& reader, CompressedPosition& pos) {
         int square = reader.read(6);
         int color = reader.read(1);
         int type = reader.read(3);
-        pos.piecesOnSquares[square] = PC(color, type);
+        pos.piecesOnSquares[square] = (color << 3) | type;
     }
 
     // 4. Global State
@@ -166,200 +199,199 @@ bool read_next_position(BitReader& reader, CompressedPosition& pos) {
     return true;
 }
 
+/*uint64_t flip_vertical(uint64_t b) {
+    return  (b << 56) |
+            ((b << 40) & 0x00ff000000000000ULL) |
+            ((b << 24) & 0x0000ff0000000000ULL) |
+            ((b << 8) & 0x000000ff00000000ULL) |
+            ((b >> 8) & 0x00000000ff000000ULL) |
+            ((b >> 24) & 0x0000000000ff0000ULL) |
+            ((b >> 40) & 0x000000000000ff00ULL) |
+            (b >> 56);
+}*/
+
+/*struct CastlingCNN {
+    bool friendly_ks, friendly_qs;
+    bool enemy_ks, enemy_qs;
+};
+
+CastlingCNN get_normalized_castling(const Board& board) {
+    CastlingCNN c = {false, false, false, false};
+
+    if (board.sideToMove == White) {
+        c.friendly_ks = board.castling & 1;
+        c.friendly_qs = board.castling & 2;
+        c.enemy_ks    = board.castling & 4;
+        c.enemy_qs    = board.castling & 8;
+    } else {
+        // Swap White's rights into Enemy slots, 
+        // and Black's rights into Friendly slots.
+        c.friendly_ks = board.castling & 4;
+        c.friendly_qs = board.castling & 8;
+        c.enemy_ks    = board.castling & 1;
+        c.enemy_qs    = board.castling & 2;
+    }
+    return c;
+}*/
+
 // --- 1. Define the Custom Dataset ---
 class ChessDataset : public torch::data::datasets::Dataset<ChessDataset> {
 private:
-    std::vector<CompressedPosition> samples;
+  std::vector<CompressedPosition> samples;
 public:
-    ChessDataset(const std::string& filepath) {
-        std::cout << "Opening dataset: " << filepath << "..." << std::endl;
-        std::ifstream file(filepath, std::ios::binary);
-        if (!file.is_open()) {
-            throw std::runtime_error("Could not open file!");
-        }
-
-        BitReader reader(file);
-        CompressedPosition pos;
-        int cp_min = 1000, cp_max = -1000;
-        
-        int count = 0;
-        while (read_next_position(reader, pos)) {
-            samples.push_back(pos);
-            cp_min = std::min(cp_min, pos.eval_cp);
-            cp_max = std::max(cp_max, pos.eval_cp);
-            count++;
-            if (count % 1000000 == 0) std::cout << "Loaded " << count << " positions. cp_min " << cp_min << ", cp_max " << cp_max << "\n" << std::flush;
-        }
-        std::cout << "Finished loading " << samples.size() << " positions. cp_min " << cp_min << ", cp_max " << cp_max << std::endl;
-
-    }
-    // The "Hot" Path: Converts 1 struct into Tensors (Input + Label)
-    torch::data::Example<> get(size_t index) override {
-        const CompressedPosition& pos = samples[index];
-        Board board = {};
-        board.sideToMove = (Color)pos.side_to_move;
-        board.enPassant = (File)pos.ep_file;
-        if (pos.castling_rights & 1) board.castlingRook[0][0] = FileH;
-        else board.castlingRook[0][0] = FileNone;
-        if (pos.castling_rights & 2) board.castlingRook[0][1] = FileA;
-        else board.castlingRook[0][1] = FileNone;
-        if (pos.castling_rights & 4) board.castlingRook[1][0] = FileH;
-        else board.castlingRook[1][0] = FileNone;
-        if (pos.castling_rights & 8) board.castlingRook[1][1] = FileA;
-        else board.castlingRook[1][1] = FileNone;
-
-        for(int sq = 0; sq < 64; ++sq) {
-            board.piecesOnSquares[sq] = (Piece)pos.piecesOnSquares[sq];
-            Piece pc = (Piece)pos.piecesOnSquares[sq];
-            PieceType type = PC_TYPE(pc);
-            Color color = PC_COLOR(pc);
-            if (type != PieceTypeNone) {
-              board.side[color] |= (1ULL << sq);
-              board.pieceTypes[type - 1] |= (1ULL << sq);
-            }
-        }
-        
-    		struct MovesContext movesContext;
-    		unsigned long long movesFromSquares[64] = {0};
-    		unsigned long long whiteAttacks, blackAttacks, legalMoves = 0;
-    		if (board.sideToMove == ColorWhite) {
-    		  board.sideToMove = ColorBlack;
-    		  whiteAttacks = getAttackedSquaresOnly(&board);
-    		  board.sideToMove = ColorWhite;
-    		  blackAttacks = getAttackedSquares(&board, &movesContext);
-      		generateMoves(&board, &movesContext, blackAttacks, movesFromSquares);
-    		} else {
-    		  board.sideToMove = ColorWhite;
-    		  blackAttacks = getAttackedSquaresOnly(&board);
-    		  board.sideToMove = ColorBlack;
-    		  whiteAttacks = getAttackedSquares(&board, &movesContext);
-      		generateMoves(&board, &movesContext, whiteAttacks, movesFromSquares);
-    		}
-        
-        // 3. Create the Tensor (16 channels x 8 x 8)
- /*       torch::Tensor input = torch::zeros({16, 8, 8}, torch::kFloat32);
-        
-        // Pointers to raw data for fast access
-        float* data = input.data_ptr<float>();
-
-        for(int sq = 0; sq < 64; ++sq) {
-            Piece pc = (Piece)pos.piecesOnSquares[sq];
-            if (pc != 0) {
-              Color color = PC_COLOR(pc);
-              PieceType type  = PC_TYPE(pc);
-              int channel =  color * 6 + (type - 1);
-              data[(channel << 6) | sq] = 1.0f;
-            }
-            
-            // Fill Attack Planes (Channels 12, 13)
-            if ((whiteAttacks >> sq) & 1) data[(12 << 6) | sq] = 1.0f;
-            if ((blackAttacks >> sq) & 1) data[(13 << 6)| sq] = 1.0f;
-
-            // Fill Legal Move Plane (Channel 14)
-            if ((movesFromSquares[sq] >> sq) & 1) data[(14 << 6) | sq] = 1.0f;
-
-            // Fill Meta Plane (Channel 15 - Side to Move)
-            data[(15 << 6) | sq] = (pos.side_to_move == 0) ? 1.0f : -1.0f;
-        }
-*/
-
-        //board is oriented for the side to move perspective to help the model learn it from that side
-        torch::Tensor input = torch::zeros({15, 8, 8}, torch::kFloat32);
-        
-        // Pointers to raw data for fast access
-        float* data = input.data_ptr<float>();
-        
-        bool is_black = (pos.side_to_move == ColorBlack);
-        
-        for(int sq = 0; sq < 64; ++sq) {
-            // 1. Flip the square index if it's Black's turn
-            // sq ^ 56 maps rank 0 to rank 7, rank 1 to rank 6, etc.
-            int input_sq = is_black ? (sq ^ 56) : sq;
-        
-            int pc = pos.piecesOnSquares[sq];
-            if (pc != 0) {
-                int color = (pc >> 3) & 1;
-                int type  = pc & 7;
-        
-                // 2. Swap piece colors: If it's Black's turn, Black's pieces 
-                // go into the "Friendly" channels (0-5).
-                int input_color = is_black ? (1 - color) : color;
-                int channel = input_color * 6 + (type - 1);
-                
-                data[(channel << 6) | input_sq] = 1.0f;
-            }
-            
-            // 1. Determine which bitboard belongs to 'Friendly' (side to move)
-            uint64_t friendlyAttacks = is_black ? blackAttacks : whiteAttacks;
-            uint64_t enemyAttacks    = is_black ? whiteAttacks : blackAttacks;
-            
-            // 2. Fill the planes using the flipped coordinate (input_sq)
-            if ((friendlyAttacks >> sq) & 1) data[(12 << 6) | input_sq] = 1.0f;
-            if ((enemyAttacks >> sq) & 1) data[(13 << 6) | input_sq] = 1.0f;        
-            
-            if ((movesFromSquares[sq] >> sq) & 1) data[(14 << 6) | input_sq] = 1.0f;
-        
-            // 4. Side to Move Plane (Channel 15) - no need
-            // In this "Canonical" view, the side to move is ALWAYS 1.0f
-            // because the board is already oriented for them.
-            //data[(15 << 6) | input_sq] = 1.0f;
-        }
-
-        // 4. Create Target Tensor
-        // Normalize centipawns (e.g., clamp between -1000 and 1000, then divide)
-        //float normalized_score = std::max(-1000.0f, std::min(1000.0f, (float)pos.eval_cp));
-        //normalized_score /= 1000.0f; // Range -1.0 to 1.0; negative score - white's loosing, positive - white's winning 
-        //instead of linear clamping, use sigmoid
-        float normalized_score = tanh((float)pos.eval_cp / eval_scale);
-        
-        // Important: If side_to_move is Black, but eval is from White's perspective, flip it!
-        // NNUE usually trains on "Eval from Side-to-Move's perspective", so we do the same for our CNN
-        if (pos.side_to_move == ColorBlack) normalized_score = -normalized_score;
-        torch::Tensor target = torch::tensor({normalized_score}, torch::kFloat32);
-
-        return {input, target};
+  ChessDataset(const std::string& filepath) {
+    std::cout << "Opening dataset: " << filepath << "..." << std::endl;
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+      throw std::runtime_error("Could not open file!");
     }
 
-    torch::optional<size_t> size() const override {
-        return samples.size();
+    BitReader reader(file);
+    CompressedPosition pos;
+    int cp_min = 1000, cp_max = -1000;
+    
+    int count = 0;
+    while (read_next_position(reader, pos)) {
+      samples.push_back(pos);
+      cp_min = std::min(cp_min, pos.eval_cp);
+      cp_max = std::max(cp_max, pos.eval_cp);
+      count++;
+      if (count % 1000000 == 0) std::cout << "Loaded " << count << " positions. cp_min " << cp_min << ", cp_max " << cp_max << "\n" << std::flush;
     }
+    std::cout << "Finished loading " << samples.size() << " positions. cp_min " << cp_min << ", cp_max " << cp_max << std::endl;
+  }
+  // The "Hot" Path: Converts 1 struct into Tensors (Input + Label)
+  torch::data::Example<> get(size_t index) override {
+    const CompressedPosition& pos = samples[index];
+    Board board = {};
+    board.sideToMove = static_cast<Color>(pos.side_to_move);
+    board.enPassant = static_cast<File>(pos.ep_file);
+    board.castlingRights = pos.castling_rights;
+
+    for(int sq = 0; sq < 64; ++sq) {
+      Piece pc = static_cast<Piece>(pos.piecesOnSquares[sq]);
+      board.piecesOnSquares[sq] = pc;
+      PieceType type = PC_TYPE(pc);
+      Color color = PC_COLOR(pc);
+      if (type != PieceTypeNone) {
+        board.side[color] |= (1ULL << sq);
+        board.pieceTypes[type - 1] |= (1ULL << sq);
+      }
+    }
+    if (pos.castling_rights & 1) board.castlingRooks |= msBit(board.side[ColorWhite] & board.pieceTypes[Rook - 1]);
+    if (pos.castling_rights & 2) board.castlingRooks |= lsBit(board.side[ColorWhite] & board.pieceTypes[Rook - 1]);
+    if (pos.castling_rights & 4) board.castlingRooks |= msBit(board.side[ColorBlack] & board.pieceTypes[Rook - 1]);
+    if (pos.castling_rights & 8) board.castlingRooks |= lsBit(board.side[ColorBlack] & board.pieceTypes[Rook - 1]);
+    
+		Color sideToMove = board.sideToMove;
+	  board.sideToMove = ColorWhite;
+	  uint64_t blackAttacks = getAttackedSquaresOnly(board);
+	  board.sideToMove = ColorBlack;
+	  uint64_t whiteAttacks = getAttackedSquaresOnly(board);
+    board.sideToMove = sideToMove;
+    
+    bool is_black = (sideToMove == ColorBlack);    		
+    // 1. Determine which bitboard belongs to 'Friendly' (side to move)
+    uint64_t friendlyAttacks = is_black ? blackAttacks : whiteAttacks;
+    uint64_t enemyAttacks = is_black ? whiteAttacks : blackAttacks;
+    //board is oriented for the side to move perspective to help the model learn it only once
+	  auto [king_moves, pinned, pinning, checkers, kingSquare] = kingMoves(board);
+    uint64_t all_legal_moves = king_moves;
+    int num_checkers = checkers ? bitCount(checkers) : 0;
+    auto [check_mask, ep_mask] = num_checkers ? checkMask(board, kingSquare, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL); 
+
+    if (num_checkers <= 1) {
+      // Loop through friendly pieces to gather their moves
+      for (PieceType pt = Pawn; pt <= Queen; ++pt) {
+        uint64_t occupations = board.side[is_black ? ColorBlack : ColorWhite] & board.pieceTypes[pt - 1]; 
+        while (occupations) {
+          const Square sq = popLSB(occupations);
+          all_legal_moves |= piece_moves(board, pt, sq, kingSquare, pinned, pinning, check_mask, ep_mask);
+        }
+      }
+    }       
+
+    torch::Tensor input = torch::zeros({15, 8, 8}, torch::kFloat32);
+    // Pointers to raw data for fast access
+    float* data = input.data_ptr<float>();        
+    for(int sq = 0; sq < 64; ++sq) {
+      // 1. Flip the square index if it's Black's turn
+      // sq ^ 56 maps rank 0 to rank 7, rank 1 to rank 6, etc.
+      int input_sq = is_black ? (sq ^ 56) : sq;
+      uint64_t moves = 0;
+      Piece pc = board.piecesOnSquares[sq];
+      if (pc != PieceNone) {
+        Color color = PC_COLOR(pc);
+        PieceType type  = PC_TYPE(pc);
+        // 2. Swap piece colors: if it's black's turn, black's pieces go into the "Friendly" channels (0-5).
+        int input_color = is_black ? (1 - color) : color;
+        int channel = input_color * 6 + (type - 1);
+        data[(channel << 6) | input_sq] = 1.0f;
+      }                        
+      // 3. Fill the planes using the flipped coordinate (input_sq)
+      if ((friendlyAttacks >> sq) & 1) data[(12 << 6) | input_sq] = 1.0f;
+      if ((enemyAttacks >> sq) & 1) data[(13 << 6) | input_sq] = 1.0f;
+      if ((all_legal_moves >> sq) & 1) data[(14 << 6) | input_sq] = 1.0f;
+    }
+
+    // 4. Create Target Tensor
+    // Normalize centipawns (e.g., clamp between -1000 and 1000, then divide)
+    //float normalized_score = std::max(-1000.0f, std::min(1000.0f, (float)pos.eval_cp));
+    //normalized_score /= 1000.0f; // Range -1.0 to 1.0; negative score - white's loosing, positive - white's winning 
+    //instead of linear clamping, use sigmoid
+    float normalized_score = tanh(static_cast<float>(pos.eval_cp) / eval_scale);
+    
+    // Important: If side_to_move is Black, but eval is from White's perspective, flip it!
+    // NNUE usually trains on "Eval from Side-to-Move's perspective", so we do the same for our CNN
+    if (is_black) normalized_score = -normalized_score;
+    torch::Tensor target = torch::tensor({normalized_score}, torch::kFloat32);
+
+    return {input, target};
+  }
+
+  torch::optional<size_t> size() const override {
+    return samples.size();
+  }
 };
 
 // Helper to find all split files matching pattern "lichess_db_eval(_\d+)?\.bin"
 std::vector<std::string> get_data_files(const std::string& base_path) {
-    namespace fs = std::filesystem;
-    std::vector<std::string> files;
-    
-    // Check if base file exists
-    if (fs::exists(base_path)) files.push_back(base_path);
+  namespace fs = std::filesystem;
+  std::vector<std::string> files;
+  
+  // Check if base file exists
+  if (fs::exists(base_path)) files.push_back(base_path);
 
-    // Check for numbered splits: base_1.bin, base_2.bin...
-    // We assume the extension is .bin and the prefix is everything before .bin
-    std::string path_no_ext = base_path.substr(0, base_path.find_last_of("."));
-    
-    int index = 1;
-    while (true) {
-        std::string next_file = path_no_ext + "_" + std::to_string(index) + ".bin";
-        if (fs::exists(next_file)) {
-            files.push_back(next_file);
-            index++;
-        } else {
-            break; 
-        }
+  // Check for numbered splits: base_1.bin, base_2.bin...
+  // We assume the extension is .bin and the prefix is everything before .bin
+  std::string path_no_ext = base_path.substr(0, base_path.find_last_of("."));
+  
+  int index = 1;
+  while (index <= 29) {
+    std::string next_file = path_no_ext + "_" + std::to_string(index) + ".bin";
+    if (fs::exists(next_file)) {
+      files.push_back(next_file);
     }
-    return files;
+    index++;
+  }
+  return files;
 }
 
 int main() {
-    init_magic_bitboards();
+    Stockfish::Bitboards::init();
 
     // 1. Hyperparameters
-    const int64_t batch_size = 2048;
-    double learning_rate = 0.0007;
-    const int num_epochs = 10;
+    const int64_t batch_size = 2048; //no significant differences between 2048 and 1024 bath sizes
+    double learning_rate = 1e-3; //started training with 0.003, was unstable with 0.004 and above
+    const int num_epochs = 1;
+    const int num_workers = 1;
+    const double LR_MAX = learning_rate; 
+    const double LR_MIN = 1e-4; // Go very close to zero by the end
+    const int64_t total_estimated_positions = 300000000 * num_epochs; 
+    const int64_t TOTAL_STEPS = total_estimated_positions / batch_size; 
     const std::string base_data_path = "../lichess_db_eval.bin";
-    const std::string test_data_path = "../Downloads/lichess_db_broadcast.bin";
-    const std::string weights_file = "simple_cnnX.pt";
+    const std::string test_data_path = "../Downloads/lichess_db_broadcast_2026-02.bin";
+    const std::string weights_file = "simple_cnn.pt";
 
     auto file_list = get_data_files(base_data_path);
     std::cout << "Found " << file_list.size() << " data files." << std::endl;
@@ -407,24 +439,26 @@ int main() {
     torch::optim::Adam optimizer(model->parameters(), torch::optim::AdamOptions(learning_rate));
 
     // 6. Training Loop
-    std::cout << "Starting training..." << std::endl;
+    std::cout << "Starting training..." << std::endl;  
+          
+    int64_t global_step = 0;
+    
     for (int epoch = 1; epoch <= num_epochs; ++epoch) {        
         // Optional: Shuffle file order to mix data slightly better
         std::random_device rd;
         std::mt19937 g(rd());
         std::shuffle(file_list.begin(), file_list.end(), g);
   
-  
         double epoch_total_loss = 0.0;
         size_t epoch_total_batches = 0;
         int file_number = 0; //when the list is randomized, it's easy to keep track
         
         // LR reductio logic
-        double best_loss = 999.0f;
-        int patience_counter = 0;
-        const int MAX_PATIENCE = 5; // How many check-ins to wait
-        const float RELATIVE_THRESHOLD = 0.005f; // 0.5% improvement required
-        double running_loss = 0;
+        //double best_loss = 999.0f;
+        //int patience_counter = 0;
+        //const int MAX_PATIENCE = 3; // How many check-ins to wait
+        //const float RELATIVE_THRESHOLD = 0.005f; // 0.5% improvement required
+        //double running_loss = 0;
         
         for (const auto& filepath : file_list) {
             std::cout << "  Processing file " << ++file_number << ": " << filepath << std::endl;
@@ -439,11 +473,12 @@ int main() {
 
                 auto data_loader = torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
                     std::move(dataset), 
-                    torch::data::DataLoaderOptions().batch_size(batch_size).workers(2)
+                    torch::data::DataLoaderOptions().batch_size(batch_size).workers(num_workers)
                 );
 
                 // Train on this chunk
                 model->train();
+                auto start = std::chrono::high_resolution_clock::now();
                 for (auto& batch : *data_loader) {
                     auto data = batch.data.to(device);
                     auto targets = batch.target.to(device);
@@ -454,9 +489,20 @@ int main() {
                     loss.backward();
                     optimizer.step();
 
+                    global_step++; // Increment global step count
+    
+                    // --- NEW: Apply Cosine Annealing ---
+                    double progress = std::min(1.0, (double)global_step / TOTAL_STEPS);
+                    double current_lr = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + std::cos(progress * M_PI));
+                    
+                    for (auto& group : optimizer.param_groups()) {
+                        static_cast<torch::optim::AdamOptions&>(group.options()).lr(current_lr);
+                    }
+                    // -----------------------------------
+
                     epoch_total_loss += loss.item<double>();
                     epoch_total_batches++;
-                    running_loss += loss.item<double>();
+                    /*running_loss += loss.item<double>();
                     
                     if (epoch_total_batches % 10000 == 0) {
                         double current_window_loss = running_loss / 10000;
@@ -483,11 +529,12 @@ int main() {
                             std::cout << ">>> Plateau triggered! New LR: " << learning_rate << std::endl;
                             patience_counter = 0; // Reset after reduction
                         }
-                    }                    
+                    }*/                    
 
                     // Optional: Print less frequently to avoid console spam
-                    if (epoch_total_batches % 1000 == 0) {
-                         std::printf("\r    Batch %ld | Loss: %.4f", epoch_total_batches, loss.item<double>());
+                    if (epoch_total_batches % 100 == 0) {
+                         double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
+                         std::printf("\r    Batch %ld | Loss: %.4f | Current LR %.6f | Batch size %lld | %.0f nps", epoch_total_batches, loss.item<double>(), current_lr, batch_size, epoch_total_batches * batch_size / elapsed);
                          std::fflush(stdout);
                     }
                 }
@@ -498,7 +545,7 @@ int main() {
             // Save Checkpoint
             torch::save(model, "simple_cnn_checkpoint_" + std::to_string(epoch) + ".pt");
 
-        }
+        //}
 
         double avg_loss = epoch_total_loss / (epoch_total_batches + 1); // Avoid div/0
         std::cout << "=== End of Epoch " << epoch << " | Avg Loss: " << avg_loss << " ===" << std::endl;
@@ -514,14 +561,16 @@ int main() {
             size_t test_total_batches = 0;
             double mean_cp_error_total = 0;
             double sign_accuracy_total = 0;
-
+            double elapsed;
+            std::optional<size_t> positions;
             { // Scope for memory management
                 auto test_dataset = ChessDataset(test_data_path).map(torch::data::transforms::Stack<>());
+                positions = test_dataset.size();
                 auto test_loader = torch::data::make_data_loader(
                     std::move(test_dataset),
-                    torch::data::DataLoaderOptions().batch_size(batch_size).workers(2)
+                    torch::data::DataLoaderOptions().batch_size(batch_size * 2).workers(num_workers)
                 );
-
+                auto start = std::chrono::high_resolution_clock::now();
                 for (auto& batch : *test_loader) {
                     auto data = batch.data.to(device).to(torch::kHalf);
                     auto targets = batch.target.to(device);
@@ -544,6 +593,7 @@ int main() {
                     test_total_loss += loss.item<double>();
                     test_total_batches++;
                 }
+                elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();                
             }
             
             double avg_test_loss = (test_total_batches > 0) ? (test_total_loss / test_total_batches) : 0.0;
@@ -552,17 +602,18 @@ int main() {
             std::cout << "    Average CP Error: " << avg_cp_loss << " centipawns" << std::endl;
             double avg_sign_error = (test_total_batches > 0) ? (sign_accuracy_total / test_total_batches) : 0.0;
             std::cout << "    Sign Accuracy: " << avg_sign_error << "%" << std::endl;
+            std::cout << "    Time spent: " << elapsed << " sec. " << positions.value() / elapsed << " positions/sec" << std::endl;
             
             model->to(torch::kFloat32);
         } else {
             std::cerr << "Warning: Test file " << test_data_path << " not found. Skipping validation." << std::endl;
-        }
-                
+        }      
+  
+     }     
         // Save Checkpoint
         //torch::save(model, "simple_cnn_checkpoint_" + std::to_string(epoch) + ".pt");
     }
 
     std::cout << "Training complete." << std::endl;
-    cleanup_magic_bitboards();
     return 0;
 }

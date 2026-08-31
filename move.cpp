@@ -4,6 +4,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <tuple>
+#include "nnue/bitboard.h"
 #include "libchess.h"
 
 //#ifdef __cplusplus
@@ -13,8 +15,8 @@
 int uci2move_idx(const char * uci_move, Move& move) {
   assert(uci_move);
   assert(strlen(uci_move) >= 4);
-  move.src = SQ(uci_move[1] - '1', uci_move[0] - 'a');
-  move.dst = SQ(uci_move[3] - '1', uci_move[2] - 'a');
+  move.src = SQ(static_cast<Rank>(uci_move[1] - '1'), static_cast<File>(uci_move[0] - 'a'));
+  move.dst = SQ(static_cast<Rank>(uci_move[3] - '1'), static_cast<File>(uci_move[2] - 'a'));
   move.promoType = PieceTypeNone;
   int idx = (move.src << 6) | move.dst;
   if (strlen(uci_move) == 5) { //this will not include null-terminated char '\0'
@@ -134,12 +136,8 @@ int san2move(Board& board, const char * san_move, Move& move) {
 		}
 	}
 
- 	KingSquare kingSq;
-	Square kingSquare = getKingSquare(board, kingSq);
-	MovesContext movesContext = {};
-	uint64_t attackedSquares = getAttackedSquares(board, movesContext);
-	uint64_t king_moves = kingMoves(board, kingSquare, kingSq, movesContext, attackedSquares);
-
+	auto [king_moves, pinned, pinning, checkers, kingSquare] = kingMoves(board);
+  auto [check_mask, ep_mask] = checkers? checkMask(board, kingSquare, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL);
 	//castling
 	Square kingCastlingSquare = SquareNone;
 	int castlingSide;
@@ -153,7 +151,6 @@ int san2move(Board& board, const char * san_move, Move& move) {
 	}
 	if (kingCastlingSquare != SquareNone) {
 		movingPiece = PC(board.sideToMove, King);
-		//move.src = lsBit(board.side[board.sideToMove] & board.pieceTypes[King - 1]);
 		move.src = kingSquare;
 
 		if (!board.isChess960) {
@@ -165,8 +162,12 @@ int san2move(Board& board, const char * san_move, Move& move) {
 				return 4;
 			}
 		} else { //chess960
-			const Rank rookRank = board.sideToMove == ColorWhite ? Rank1 : Rank8;
-			const Square rookSquare = SQ(rookRank, board.castlingRook[board.sideToMove][castlingSide]);
+		  uint64_t rooks = board.castlingRooks & board.side[board.sideToMove];
+		  if (!rooks) {
+		    printf("san2move() error for chess960: no rooks are available for castling\n");
+		    return 5;
+		  }
+			const Square rookSquare = castlingSide == 0 ? msBit(rooks) : lsBit(rooks);
 			if (king_moves & SQ_BIT(rookSquare))
 			  move.dst = rookSquare;
 			else {
@@ -198,7 +199,7 @@ int san2move(Board& board, const char * san_move, Move& move) {
 			if (idx) {
 				const int pieceIndex = idx - pieces;
 				if (pieceIndex > 1)
-					movingPiece = PC(board.sideToMove, pieceIndex);
+					movingPiece = PC(board.sideToMove, static_cast<PieceType>(pieceIndex));
 				else if (pieceIndex == 1) {
 					move.type = MoveTypeCapture;
 				}
@@ -225,7 +226,7 @@ int san2move(Board& board, const char * san_move, Move& move) {
 			const Square srcSquare = SQ(srcRanks[board.sideToMove], srcFile);
 			if (SQ_RANK(move.dst) == dstRanks[board.sideToMove]) {
   			if (board.piecesOnSquares[srcSquare] == PC(board.sideToMove, Pawn)) {
-     		  uint64_t moves = piece_moves(Pawn, srcSquare, movesContext, kingSq, board);
+     		  uint64_t moves = piece_moves(board, Pawn, srcSquare, kingSquare, pinned, pinning, check_mask, ep_mask);
   				if ((moves & SQ_BIT(move.dst))) {
   					uint64_t opponentPawns = board.side[OPP_COLOR(board.sideToMove)] & board.pieceTypes[Pawn - 1];
   					while (opponentPawns) {
@@ -240,11 +241,11 @@ int san2move(Board& board, const char * san_move, Move& move) {
   				}
   			}
 			}
-		} else if ((board.enPassant < FileNone) && board.enPassant + (board.sideToMove == ColorWhite ? Rank6 << 3 : Rank3 << 3) == move.dst) {
+		} else if ((board.enPassant < FileNone) && SQ(board.sideToMove == ColorWhite ? Rank6 : Rank3, board.enPassant) == move.dst) {
 			move.type = MoveTypeEnPassant; // capture flag should have been set up already from "x" pattern in SAN move
 			move.src = board.sideToMove == ColorWhite ? SQ_FILE(move.dst) > srcFile ? (Square)(move.dst - 9) : (Square)(move.dst - 7) : SQ_FILE(move.dst) > srcFile ? (Square)(move.dst + 7) : (Square)(move.dst + 9);
 		}
-	}
+	} 
 	if (move.src == SquareNone && srcFile != FileNone && srcRank != RankNone)
 		move.src = SQ(srcRank, srcFile);
 	else {
@@ -253,19 +254,19 @@ int san2move(Board& board, const char * san_move, Move& move) {
 		//find move candidates
 		//get a bitboard of squares where moving piece names (for example, white knights) are
 		const PieceType pt = PC_TYPE(movingPiece);
-		uint64_t cp = board.side[board.sideToMove] & board.pieceTypes[pt - 1];
+		uint64_t pieces = board.side[board.sideToMove] & board.pieceTypes[pt - 1];
 		//iterate over all squares where movingPiece.name are located
-		while (cp) {
-  		Square s = lsBit(cp);
-  		uint64_t moves;
+		while (pieces) {
+  		Square srcSquare = popLSB(pieces);
+  		uint64_t pc_moves;
   		if (pt != King)
-  		  moves = piece_moves(pt, s, movesContext, kingSq, board);
-  		else moves = king_moves;
-			if ((moves & SQ_BIT(move.dst))) {
-  			//if moving piece is a pawn (its source file is known and equals to the square s.file) or a king
-				if ((pt == Pawn && SQ_FILE(s) == srcFile) || pt == King) {
-					//we are sure that square s is the source square
-					move.src = s;
+  		  pc_moves = piece_moves(board, pt, srcSquare, kingSquare, pinned, pinning, check_mask, ep_mask);
+  		else pc_moves = king_moves;
+			if ((pc_moves & SQ_BIT(move.dst))) {
+  			//if moving piece is a pawn (its source file is known and equals to the square SQ_FILE(srcSquare) or a king
+				if ((pt == Pawn && SQ_FILE(srcSquare) == srcFile) || pt == King) {
+					//we are sure that square srcSquare is the source square
+					move.src = srcSquare;
 					break;
 				} else { //otherwise add this square to moveCandidates squares
 					if (n >= 10) {
@@ -273,10 +274,9 @@ int san2move(Board& board, const char * san_move, Move& move) {
 				    writeDebug(board);
 				    return 8;
 					}				
-					moveCandidates[n++] = s;
+					moveCandidates[n++] = srcSquare;
         }
 			}
-			cp &= cp - 1;
 		} //end of while() loop over squares
 		//if moving piece source square is still unknown (i.e. its not a pawn or a king)
 		if (move.src == SquareNone) {
@@ -304,7 +304,8 @@ int san2move(Board& board, const char * san_move, Move& move) {
   			move.src = moveCandidates[maxI];
   		}
 			else {
-				printf("san2move() error: ambiguous move %s, moveType %s, srcRank %c, srcFile %c, max candidate rating %d, max candidates %d\n", sanMove, moveType[move.type], enumRanks[srcRank], enumFiles[srcFile], maxT, n);
+			  char fen[MAX_FEN_STRING_LEN];
+				printf("san2move() error: ambiguous move %s, movingPiece %s, moveType %s, srcRank %c, srcFile %c, max candidate rating %d, max candidates %d, fen %s\n", sanMove, piece[movingPiece], moveType[move.type], enumRanks[srcRank], enumFiles[srcFile], maxT, n, board2fen(board, fen));
 				writeDebug(board);
 				return 9;
 			}
@@ -316,7 +317,7 @@ int san2move(Board& board, const char * san_move, Move& move) {
 		return 10;
 	}
 	
-	if (movesContext.num_checkers > 1 && PC_TYPE(movingPiece) != King) {
+	if (bitCount(checkers) > 1 && PC_TYPE(movingPiece) != King) {
 	  char fenString[MAX_FEN_STRING_LEN] = "";
 		printf("san2move() error: %s move from %s to %s is illegal because king is checked twice. FEN %s\n", piece[movingPiece], square[move.src], square[move.dst], board2fen(board, fenString));
 		writeDebug(board);
@@ -325,8 +326,10 @@ int san2move(Board& board, const char * san_move, Move& move) {
 	}
 
 	uint64_t moves;
-	if (PC_TYPE(movingPiece) != King)
-	  moves = piece_moves(PC_TYPE(movingPiece), move.src, movesContext, kingSq, board);
+	if (PC_TYPE(movingPiece) != King) {
+	  //printf("san2move() debug: check_mask %llx\n", check_mask);
+	  moves = piece_moves(board, PC_TYPE(movingPiece), move.src, kingSquare, pinned, pinning, check_mask, ep_mask);
+	}
 	else moves = king_moves;
 	
 	if (!(moves & SQ_BIT(move.dst))) {
@@ -352,19 +355,17 @@ char * move2san(Board& board, const Move& move, char * sanMove) {
 	const Piece movingPiece = board.piecesOnSquares[move.src];
 	const PieceType mpType = PC_TYPE(movingPiece);
 	
- 	KingSquare kingSq;
-	Square kingSquare = getKingSquare(board, kingSq);
-	MovesContext movesContext = {};
-	uint64_t attackedSquares = getAttackedSquares(board, movesContext);
-	kingMoves(board, kingSquare, kingSq, movesContext, attackedSquares);
-	if (movesContext.num_checkers > 1 && mpType != King) {
+	auto [king_moves, pinned, pinning, checkers, kingSquare] = kingMoves(board);
+  
+	if (bitCount(checkers) > 1 && mpType != King) {
 	  char fenString[MAX_FEN_STRING_LEN] = "";
 		printf("move2san() error: %s move from %s to %s is illegal; FEN %s\n", piece[movingPiece], square[move.src], square[move.dst], board2fen(board, fenString));
 		writeDebug(board);
 		//for (int i = 0; i < n; i++) printf("moveCandidate %s\n", square[moveCandidates[i]]);
 		return nullptr;	  
 	}
-		
+  auto [check_mask, ep_mask] = checkers? checkMask(board, kingSquare, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL);
+	
 	int i = 0;
 	if (mpType != Pawn)
 		sanMove[i++] = pieceLetter[mpType];
@@ -378,7 +379,7 @@ char * move2san(Board& board, const Move& move, char * sanMove) {
 		int idx = 0;
 		while (cp) {
   		const Square s = lsBit(cp);
-  		uint64_t moves = piece_moves(mpType, s, movesContext, kingSq, board);
+  		uint64_t moves = piece_moves(board, mpType, s, kingSquare, pinned, pinning, check_mask, ep_mask);
 			if (moves & SQ_BIT(move.dst)) moveCandidates[idx++] = s;
 			cp &= cp - 1;
 		}

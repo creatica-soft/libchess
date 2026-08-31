@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <thread>
+#include "nnue/bitboard.h"
 #include "libchess.h"
 
 //#ifdef __cplusplus
@@ -709,7 +710,7 @@ float getEval(const Engine& engine) {
 			fprintf(engine.logfile, "%s", line);
 			fflush(engine.logfile);
 		}
-		if (strstr(line, "Final evaluation ") - line == 0) {
+		if (strstr(line, "Final evaluation") - line == 0) {
 			char * score_start = strpbrk(line, "+-");
 			score = strtof(score_start, NULL);
 			break;
@@ -717,7 +718,7 @@ float getEval(const Engine& engine) {
 	}
 	return score;
 }
-
+//returns Stockfish eval in pawns from White's perspective
 float eval(const Engine& engine) {
 	fprintf(engine.toEngine, "eval\n");
 	fflush(engine.toEngine);

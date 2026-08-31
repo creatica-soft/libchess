@@ -33,15 +33,19 @@ CHESS_API double evaluate_nnue(Board& board, NNUEContext& ctx);
 
 static Stockfish::Eval::NNUE::Networks * networks = nullptr;
 
-void init_nnue(const char * nnue_file_big, const char * nnue_file_small) {
+//void init_nnue(const char * nnue_file_big, const char * nnue_file_small) {
+void init_nnue() {
     //Stockfish::Bitboards::init();
     //Stockfish::Position::init();
     if (!networks) {
-        Stockfish::Eval::NNUE::NetworkBig big(Stockfish::Eval::NNUE::EvalFile{}, Stockfish::Eval::NNUE::EmbeddedNNUEType::BIG);
-        Stockfish::Eval::NNUE::NetworkSmall small(Stockfish::Eval::NNUE::EvalFile{}, Stockfish::Eval::NNUE::EmbeddedNNUEType::SMALL);
-        big.load("", nnue_file_big);
-        small.load("", nnue_file_small);
-        networks = new Stockfish::Eval::NNUE::Networks(std::move(big), std::move(small));
+        //Stockfish::Eval::NNUE::NetworkBig big(Stockfish::Eval::NNUE::EvalFile{}, Stockfish::Eval::NNUE::EmbeddedNNUEType::BIG);
+        //Stockfish::Eval::NNUE::NetworkSmall small(Stockfish::Eval::NNUE::EvalFile{}, Stockfish::Eval::NNUE::EmbeddedNNUEType::SMALL);
+        //big.load("", nnue_file_big);
+        //small.load("", nnue_file_small);
+        //networks = new Stockfish::Eval::NNUE::Networks(std::move(big), std::move(small));
+        networks = new Stockfish::Eval::NNUE::Networks(Stockfish::Eval::NNUE::EvalFile({EvalFileDefaultNameBig, "None", ""}), Stockfish::Eval::NNUE::EvalFile({EvalFileDefaultNameSmall, "None", ""}));
+        networks->big.load("", "");
+        networks->small.load("", "");
     }
 }
 
@@ -67,11 +71,12 @@ double evaluate_nnue(const Board& board, NNUEContext& ctx) {
     v = Stockfish::Eval::evaluate(*networks, board, *ctx.accumulator_stack, *ctx.caches, 0);
     //comment out next line to keep it from the perspective of the side to move
     //v = ctx.pos->side_to_move() == Stockfish::WHITE ? v : -v; 
-    return 0.01 * Stockfish::to_cp(v, board);
+    return 0.01 * Stockfish::Eval::to_cp(v, board);
 }
 
-void accumulator_stack_push(NNUEContext& ctx, Stockfish::DirtyPiece& dp) {
-  ctx.accumulator_stack->push((Stockfish::DirtyPiece)dp);
+std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx) {
+  auto [dirtyPiece, dirtyThreats] = ctx.accumulator_stack->push();
+  return {dirtyPiece, dirtyThreats};
 }
 void accumulator_stack_pop(NNUEContext& ctx) {
   ctx.accumulator_stack->pop();

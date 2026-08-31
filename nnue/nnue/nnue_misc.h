@@ -1,6 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
+  Copyright (C) 2004-2026 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -20,8 +20,10 @@
 #define NNUE_MISC_H_INCLUDED
 
 #include <cstddef>
+#include <memory>
 #include <string>
 
+#include "../misc.h"
 #include "../types.h"
 #include "nnue_architecture.h"
 #include "../board.h"
@@ -32,16 +34,16 @@ namespace Stockfish {
 
 namespace Eval::NNUE {
 
+// EvalFile uses fixed string types because it's part of the network structure which must be trivial.
 struct EvalFile {
     // Default net name, will use one of the EvalFileDefaultName* macros defined
     // in evaluate.h
-    std::string defaultName;
+    FixedString<256> defaultName;
     // Selected net name, either via uci option or default
-    std::string current;
+    FixedString<256> current;
     // Net description extracted from the net file
-    std::string netDescription;
+    FixedString<256> netDescription;
 };
-
 
 struct NnueEvalTrace {
     static_assert(LayerStacks == PSQTBuckets);
@@ -54,9 +56,21 @@ struct NnueEvalTrace {
 struct Networks;
 struct AccumulatorCaches;
 
+//std::string trace(Position& pos, const Networks& networks, AccumulatorCaches& caches);
 std::string trace(Board& board, const Networks& networks, AccumulatorCaches& caches);
 
 }  // namespace Stockfish::Eval::NNUE
 }  // namespace Stockfish
+
+template<>
+struct std::hash<Stockfish::Eval::NNUE::EvalFile> {
+    std::size_t operator()(const Stockfish::Eval::NNUE::EvalFile& evalFile) const noexcept {
+        std::size_t h = 0;
+        Stockfish::hash_combine(h, evalFile.defaultName);
+        Stockfish::hash_combine(h, evalFile.current);
+        Stockfish::hash_combine(h, evalFile.netDescription);
+        return h;
+    }
+};
 
 #endif  // #ifndef NNUE_MISC_H_INCLUDED

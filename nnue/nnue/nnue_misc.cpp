@@ -1,6 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
+  Copyright (C) 2004-2026 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -32,10 +32,10 @@
 
 //#include "../position.h"
 #include "../types.h"
-#include "../uci.h"
+//#include "../uci.h"
 #include "network.h"
-#include "../evaluate.h"
 #include "nnue_accumulator.h"
+#include "../evaluate.h"
 
 namespace Stockfish::Eval::NNUE {
 
@@ -50,7 +50,7 @@ namespace {
 
     buffer[0] = (v < 0 ? '-' : v > 0 ? '+' : ' ');
 
-    int cp = std::abs(Stockfish::to_cp(v, pos));
+    int cp = std::abs(UCIEngine::to_cp(v, pos));
     if (cp >= 10000)
     {
         buffer[1] = '0' + cp / 10000;
@@ -84,7 +84,7 @@ void format_cp_compact(Value v, char* buffer, const Board& board) {
 
     buffer[0] = (v < 0 ? '-' : v > 0 ? '+' : ' ');
 
-    int cp = std::abs(Stockfish::to_cp(v, board));
+    int cp = std::abs(Stockfish::Eval::to_cp(v, board)); //see evaluate.cpp
     if (cp >= 10000)
     {
         buffer[1] = '0' + cp / 10000;
@@ -117,24 +117,22 @@ void format_cp_compact(Value v, char* buffer, const Board& board) {
 // Converts a Value into pawns, always keeping two decimals
 /*void format_cp_aligned_dot(Value v, std::stringstream& stream, const Position& pos) {
 
-    const double pawns = std::abs(0.01 * Stockfish::to_cp(v, pos));
+    const double pawns = std::abs(0.01 * UCIEngine::to_cp(v, pos));
 
     stream << (v < 0   ? '-'
                : v > 0 ? '+'
                        : ' ')
            << std::setiosflags(std::ios::fixed) << std::setw(6) << std::setprecision(2) << pawns;
 }*/
-
 void format_cp_aligned_dot(Value v, std::stringstream& stream, const Board& board) {
 
-    const double pawns = std::abs(0.01 * Stockfish::to_cp(v, board));
+    const double pawns = std::abs(0.01 * Stockfish::Eval::to_cp(v, board)); //see evaluate.cpp
 
     stream << (v < 0   ? '-'
                : v > 0 ? '+'
                        : ' ')
            << std::setiosflags(std::ios::fixed) << std::setw(6) << std::setprecision(2) << pawns;
 }
-
 }
 
 
@@ -165,11 +163,11 @@ trace(Position& pos, const Eval::NNUE::Networks& networks, Eval::NNUE::Accumulat
             format_cp_compact(value, &board[y + 2][x + 2], pos);
     };
 
-    AccumulatorStack accumulators;
+    auto accumulators = std::make_unique<AccumulatorStack>();
 
     // We estimate the value of each piece by doing a differential evaluation from
     // the current base eval, simulating the removal of the piece from its square.
-    auto [psqt, positional] = networks.big.evaluate(pos, accumulators, &caches.big);
+    auto [psqt, positional] = networks.big.evaluate(pos, *accumulators, caches.big);
     Value base              = psqt + positional;
     base                    = pos.side_to_move() == WHITE ? base : -base;
 
@@ -184,8 +182,8 @@ trace(Position& pos, const Eval::NNUE::Networks& networks, Eval::NNUE::Accumulat
             {
                 pos.remove_piece(sq);
 
-                accumulators.reset();
-                std::tie(psqt, positional) = networks.big.evaluate(pos, accumulators, &caches.big);
+                accumulators->reset();
+                std::tie(psqt, positional) = networks.big.evaluate(pos, *accumulators, caches.big);
                 Value eval                 = psqt + positional;
                 eval                       = pos.side_to_move() == WHITE ? eval : -eval;
                 v                          = base - eval;
@@ -201,8 +199,8 @@ trace(Position& pos, const Eval::NNUE::Networks& networks, Eval::NNUE::Accumulat
         ss << board[row] << '\n';
     ss << '\n';
 
-    accumulators.reset();
-    auto t = networks.big.trace_evaluate(pos, accumulators, &caches.big);
+    accumulators->reset();
+    auto t = networks.big.trace_evaluate(pos, *accumulators, caches.big);
 
     ss << " NNUE network contributions "
        << (pos.side_to_move() == WHITE ? "(White to move)" : "(Black to move)") << std::endl
@@ -253,41 +251,42 @@ trace(Board& chess_board, const Eval::NNUE::Networks& networks, Eval::NNUE::Accu
         for (int i = 1; i < 3; ++i)
             board[y + i][x] = board[y + i][x + 8] = '|';
         board[y][x] = board[y][x + 8] = board[y + 3][x + 8] = board[y + 3][x] = '+';
-        if (pc != PIECE_NONE)
+        if (pc != 7)
             board[y + 1][x + 4] = PieceToChar[pc];
-        if (is_valid(value))
+        if (is_valid(value)) //constexpr bool is_valid(Value value) { return value != VALUE_NONE; } //VALUE_NONE = 32002
             format_cp_compact(value, &board[y + 2][x + 2], chess_board);
     };
 
-    AccumulatorStack accumulators;
+    auto accumulators = std::make_unique<AccumulatorStack>();
 
     // We estimate the value of each piece by doing a differential evaluation from
     // the current base eval, simulating the removal of the piece from its square.
-    auto [psqt, positional] = networks.big.evaluate(chess_board, accumulators, &caches.big);
-    Value base = psqt + positional;
-    base = chess_board.sideToMove == WHITE ? base : -base;
-    //printf("trace() debug: base eval %d\n", base);
-
+    auto [psqt, positional] = networks.big.evaluate(chess_board, *accumulators, caches.big); //see network.cpp
+    Value base              = psqt + positional;
+    base                    = chess_board.sideToMove == WHITE ? base : -base;
+    //printf("NNUE::trace() debug: base = psqt (%d) + positional (%d) = %d\n", psqt, positional, psqt + positional);
     for (File f = FILE_A; f <= FILE_H; ++f)
         for (Rank r = RANK_1; r <= RANK_8; ++r)
         {
             Square sq = make_square(f, r);
             Piece  pc = (Piece)chess_board.piecesOnSquares[sq];
             Value  v  = VALUE_NONE;
-            //printf("trace() debug: pc %d on sq %d\n", pc, sq);
-            if (pc != PIECE_NONE && type_of(pc) != KING)
+
+            //if (pc != NO_PIECE && type_of(pc) != KING)
+            if (pc != 7 && type_of(pc) != KING)
             {
-                chess_board.piecesOnSquares[sq] = PIECE_NONE;
+                //chess_board.piecesOnSquares[sq] = NO_PIECE;
+                chess_board.piecesOnSquares[sq] = 7;
                 chess_board.side[(pc >> 3) & 1] ^= (1ULL << sq);
                 chess_board.pieceTypes[(pc & 7) - 1] ^= (1ULL << sq);
 
-                accumulators.reset();
-                std::tie(psqt, positional) = networks.big.evaluate(chess_board, accumulators, &caches.big);
+                accumulators->reset();
+                std::tie(psqt, positional) = networks.big.evaluate(chess_board, *accumulators, caches.big); //see network.cpp
                 Value eval                 = psqt + positional;
                 eval                       = chess_board.sideToMove == WHITE ? eval : -eval;
-                //printf("trace() debug: eval without piece %d\n", eval);
+                //printf("NNUE::trace() debug: %d: eval = psqt (%d) + positional (%d) = %d\n", pc, eval, positional, eval + positional);
                 v                          = base - eval;
-                //printf("trace() debug: pc %d on sq %d value %d\n", pc, sq, v);
+                //printf("NNUE::trace() debug: %d: v = base (%d) - eval (%d) = %d\n", pc, base, eval, base - eval);
 
                 chess_board.piecesOnSquares[sq] = pc;
                 chess_board.side[(pc >> 3) & 1] |= (1ULL << sq);
@@ -302,8 +301,8 @@ trace(Board& chess_board, const Eval::NNUE::Networks& networks, Eval::NNUE::Accu
         ss << board[row] << '\n';
     ss << '\n';
 
-    accumulators.reset();
-    auto t = networks.big.trace_evaluate(chess_board, accumulators, &caches.big);
+    accumulators->reset();
+    auto t = networks.big.trace_evaluate(chess_board, *accumulators, caches.big); //see network.cpp
 
     ss << " NNUE network contributions "
        << (chess_board.sideToMove == WHITE ? "(White to move)" : "(Black to move)") << std::endl
@@ -334,6 +333,5 @@ trace(Board& chess_board, const Eval::NNUE::Networks& networks, Eval::NNUE::Accu
 
     return ss.str();
 }
-
 
 }  // namespace Stockfish::Eval::NNUE
