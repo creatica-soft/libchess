@@ -74,6 +74,13 @@ std::atomic<bool> challenge_declined {false};
 //so the extra ones were abandoned and lost on time. Bounded by the 5 s wait plus the
 //cancel below, so it cannot wedge the bot shut.
 std::atomic<bool> challenge_outstanding {false};
+//Empty means "accept anyone" (subject to the variant and speed checks). Populated by
+//--accept-only=<username>, which replaces the opponent names that used to be hardcoded
+//into the accept condition and needed a rebuild to change.
+std::unordered_set<std::string> accept_only;
+static bool challengerAllowed(const std::string& challenger_id) {
+    return accept_only.empty() || accept_only.count(challenger_id) > 0;
+}
 std::atomic<bool> playing {true};
 std::mutex mutex;
 std::mutex playing_mutex;
@@ -737,7 +744,7 @@ void ProcessEvent(const json& event) {
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
             if ((!game_in_progress.load() && !challenge_outstanding.load() && (variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960")) &&
-                (speed == "blitz" || speed == "rapid" || speed == "classical") && (challenger_id == "poliakevitch" || challenger_id == "creaticachessbot2") /*&& title != "BOT"*/) {
+                (speed == "blitz" || speed == "rapid" || speed == "classical") && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -826,15 +833,42 @@ int main(int argc, char ** argv) {
   for (int i = 1; i < argc; i++) {
     const std::string arg = argv[i];
     if (arg == "--no-challenge") no_challenge = true;
+    else if (arg.rfind("--accept-only=", 0) == 0) {
+      //Comma-separated list; the flag may also be repeated.
+      std::stringstream names(arg.substr(14));
+      std::string who;
+      int added = 0;
+      while (std::getline(names, who, ',')) {
+        //tolerate stray spaces around a name
+        const size_t b = who.find_first_not_of(" \t");
+        const size_t e = who.find_last_not_of(" \t");
+        if (b == std::string::npos) continue;
+        accept_only.insert(who.substr(b, e - b + 1));
+        added++;
+      }
+      if (!added) { fprintf(stderr, "%s: --accept-only= needs at least one username\n", argv[0]); return 1; }
+    }
     else if (arg == "-h" || arg == "--help") {
-      printf("usage: %s [--no-challenge]\n"
-             "  --no-challenge   do not challenge other bots; only respond to incoming challenges\n", argv[0]);
+      printf("usage: %s [--no-challenge] [--accept-only=<user>[,<user>...]]\n"
+             "  --no-challenge         do not challenge other bots; only respond to incoming challenges\n"
+             "  --accept-only=<a>[,<b>...]  only accept challenges from these users.\n"
+             "                         May be repeated. Omit entirely to accept anyone.\n", argv[0]);
       return 0;
     } else {
       fprintf(stderr, "%s: unknown argument '%s' (try --help)\n", argv[0], argv[i]);
       return 1;
     }
   }
+  //Report the configuration we parsed before doing anything that can fail, so a
+  //mistyped filter is obvious rather than silently meaning "accept anyone".
+  if (accept_only.empty()) std::cout << "main(): accepting challenges from ANYONE" << std::endl;
+  else {
+    std::cout << "main(): accepting challenges only from:";
+    for (const auto& w : accept_only) std::cout << " " << w;
+    std::cout << std::endl;
+  }
+  if (no_challenge) std::cout << "main(): --no-challenge, so we will not challenge anyone" << std::endl;
+
   if (token.empty()) {
     fprintf(stderr, "lichess_bot: LICHESS_TOKEN is not set.\n"
                     "  export LICHESS_TOKEN=\"$(cat ~/.config/creatica/lichess_token)\"\n");
@@ -860,8 +894,7 @@ int main(int argc, char ** argv) {
 
   curl_global_init(CURL_GLOBAL_DEFAULT);
   std::thread challenge;
-  if (no_challenge) std::cout << "main(): --no-challenge, so we will not challenge anyone" << std::endl;
-  else challenge = std::thread(GetAndProcessBots, nb);
+  if (!no_challenge) challenge = std::thread(GetAndProcessBots, nb);
   std::string event_url = "https://lichess.org/api/stream/event";
   while (playing.load()) {  // Main loop: Keep streaming events
       StreamAndProcess(event_url, ProcessEvent);
