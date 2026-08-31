@@ -168,7 +168,13 @@ struct MCTSNode {
     std::atomic<int> num_children{0};
     std::atomic<int> pending_evals{0};
     std::atomic<int> generation{0};
-    std::atomic<int> terminal{0}; //0 (pending), 1 (mate), 2 (stalemate), 3 (repetition), 4 (evaluated)
+    //terminal is the terminal TYPE only: 0 (not terminal), 1 (mate), 2 (stalemate).
+    //It used to double as an "evaluated" flag by taking the value 4, which meant a
+    //mate node (terminal == 1) could never satisfy a `>= 4` test and was treated as
+    //permanently unevaluated - so mates were skipped in PV reporting and the root
+    //wait loop would spin forever on a terminal root. Those are separate facts now.
+    std::atomic<int> terminal{0};
+    std::atomic<bool> evaluated{false}; //a usable value/priors have been stored
     std::shared_mutex mutex;  // For protecting children expansion
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
     //std::atomic<MCTSNode *> parent {nullptr};
@@ -349,7 +355,12 @@ public:
             auto start_time = std::chrono::steady_clock::now();
             int spin_count = 0;
             
-            while (nodes.size() < batch_size) {
+            //`running` must be tested HERE too, not only by the outer loop: the timeout
+            //break below sits inside `if (!nodes.empty())`, so an idle server - queue
+            //empty and nothing buffered, which is exactly the state at shutdown - spun
+            //in here forever and never returned to re-read `running`. quit() then never
+            //took effect and server_thread.join() blocked for good.
+            while (nodes.size() < batch_size && running.load(std::memory_order_relaxed)) {
                 size_t popped = queue.pop_batch(nodes, boards, paths, batch_size - nodes.size());
                 
                 if (popped == 0) {
@@ -370,6 +381,11 @@ public:
                     spin_count = 0; // Reset spin count on successful pop
                 }
             }    
+
+            //Collection can now end with nothing buffered - quit() breaks the inner loop
+            //immediately. Feeding an empty batch to the model throws
+            //"cannot reshape tensor of 0 elements into shape [0, -1]".
+            if (nodes.empty()) continue;
 
             // 1. Parallel Flatten directly into the CPU tensor memory
             torch::Tensor current_batch_tensor = cpu_tensor.slice(0, 0, (long)nodes.size());
@@ -404,7 +420,10 @@ public:
                 double eval = std::clamp(results_ptr[i], -0.999f, 0.999f);
                 int cp = static_cast<int>(std::atanh(eval) * eval_scale);
                 //printf("cp %d\n", cp);
-                leaf->cp.store(cp, std::memory_order_relaxed);
+                //Never overwrite a child proven terminal at expansion time - its score
+                //is exact and the network's guess is not.
+                if (leaf->terminal.load(std::memory_order_acquire) == 0)
+                    leaf->cp.store(cp, std::memory_order_relaxed);
                 
                 if (!path.empty()) {
                     auto* parent = path.back();
@@ -415,7 +434,7 @@ public:
                 path.push_back(leaf);
                 backpropagate(eval, path); 
                 inflight_count.fetch_sub(1, std::memory_order_release);
-                leaf->terminal.store(4, std::memory_order_release);
+                leaf->evaluated.store(true, std::memory_order_release);
                 pos_dedup.remove(leaf->hash.load(std::memory_order_relaxed));
             }
         }
@@ -540,7 +559,7 @@ private:
             double prob = (inv_total == 0.0) ? (1.0f / n) : (double)(evals[i] * inv_total);
             edges[i].P.store(prob, std::memory_order_release);
         }
-        parent->terminal.store(4, std::memory_order_release);
+        parent->evaluated.store(true, std::memory_order_release);
     }
     
     void backpropagate(double eval, const std::vector<MCTSNode*>& path) {

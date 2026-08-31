@@ -803,12 +803,21 @@ int main(int argc, char **argv) {
       uciLoop();
     }
     search_thread.join();
-    // Wait for the engine to finish (or handle signals)
-    //server_thread.join();
+    // Tell the inference server to stop, THEN wait for it. Destroying a joinable
+    // std::thread calls std::terminate(), which is the bare "libc++abi: terminating"
+    // SIGABRT this engine hit on every exit - after printing its bestmove, so it looked
+    // harmless interactively but aborts any unattended tournament run.
     server.quit();
+    server_thread.join();
     
     shutdown_thread_pool();
     curl_global_cleanup();
     fclose(logfile);
-    return 0;
+    // Everything of ours is finished here: both threads joined, the pool down, curl
+    // cleaned up and the log closed. What remains is libtorch's own static teardown,
+    // which throws "recursive_mutex lock failed: Invalid argument" out of a destructor
+    // and aborts - AFTER bestmove has been printed, so it looks harmless interactively
+    // but returns 134 and kills any unattended tournament run. Nothing is left to flush,
+    // so leave via _Exit and skip static destruction entirely.
+    std::_Exit(0);
 }

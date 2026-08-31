@@ -586,6 +586,12 @@ struct StateInfo {
     uint8_t castlingRights;
     uint64_t castlingRooks;
     bool isCheck = false;
+    //isMate/isStaleMate were NOT saved here, so undo_move() left the board wearing the
+    //flags of whatever position was last examined. Any code that calls
+    //isCheckMateStaleMate() on a child mid-search - which is how per-child terminal
+    //detection has to work - then corrupted its caller's view of the parent.
+    bool isMate = false;
+    bool isStaleMate = false;
     uint8_t num_moves = 0;
     // Pointers to previous state allow for repetition detection
     //StateInfo* previous; //currently not used
