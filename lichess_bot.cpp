@@ -197,6 +197,11 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        //Without these a half-open connection blocks this request forever - and a move
+        //POST that never returns means the move is never sent and the game flags.
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); //curl is used from several threads here
         curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 65536L);
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
         if (method == "POST") {
@@ -433,8 +438,14 @@ void StreamAndProcess(const std::string& url, std::function<void(const json&)> p
     // Keep connection alive longer for correspondence games - this may not be needed - we terminate curl_easy_perform() with
     // WriteCallback() returning 0 when we press Ctrl-C, which sets playng to false. 
     // WriteCallback() is called at least every 7 seconds with empty line as a keep alive if no other events occur
-    //curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); //1 byte a second - average speed over CURLOPT_LOW_SPEED_TIME interval
-    //curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 600L);  // 10min timeout - if average speed is below CURLOPT_LOW_SPEED_LIMIT, abort
+    //These were commented out, so a silently dead socket (sleep/wake, Wi-Fi handover, a
+    //NAT table eviction) left curl_easy_perform blocked indefinitely - macOS only starts
+    //probing after 2 hours - and the bot never saw another event. The comment above says
+    //a keep-alive newline arrives at least every 7 s, so 30 s of silence means it is dead.
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     CURLcode res = curl_easy_perform(curl); //this blocks until curl times out or errors out
     if (res != CURLE_OK) {
@@ -482,9 +493,18 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
             strcat(creatica.moves, evaluations[0]->ponder);
           }
         } else creatica.moves[0] = '\0';
+int pos_retries = 0;
 try_pos: if (!position(creatica)) {
           fprintf(stderr, "ComputeAndPostMove() error: position() returned false, fen %s\n", creatica.position);
-          exit(-1);
+          //position() returns isReady(), which is false only when the pipe hits EOF -
+          //i.e. the engine child has died. exit(-1) here killed the WHOLE bot from a
+          //detached thread inside a curl callback: the rated game was forfeited, no
+          //'quit' was sent and neither fifo was removed - which is how /tmp filled with
+          //orphaned pipes. It also made the restart code immediately below unreachable.
+          if (++pos_retries > 3) {
+            fprintf(stderr, "ComputeAndPostMove() error: engine did not come back after %d attempts; abandoning this move\n", pos_retries);
+            return;
+          }
           initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
           setEngineOptions();
           strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
@@ -504,8 +524,8 @@ try_again:  if (go(creatica, evaluations)) {
               strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
               strncpy(creatica.moves, moves.c_str(), MAX_UCI_MOVES_LEN);
               if (!position(creatica)) {
-                fprintf(stderr, "ComputeAndPostMove() error: position() returned false, fen %s\n", creatica.position);
-                exit(-1);
+                fprintf(stderr, "ComputeAndPostMove() error: position() returned false after restart, fen %s\n", creatica.position);
+                return; //lose this move, not the whole bot
               }
               creatica.wtime = wtime;
               creatica.btime = btime;
@@ -621,8 +641,11 @@ void HandleGame(const std::string& game_id) {
                 bool draw_offer = is_white ? bdraw : wdraw;
                 ComputeAndPostMove(game_id, draw_offer, our_turn, initial_fen, moves, wtime, btime, winc, binc);
             } else if (state.contains("type") && state["type"] == "opponentGone") {
-                bool gone = state["gone"];
-                int claimWinInSeconds = state["claimWinInSeconds"];
+                //lichess omits claimWinInSeconds entirely when gone is false, and a bare
+                //operator[] on a const json& asserts and abort()s - which killed the bot
+                //every time an opponent disconnected and came back.
+                bool gone = state.value("gone", false);
+                int claimWinInSeconds = state.value("claimWinInSeconds", -1);
                 if (gone) {
                     std::cout << "HandleGame() debug: game " << game_id << " state: opponentGone. Victory can be claimed in " << claimWinInSeconds << " sec" << std::endl;
                     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -764,6 +787,9 @@ void signal_handler(int sig) {
 int main() {
   const int multiPV = MULTI_PV;
   std::signal(SIGINT, signal_handler);  // Set up Ctrl-C handler
+  //A write to a dead engine's pipe raises SIGPIPE, whose default action terminates the
+  //process. Ignore it so the write returns EPIPE and the restart path can run instead.
+  std::signal(SIGPIPE, SIG_IGN);
   //init_magic_bitboards();
   Stockfish::Bitboards::init();
   rng.seed(static_cast<unsigned int>(std::random_device{}()));
