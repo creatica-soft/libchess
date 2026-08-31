@@ -24,7 +24,8 @@
 #define CREATICA_PATH "/Users/ap/libchess/creatica-shared-root"
 #define DEPTH 0
 #define MOVETIME 0
-#define HASH 2048
+#define HASH 512 //was 2048. MCTSNode went 216 -> 56 bytes, so 512 MB now holds more
+                 //tree than 2 GB did before, at a quarter of the footprint on an 8 GB box
 #define THREADS 8
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
@@ -69,6 +70,13 @@ std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
 std::atomic<bool> challenge_accepted {false};
 std::atomic<bool> challenge_declined {false};
+//"Am I committed to a game?" has TWO parts and only one was tracked. game_in_progress
+//covers a game that has started; this covers a challenge WE sent that has not yet been
+//answered. Without it the bot could send a challenge, accept someone else's while
+//waiting, then have its own accepted too - and it has resources for exactly one game,
+//so the extra ones were abandoned and lost on time. Bounded by the 5 s wait plus the
+//cancel below, so it cannot wedge the bot shut.
+std::atomic<bool> challenge_outstanding {false};
 std::atomic<bool> playing {true};
 std::mutex mutex;
 std::mutex playing_mutex;
@@ -253,6 +261,10 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
         std::cout << "CreateChallenge(): Skipping - game already in progress" << std::endl;
         return false;
     }
+    if (challenge_outstanding.load()) {
+        std::cout << "CreateChallenge(): Skipping - one of our challenges is still outstanding" << std::endl;
+        return false;
+    }
     std::string url = "https://lichess.org/api/challenge/" + opponent;
     std::stringstream fields;
     fields << "rated=" << (rated ? "true" : "false")
@@ -276,6 +288,7 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
         std::cerr << "CreateChallenge(): challengeId is empty" << std::endl;
         return false;
       }
+      challenge_outstanding.store(true); //committed until accepted, declined or cancelled
       std::cout << "CreateChallenge(): Challenge " <<  challengeId << " sent to " << opponent << " successfully" << std::endl;      
     } else {
       std::string error;
@@ -384,6 +397,7 @@ void GetAndProcessBots(int nb) {
                         } else {
                           std::cout << "GetAndProcessBots() error: failed to cancel our challenge " << challengeId << std::endl;
                         }
+                        challenge_outstanding.store(false); //cancelled - free to accept again
                         break;
                     //}
                   }
@@ -649,6 +663,7 @@ void ProcessEvent(const json& event) {
               {
                 std::lock_guard<std::mutex> lk(challenge_mutex);
                 challenge_accepted.store(true);
+                challenge_outstanding.store(false);
               }
               challenge_cv.notify_one();
             }
@@ -656,6 +671,7 @@ void ProcessEvent(const json& event) {
               {
                 std::lock_guard<std::mutex> lk(challenge_mutex);
                 challenge_declined.store(true);
+                challenge_outstanding.store(false);
               }
               challenge_cv.notify_one();
             }
@@ -663,7 +679,7 @@ void ProcessEvent(const json& event) {
         }
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
-            if ((!game_in_progress.load() && (variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960")) &&
+            if ((!game_in_progress.load() && !challenge_outstanding.load() && (variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960")) &&
                 (speed == "blitz" || speed == "rapid" || speed == "classical") && (challenger_id == "poliakevitch" || challenger_id == "creaticachessbot2") /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
@@ -674,7 +690,7 @@ void ProcessEvent(const json& event) {
             } else {
                 std::string decline_url = "https://lichess.org/api/challenge/" + challenge_id + "/decline";
                 std::string reason = "reason=";
-                if (game_in_progress.load()) reason += "later";
+                if (game_in_progress.load() || challenge_outstanding.load()) reason += "later";
                 else if (variant != "standard" && variant != "chess960") reason += "variant";
                 else if (speed != "blitz" && speed != "rapid" && speed != "classical") reason += "timeControl";
                 else reason += "generic";
@@ -707,6 +723,7 @@ void ProcessEvent(const json& event) {
           {
             std::lock_guard<std::mutex> lc(playing_mutex);
             game_in_progress.store(true);
+            challenge_outstanding.store(false); //the game supersedes any outstanding challenge
           }
           game_cv.notify_one();
           //start a detached thread to play a single game
