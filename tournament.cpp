@@ -22,8 +22,17 @@ const char * SYZYGY_PATH = "/Users/ap/syzygy";
 #define PGN_FILE "match3.pgn"
 #define MOVETIME 2000
 #define DEPTH 0
-#define HASH 2024
-#define THREADS 8
+//Per-engine resources. Both used to get HASH 2024 / THREADS 8, i.e. 4 GB and 16
+//threads on a 4-performance-core, 8 GB machine - the match swapped before it meant
+//anything. Creatica's Hash is its MCTS tree; Stockfish's is a transposition table
+//and it needs far less to play at a limited strength.
+#define HASH_1 512
+#define HASH_2 128
+#define THREADS_1 4
+#define THREADS_2 1
+//Stockfish is the one that has to be held down: Creatica advertises neither
+//UCI_LimitStrength nor UCI_Elo, so engine.cpp's option lookup silently ignores them.
+#define OPPONENT_ELO 2600
 
 // Tuning Settings
 #define GAMES_PER_MATCH 20  // 10 is very noisy; 20-40 is better for statistical significance
@@ -102,8 +111,21 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
         exit(1);
       }    
     }
-    Move move;
-    uci2move_idx(evaluations[0]->bestmove, move);        
+    Move move = {}; //was uninitialised, so move.type below was stack garbage
+    uci2move_idx(evaluations[0]->bestmove, move);
+    //move2san() reads move.type to decide whether to emit 'x', but ff_move() further
+    //down is what actually SETS that type - so every capture in every match PGN was
+    //written without its capture marker ("Nf7" for Nxf7, "d4" for exd4), which is not
+    //legal SAN and cannot be re-imported. move2san needs the PRE-move board for
+    //disambiguation, so it cannot simply be moved after ff_move; classify here instead.
+    if (board.piecesOnSquares[move.dst] != PieceNone) move.type = MoveTypeCapture;
+    //Castling likewise, or it is written as a plain king move ("Kc1" instead of O-O-O).
+    //Standard chess only: Chess960 encodes castling as king-takes-own-rook.
+    if (!board.isChess960 && PC_TYPE(board.piecesOnSquares[move.src]) == King) {
+      const int d = (int)move.dst - (int)move.src;
+      if (d == 2) move.type = MoveTypeCastlingKingside;
+      else if (d == -2) move.type = MoveTypeCastlingQueenside;
+    }
     char sanMove[12] = "";
     strcat(sanMoves, move2san(board, move, sanMove));
     strcat(sanMoves, " ");        
@@ -139,7 +161,9 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
       score_engine_2 += 0.5;
   }
     
-  char res[8];
+  char res[8] = "*"; //"*" is the PGN tag for an unfinished/unknown result - this was
+                     //uninitialised, so any game ending outside the branches below wrote
+                     //stack garbage into the [Result] tag.
   if (board.isMate) {
     if (board.sideToMove == ColorWhite) strcpy(res, "0-1");
     else strcpy(res, "1-0"); 
@@ -204,8 +228,12 @@ int main(int argc, char ** argv) {
     evaluations[0]->maxPlies = 1;
 
     // Init Engines
-    initChessEngine(engine_1, ENGINE_1, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, 1, false, true, 2600); //MultiPV, logging, limitStrength, Elo
-    initChessEngine(engine_2, ENGINE_2, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, 1, false, false, 2300);
+    //limitStrength/Elo were on the WRONG engine: Creatica got them (a silent no-op,
+    //it advertises neither option) while Stockfish got false and therefore played at
+    //full strength. Every match run this way measured Creatica against an unlimited
+    //Stockfish.
+    initChessEngine(engine_1, ENGINE_1, MOVETIME, DEPTH, HASH_1, THREADS_1, SYZYGY_PATH, 1, false, false, 0);            //Creatica, unlimited
+    initChessEngine(engine_2, ENGINE_2, MOVETIME, DEPTH, HASH_2, THREADS_2, SYZYGY_PATH, 1, false, true, OPPONENT_ELO);  //Stockfish, held to OPPONENT_ELO
 
     FILE* logFile = fopen(PGN_FILE, "a");
 
