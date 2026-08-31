@@ -663,7 +663,7 @@ void ProcessEvent(const json& event) {
         }
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
-            if ((!game_in_progress.load() && variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960") &&
+            if ((!game_in_progress.load() && (variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960")) &&
                 (speed == "blitz" || speed == "rapid" || speed == "classical") && (challenger_id == "poliakevitch" || challenger_id == "creaticachessbot2") /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {

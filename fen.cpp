@@ -96,10 +96,18 @@ unsigned char find_king_file(const char * rank_str, char king_char) {
 int fen2board(Board& board, const char * fenstr) {
     assert(fenstr);
     size_t len = strlen(fenstr) + 1;
-    assert(len <= MAX_FEN_STRING_LEN);
+    //assert() is compiled out by -DNDEBUG in BOTH build paths, so it was the only
+    //thing standing between an over-long FEN and a stack buffer that strncpy leaves
+    //unterminated at exactly this size - strtok_r would then walk off the end.
+    //Reject explicitly, and terminate unconditionally.
+    if (len > MAX_FEN_STRING_LEN) {
+        fprintf(stderr, "fen2board() error: FEN is %zu bytes, maximum is %d\n", len, MAX_FEN_STRING_LEN);
+        return 1;
+    }
 
     char local_fen[MAX_FEN_STRING_LEN];
     strncpy(local_fen, fenstr, sizeof(local_fen));
+    local_fen[sizeof(local_fen) - 1] = '\0';
     char *saveptr_main = NULL;
     char *token = strtok_r(local_fen, " ", &saveptr_main);
     unsigned char field_idx = 0;
@@ -172,7 +180,14 @@ int fen2board(Board& board, const char * fenstr) {
     //((unsigned int *)board.castlingRook)[0] = 0x08080808;
     board.castlingRooks = 0;
     board.castlingRights = 0;
-    //board.isChess960 = false;
+    //These were never reset, so every cached flag leaked from the PREVIOUS position:
+    //one Chess960 game left isChess960 true for the life of the process, and a stale
+    //isCheck made nnue.cpp return the NNUE_CHECK sentinel for a position not in check.
+    board.isChess960 = false;
+    board.isCheck = false;
+    board.isMate = false;
+    board.isStaleMate = false;
+    board.num_moves = 0;
 
     if (castling_ptr[0] != '-') {
         const char wf[] = "ABCDEFGH";

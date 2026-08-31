@@ -263,7 +263,7 @@ trace(Board& chess_board, const Eval::NNUE::Networks& networks, Eval::NNUE::Accu
     // the current base eval, simulating the removal of the piece from its square.
     auto [psqt, positional] = networks.big.evaluate(chess_board, *accumulators, caches.big); //see network.cpp
     Value base              = psqt + positional;
-    base                    = chess_board.sideToMove == WHITE ? base : -base;
+    base                    = static_cast<Color>(chess_board.sideToMove) == WHITE ? base : -base;
     //printf("NNUE::trace() debug: base = psqt (%d) + positional (%d) = %d\n", psqt, positional, psqt + positional);
     for (File f = FILE_A; f <= FILE_H; ++f)
         for (Rank r = RANK_1; r <= RANK_8; ++r)
@@ -273,22 +273,22 @@ trace(Board& chess_board, const Eval::NNUE::Networks& networks, Eval::NNUE::Accu
             Value  v  = VALUE_NONE;
 
             //if (pc != NO_PIECE && type_of(pc) != KING)
-            if (pc != 7 && type_of(pc) != KING)
+            if (pc != Piece(::PieceNone) && type_of(pc) != KING)
             {
                 //chess_board.piecesOnSquares[sq] = NO_PIECE;
-                chess_board.piecesOnSquares[sq] = 7;
+                chess_board.piecesOnSquares[sq] = ::PieceNone;
                 chess_board.side[(pc >> 3) & 1] ^= (1ULL << sq);
                 chess_board.pieceTypes[(pc & 7) - 1] ^= (1ULL << sq);
 
                 accumulators->reset();
                 std::tie(psqt, positional) = networks.big.evaluate(chess_board, *accumulators, caches.big); //see network.cpp
                 Value eval                 = psqt + positional;
-                eval                       = chess_board.sideToMove == WHITE ? eval : -eval;
+                eval                       = static_cast<Color>(chess_board.sideToMove) == WHITE ? eval : -eval;
                 //printf("NNUE::trace() debug: %d: eval = psqt (%d) + positional (%d) = %d\n", pc, eval, positional, eval + positional);
                 v                          = base - eval;
                 //printf("NNUE::trace() debug: %d: v = base (%d) - eval (%d) = %d\n", pc, base, eval, base - eval);
 
-                chess_board.piecesOnSquares[sq] = pc;
+                chess_board.piecesOnSquares[sq] = static_cast<::Piece>(pc);
                 chess_board.side[(pc >> 3) & 1] |= (1ULL << sq);
                 chess_board.pieceTypes[(pc & 7) - 1] |= (1ULL << sq);
             }
@@ -305,7 +305,7 @@ trace(Board& chess_board, const Eval::NNUE::Networks& networks, Eval::NNUE::Accu
     auto t = networks.big.trace_evaluate(chess_board, *accumulators, caches.big); //see network.cpp
 
     ss << " NNUE network contributions "
-       << (chess_board.sideToMove == WHITE ? "(White to move)" : "(Black to move)") << std::endl
+       << (static_cast<Color>(chess_board.sideToMove) == WHITE ? "(White to move)" : "(Black to move)") << std::endl
        << "+------------+------------+------------+------------+\n"
        << "|   Bucket   |  Material  | Positional |   Total    |\n"
        << "|            |   (PSQT)   |  (Layers)  |            |\n"
