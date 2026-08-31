@@ -1049,6 +1049,8 @@ PieceType do_move(Board& board, Move& move, StateInfo& state) {
 	state.halfmoveClock = board.halfmoveClock;
 	//preserve check info
 	state.isCheck = board.isCheck;
+	state.isMate = board.isMate;
+	state.isStaleMate = board.isStaleMate;
 
 	//branchless halfmoveClock update
 	bool resetClock = (mpType == Pawn) | (state.capturedType != PieceTypeNone);
@@ -1315,6 +1317,8 @@ PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::Dirt
 	state.halfmoveClock = board.halfmoveClock;
 	//preserve check info
 	state.isCheck = board.isCheck;
+	state.isMate = board.isMate;
+	state.isStaleMate = board.isStaleMate;
   
   //branchless halfmoveClock update
 	bool resetClock = (mpType == Pawn) | (state.capturedType != PieceTypeNone);
@@ -1365,6 +1369,8 @@ void undo_move(Board& board, const Move& move, const StateInfo& state) {
 	
 	//restore check info
 	board.isCheck = state.isCheck;
+	board.isMate = state.isMate;
+	board.isStaleMate = state.isStaleMate;
 
 	//decrement move number if it was black's move
 	if (board.sideToMove == ColorBlack) --board.moveNumber;

@@ -345,6 +345,21 @@ int expand(MCTSNode * node, Board& chess_board, const ZobristHash& board_hash, c
       continue; //repetition - skip it
     }
     MCTSNode * child = make_child(child_hash.hash);
+    //Detect a terminal CHILD here, as the NNUE engine does at creatica-shared-root.cpp:413.
+    //Without it the network sees a mating position as ordinary and the mate is only found
+    //if that child is itself expanded much later - a forced mate in one came back as
+    //"score cp 589". One legal-move generation per child, no network evaluation.
+    //Safe now that StateInfo carries isMate/isStaleMate, so undo_move() restores them.
+    if (child->terminal.load(std::memory_order_acquire) == 0) {
+      isCheckMateStaleMate(chess_board);
+      if (chess_board.isMate) {        //cp is from the CHILD's side-to-move perspective
+        child->cp.store(-MATE_SCORE, std::memory_order_relaxed);
+        child->terminal.store(1, std::memory_order_release);
+      } else if (chess_board.isStaleMate) {
+        child->cp.store(0, std::memory_order_relaxed);
+        child->terminal.store(2, std::memory_order_release);
+      }
+    }
     children.push_back({child, (move.promoType << 12) | (move.src << 6) | move.dst, chess_board});
     undo_move(chess_board, move, state);
   }
@@ -371,6 +386,21 @@ int expand(MCTSNode * node, Board& chess_board, const ZobristHash& board_hash, c
               continue; //repetition - skip it
             }
             MCTSNode * child = make_child(child_hash.hash);
+            //Detect a terminal CHILD here, as the NNUE engine does at creatica-shared-root.cpp:413.
+            //Without it the network sees a mating position as ordinary and the mate is only found
+            //if that child is itself expanded much later - a forced mate in one came back as
+            //"score cp 589". One legal-move generation per child, no network evaluation.
+            //Safe now that StateInfo carries isMate/isStaleMate, so undo_move() restores them.
+            if (child->terminal.load(std::memory_order_acquire) == 0) {
+              isCheckMateStaleMate(chess_board);
+              if (chess_board.isMate) {        //cp is from the CHILD's side-to-move perspective
+                child->cp.store(-MATE_SCORE, std::memory_order_relaxed);
+                child->terminal.store(1, std::memory_order_release);
+              } else if (chess_board.isStaleMate) {
+                child->cp.store(0, std::memory_order_relaxed);
+                child->terminal.store(2, std::memory_order_release);
+              }
+            }
             children.push_back({child, (move.promoType << 12) | (move.src << 6) | move.dst, chess_board});
             undo_move(chess_board, move, state);
       	  }
@@ -464,9 +494,14 @@ void mcts_search(ThreadParams& params, EvalQueue<65536>& queue) {
     if (path_count == 0) pos_history.insert(sim_zh.hash);
     bool repetition = (global_count + path_count >= 1); 
     if (repetition) {
+      //Repetition is a property of the PATH taken to reach this position, not of the
+      //position itself, so it must stay local to this simulation. Stamping the shared
+      //transposition node - as this used to - was a textbook graph-history-interaction
+      //bug: every other path that later transposed into the node inherited a draw
+      //verdict it had not earned. Worse, `terminal` doubles as the "priors finalized"
+      //flag (finalize_priors stores 4, and :592/:632 test < 4), so writing 3 also
+      //reset an already-expanded node to "not ready".
       terminal = 3;
-      node->terminal.store(3, std::memory_order_release);
-      node->cp.store(0, std::memory_order_release);
       break;
     }
   } //end of while(node.num_children > 0) loop
@@ -589,8 +624,12 @@ void uci_output_thread() {
       char uci_move[6];
       idx2uci(move_idx, uci_move);
       MCTSNode * child = children[visits[i].second].child.load(std::memory_order_acquire);
-      if (child->terminal.load(std::memory_order_acquire) < 4) {
-        // Optionally print a line with score cp 0 or skip
+      //Skip only nodes that are genuinely unevaluated. A terminal child (mate or
+      //stalemate) carries a real score and MUST be reported - the old `terminal < 4`
+      //test hid every mate from the PV, which is why a forced mate in one came back
+      //as "score cp 456" and the mating move was never played.
+      if (!child->evaluated.load(std::memory_order_acquire) &&
+          child->terminal.load(std::memory_order_acquire) == 0) {
         continue; // skip unevaluated nodes
       }
       // Better score for UCI output:
@@ -629,7 +668,10 @@ void runMCTS(EvalQueue<65536>& queue) {
       set_root(queue);      
     }
     // Inside runMCTS, after set_root(queue)
-    while (search.root->terminal.load(std::memory_order_acquire) < 4) {
+    //Also break out when the root is itself terminal, or this spins forever on a
+    //position that is already mate or stalemate.
+    while (!search.root->evaluated.load(std::memory_order_acquire) &&
+           search.root->terminal.load(std::memory_order_acquire) == 0) {
         std::this_thread::yield();
     }
 
