@@ -74,6 +74,36 @@ std::atomic<bool> challenge_declined {false};
 //so the extra ones were abandoned and lost on time. Bounded by the 5 s wait plus the
 //cancel below, so it cannot wedge the bot shut.
 std::atomic<bool> challenge_outstanding {false};
+//When that challenge was sent. lichess expires a challenge in ~20 s and we cancel after
+//5 s, so anything older than this is certainly gone - whatever happened to the events we
+//were waiting for. A flag guarding an asynchronous external event must not depend on
+//having enumerated every clear path correctly: if one is ever missed the bot would stop
+//challenging anyone, permanently and silently. This makes that failure self-heal.
+#define CHALLENGE_OUTSTANDING_TIMEOUT_MS 30000
+std::atomic<long long> challenge_sent_ms {0};
+static long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void markChallengeSent() {
+    challenge_sent_ms.store(nowMs());
+    challenge_outstanding.store(true);
+}
+static void clearChallengeOutstanding() {
+    challenge_outstanding.store(false);
+}
+//True only while a challenge we sent is still plausibly live.
+static bool challengeStillOutstanding() {
+    if (!challenge_outstanding.load()) return false;
+    const long long age = nowMs() - challenge_sent_ms.load();
+    if (age > CHALLENGE_OUTSTANDING_TIMEOUT_MS) {
+        std::cerr << "challengeStillOutstanding(): our challenge has been outstanding for "
+                  << age << " ms with no accept, decline or cancel - clearing it" << std::endl;
+        clearChallengeOutstanding();
+        return false;
+    }
+    return true;
+}
 //Empty means "accept anyone" (subject to the variant and speed checks). Populated by
 //--accept-only=<username>, which replaces the opponent names that used to be hardcoded
 //into the accept condition and needed a rebuild to change.
@@ -293,8 +323,9 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
         std::cout << "CreateChallenge(): Skipping - game already in progress" << std::endl;
         return false;
     }
-    if (challenge_outstanding.load()) {
-        std::cout << "CreateChallenge(): Skipping - one of our challenges is still outstanding" << std::endl;
+    if (challengeStillOutstanding()) {
+        std::cout << "CreateChallenge(): Skipping - a challenge we sent "
+                  << (nowMs() - challenge_sent_ms.load()) << " ms ago is still outstanding" << std::endl;
         return false;
     }
     std::string url = "https://lichess.org/api/challenge/" + opponent;
@@ -320,7 +351,7 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
         std::cerr << "CreateChallenge(): challengeId is empty" << std::endl;
         return false;
       }
-      challenge_outstanding.store(true); //committed until accepted, declined or cancelled
+      markChallengeSent(); //committed until accepted, declined, cancelled or stale
       std::cout << "CreateChallenge(): Challenge " <<  challengeId << " sent to " << opponent << " successfully" << std::endl;      
     } else {
       std::string error;
@@ -429,7 +460,7 @@ void GetAndProcessBots(int nb) {
                         } else {
                           std::cout << "GetAndProcessBots() error: failed to cancel our challenge " << challengeId << std::endl;
                         }
-                        challenge_outstanding.store(false); //cancelled - free to accept again
+                        clearChallengeOutstanding(); //cancelled - free to accept again
                         break;
                     //}
                   }
@@ -727,7 +758,7 @@ void ProcessEvent(const json& event) {
               {
                 std::lock_guard<std::mutex> lk(challenge_mutex);
                 challenge_accepted.store(true);
-                challenge_outstanding.store(false);
+                clearChallengeOutstanding();
               }
               challenge_cv.notify_one();
             }
@@ -735,7 +766,7 @@ void ProcessEvent(const json& event) {
               {
                 std::lock_guard<std::mutex> lk(challenge_mutex);
                 challenge_declined.store(true);
-                challenge_outstanding.store(false);
+                clearChallengeOutstanding();
               }
               challenge_cv.notify_one();
             }
@@ -743,7 +774,7 @@ void ProcessEvent(const json& event) {
         }
         std::cout << "ProcessEvent() debug: received challenge " << challenge_id << " with status " << status << " from " << challenger_id << std::endl;
         if (status == "created") {
-            if ((!game_in_progress.load() && !challenge_outstanding.load() && (variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960")) &&
+            if ((!game_in_progress.load() && !challengeStillOutstanding() && (variant == "standard" /*|| variant == "fromPosition"*/ || variant == "chess960")) &&
                 (speed == "blitz" || speed == "rapid" || speed == "classical") && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
@@ -754,7 +785,7 @@ void ProcessEvent(const json& event) {
             } else {
                 std::string decline_url = "https://lichess.org/api/challenge/" + challenge_id + "/decline";
                 std::string reason = "reason=";
-                if (game_in_progress.load() || challenge_outstanding.load()) reason += "later";
+                if (game_in_progress.load() || challengeStillOutstanding()) reason += "later";
                 else if (variant != "standard" && variant != "chess960") reason += "variant";
                 else if (speed != "blitz" && speed != "rapid" && speed != "classical") reason += "timeControl";
                 else reason += "generic";
@@ -787,7 +818,7 @@ void ProcessEvent(const json& event) {
           {
             std::lock_guard<std::mutex> lc(playing_mutex);
             game_in_progress.store(true);
-            challenge_outstanding.store(false); //the game supersedes any outstanding challenge
+            clearChallengeOutstanding(); //the game supersedes any outstanding challenge
           }
           game_cv.notify_one();
           //start a detached thread to play a single game
