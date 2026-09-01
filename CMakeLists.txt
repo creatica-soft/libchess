@@ -108,6 +108,12 @@ else()
 endif()
 
 # Include directories
+# .incbin is an assembler directive, so CMake cannot see that network.cpp depends on the
+# two net files - swapping a net changed nothing until this TU happened to be recompiled,
+# silently leaving the old net embedded in the library.
+set_source_files_properties(nnue/nnue/network.cpp PROPERTIES OBJECT_DEPENDS
+  "${PROJECT_SOURCE_DIR}/nn-c288c895ea92.nnue;${PROJECT_SOURCE_DIR}/nn-37f18f62d772.nnue")
+
 target_include_directories(chess PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 #target_include_directories(creatica PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 

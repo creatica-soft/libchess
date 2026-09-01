@@ -24,8 +24,12 @@
 #define CREATICA_PATH "/Users/ap/libchess/creatica-shared-root"
 #define DEPTH 0
 #define MOVETIME 0
-#define HASH 512 //was 2048. MCTSNode went 216 -> 56 bytes, so 512 MB now holds more
-                 //tree than 2 GB did before, at a quarter of the footprint on an 8 GB box
+//Back to 2048 after a bad call on my part. MCTSNode did shrink 216 -> 56 bytes, but with
+//edges the cost per node only went 535 -> 375, i.e. 1.43x cheaper - while dropping Hash
+//from 2048 to 512 cut the budget 4x. Net effect was 4.01M nodes -> 1.43M, about a THIRD
+//of the tree the engine had when it was rated 2300-2400. At 2048 the smaller node is a
+//real gain instead: 5.72M nodes for the same memory the bot was already using.
+#define HASH 2048
 #define THREADS 8
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
