@@ -225,6 +225,10 @@ void handleUCI(void) {
         }
       }
     }
+    //Handled directly in the setoption parser rather than via optionCheck[], whose
+    //enum lives in the shared libchess.h.
+    print("option name PolicyPriors type check default false\n");
+    log_file("option name PolicyPriors type check default false\n");
     print("uciok\n");
     log_file("uciok\n");
 }
@@ -246,6 +250,14 @@ void handleOption(char * command) {
           break;
         }
       }
+      //PolicyPriors is handled here rather than through chessEngine.optionCheck[]: that
+      //enum lives in libchess.h, which is the shared library header used by the other
+      //engines, and adding a member there would force a library rebuild.
+      if (strncasecmp(name, "PolicyPriors", 13) == 0) {
+        use_policy_priors = (strncmp(value, "true", 4) == 0);
+        log_file("PolicyPriors = %s\n", use_policy_priors ? "true" : "false");
+        print("info string PolicyPriors = %s\n", use_policy_priors ? "true" : "false");
+      } else
       if (idx < 0) {
           log_file("info string error unknown option name %s\n", name);
           print("info string error unknown option name %s\n", name);
@@ -742,7 +754,22 @@ int main(int argc, char **argv) {
     TB_LARGEST = 0;
     logfile = fopen("uci-kan.log", "a"); //was "w"
     
-    const std::string weights_file = "simple_bkan.pt";
+    // Was "simple_bkan.pt" -- the 1,562,065-byte SINGLE-head net. The model in
+    // creatica-kan.hpp is now the dual-head architecture (1,494,561 parameters,
+    // 5,978,244 bytes of tensors), so that file no longer describes it.
+    //Also settable from the environment, because the tournament driver's setOption()
+    //goes through nametoindex() and PolicyPriors is deliberately not in optionCheck[]
+    //(that enum lives in the shared libchess.h). initChessEngine fork/execs, so the
+    //child inherits whatever the harness set just before spawning it.
+    if (const char * e = std::getenv("CREATICA_POLICY_PRIORS")) {
+      use_policy_priors = (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+      log_file("PolicyPriors = %s (from environment)\n", use_policy_priors ? "true" : "false");
+    }
+    //CREATICA_NET lets the tournament give each side its own checkpoint, the same way
+    //CREATICA_POLICY_PRIORS gives each its own mode -- initChessEngine fork/execs, so the
+    //child inherits whatever was set just before it was spawned.
+    const char * net_env = std::getenv("CREATICA_NET");
+    const std::string weights_file = net_env ? net_env : "dual_head_kan.pt";
     if (torch::cuda::is_available()) {
         log_file("CUDA is available! Using on GPU\n");
         device = torch::Device(torch::kCUDA);
@@ -755,6 +782,25 @@ int main(int argc, char **argv) {
 
     if (std::filesystem::exists(weights_file)) {
       log_file("Loading weights from %s...\n", weights_file.c_str());
+      // torch::load populates PARTIALLY on an architecture mismatch WITHOUT throwing.
+      // The value path never touches the attention or policy modules, so a wrong file
+      // leaves those at random init and the engine still plays -- the policy would then
+      // be tested against pure noise and read as a modelling failure. Tensor bytes are
+      // param_count * 4 plus a few KB of archive overhead; anything outside that is a
+      // different architecture.
+      {
+        int64_t np = 0;
+        for (const auto& t : model->parameters()) np += t.numel();
+        const auto sz  = (int64_t)std::filesystem::file_size(weights_file);
+        const auto want = np * 4;
+        log_file("Model has %lld parameters (%lld bytes of tensors); %s is %lld bytes\n",
+                 (long long)np, (long long)want, weights_file.c_str(), (long long)sz);
+        if (sz < want || sz - want > 65536) {
+          log_file("FATAL: %s does not match this architecture. Refusing to run on a "
+                   "partially-loaded model.\n", weights_file.c_str());
+          return 1;
+        }
+      }
       torch::load(model, weights_file);
       log_file("Loaded weights from %s\n", weights_file.c_str());
     } else {

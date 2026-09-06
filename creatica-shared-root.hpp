@@ -27,7 +27,20 @@
 #include <curl/curl.h>
 #include "libchess.h"
 
-#define THREADS 8
+//Measured, on this 4-performance-core M1 with the machine idle: node throughput peaks at
+//4 threads and falls away sharply, 8 threads giving 36% FEWER nodes than 4.
+//
+//    threads   2        4          6          8
+//    nodes     1.92M    4.28M      3.68M      2.73M
+//
+//It is contention, not core placement. Biasing the threads onto performance cores with
+//QOS_CLASS_USER_INTERACTIVE recovers none of it (measured 0.94x at 4 threads, 0.63x at 8),
+//so the cost is the shared transposition map's mutex and virtual-loss interference between
+//threads, which grow faster with thread count than throughput does. The 5th through 8th
+//threads cost more in lock traffic than they contribute in nodes.
+//
+//The UCI Threads option still accepts 1-8; only the default changed.
+#define THREADS 4
 #define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
 #define SYZYGY_PATH "/Users/ap/syzygy"

@@ -16,26 +16,81 @@
 #include "libchess.h" // Ensure this path is correct
 
 // --- Configuration ---
-const char * ENGINE_1 = "/Users/ap/libchess/creatica-shared-root";
-const char * ENGINE_2 = "/Users/ap/stockfish-macos-m1-apple-silicon";
+//A/B test of ONE option. Both sides are the same binary, so any difference in result is
+//attributable to ReuseTree and nothing else -- no difference in net, search, or build.
+const char * ENGINE_1 = "/Users/ap/libchess/creatica";   // ReuseTree ON
+const char * ENGINE_2 = "/Users/ap/libchess/creatica";   // ReuseTree OFF (the incumbent)
 const char * SYZYGY_PATH = "/Users/ap/syzygy";
-#define PGN_FILE "match3.pgn"
-#define MOVETIME 2000
+#define PGN_FILE "reuse_match.pgn"
+//1000 ms rather than 2000: a comparison is only as good as its sample size, and the ordering of
+//two configurations survives a shorter time control even where the absolute strength does not.
+#define MOVETIME 1000
 #define DEPTH 0
-//Per-engine resources. Both used to get HASH 2024 / THREADS 8, i.e. 4 GB and 16
-//threads on a 4-performance-core, 8 GB machine - the match swapped before it meant
-//anything. Creatica's Hash is its MCTS tree; Stockfish's is a transposition table
-//and it needs far less to play at a limited strength.
-#define HASH_1 512
-#define HASH_2 128
+//Identical resources on both sides -- this is an A/B test, so anything asymmetric would
+//confound it. 4 threads each (measured best on four performance cores) and 1 GB of tree each;
+//only one side searches at a time, so the machine is not oversubscribed.
+//
+//Hash matters more than usual here: with reuse the tree is not discarded every move, so it
+//grows until GcThreshold. Both sides get the same allocation so neither is advantaged.
+#define HASH_1 1024
+#define HASH_2 1024
 #define THREADS_1 4
-#define THREADS_2 1
-//Stockfish is the one that has to be held down: Creatica advertises neither
-//UCI_LimitStrength nor UCI_Elo, so engine.cpp's option lookup silently ignores them.
-#define OPPONENT_ELO 2600
+#define THREADS_2 4
+//Unused: creatica advertises neither UCI_LimitStrength nor UCI_Elo. Kept so the
+//initChessEngine() call below stays readable.
+#define OPPONENT_ELO 0
+
+//Per-engine settings, BY NAME.
+//
+//initChessEngine() only knows the handful of options every engine has -- Hash, Threads,
+//MultiPV, SyzygyPath, UCI_Elo -- so a match could previously only ever compare two engines at
+//their default settings. Anything engine-specific had no way in. Listing options by name here
+//means either side can be configured, including options that exist in one engine and not the
+//other; a name the engine does not advertise is reported and skipped rather than written into
+//whatever option happens to sit at that position in its list.
+//
+//This is also how a match answers "does this setting help": put the same binary on both sides
+//and change one line.
+struct NamedSpin  { const char * name; int64_t value; };
+struct NamedCheck { const char * name; bool    value; };
+
+//Leave a list empty to run that engine at its own defaults.
+//THE ONE VARIABLE. Everything else is identical between the sides.
+static const std::vector<NamedSpin>  SPINS_1  = { };
+static const std::vector<NamedCheck> CHECKS_1 = { {"ReuseTree", true},
+                                                  {"FinalInfoLines", false},
+                                                  {"IntermittentInfoLines", false} };
+
+static const std::vector<NamedSpin>  SPINS_2  = { };
+static const std::vector<NamedCheck> CHECKS_2 = { {"FinalInfoLines", false},
+                                                  {"IntermittentInfoLines", false} };
+
+//Which side is which, for the PGN. With the same binary on both sides both [White] and [Black]
+//read "creatica", so without this the games are unattributable after the fact -- and a match
+//whose result cannot be traced back to a configuration is not a measurement.
+static std::string optionsLabel(const std::vector<NamedSpin>& spins,
+                                const std::vector<NamedCheck>& checks) {
+    std::string out;
+    for (const NamedSpin& o : spins) {
+        if (!out.empty()) out += ", ";
+        out += std::string(o.name) + "=" + std::to_string((long long)o.value);
+    }
+    for (const NamedCheck& o : checks) {
+        if (!out.empty()) out += ", ";
+        out += std::string(o.name) + "=" + (o.value ? "true" : "false");
+    }
+    return out.empty() ? "defaults" : out;
+}
+
+static void applyNamedOptions(Engine& e, const std::vector<NamedSpin>& spins,
+                              const std::vector<NamedCheck>& checks) {
+    for (const NamedSpin& o : spins)   setEngineSpin(e, o.name, o.value);
+    for (const NamedCheck& o : checks) setEngineCheck(e, o.name, o.value);
+    setOptions(e);
+}
 
 // Tuning Settings
-#define GAMES_PER_MATCH 20  // 10 is very noisy; 20-40 is better for statistical significance
+#define GAMES_PER_MATCH 40  // 40 resolves ~100 Elo at the observed draw rates; 10-20 resolves nothing
 
 // Global Engine Objects
 struct Engine engine_1;
@@ -171,7 +226,11 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
   else if (board.isStaleMate || board.halfmoveClock == 100 || (__builtin_popcountl(board.side[ColorWhite] | board.side[ColorBlack]) <= 5 && evaluations[0]->scorecp == 0) || repetition) strcpy(res, "1/2-1/2");
   auto now = std::chrono::system_clock::now();
   std::string date = std::format("{:%Y.%m.%d}", now);
-  fprintf(pgnFile, "[Event \"Match of Champions\"]\n[Site \"sv Beruta\"]\n[Date \"%s\"]\n[Round \"%d\"]\n[White \"%s\"]\n[Black \"%s\"]\n[FEN \"%s\"]\n[Result \"%s\"]\n\n", date.c_str(), game_id, white.id, black.id, start_fen, res);
+  //Which configuration played which colour, recorded per game.
+  const bool white_is_1 = (&white == &engine_1);
+  const std::string wopts = white_is_1 ? optionsLabel(SPINS_1, CHECKS_1) : optionsLabel(SPINS_2, CHECKS_2);
+  const std::string bopts = white_is_1 ? optionsLabel(SPINS_2, CHECKS_2) : optionsLabel(SPINS_1, CHECKS_1);
+  fprintf(pgnFile, "[Event \"Match of Champions\"]\n[Site \"sv Beruta\"]\n[Date \"%s\"]\n[Round \"%d\"]\n[White \"%s\"]\n[Black \"%s\"]\n[FEN \"%s\"]\n[Result \"%s\"]\n[TimeControl \"%d+0\"]\n[WhiteOptions \"%s\"]\n[BlackOptions \"%s\"]\n\n", date.c_str(), game_id, white.id, black.id, start_fen, res, (int)(MOVETIME / 1000), wopts.c_str(), bopts.c_str());
 
 	char * token = strtok(sanMoves, " ");
 	bool first_move = true;
@@ -232,8 +291,13 @@ int main(int argc, char ** argv) {
     //it advertises neither option) while Stockfish got false and therefore played at
     //full strength. Every match run this way measured Creatica against an unlimited
     //Stockfish.
-    initChessEngine(engine_1, ENGINE_1, MOVETIME, DEPTH, HASH_1, THREADS_1, SYZYGY_PATH, 1, false, false, 0);            //Creatica, unlimited
-    initChessEngine(engine_2, ENGINE_2, MOVETIME, DEPTH, HASH_2, THREADS_2, SYZYGY_PATH, 1, false, true, OPPONENT_ELO);  //Stockfish, held to OPPONENT_ELO
+    initChessEngine(engine_1, ENGINE_1, MOVETIME, DEPTH, HASH_1, THREADS_1, SYZYGY_PATH, 1, false, false, 0);          //same binary, ReuseTree on
+    initChessEngine(engine_2, ENGINE_2, MOVETIME, DEPTH, HASH_2, THREADS_2, SYZYGY_PATH, 1, false, false, 0);          //same binary, ReuseTree off
+
+    //Engine-specific settings, applied by name. Both lists are declared at the top of the file.
+    applyNamedOptions(engine_1, SPINS_1, CHECKS_1);
+    applyNamedOptions(engine_2, SPINS_2, CHECKS_2);
+    printf("engine_1: %s\nengine_2: %s\n", engine_1.id, engine_2.id);
 
     FILE* logFile = fopen(PGN_FILE, "a");
 

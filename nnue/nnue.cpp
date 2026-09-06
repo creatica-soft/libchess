@@ -76,6 +76,23 @@ double evaluate_nnue(const Board& board, NNUEContext& ctx) {
     return 0.01 * Stockfish::Eval::to_cp(v, board);
 }
 
+//Size of the NNUE feature vector: the feature transformer's post-activation output, the
+//same buffer the value network's first affine layer reads. 1024 bytes for the big net.
+int nnue_feature_dims() {
+    return (int)Stockfish::Eval::NNUE::FeatureTransformer<
+                    Stockfish::Eval::NNUE::TransformedFeatureDimensionsBig>::BufferSize;
+}
+
+//Write that vector for `board` into `out`, which must hold nnue_feature_dims() bytes.
+//This is the representation a policy head would train on: it is maintained incrementally
+//by the accumulator stack, so at a search node it is already computed and free to read --
+//which is what lets a SINGLE position be scored without assembling a GPU batch.
+int nnue_features(const Board& board, NNUEContext& ctx, unsigned char* out) {
+    if (!networks || !ctx.accumulator_stack || !ctx.caches) return 0;
+    return (int)networks->big.transform_features(board, *ctx.accumulator_stack,
+                                                 ctx.caches->big, out);
+}
+
 std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx) {
   auto [dirtyPiece, dirtyThreats] = ctx.accumulator_stack->push();
   return {dirtyPiece, dirtyThreats};

@@ -1,49 +1,182 @@
 # libchess
 
-This is a C/C++ chess library with python bindings (libffi). One may prefer python ctypes module instead of libffi. This library is built on top of the one that wrote in C# few years ago for MS Windows chess game analyzer available at https://chessgame-analyzer.creatica.org. Additionally, this library uses magic bitboards instead of a linear approach for move generation of ray pieces, supports Syzygy tables for end games, uses Uthash for caching data, has CNN and transformer libtorch-based chess AI model(s), which can be trained and tested on PGN files as well as a very basic UCI AI-based chess engine with a MCTS algorithm to test the model in UCI-capable chess GUI. 
+A C++20 chess library — board representation, legal move generation, FEN/SAN/PGN, Zobrist
+hashing, Syzygy probing and NNUE evaluation — together with **creatica**, a UCI engine built
+on it that searches with MCTS and evaluates leaves with NNUE.
 
-To build with cmake to produce Makefile. To run eval.py, you may need a chess engine such as stockfish. There are other python scripts such as genEndGames.py that will produce a PGN file that could be used for training an AI model. 
+The library descends from a C# chess-game analyser
+(https://chessgame-analyzer.creatica.org) by way of a C implementation, and was reworked to
+C++20. `nnue/` is a heavily stripped fork of Stockfish, ported to evaluate libchess's own
+`Board` rather than Stockfish's `Position`.
 
-```
+Top-level code is MIT (see `LICENSE`); `nnue/` retains Stockfish's GPL-3 headers.
+
+> **Historical code lives in [`attic/`](attic/README.md)** — the libtorch CNN and
+> transformer era, the original C implementation, the cffi Python bindings, and superseded
+> engines. It is stale against the current API and nothing builds it. The root directory is
+> still a working scratchpad rather than a curated tree, so `CMakeLists.txt` and the compile
+> lines described below remain the authority on what is live.
+
+
+## Build
+
+In-source CMake build; the generated `Makefile`, `CMakeCache.txt` and `CMakeFiles/` live in
+the repository root and are untracked.
+
+```sh
 cmake .
-make
-gcc -E libchess.h > libchess.ph
-(install libffi)
-python3 tasks.py
-export LD_LIBRARY_PATH=.
-python3 eval.py
-```
-To compile without cmake using clang (works on MacOS):
-
-For chess library:
-```
-cc -Wno-strncat-size -O3 -Xclang -fopenmp -Wl,-dylib,-lsqlite3,-lomp,-rpath,/opt/anaconda3/lib -I /opt/anaconda3/include -L/opt/anaconda3/lib -o libchess.so bitscanner.c board.c engine.c fen.c game.c game_omp.c move.c piece.c square.c tag.c zobrist-hash.c sqlite.c my_md5.c magic_bitboards.c boards_legal_moves8.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp nnue/nnue/nnue_misc.cpp
+make -j            # everything
+make chess         # just the shared library
+make test_pos      # a single target
 ```
 
-Please notice dependencies such as OMP. It's mainly used in game_omp.c, which meant to preprocess PGN chess data for AI model training and inference. If you don't plan to use AI, then OMP is not needed, just drop the game_omp.c file from the line and from CMakeLists.txt.
+CMake targets: `chess` (the shared library), `test_pos`, `perft`, `test_nnue`, `test_tb`,
+`test_smp`, `tournament`, `lichess_bot`.
 
-Do not forget to run init_magic_bitboards() at start and cleanup_magic_bitboards() at the end in your programs for ray piece move generation. Otherwise, segfault is guaranteed. 
+**Everything else carries its exact compile command in a comment at the top of its own
+source file** — the first line, or the second where the first reads `//For MacOS using
+clang`. That is the convention here; use it rather than inventing flags:
 
-For chess AI model training:
+| binary | source |
+|---|---|
+| `creatica` | `creatica.cpp` (options and UCI adapter) + `creatica_search.cpp` (the MCTS search) |
+| `creatica-shared-root` | `creatica-shared-root.cpp` — the engine before the policy head, kept as a baseline |
+| `creatica-shared-root` | `creatica-shared-root.cpp` — the engine without the policy head |
+| `nnue_policy_train` | `nnue_policy_train.cpp` — trains the policy head (needs libtorch) |
+| `gui_helper` | `gui_helper.cpp` — move legality and PGN parsing for the browser GUI |
+| `bench_policy_net`, `bench_prior_acc`, `bench_blend` | prior-quality measurement |
+
+Notes:
+
+- The library is around 110 MB because both NNUE nets are embedded at compile time with
+  `incbin`. The filenames are `#define`s in `nnue/evaluate.h`; switching nets means editing
+  that header and rebuilding `chess`.
+- `CMakeLists.txt` hardcodes `-rpath /Users/ap/libchess` and `-O3 -march=native`. Adjust the
+  rpath when building elsewhere.
+- Build **without** extra SIMD macros. `-march=native` alone is measurably faster here than
+  forcing `USE_NEON`.
+
+
+## Required initialisation
+
+Call once at program start, in this order:
+
+```cpp
+Stockfish::Bitboards::init();   // sliding-piece attack tables — REQUIRED, segfaults without it
+zobristHash(z);                 // Zobrist tables from noise.h
+init_nnue();                    // loads the embedded nets
+init_nnue_context(ctx);         // one NNUEContext per search thread
 ```
-c++ -O3 -I <path_to_libtorch>/libtorch/include -I <path_to_libtorch>/libtorch/include/torch/csrc/api/include -L <path_to_libtorch>/libtorch/lib -L <path_to_libchess> -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,<path_to_libtorch>/libtorch/lib,-rpath,<path_to_libchess> -o chess_cnn train_chess_cnn.cpp chess_cnn.cpp
+
+`init_magic_bitboards()` / `cleanup_magic_bitboards()` are **obsolete**. `board.cpp` uses
+`Stockfish::attacks_bb<>` from `nnue/bitboard.h`, and `magic_bitboards.cpp` is dead code kept
+only for the unbuilt experiment files. Older comments in the tree still mention them.
+
+
+## The engine
+
+`creatica` is a UCI engine: per-thread MCTS trees over a shared root, NNUE leaf evaluation,
+Syzygy probing at five pieces or fewer, and a learned policy head blended into the move
+priors. It plays roughly 100 Elo above the same engine without the policy head.
+
+Every tunable is a UCI option — there are no environment variables — and the option block is
+generated from the engine's own declarations, so adding a knob is one line in the engine.
+See **[ENGINE_SETTINGS.md](ENGINE_SETTINGS.md)** for what each one does and what has actually
+been measured about them.
+
+```sh
+./creatica                      # speaks UCI on stdin/stdout
+./creatica bench                # one fixed search, for a smoke test after a build
 ```
-Please notice dependencies, i.e. libtorch. You would need to provide a path to PGN files for training and PGN files for testing in train_chess_cnn.cpp. You may try simplified model in chess_cnn6.cpp and train_chess_cnn6.cpp or heavier ones such as chess_trans.cpp and train_chess_trans.cpp or train_chess_enc_dec.cpp. You may need to select which boards_legal_movesX.c file to use for which model when making libchess.so. 
 
-game.c file is far from being perfect. It has mostly functions to work with PGN files, SQLite3 databases (sqlite.c), generate end games, etc. Possibly, it will be removed from the library and used for various tools in a future.  
+Two files carry the shared protocol layer and are used by any engine here:
+`uci_options.h` (self-describing options), `uci_engine.h` (the `SearchEngine` interface) and
+`uci_frontend.cpp` (the one protocol loop).
 
-For UCI chess engine that uses chess AI model with pre-trained weights and MCTS when close to endgame or Syzygy tables for moves when the number of pieces is equal or less than 5 (tables of 1 GB in size):
+
+## Browser GUI
+
+A local web interface for playing, analysing and running engine matches:
+
+```sh
+python3 chess_gui.py            # then open the printed URL
 ```
-c++ -Wno-deprecated-declarations -Wno-deprecated -O3 -I <path_to_libtorch>/libtorch/include -I <path_to_libtorch>/libtorch/include/torch/csrc/api/include -I <path_to_libchess> -L <path_to_libtorch>/libtorch/lib -L <path_to_libchess> -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,<path_to_libtorch>/libtorch/lib,-rpath,<path_to_libchess> chess_cnn_mcts.cpp uci.cpp chess_cnn.cpp tbcore.c tbprobe.c -o chess_engine
+
+Standard library only — nothing to install. It binds to `127.0.0.1`. Three tabs:
+
+- **Play** — human against any engine, with legal-move highlighting and undo
+- **Analyse** — step through a game or position, with evaluation, best move and PV; engine
+  settings can be changed per analysis, so two configurations can be compared on one position
+- **Tournament** — engine-vs-engine matches with a configurable opening book, a live board,
+  and PGN saved as each game finishes
+
+Move legality and PGN parsing come from `gui_helper`, which links `libchess` — deliberately,
+so the GUI can never disagree with the engine about what is legal. Settings editors are built
+from what each engine advertises rather than a hand-maintained list.
+
+
+## Tests
+
+There is no test framework. Each `test_*` is a standalone binary taking a **FEN as six
+separate argv words** (no argument means the start position):
+
+```sh
+./test_pos "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8" w - - 0 1
+./test_pos test_fen_strings        # one FEN per line; the tracked regression set
+./test_tb  <fen…>                  # Syzygy root probe
+./test_nnue <fen…>                 # NNUE eval and move ordering for one position
+./test_smp [fen…] [ucimove] [hash] # multithreaded MCTS search
+./tournament                       # engine-vs-engine self-play match
 ```
-You would need to download Syzygy tables and update TB_MAX_PIECES in uci.cpp before compiling chess_engine.
 
-To comply with licensing of Fathom Syzygy Table Bases:
+`test_pos` is the correctness harness worth running after any change to move generation,
+`do_move`/`undo_move`, hashing or the NNUE accumulator. For every legal move in a position it
+checks the FEN round-trip, `reconcile()` (bitboards against the mailbox), incremental
+`updateHash()` against a full `getHash()`, the incremental NNUE accumulator against a fresh
+context, and the result against an external Stockfish's own evaluation. **It reports failures
+on stdout and returns early — read the output; the exit code is not a verdict.**
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+External paths (`STOCKFISH`, `SYZYGY_PATH`, movetime, hash size, thread count) are `#define`s
+at the top of each test file, not command-line flags.
+
+
+## Training the policy head
+
+`nnue_policy_train.cpp` trains a policy head over the NNUE feature transformer's own output,
+from lichess evaluation shards. It needs libtorch; the compile line is in the file.
+
+```sh
+BUILD_CACHE=<dir> ./nnue_policy_train          # extract features once (~48 min)
+FEATURE_CACHE=<dir> BATCH_SIZE=8192 LR_MAX=2e-3 EPOCHS=5 ./nnue_policy_train
+EXPORT_WEIGHTS=nnue_policy.bin ./nnue_policy_train   # write the flat net the engine loads
+```
+
+Caching the extracted features removes about 73% of the per-sample CPU cost and is worth
+doing before any long run. The training knobs are environment variables — this is a script,
+not a protocol server — and are documented in
+[ENGINE_SETTINGS.md](ENGINE_SETTINGS.md#training-options).
+
+
+## Historical
+
+`README` previously documented the C codebase (`board.c`, `game_omp.c`, OpenMP, SQLite) and a
+cffi Python-bindings flow (`gcc -E libchess.h > libchess.ph`, `tasks.py`, `eval.py`). Those
+bindings no longer regenerate: `libchess.h` now uses templates, references and
+`std::pair`/`std::tuple` returns that cffi's `cdef` cannot parse. The checked-in `libchess.ph`
+predates the C to C++20 rework. The libtorch CNN and transformer models from that era are
+still in the tree but are not built.
+
+
+## Licence
+
+Top-level code is MIT — see `LICENSE`. `nnue/` is a fork of Stockfish and retains its GPL-3
+headers.
+
+Fathom Syzygy tablebase probing code is included under its own terms:
+
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+> INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+> PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+> FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+> OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+> DEALINGS IN THE SOFTWARE.

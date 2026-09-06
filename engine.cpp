@@ -207,13 +207,23 @@ int getOptions(Engine& engine) {
 				}
 			}
 		}
+		//Both fields used to be copied with strncpy(dst, src, sizeof dst) and then have their
+		//LAST character deleted unconditionally to strip the newline. Two defects: a source at
+		//least as long as the buffer left it with no terminator, so the strlen() on the next
+		//line read past the end; and when the line arrived already stripped, the delete ate a
+		//real character -- an engine identifying itself as "StubEngine" was recorded as
+		//"StubEngin". Copy one byte short, terminate, then remove a newline only if there is one.
 		else if (strstr(line, "id name ") - line == 0) {
-			strncpy(engine.id, line + 8, MAX_UCI_OPTION_STRING_LEN);
-			engine.id[strlen(engine.id) - 1] = '\0';
+			strncpy(engine.id, line + 8, MAX_UCI_OPTION_STRING_LEN - 1);
+			engine.id[MAX_UCI_OPTION_STRING_LEN - 1] = '\0';
+			for (size_t n = strlen(engine.id); n && (engine.id[n - 1] == '\n' || engine.id[n - 1] == '\r'); --n)
+				engine.id[n - 1] = '\0';
 		}
 		else if (strstr(line, "id author ") - line == 0) {
-			strncpy(engine.authors, line + 10, 2 * MAX_UCI_OPTION_STRING_LEN);
-			engine.authors[strlen(engine.authors) - 1] = '\0';
+			strncpy(engine.authors, line + 10, 2 * MAX_UCI_OPTION_STRING_LEN - 1);
+			engine.authors[2 * MAX_UCI_OPTION_STRING_LEN - 1] = '\0';
+			for (size_t n = strlen(engine.authors); n && (engine.authors[n - 1] == '\n' || engine.authors[n - 1] == '\r'); --n)
+				engine.authors[n - 1] = '\0';
 		}
 	}
 	return 0;
@@ -322,6 +332,58 @@ int setOption(const Engine& engine, const char * name, OptionType type, void * v
 	//	fprintf(stderr, "%s", line);
 	//}
 	return 0;
+}
+
+//Set an option by name. See the comment on the declarations in libchess.h for why indexing
+//optionSpin[]/optionCheck[] with the EngineSpinOptions enum was wrong.
+bool setEngineSpin(Engine& engine, const char * name, int64_t value) {
+	const int idx = nametoindex(engine, name, Spin);
+	if (idx < 0) {
+		fprintf(stderr, "setEngineSpin() warning: engine %s does not advertise spin option '%s' - ignored\n",
+		        engine.id[0] ? engine.id : engine.engineName, name);
+		return false;
+	}
+	const int64_t lo = engine.optionSpin[idx].min, hi = engine.optionSpin[idx].max;
+	if (value < lo || value > hi) {
+		fprintf(stderr, "setEngineSpin() warning: %s = %lld is outside the advertised range %lld..%lld, clamped\n",
+		        name, (long long)value, (long long)lo, (long long)hi);
+		value = value < lo ? lo : hi;
+	}
+	engine.optionSpin[idx].value = value;
+	return true;
+}
+
+bool setEngineCheck(Engine& engine, const char * name, bool value) {
+	const int idx = nametoindex(engine, name, Check);
+	if (idx < 0) {
+		fprintf(stderr, "setEngineCheck() warning: engine %s does not advertise check option '%s' - ignored\n",
+		        engine.id[0] ? engine.id : engine.engineName, name);
+		return false;
+	}
+	engine.optionCheck[idx].value = value;
+	return true;
+}
+
+bool setEngineStringOption(Engine& engine, const char * name, const char * value) {
+	const int idx = nametoindex(engine, name, String);
+	if (idx < 0) {
+		fprintf(stderr, "setEngineStringOption() warning: engine %s does not advertise string option '%s' - ignored\n",
+		        engine.id[0] ? engine.id : engine.engineName, name);
+		return false;
+	}
+	strncpy(engine.optionString[idx].value, value ? value : "", MAX_UCI_OPTION_STRING_LEN - 1);
+	engine.optionString[idx].value[MAX_UCI_OPTION_STRING_LEN - 1] = '\0';
+	return true;
+}
+
+bool engineSpinRange(const Engine& engine, const char * name,
+                     int64_t& lo, int64_t& hi, int64_t& def) {
+	const int idx = nametoindex(engine, name, Spin);
+	if (idx < 0) return false;
+	lo  = engine.optionSpin[idx].min;
+	hi  = engine.optionSpin[idx].max;
+	def = engine.optionSpin[idx].defaultValue;
+	return true;
 }
 
 void setOptions(const Engine& engine) {

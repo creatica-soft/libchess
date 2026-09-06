@@ -21,7 +21,16 @@
 
 #define INTERMITTENT_INFO_LINES false
 #define FINAL_INFO_LINES false
-#define CREATICA_PATH "/Users/ap/libchess/creatica-shared-root"
+//The engine with the learned policy head blended into the move priors. Measured at
+//13.0/20 against creatica-shared-root at 2 s/move -- about +108 Elo, p ~ 0.03 -- so the bot
+//had been playing rated games with the weaker of the two engines available to it.
+//
+//NOTE: the engine loads its policy net from the RELATIVE path "nnue_policy.bin", so it must
+//be started with /Users/ap/libchess as the working directory. If the net cannot be found it
+//does not fail: it prints an info string and falls back to the eval-derived prior, which is
+//sound but is exactly the ~108 Elo this change is meant to gain. Check the engine's startup
+//line says "policy head nnue_policy.bin loaded".
+#define CREATICA_PATH "/Users/ap/libchess/creatica"
 #define DEPTH 0
 #define MOVETIME 0
 //Back to 2048 after a bad call on my part. MCTSNode did shrink 216 -> 56 bytes, but with
@@ -30,7 +39,11 @@
 //of the tree the engine had when it was rated 2300-2400. At 2048 the smaller node is a
 //real gain instead: 5.72M nodes for the same memory the bot was already using.
 #define HASH 2048
-#define THREADS 8
+//4, not 8. Measured on this machine: 4 threads searched about 36% more nodes per second on
+//four performance cores, and won a 24-game match 14-10. Both engine headers default to 4; this
+//file was still overriding that with the value the measurement rejected, so the bot has been
+//running the worse setting. It also halves the number of NNUE contexts, which is fixed memory.
+#define THREADS 4
 #define SYZYGY_PATH "/Users/ap/syzygy"
 #define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
 #define DRAW_CP 30 //accept draw if score cp is less than this value in centipawns
@@ -48,7 +61,11 @@
                       // C * 100 = max(EXPLORATION_MIN, (EXPLORATION_MAX - seldepth * EXPLORATION_DEPTH_DECAY))
 //#define PROBABILITY_MASS 100 //% - cumulative probability - how many moves we consider
 #define VIRTUAL_LOSS 36 //this is used primarily for performance in MT to avoid threads working on the same tree nodes
-#define EVAL_SCALE 61 //This is a divisor in W = tanh(eval/eval_scale) where eval is NNUE evaluation in pawns. 
+//EvalScale is NOT a UCI option on creatica -- it is a compile-time constant, EVAL_SCALE 61 in
+//creatica_search.hpp, the same 61 this file used to try to send. Setting it here did nothing
+//except print a warning at every engine start, so it is gone. Change it in the header if you
+//ever want a different value, and remember it also has to match the model training constant
+//(eval_scale = 600.0f, i.e. 600 centipawns) or the engine and the net are in different units.
                      //W is a fundamental value in Monte Carlo tree node along with N (number of visits) 
                      //and P (prior move probability), though P belongs to edges (same as move) but W and N to nodes.
 #define TEMPERATURE 58 //used in calculating probabilities for moves in get_prob() using softmax:
@@ -60,6 +77,33 @@
 //The API token is read from the environment so that it never lives in the source tree.
 //Keep it outside the repository and export it before starting the bot, e.g.
 //  export LICHESS_TOKEN="$(cat ~/.config/creatica/lichess_token)"
+//Per-instance settings, overridable from the environment.
+//
+//Two bots can then run from one binary and differ only in what is being tested -- which is
+//what a bot-vs-bot experiment needs, since the two must differ in exactly one thing. The
+//token already worked this way; these follow it. The #defines above remain the defaults, so
+//running the bot with no environment set behaves exactly as before.
+//
+//  LICHESS_TOKEN     the API token (already supported)
+//  LICHESS_USERNAME  this account's name, lowercase
+//  CREATICA_ENGINE   path to the engine binary
+//  CREATICA_THREADS  search threads
+//  CREATICA_HASH     MB for the MCTS tree
+//  CREATICA_PONDER   1 or 0
+static std::string env_str(const char * name, const char * dflt) {
+  const char * v = std::getenv(name);
+  return (v && *v) ? std::string(v) : std::string(dflt);
+}
+static int env_int(const char * name, int dflt) {
+  const char * v = std::getenv(name);
+  return (v && *v) ? (int)strtol(v, nullptr, 10) : dflt;
+}
+static bool env_bool(const char * name, bool dflt) {
+  const char * v = std::getenv(name);
+  if (!v || !*v) return dflt;
+  return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+}
+
 static std::string load_lichess_token() {
     //Do NOT exit from here: this runs as a global initializer, before main(), so bailing
     //out made even --help impossible without a token. main() checks it after parsing args.
@@ -67,6 +111,20 @@ static std::string load_lichess_token() {
     return (t && *t) ? std::string(t) : std::string();
 }
 const std::string token = load_lichess_token();
+const std::string bot_username = env_str("LICHESS_USERNAME", BOT_USERNAME);
+const std::string engine_path  = env_str("CREATICA_ENGINE",  CREATICA_PATH);
+const int         bot_threads  = env_int("CREATICA_THREADS", THREADS);
+const int         bot_hash     = env_int("CREATICA_HASH",    HASH);
+const bool        bot_ponder   = env_bool("CREATICA_PONDER", PONDER);
+//Time control of challenges this bot SENDS. Only the challenging side's values are used --
+//the accepting side plays whatever it is offered -- so setting these on the --no-challenge
+//instance has no effect.
+const int         bot_clock     = env_int("CREATICA_CLOCK", CLOCK_LIMIT);
+const int         bot_increment = env_int("CREATICA_INC",   CLOCK_INCREMENT);
+//Per instance, so two bots running side by side do not interleave into one file.
+std::mutex results_mutex;
+const std::string results_path = env_str("CREATICA_RESULTS", ("results_" + bot_username + ".csv").c_str());
+#define RESULTS_FILE results_path.c_str()
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
 std::atomic<bool> challenge_accepted {false};
@@ -112,6 +170,15 @@ static bool challengeStillOutstanding() {
 //--accept-only=<username>, which replaces the opponent names that used to be hardcoded
 //into the accept condition and needed a rebuild to change.
 std::unordered_set<std::string> accept_only;
+//--challenge=<user> names the opponent to challenge, instead of picking a random bot from
+//lichess's online list. --accept-only does NOT constrain this: it gates only INCOMING
+//challenges, so a bot left free to challenge will go and play whoever it finds, which is not
+//what you want when the point is to play one specific opponent under controlled conditions.
+std::string challenge_target;
+//--casual sends unrated challenges. Rated is right for measuring strength on the ladder;
+//casual is right for an A/B between two of your own bots, which would otherwise drag both
+//ratings around for a result that has nothing to do with the ladder.
+bool challenge_rated = true;
 static bool challengerAllowed(const std::string& challenger_id) {
     return accept_only.empty() || accept_only.count(challenger_id) > 0;
 }
@@ -168,21 +235,43 @@ static int StreamProgress(void * clientp, curl_off_t, curl_off_t, curl_off_t, cu
     return 0;
 }
 
+//Every option is set BY NAME. This used to index creatica.optionSpin[] with the
+//EngineSpinOptions enum, but getOptions() fills that array in the order the engine advertises
+//its options, so the enum addressed the right slot only by coincidence. EVAL_SCALE went to
+//index 10, past the nine options creatica advertises, so setOptions() never sent
+//it and the engine ran its own default; against creatica, which advertises fourteen, the same
+//index is PolicyBlend and 61 would have set the blend to 0.61 instead of 0.45.
+//
+//A name the engine does not advertise is now reported rather than silently written elsewhere.
+//Warnings are printed once, since setEngineOptions() is called again after every engine restart.
 void setEngineOptions() {
-	  creatica.optionSpin[MultiPV].value = MULTI_PV;
-	  creatica.optionSpin[PVPlies].value = PV_PLIES;
-	  //creatica.optionSpin[ProbabilityMass].value = PROBABILITY_MASS;
-	  creatica.optionSpin[ExplorationMin].value = EXPLORATION_MIN;
-	  creatica.optionSpin[ExplorationMax].value = EXPLORATION_MAX;
-	  creatica.optionSpin[ExplorationDepthDecay].value = EXPLORATION_DEPTH_DECAY;
-	  //creatica.optionSpin[Noise].value = MAX_NOISE;
-	  creatica.optionSpin[VirtualLoss].value = VIRTUAL_LOSS;
-	  creatica.optionSpin[EvalScale].value = EVAL_SCALE;
-	  creatica.optionSpin[Temperature].value = TEMPERATURE;
-	  creatica.optionCheck[FinalInfoLines].value = FINAL_INFO_LINES;
-	  creatica.optionCheck[IntermittentInfoLines].value = INTERMITTENT_INFO_LINES;
-	  creatica.optionCheck[Ponder].value = PONDER;
-	  setOptions(creatica);
+	static bool complained = false;
+	struct Spin { const char * name; int64_t value; };
+	static const Spin spins[] = {
+		{"MultiPV",               MULTI_PV},
+		{"PVPlies",               PV_PLIES},
+		{"ExplorationMin",        EXPLORATION_MIN},
+		{"ExplorationMax",        EXPLORATION_MAX},
+		{"ExplorationDepthDecay", EXPLORATION_DEPTH_DECAY},
+		{"VirtualLoss",           VIRTUAL_LOSS},
+		{"Temperature",           TEMPERATURE},
+	};
+	struct Check { const char * name; bool value; };
+	static const Check checks[] = {
+		{"FinalInfoLines",        FINAL_INFO_LINES},
+		{"IntermittentInfoLines", INTERMITTENT_INFO_LINES},
+		{"Ponder",                bot_ponder},
+	};
+
+	//setEngineSpin()/setEngineCheck() print their own warning naming the engine and the option.
+	for (const Spin& o : spins)
+		if (!setEngineSpin(creatica, o.name, o.value) && !complained)
+			fprintf(stderr, "  (%s = %lld therefore has no effect)\n", o.name, (long long)o.value);
+	for (const Check& o : checks)
+		if (!setEngineCheck(creatica, o.name, o.value) && !complained)
+			fprintf(stderr, "  (%s = %s therefore has no effect)\n", o.name, o.value ? "true" : "false");
+	complained = true;
+	setOptions(creatica);
 }
 
 // Callback for curl to write response data incrementally
@@ -397,7 +486,7 @@ void GetAndProcessBots(int nb) {
                       if (line.empty()) continue;
                       try {
                           json data = json::parse(line);
-                          if (BOT_USERNAME == data.value("username", "")) continue; //don't challenge itself
+                          if (bot_username == data.value("username", "")) continue; //don't challenge itself
                           if (data.contains("perfs") && data["perfs"].contains("blitz")) {
                               int rating = data["perfs"]["blitz"].value("rating", 0);
                               if ((rating > MIN_ELO && rating < MAX_ELO) || data.value("username", "") == "creaticachessbot2") {
@@ -422,6 +511,15 @@ void GetAndProcessBots(int nb) {
                   std::this_thread::sleep_for(std::chrono::milliseconds(10000)); //sleep for 10s and try to create a list of bots again
               }
           } //end of while (bots.empty)
+          //A named opponent replaces the list entirely, so the retry loop below is unchanged --
+          //it just has one candidate to try.
+          if (!challenge_target.empty()) {
+            bots.clear();
+            Bot only{};
+            only.botname = challenge_target;
+            bots.push_back(only);
+          }
+          if (bots.empty()) continue;
           auto numberOfBots = bots.size();
           std::cout << "numberOfBots " << numberOfBots << std::endl;
           std::uniform_int_distribution<int> uniform(0, numberOfBots - 1);
@@ -444,7 +542,7 @@ void GetAndProcessBots(int nb) {
               std::string botname = bots[i].botname;
               std::cout << "Bot " << i << " name " << botname << ". Elo " << bots[i].elo << " +/- " << bots[i].rd << " after " << bots[i].games << " games." << std::endl; 
               std::string challengeId;
-              res = CreateChallenge(botname, true, CLOCK_LIMIT, CLOCK_INCREMENT, challengeId);
+              res = CreateChallenge(botname, challenge_rated, bot_clock, bot_increment, challengeId);
               if (res) {
                 while (!challenge_accepted.load() && !challenge_declined.load()) {
                   std::cout << "GetAndProcessBots() debug: challenge_accepted " << challenge_accepted.load() << ", challenge_declined " << challenge_declined.load() << std::endl;
@@ -539,10 +637,19 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
             std::cerr << "ComputeAndPostMove() error: getPV(creatica, evaluations, MULTI_PV) returned non-zero code, restarting..." << std::endl;
             releaseChessEngine(creatica);
             //exit(-1); //temp exit for debugging
-            initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
+            initChessEngine(creatica, engine_path.c_str(), MOVETIME, DEPTH, bot_hash, bot_threads, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
             setEngineOptions();
           } //end of if (getPV())
         } //end of if (ponder)
+        //Whether a predicted reply was actually appended to the move list below.
+        //
+        //The engine DEFERS the last move of a "go ponder" position: it ponders the position
+        //BEFORE it, building a tree over all of the opponent's replies rather than betting on
+        //one prediction. That only works when the move it defers really is the predicted reply.
+        //With no ponder move to append, the move it defers is OUR OWN, so it would ponder the
+        //position before we moved -- wrong side to move, and an entire search wasted on a tree
+        //the next search cannot use.
+        bool ponder_move_sent = false;
         //std::cout << "ComputeAndPostMove() debug: and getting PV..." << std::endl; 
         strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
         if (!moves.empty()) {
@@ -551,9 +658,10 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
           //lichess last move in position command has already been played, hence we need to play it, 
           //otherwise, the engine will ponder on it!
           //actually, it is easier to just append our ponder move to lichess moves - the engine does not care what it is anyway
-          if (PONDER && !our_turn && strcmp(evaluations[0]->ponder, "") != 0) {
+          if (bot_ponder && !our_turn && strcmp(evaluations[0]->ponder, "") != 0) {
             strcat(creatica.moves, " ");
             strcat(creatica.moves, evaluations[0]->ponder);
+            ponder_move_sent = true;
           }
         } else creatica.moves[0] = '\0';
 int pos_retries = 0;
@@ -568,7 +676,7 @@ try_pos: if (!position(creatica)) {
             fprintf(stderr, "ComputeAndPostMove() error: engine did not come back after %d attempts; abandoning this move\n", pos_retries);
             return;
           }
-          initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
+          initChessEngine(creatica, engine_path.c_str(), MOVETIME, DEPTH, bot_hash, bot_threads, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
           setEngineOptions();
           strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
           goto try_pos;
@@ -582,7 +690,7 @@ try_pos: if (!position(creatica)) {
 try_again:  if (go(creatica, evaluations)) {
               std::cerr << "ComputeAndPostMove() error: go(creatica, evaluations) returned non-zero code, restarting..." << std::endl;
               releaseChessEngine(creatica);
-              initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
+              initChessEngine(creatica, engine_path.c_str(), MOVETIME, DEPTH, bot_hash, bot_threads, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
               setEngineOptions();
               strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
               strncpy(creatica.moves, moves.c_str(), MAX_UCI_MOVES_LEN);
@@ -615,7 +723,7 @@ try_again:  if (go(creatica, evaluations)) {
               std::cerr << "ComputeAndPostMove() error: failed to post request to " << move_url << std::endl;
             std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "... done" << std::endl;
         } else { // Not our turn
-            if (numberOfPieces > 7 && PONDER) {
+            if (numberOfPieces > 7 && bot_ponder && ponder_move_sent) {
               creatica.infinite = true;
               creatica.ponder = true;
               go(creatica, evaluations);
@@ -664,7 +772,7 @@ void HandleGame(const std::string& game_id) {
                 if (gss != created && gss != started) return; //from process_line() function in StreamAndProcess()
                 std::string white_id = state["white"].value("id", "");
                 std::string black_id = state["black"].value("id", "");
-                is_white = (white_id == BOT_USERNAME);
+                is_white = (white_id == bot_username);
                 std::cout << "HandleGame() debug: our color " << (is_white ? "white" : "black") << std::endl;
     
                 // Initial position from initialFen (not state.fen)
@@ -756,7 +864,7 @@ void ProcessEvent(const json& event) {
         std::string speed = event["challenge"]["speed"];
         std::string status = event["challenge"]["status"];
         // Accept (customize logic, e.g., only standard variant)
-        if (challenger_id == BOT_USERNAME) {
+        if (challenger_id == bot_username) {
             std::cout << "ProcessEvent() debug: our challenge " << challenge_id << " status " << status << std::endl;
             if (status == "accepted") {
               {
@@ -833,6 +941,42 @@ void ProcessEvent(const json& event) {
     } else if (event.contains("type") && event["type"] == "gameFinish") {
         std::string game_id = event["game"]["gameId"];
         std::cout << "ProcessEvent() debug: game " << game_id << " (" << event["game"]["fullId"] << ") finished with " << event["game"]["status"]["name"] << std::endl;
+        //Record the result to a file. Printing it to stdout leaves an overnight experiment as
+        //terminal scrollback, and casual games do not move a rating either, so without this
+        //there is nowhere a score actually accumulates.
+        //
+        //The settings are written on every line deliberately: a results file that does not say
+        //what produced it is worth very little a week later, and this is the file someone will
+        //be reading when they want to know what the configuration was.
+        try {
+          const std::string our_colour = event["game"].value("color", "");
+          const std::string winner     = event["game"].value("winner", "");     //absent on a draw
+          const std::string status     = event["game"]["status"].value("name", "");
+          const double score = winner.empty() ? 0.5 : (winner == our_colour ? 1.0 : 0.0);
+          std::lock_guard<std::mutex> rlk(results_mutex);
+          bool fresh = true;
+          if (FILE * probe = fopen(RESULTS_FILE, "r")) { fresh = false; fclose(probe); }
+          if (FILE * rf = fopen(RESULTS_FILE, "a")) {
+            //`speed` comes from the game and is true for both sides. `offered_clock` is this bot's OWN
+            //challenge setting -- correct on the side that challenged, meaningless on the side that
+            //accepted, since the accepter plays whatever it was offered. Named so nobody reads it as
+            //the game's time control.
+            if (fresh) fprintf(rf, "utc,game_id,bot,colour,winner,score,status,speed,ponder,threads,hash,offered_clock\n");
+            const std::time_t now = std::time(nullptr);
+            char ts[32] = "";
+            std::strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
+            const std::string speed = event["game"].value("speed", "");
+            fprintf(rf, "%s,%s,%s,%s,%s,%.1f,%s,%s,%d,%d,%d,%d+%d\n",
+                    ts, game_id.c_str(), bot_username.c_str(), our_colour.c_str(),
+                    winner.empty() ? "draw" : winner.c_str(), score, status.c_str(), speed.c_str(),
+                    bot_ponder ? 1 : 0, bot_threads, bot_hash, bot_clock, bot_increment);
+            fclose(rf);
+          }
+          std::cout << "ProcessEvent(): result " << score << " as " << our_colour
+                    << " (" << (winner.empty() ? "draw" : winner) << ", " << status << ")" << std::endl;
+        } catch (const std::exception& e) {
+          std::cerr << "ProcessEvent() warning: could not record result: " << e.what() << std::endl;
+        }
         gameStateStatus.store(0);
         std::unique_lock<std::mutex> lock(mutex);
         current_game_id = "";
@@ -868,6 +1012,13 @@ int main(int argc, char ** argv) {
   for (int i = 1; i < argc; i++) {
     const std::string arg = argv[i];
     if (arg == "--no-challenge") no_challenge = true;
+    else if (arg == "--casual") challenge_rated = false;
+    else if (arg.rfind("--challenge=", 0) == 0) {
+      challenge_target = arg.substr(12);
+      if (challenge_target.empty()) {
+        fprintf(stderr, "%s: --challenge= needs a username\n", argv[0]); return 1;
+      }
+    }
     else if (arg.rfind("--accept-only=", 0) == 0) {
       //Comma-separated list; the flag may also be repeated.
       std::stringstream names(arg.substr(14));
@@ -884,8 +1035,11 @@ int main(int argc, char ** argv) {
       if (!added) { fprintf(stderr, "%s: --accept-only= needs at least one username\n", argv[0]); return 1; }
     }
     else if (arg == "-h" || arg == "--help") {
-      printf("usage: %s [--no-challenge] [--accept-only=<user>[,<user>...]]\n"
+      printf("usage: %s [--no-challenge] [--challenge=<user>] [--casual]\n"
+             "            [--accept-only=<user>[,<user>...]]\n"
              "  --no-challenge         do not challenge other bots; only respond to incoming challenges\n"
+             "  --challenge=<user>     challenge this opponent instead of a random online bot\n"
+             "  --casual               send unrated challenges\n"
              "  --accept-only=<a>[,<b>...]  only accept challenges from these users.\n"
              "                         May be repeated. Omit entirely to accept anyone.\n", argv[0]);
       return 0;
@@ -903,6 +1057,10 @@ int main(int argc, char ** argv) {
     std::cout << std::endl;
   }
   if (no_challenge) std::cout << "main(): --no-challenge, so we will not challenge anyone" << std::endl;
+  else if (!challenge_target.empty())
+    std::cout << "main(): challenging only " << challenge_target
+              << (challenge_rated ? " (rated)" : " (casual)") << std::endl;
+  else std::cout << "main(): will challenge a RANDOM online bot" << std::endl;
 
   if (token.empty()) {
     fprintf(stderr, "lichess_bot: LICHESS_TOKEN is not set.\n"
@@ -919,7 +1077,7 @@ int main(int argc, char ** argv) {
   rng.seed(static_cast<unsigned int>(std::random_device{}()));
 
   //start chess engine process and communicate with it over stdin, stdout redirected to named pipes internally
-  initChessEngine(creatica, CREATICA_PATH, MOVETIME, DEPTH, HASH, THREADS, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
+  initChessEngine(creatica, engine_path.c_str(), MOVETIME, DEPTH, bot_hash, bot_threads, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
   //else fprintf(stderr, "initilized chess engine %s for creatica\n", creatica.id);
   setEngineOptions();
   for (int i = 0; i < multiPV; i++) {

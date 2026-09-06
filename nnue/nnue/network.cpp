@@ -204,6 +204,22 @@ Network<Arch, Transformer>::evaluate(const Board& board, AccumulatorStack& accum
 }
 
 template<typename Arch, typename Transformer>
+std::size_t Network<Arch, Transformer>::transform_features(
+  const Board&                            board,
+  AccumulatorStack&                       accumulatorStack,
+  AccumulatorCaches::Cache<FTDimensions>& cache,
+  TransformedFeatureType*                 out) const {
+    constexpr uint64_t alignment = CacheLineSize;
+    alignas(alignment) TransformedFeatureType transformedFeatures[
+        FeatureTransformer<FTDimensions>::BufferSize];
+    ASSERT_ALIGNED(transformedFeatures, alignment);
+    const int bucket = (popcount(board.side[WHITE] | board.side[BLACK]) - 1) / 4;
+    (void)featureTransformer.transform(board, accumulatorStack, cache, transformedFeatures, bucket);
+    std::memcpy(out, transformedFeatures, FeatureTransformer<FTDimensions>::BufferSize);
+    return FeatureTransformer<FTDimensions>::BufferSize;
+}
+
+template<typename Arch, typename Transformer>
 void Network<Arch, Transformer>::verify(std::string evalfilePath, const std::function<void(std::string_view)>& f) const {
     if (evalfilePath.empty())
         evalfilePath = evalFile.defaultName;

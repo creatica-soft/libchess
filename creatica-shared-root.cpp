@@ -457,7 +457,6 @@ std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& boar
 std::pair<double, int> make_move(Board& chess_board, const ZobristHash& board_hash, Move& move, NNUEContext& ctx, uint64_t& child_hash, const std::unordered_set<uint64_t>& pos_history, int iter) {
   ZobristHash tmp_hash = board_hash;
   StateInfo state = {}; //keep track of num_moves and isCheck but not isMate or isStaleMate
-  //Stockfish::DirtyPiece dp;
   auto [dp, dts] = accumulator_stack_push(ctx); //for incremental NNUE evaluation, which is one order faster than full evaluation; both dp and dts are references!
   updateHash(tmp_hash, chess_board, move, do_move_dp(chess_board, move, state, dp, dts), z); //do the move, update the hash
   child_hash = tmp_hash.hash;

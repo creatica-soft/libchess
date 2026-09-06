@@ -9,7 +9,6 @@
 #include <time.h>
 #include <wchar.h>
 #include <locale.h>
-//#include "magic_bitboards.h"
 #include "nnue/bitboard.h"
 #include "libchess.h"
 #ifdef _WIN32
