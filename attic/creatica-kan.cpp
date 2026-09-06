@@ -45,6 +45,7 @@ const double eval_scale = EVAL_SCALE;
 double temperature;
 extern ChessChebyKAN kan_network;
 PositionDedup pos_dedup;
+bool use_policy_priors = false;   //set from the UCI option
 
 std::string last_move;
 std::unordered_set<uint64_t> position_history;
@@ -58,14 +59,15 @@ std::vector<ThreadParams> pool_params;
 
 void cleanup() {
   for (auto& [h, node] : search.tree) {
-      Edge * children = node->children.load(std::memory_order_relaxed);
-      delete[] children;
-      delete node;
+    Edge * children = node->children.load(std::memory_order_relaxed);
+    delete[] children;
+    delete node;
   }
   search.tree.clear();
   search.root = nullptr;
   total_children.store(0, std::memory_order_relaxed);
 }
+
 
 //we run gc() in runMCTS() before starting search threads, so no locking
 void gc() {
@@ -161,11 +163,18 @@ MCTSNode * make_child(const unsigned long hash) {
     }*/
     std::unique_lock insert_lock(map_mutex);
     auto [it, inserted] = search.tree.emplace(hash, child);
+    //Read the existing pointer BEFORE releasing the lock. `it` is an iterator into a
+    //shared unordered_map, and another thread's emplace can rehash the map the instant
+    //this unlocks -- which invalidates iterators. Dereferencing it afterwards returned a
+    //garbage MCTSNode*, and the next node->mutex.try_lock() on it died with
+    //"recursive_mutex lock failed: Invalid argument". Rare with one expansion per ~29
+    //network evaluations; common once the policy head makes an expansion cost ONE.
+    MCTSNode * existing = inserted ? nullptr : it->second;
     insert_lock.unlock();
     if (!inserted) {
       // Another thread inserted first; use the existing node and clean up ours.
       delete child;
-      child = it->second; //it->second - is a pointer to the existing node (it->first is a hash)
+      child = existing;
     }
   }
   return child; //may not be nullptr
@@ -352,12 +361,23 @@ int expand(MCTSNode * node, Board& chess_board, const ZobristHash& board_hash, c
     //Safe now that StateInfo carries isMate/isStaleMate, so undo_move() restores them.
     if (child->terminal.load(std::memory_order_acquire) == 0) {
       isCheckMateStaleMate(chess_board);
-      if (chess_board.isMate) {        //cp is from the CHILD's side-to-move perspective
-        child->cp.store(-MATE_SCORE, std::memory_order_relaxed);
-        child->terminal.store(1, std::memory_order_release);
-      } else if (chess_board.isStaleMate) {
-        child->cp.store(0, std::memory_order_relaxed);
-        child->terminal.store(2, std::memory_order_release);
+      const int want = chess_board.isMate ? 1 : (chess_board.isStaleMate ? 2 : 0);
+      if (want) {
+        //The load above is not atomic with these stores, and two threads can expand into
+        //the same transposed child. The cp write is idempotent but the W/N seeding is not,
+        //so claim the node with a CAS and let only the winner seed.
+        int expected = 0;
+        if (child->terminal.compare_exchange_strong(expected, want,
+              std::memory_order_release, std::memory_order_relaxed)) {
+          child->cp.store(want == 1 ? -MATE_SCORE : 0, std::memory_order_relaxed);
+          //Mate reaches the search ONLY through cp -> finalize_priors today: e = -cp*0.01
+          //is +200 pawns, so the mating edge takes P = 1.0 and every sibling underflows.
+          //A policy head knows nothing about terminality, so seed the child's own W/N
+          //instead. W is in the CHILD's frame and the parent reads -child->W, so a mated
+          //child is W = -1 (it has lost) and the parent sees Q = +1.
+          child->W.store(want == 1 ? -1.0 : 0.0, std::memory_order_relaxed);
+          child->N.store(1, std::memory_order_relaxed);
+        }
       }
     }
     children.push_back({child, (move.promoType << 12) | (move.src << 6) | move.dst, chess_board});
@@ -393,12 +413,20 @@ int expand(MCTSNode * node, Board& chess_board, const ZobristHash& board_hash, c
             //Safe now that StateInfo carries isMate/isStaleMate, so undo_move() restores them.
             if (child->terminal.load(std::memory_order_acquire) == 0) {
               isCheckMateStaleMate(chess_board);
-              if (chess_board.isMate) {        //cp is from the CHILD's side-to-move perspective
-                child->cp.store(-MATE_SCORE, std::memory_order_relaxed);
-                child->terminal.store(1, std::memory_order_release);
-              } else if (chess_board.isStaleMate) {
-                child->cp.store(0, std::memory_order_relaxed);
-                child->terminal.store(2, std::memory_order_release);
+              const int want = chess_board.isMate ? 1 : (chess_board.isStaleMate ? 2 : 0);
+              if (want) {
+                //Not atomic with the load above, and two threads can expand into the same
+                //transposed child. cp is idempotent, W/N seeding is not -- claim with a CAS.
+                int expected = 0;
+                if (child->terminal.compare_exchange_strong(expected, want,
+                      std::memory_order_release, std::memory_order_relaxed)) {
+                  child->cp.store(want == 1 ? -MATE_SCORE : 0, std::memory_order_relaxed);
+                  //Mate reaches the search only via cp -> finalize_priors today; a policy head
+                  //knows nothing about terminality. W is in the CHILD's frame and the parent
+                  //reads -child->W, so a mated child is W = -1 and the parent sees Q = +1.
+                  child->W.store(want == 1 ? -1.0 : 0.0, std::memory_order_relaxed);
+                  child->N.store(1, std::memory_order_relaxed);
+                }
               }
             }
             children.push_back({child, (move.promoType << 12) | (move.src << 6) | move.dst, chess_board});
@@ -423,6 +451,14 @@ int expand(MCTSNode * node, Board& chess_board, const ZobristHash& board_hash, c
   for (int i = 0; i < num_children; ++i) {
     edges[i].child.store(std::get<0>(children[i]), std::memory_order_release); 
     edges[i].move.store(std::get<1>(children[i]), std::memory_order_release);
+    //Seed a uniform prior. Edge::P defaults to 0.0, and between the publish below and
+    //the priors arriving from finalize_priors there is a window in which every P is 0:
+    //exploration = C*P*sqrt(parent_N)/(1+N) is then 0 for every child, every child has
+    //N == 0 so every Q is the same FPU value, and select_best_child's strict
+    //`score > best_score` against -INFINITY returns index 0 unconditionally -- a king
+    //move, since king moves are generated first. One batch wide today; a full GPU round
+    //trip once priors come from the policy head.
+    edges[i].P.store(1.0 / (double)num_children, std::memory_order_relaxed);
   }
 
   //PUBLISH THE NODE BEFORE ANY EVAL CAN COMPLETE. The inference server calls
@@ -436,6 +472,17 @@ int expand(MCTSNode * node, Board& chess_board, const ZobristHash& board_hash, c
   node->num_children.store(num_children, std::memory_order_release);
   total_children.fetch_add(num_children, std::memory_order_relaxed); //update total_children counter
   //Arm the counter only once the node is visible, then enqueue.
+  if (use_policy_priors) {
+    //One push for the PARENT. pending_evals stays 0 - there are no per-child completions,
+    //and the server must not decrement it. chess_board is back at the parent position
+    //after the last undo_move, and `path` already ends with `node` (mcts_search:516).
+    while (inflight_count.load(std::memory_order_acquire) >= MAX_INFLIGHT_POLICY)
+      std::this_thread::yield();
+    inflight_count.fetch_add(1, std::memory_order_acq_rel);
+    queue.push(node, chess_board, path, /*policy=*/true);
+    return 0;
+  }
+
   node->pending_evals.store(num_children, std::memory_order_release);
 
   for (int i = 0; i < num_children; ++i) {
@@ -659,6 +706,25 @@ void runMCTS(EvalQueue<65536>& queue) {
     //it seems there rarely is some kind of contamination or corruption of the tree
     //so let's try cleanup() instead of gc() if UCI Ponder option is false
     //avoid using Ponder option, sometimes called "permanent brain", i.e. thinking during opponent's time
+    //Drain work still in flight from the PREVIOUS search before freeing the tree.
+    //cleanup() and gc() below delete every MCTSNode and every Edge array, while the
+    //inference server runs continuously and never stops between searches. A late
+    //write-back dereferences leaf->children and STORES into it, so a stale item writes
+    //into freed memory -- that is the "contamination or corruption of the tree" noted
+    //just below. Rare with child evaluations, where the write-back only touches edges
+    //when pending_evals reaches zero; reliable with policy priors, where every item
+    //rewrites the whole edge array. Bounded so a lost item cannot hang the engine.
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      while (inflight_count.load(std::memory_order_acquire) > 0) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+          log_file("warning: %ld evaluations still in flight after 5s; freeing anyway\n",
+                   (long)inflight_count.load(std::memory_order_relaxed));
+          break;
+        }
+        std::this_thread::yield();
+      }
+    }
     pos_dedup.clear();
     if (chessEngine.optionCheck[Ponder].value) {
       set_root(queue);      

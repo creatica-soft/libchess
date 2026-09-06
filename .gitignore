@@ -46,3 +46,25 @@ __pycache__/
 
 # ---- macOS ----
 .DS_Store
+
+# Anything holding a lichess token. The bot reads LICHESS_TOKEN from the environment, so a
+# token should never be in a source file -- but launch commands get pasted into scratch notes,
+# and one such file (unbalanced-openings.txt) was one `git add -A` away from publishing two
+# live tokens. Lichess auto-revokes exposed tokens, so that costs you the accounts' sessions,
+# not just the secret. Prefer keeping the token outside the repo entirely:
+#   export LICHESS_TOKEN="$(cat ~/.config/creatica/lichess_token)"
+unbalanced-openings.txt
+*.local.sh
+run_bots*.sh
+*secret*
+
+# Experiment output and engine logs -- regenerated, and noise in a diff.
+results_*.csv
+creatica*.log
+uci*.log
+engine_log*
+*.pgn
+# Large external tools and model artefacts that do not belong in the source tree.
+stockfish-macos-*
+*.mlmodelc/
+*.weights

@@ -51,13 +51,22 @@ int Eval::simple_eval(const Board& board) {
     int c = board.sideToMove;
     int pawns = popcount(board.pieceTypes[PAWN - 1] & board.side[c]);
     int opp_pawns = popcount(board.pieceTypes[PAWN - 1] & board.side[c ^ 1]);
-    unsigned long long non_pawns = (board.side[c]) ^ board.pieceTypes[PAWN - 1];
+    //Was `side[c] ^ pieceTypes[PAWN-1]`. XOR only equals "clear the pawns" when the pawn
+    //set is a SUBSET of the operand -- true at line 137 below, where the operand is all
+    //occupied squares, but false here, where it is one side's pieces. The XOR therefore
+    //pulled in the OPPONENT's pawns, and the algebra made the pawn terms cancel outright:
+    //  np      = my_non_pawns  + opp_pawns * PawnValue
+    //  opp_np  = opp_non_pawns + my_pawns  * PawnValue
+    //  result  = PawnValue*(pawns - opp_pawns) + (np - opp_np) = my_non_pawns - opp_non_pawns
+    //so simple_eval ignored pawns entirely, and use_smallnet() routed on non-pawn material
+    //alone.
+    unsigned long long non_pawns = board.side[c] & ~board.pieceTypes[PAWN - 1];
     int np = 0;
     while (non_pawns) {
       int sq = pop_lsb(non_pawns);
       np += PieceValue[board.piecesOnSquares[sq]];
     }
-    unsigned long long opp_non_pawns = (board.side[c ^ 1]) ^ board.pieceTypes[PAWN - 1];
+    unsigned long long opp_non_pawns = board.side[c ^ 1] & ~board.pieceTypes[PAWN - 1];
     int opp_np = 0;
     while (opp_non_pawns) {
       int sq = pop_lsb(opp_non_pawns);

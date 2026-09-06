@@ -321,7 +321,10 @@ void ecoClassify(Game& game, struct EcoLine ** ecoLine, int numberOfEcoLines) {
 }
 
 int initGame(Game& game, FILE * file) {
-	char line[80];
+	//Initialised: if the skip loop below ends because fgets() hit EOF rather than
+	//because it found a move line, `line` is never written, and the strcat() that
+	//follows would concatenate uninitialised stack memory into sanMoves.
+	char line[80] = "";
 	//read game PGN tags
 	if (gTags(game.tags, file)) {
 	  //fprintf(stderr, "initGame(): gTags() returned EOF\n");
@@ -330,21 +333,52 @@ int initGame(Game& game, FILE * file) {
 	//fprintf(stderr, "initGame(): [Event \"%s\"]\n", game.tags[Event]);
 
 	//skip empty lines and tag lines if any           
+	bool haveMoveLine = false;
 	while (fgets(line, sizeof line, file)) {
-		if (!isEmptyLine(line) && line[0] != '[') break;
+		if (!isEmptyLine(line) && line[0] != '[') { haveMoveLine = true; break; }
 	}
 	game.sanMoves[0] = '\0';
 
-	//Read game moves until first empty line
-	strcat(game.sanMoves, line);
+	//Read game moves until first empty line.
+	//
+	//Bounded: sanMoves is MAX_SAN_MOVES_LEN and a long game -- or one carrying long
+	//comments, which are only stripped further down -- would otherwise run off the end
+	//of the struct. Truncation loses moves; a plain strcat() corrupts memory.
+	size_t used = 0;
+	const size_t cap = sizeof game.sanMoves - 1;
+	if (haveMoveLine) {
+		const size_t n = strnlen(line, sizeof line);
+		const size_t take = (n > cap - used) ? cap - used : n;
+		memcpy(game.sanMoves + used, line, take);
+		used += take;
+		game.sanMoves[used] = '\0';
+	}
 	while (fgets(line, sizeof line, file)) {
 		if (isEmptyLine(line)) break;
-		strcat(game.sanMoves, line);
+		const size_t n = strnlen(line, sizeof line);
+		const size_t take = (n > cap - used) ? cap - used : n;
+		if (!take) break;                 //sanMoves is full; keep what we have
+		memcpy(game.sanMoves + used, line, take);
+		used += take;
+		game.sanMoves[used] = '\0';
 	}
-	if (feof(file)) {
-	  //fprintf(stderr, "initGame() returned EOF\n");
-	  return 1;			
-	}
+
+	//EOF is reported to the caller, but ONLY after the game that was just read has been
+	//normalised.
+	//
+	//This used to return 1 here, before the three calls below. Reaching EOF while
+	//reading the moves of a perfectly good game is the normal way a PGN file ends, so
+	//the LAST game of every file came back raw: move numbers, comments, variations and
+	//the result token all still in sanMoves, and numberOfPlies left at 0. It only looked
+	//correct for files that happen to end with a blank line, because then the move loop
+	//breaks on the empty line before EOF is set. Callers such as play_games.cpp use the
+	//game regardless of the return value, so they were silently handing an unnormalised
+	//move list to san2move() for one game per file.
+	//
+	//The contract is unchanged: non-zero still means end of file. What changed is that
+	//the Game handed back is now always fully parsed. A caller that needs to know
+	//whether a game was actually read should test numberOfPlies, not the return value.
+	const int atEof = feof(file) ? 1 : 0;
 
 	//strip the game result;
   stripGameResult(game);
@@ -354,7 +388,7 @@ int initGame(Game& game, FILE * file) {
 
 	//strip move numbers
 	game.numberOfPlies = movesOnly(game.sanMoves);
-	return 0;
+	return atEof;
 }
 
 ///<summary>

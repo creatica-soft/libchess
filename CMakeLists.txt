@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(chess SHARED board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp)
 
 # Define the executable
-#add_executable(creatica creatica.cpp uci.cpp tbcore.c tbprobe.c)
+#add_executable(creatica attic/creatica.cpp attic/uci.cpp tbcore.c tbprobe.c)  # historical; does not compile against the current API
 add_executable(test_pos test_pos.cpp)
 add_executable(perft perft.cpp)
 add_executable(test_nnue tbcore.c tbprobe.c test_nnue.cpp)

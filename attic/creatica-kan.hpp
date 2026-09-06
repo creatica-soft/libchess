@@ -57,6 +57,15 @@ const double VIRTUAL_LOSS = 35;   // Penalty in centipawns – tuneable, start w
 #define BATCH_SIZE 2 * 8192
 #define TIMEOUT_US 10 //2000
 #define MAX_INFLIGHT 4 * 16384 // tuneable – start with 4× target batch
+//MAX_INFLIGHT throttles queue ITEMS, but an item means different things in the two prior
+//modes: roughly 29 items per expansion with child evaluations, exactly ONE with policy
+//priors. Left at 65536 the policy path runs 65536 expansions ahead of any value coming
+//back -- 29x child mode's lookahead. Measured consequence: a backlog of 47,000 items that
+//would not drain in 5 seconds, the engine silent long enough for the tournament driver to
+//declare it dead, and a search expanding blind because every child still sits at its
+//first-play-urgency value. Throttle pending EXPANSIONS instead, matching what child mode
+//already allows (65536 / ~29).
+#define MAX_INFLIGHT_POLICY 2048
 #define PV_PLIES 16
 #define PONDER false
 #define DISPLAY_INTERMITTENT_INFO_LINES true
@@ -95,6 +104,11 @@ struct ChebyKANLayerImpl : torch::nn::Module {
         // x shape: [batch, in_features]
         // 1. Precompute the Chebyshev basis T_n(x)
         // We use a vector of tensors for the recurrence
+        // Bound the input before building the Chebyshev basis -- MUST match the trainer.
+        // Without it T_8 of layer 1's unbounded output reaches ~8e6 and fp16 inference
+        // overflows outright. See dual_head_kan_train.cpp for the full reasoning.
+        x = torch::tanh(x);
+
         std::vector<torch::Tensor> T;
         T.push_back(torch::ones_like(x)); // T0 = 1
         T.push_back(x);                  // T1 = x
@@ -125,29 +139,243 @@ struct ChebyKANLayerImpl : torch::nn::Module {
 };
 TORCH_MODULE(ChebyKANLayer);
 
+#ifndef MAX_TRAIN_PVS
+#define MAX_TRAIN_PVS MAX_PVS
+#endif
+
+#ifndef POLICY_TEMP
+#define POLICY_TEMP 1.5
+#endif
+
+// MUST match dual_head_kan_train.cpp. Width is also derived from the loaded tensor in
+// ChebyKANLayerImpl, but DEGREE is not -- it comes from the constructor and decides how
+// many basis terms are built, so a mismatch reshapes the weights into garbage.
+// -DCONV_POLICY=1 replaces the bilinear from/to table with an AlphaZero-style directional
+// head: a move is (from-square, plane) where the 73 planes are 8 directions x 7 distances,
+// 8 knight moves and 9 underpromotions. Two advantages over the bilinear table. It is
+// cheaper -- 118k MACs/position against 494k, once the trunk context is projected down
+// before being broadcast to every square. And it shares weights across the board: a rook
+// going e1-e8 and one going a1-a8 are the same "north 7", where the bilinear table has to
+// learn them as two unrelated entries in a 64x64 grid.
+#ifndef CONV_POLICY
+#define CONV_POLICY 0
+#endif
+// Width the 64-wide trunk context is projected to before per-square broadcast. Broadcasting
+// all 64 is what makes the conv head only 31% cheaper instead of 4x.
+#ifndef POLICY_CTX
+#define POLICY_CTX 16
+#endif
+
+#if CONV_POLICY
+static constexpr int POLICY_PLANES = 73;
+static constexpr int POLICY_OUT    = 64 * POLICY_PLANES;   // 4672
+#else
+static constexpr int POLICY_OUT    = 64 * 64;              // 4096
+#endif
+
+// Plane index for a move in the SIDE-TO-MOVE-ORIENTED frame; -1 if it has no queen/knight
+// shape. Verified exhaustively: 1792 shaped moves over all 64 squares, no collisions.
+static inline int move_plane(int from_i, int to_i, int promo) {
+    const int dr = (to_i >> 3) - (from_i >> 3);
+    const int df = (to_i & 7)  - (from_i & 7);
+    if (promo == Knight || promo == Bishop || promo == Rook) {   // queen promo uses a queen plane
+        const int dirp = (df == 0) ? 0 : (df < 0 ? 1 : 2);
+        const int pcp  = (promo == Knight) ? 0 : (promo == Bishop ? 1 : 2);
+        return 64 + pcp * 3 + dirp;
+    }
+    static const int kn[8][2] = {{2,1},{1,2},{-1,2},{-2,1},{-2,-1},{-1,-2},{1,-2},{2,-1}};
+    for (int i = 0; i < 8; ++i) if (dr == kn[i][0] && df == kn[i][1]) return 56 + i;
+    static const int dir[8][2] = {{1,0},{1,1},{0,1},{-1,1},{-1,0},{-1,-1},{0,-1},{1,-1}};
+    for (int i = 0; i < 8; ++i)
+        for (int d = 1; d <= 7; ++d)
+            if (dr == dir[i][0]*d && df == dir[i][1]*d) return i*7 + (d-1);
+    return -1;
+}
+
+// Index of a move in the policy output, oriented squares in, -1 if unrepresentable.
+static inline int policy_index(int from_i, int to_i, int promo) {
+#if CONV_POLICY
+    const int pl = move_plane(from_i, to_i, promo);
+    return pl < 0 ? -1 : from_i * POLICY_PLANES + pl;
+#else
+    (void)promo;
+    return from_i * 64 + to_i;
+#endif
+}
+
+#ifndef KAN_HIDDEN
+#define KAN_HIDDEN 256
+#endif
+#ifndef KAN_DEGREE
+#define KAN_DEGREE 8
+#endif
+
+#ifndef POLICY_DIM
+#define POLICY_DIM 32
+#endif
+// Width of the attention layer's per-square representation; follows POLICY_DIM unless set.
+#ifndef ATTN_DIM
+#define ATTN_DIM POLICY_DIM
+#endif
+
+// Self-attention over the 64 squares. DEFAULT ON: it is the only large effect measured
+// here -- Top-6 67.5% with it against 58.6% without, on the same shard, against a noise
+// floor of 0.8 points. Costs 14,176 parameters and about 23 microseconds per position.
+// Build with -DUSE_ATTENTION=0 for the ablation.
+#ifndef USE_ATTENTION
+#define USE_ATTENTION 1
+#endif
+
+#if USE_ATTENTION
+// One self-attention layer over the 64 squares, so a square can fold in what is on the
+// other 63 before the bilinear head scores pairs. Without it each square sees only its
+// own 9 planes plus a shared position summary, so the head cannot know that the squares
+// between a rook and its target are empty, or that a bishop covers the destination.
+//
+// Chess is a 64-token sequence, which is why this is affordable: the 64x64 attention
+// matrix that makes transformers expensive on language is trivial here.
+
+struct SquareAttentionImpl : torch::nn::Module {
+    torch::Tensor pos_emb, Win, bin_, Wq, Wk, Wv, Wo, W1, b1, W2, b2;
+    int d, hidden;
+    SquareAttentionImpl(int in_feats, int d_ = 32, int hidden_ = 64) : d(d_), hidden(hidden_) {
+        auto u = [](std::initializer_list<int64_t> shp, int fan) {
+            float sc = std::sqrt(1.0f / fan);
+            return torch::empty(shp).uniform_(-sc, sc);
+        };
+        // a1 and h8 are not interchangeable, so each square gets a learned identity
+        pos_emb = register_parameter("pos_emb", 0.02f * torch::randn({64, d_}));
+        Win  = register_parameter("Win",  u({in_feats, d_}, in_feats));
+        bin_ = register_parameter("bin",  torch::zeros({d_}));
+        Wq   = register_parameter("Wq",   u({d_, d_}, d_));
+        Wk   = register_parameter("Wk",   u({d_, d_}, d_));
+        Wv   = register_parameter("Wv",   u({d_, d_}, d_));
+        Wo   = register_parameter("Wo",   u({d_, d_}, d_));
+        W1   = register_parameter("W1",   u({d_, hidden_}, d_));
+        b1   = register_parameter("b1",   torch::zeros({hidden_}));
+        W2   = register_parameter("W2",   u({hidden_, d_}, hidden_));
+        b2   = register_parameter("b2",   torch::zeros({d_}));
+    }
+    // x [B,64,in_feats] -> [B,64,d]
+    torch::Tensor forward(torch::Tensor x) {
+        auto z = torch::matmul(x, Win) + bin_ + pos_emb;
+        z = torch::layer_norm(z, {d});
+        auto q = torch::matmul(z, Wq);
+        auto k = torch::matmul(z, Wk);
+        auto v = torch::matmul(z, Wv);
+        auto a = torch::softmax(torch::matmul(q, k.transpose(1, 2))
+                                / std::sqrt(static_cast<float>(d)), -1);
+        z = z + torch::matmul(torch::matmul(a, v), Wo);
+        z = torch::layer_norm(z, {d});
+        z = z + torch::matmul(torch::relu(torch::matmul(z, W1) + b1), W2) + b2;
+        return torch::layer_norm(z, {d});
+    }
+};
+TORCH_MODULE(SquareAttention);
+#endif   // USE_ATTENTION
+
+#if CONV_POLICY
+// A 1x1 convolution over the 8x8 board IS a per-square linear map, so this is a matmul --
+// same arithmetic, none of the conv-kernel overhead.
+struct ConvPolicyHeadImpl : torch::nn::Module {
+    torch::Tensor Wc, bc, Wp, bp;
+    ConvPolicyHeadImpl(int plane_feats, int ctx, int ctx_out) {
+        auto u = [](std::initializer_list<int64_t> shp, int fan) {
+            float sc = std::sqrt(1.0f / fan);
+            return torch::empty(shp).uniform_(-sc, sc);
+        };
+        Wc = register_parameter("Wc", u({ctx, ctx_out}, ctx));           // squeeze the context once
+        bc = register_parameter("bc", torch::zeros({ctx_out}));
+        const int in = plane_feats + ctx_out;
+        Wp = register_parameter("Wp", u({in, POLICY_PLANES}, in));       // per-square -> 73 planes
+        bp = register_parameter("bp", torch::zeros({POLICY_PLANES}));
+    }
+    // x_sq [B,64,plane_feats], ctx [B,ctx] -> [B, 64*73]
+    torch::Tensor forward(torch::Tensor x_sq, torch::Tensor ctx) {
+        const int64_t B = x_sq.size(0);
+        auto c = torch::tanh(torch::matmul(torch::tanh(ctx), Wc) + bc);  // [B,ctx_out]
+        auto h = torch::cat({x_sq, c.unsqueeze(1).expand({B, 64, c.size(1)})}, 2);
+        auto s = torch::matmul(h, Wp) + bp;                              // [B,64,73]
+        return s.reshape({B, 64 * POLICY_PLANES});
+    }
+};
+TORCH_MODULE(ConvPolicyHead);
+#endif
+
+struct BilinearPolicyHeadImpl : torch::nn::Module {
+    torch::Tensor Wf, bf, Wt, bt, Wb;
+    int d;
+    BilinearPolicyHeadImpl(int plane_feats = 9, int ctx = 64, int d_ = 32) : d(d_) {
+        const int in = plane_feats + ctx;
+        float sc = std::sqrt(1.0f / in);
+        Wf = register_parameter("Wf", torch::empty({in, d}).uniform_(-sc, sc));
+        bf = register_parameter("bf", torch::zeros({d}));
+        Wt = register_parameter("Wt", torch::empty({in, d}).uniform_(-sc, sc));
+        bt = register_parameter("bt", torch::zeros({d}));
+        // start near identity so the head begins as a plain dot product between the
+        // two square embeddings rather than as noise
+        Wb = register_parameter("Wb", torch::eye(d) + 0.01f * torch::randn({d, d}));
+    }
+    // x_sq [B,64,plane_feats], ctx [B,64] -> [B,4096] logits, index = from*64 + to
+    torch::Tensor forward(torch::Tensor x_sq, torch::Tensor ctx) {
+        const int64_t B = x_sq.size(0);
+        // The trunk's output is an unbounded matmul, so squash it before the head reads
+        // it, and scale the bilinear product by 1/sqrt(d) the way attention does. Both
+        // keep the head in a sane starting range.
+        auto c = torch::tanh(ctx).unsqueeze(1).expand({B, 64, ctx.size(1)});
+        auto h = torch::cat({x_sq, c}, 2);                     // [B,64,in]
+        auto U = torch::matmul(h, Wf) + bf;                    // [B,64,d]
+        auto V = torch::matmul(h, Wt) + bt;                    // [B,64,d]
+        auto S = torch::matmul(torch::matmul(U, Wb), V.transpose(1, 2))
+                 / std::sqrt(static_cast<float>(d));           // [B,64,64]
+        return S.reshape({B, 64 * 64});
+    }
+};
+TORCH_MODULE(BilinearPolicyHead);
+
 struct ChessChebyKANImpl : torch::nn::Module {
     ChebyKANLayer layer1{nullptr}, layer2{nullptr};
     torch::nn::Linear value_head{nullptr};
+#if CONV_POLICY
+    ConvPolicyHead policy{nullptr};
+#else
+    BilinearPolicyHead policy{nullptr};
+#endif
+#if USE_ATTENTION
+    SquareAttention attn{nullptr};
+#endif
 
-    ChessChebyKANImpl(int in_features = 576, int hidden = 256, int degree = 4) {
-        layer1 = register_module("layer1", ChebyKANLayer(in_features, hidden, degree));
-        layer2 = register_module("layer2", ChebyKANLayer(hidden, 32, degree));
-        
-        // Final mapping to a single scalar
-        value_head = register_module("value_head", torch::nn::Linear(32, 1));
+    ChessChebyKANImpl(int in_features = 576, int hidden = KAN_HIDDEN, int degree = KAN_DEGREE) {
+        layer1     = register_module("layer1", ChebyKANLayer(in_features, hidden, degree));
+        layer2     = register_module("layer2", ChebyKANLayer(hidden, 64, degree));
+        value_head = register_module("value_head", torch::nn::Linear(64, 1));
+#if USE_ATTENTION
+        // attention consumes the 9 planes plus the broadcast context and emits 32/square
+        attn       = register_module("attn",   SquareAttention(9 + 64, ATTN_DIM));
+        policy     = register_module("policy", BilinearPolicyHead(ATTN_DIM, 64, POLICY_DIM));
+#else
+#if CONV_POLICY
+        policy     = register_module("policy", ConvPolicyHead(9, 64, POLICY_CTX));
+#else
+        policy     = register_module("policy", BilinearPolicyHead(9, 64, POLICY_DIM));
+#endif
+#endif
     }
 
-    torch::Tensor forward(torch::Tensor x) {
-        x = x.view({x.size(0), -1}); 
-        
-        x = layer1->forward(x);
-        x = layer2->forward(x);
-        
-        // Final value output
-        auto out = value_head->forward(x);
-        
-        // Return tanh to keep it in the [-1, 1] range for your centipawn conversion
-        return torch::tanh(out);
+    // x [B,576] -> { value [B,1] (pre-tanh), policy logits [B,4096] }
+    std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor x) {
+        const int64_t B = x.size(0);
+        auto flat = x.view({B, -1});
+        auto ctx  = layer2->forward(layer1->forward(flat));    // [B,64] position context
+        auto value = value_head->forward(ctx);                 // [B,1]
+        // The 576 inputs are already 9 planes x 64 squares -- data[(plane << 6) | sq] --
+        // so per-square features come free with a reshape, no convolution needed.
+        auto x_sq = flat.view({B, 9, 64}).transpose(1, 2).contiguous();  // [B,64,9]
+#if USE_ATTENTION
+        auto ctx_b = torch::tanh(ctx).unsqueeze(1).expand({B, 64, ctx.size(1)});
+        x_sq = attn->forward(torch::cat({x_sq, ctx_b}, 2));              // [B,64,32]
+#endif
+        return {value, policy->forward(x_sq, ctx)};
     }
 };
 TORCH_MODULE(ChessChebyKAN);
@@ -228,6 +456,10 @@ struct PositionDedup {
 };
 
 extern PositionDedup pos_dedup;
+//When true, expand() pushes the PARENT once and priors come from the policy head instead
+//of from one network evaluation per child. Both paths live in the same binary so the A/B
+//is a single option flip.
+extern bool use_policy_priors;
 
 // Ensure the Slot is aligned to avoid performance degradation
 struct alignas(128) Slot {
@@ -237,6 +469,11 @@ struct alignas(128) Slot {
     MCTSNode* node = nullptr;
     Board board;
     std::vector<MCTSNode *> path;
+    //Which protocol this item was pushed under. Must be carried per-item, not read from
+    //a global at consume time: the option is written unsynchronised from the UCI thread
+    //and nothing drains the queue on stop, so an item pushed as a child could otherwise
+    //be consumed as a parent -- different path length, different write-back.
+    bool policy = false;
 };
 
 template<size_t Size>
@@ -256,7 +493,8 @@ struct EvalQueue {
     alignas(128) std::atomic<size_t> tail{0}; // Consumer index
 
     // Search Threads: Push the Board state reached at the leaf
-    void push(MCTSNode* node, const Board& board, const std::vector<MCTSNode*>& path) {
+    void push(MCTSNode* node, const Board& board, const std::vector<MCTSNode*>& path,
+              bool policy = false) {
         size_t h = head.load(std::memory_order_relaxed);
         int spin_count = 0; 
         
@@ -269,6 +507,7 @@ struct EvalQueue {
                     slot.node = node;
                     slot.board = board; 
                     slot.path = path;
+                    slot.policy = policy;          //before the release store below
                     slot.sequence.store(h + 1, std::memory_order_release);
                     return; // Void return type, push now guarantees success
                 }
@@ -290,7 +529,9 @@ struct EvalQueue {
         }
     }
     // Prediction Server: Pop as many as possible into a batch
-    size_t pop_batch(std::vector<MCTSNode*>& nodes, std::vector<Board>& boards, std::vector<std::vector<MCTSNode *>>& paths, size_t max_batch) {
+    size_t pop_batch(std::vector<MCTSNode*>& nodes, std::vector<Board>& boards,
+                     std::vector<std::vector<MCTSNode *>>& paths,
+                     std::vector<uint8_t>& kinds, size_t max_batch) {
         size_t t = tail.load(std::memory_order_relaxed);
         size_t count = 0;
 
@@ -304,6 +545,7 @@ struct EvalQueue {
                     nodes.push_back(slot.node);
                     boards.push_back(slot.board);
                     paths.push_back(slot.path);
+                    kinds.push_back(slot.policy ? 1 : 0);   //after the acquire load above
                     
                     // Set sequence to t + Size to mark it ready for the NEXT wrap-around producer
                     slot.sequence.store(t + Size, std::memory_order_release);
@@ -346,11 +588,14 @@ public:
         nodes.reserve(batch_size);
         boards.reserve(batch_size);
         paths.reserve(batch_size);
+        std::vector<uint8_t> kinds;   //1 = policy item (a parent), 0 = child
+        kinds.reserve(batch_size);
 
         while (running.load(std::memory_order_relaxed)) {
             nodes.clear();
             boards.clear();
             paths.clear();
+            kinds.clear();
 
             auto start_time = std::chrono::steady_clock::now();
             int spin_count = 0;
@@ -361,7 +606,7 @@ public:
             //in here forever and never returned to re-read `running`. quit() then never
             //took effect and server_thread.join() blocked for good.
             while (nodes.size() < batch_size && running.load(std::memory_order_relaxed)) {
-                size_t popped = queue.pop_batch(nodes, boards, paths, batch_size - nodes.size());
+                size_t popped = queue.pop_batch(nodes, boards, paths, kinds, batch_size - nodes.size());
                 
                 if (popped == 0) {
                     if (!nodes.empty()) {
@@ -396,7 +641,13 @@ public:
                 //configured BATCH_SIZE is an upper bound the server may never approach -
                 //and per-position model cost depends almost entirely on this number.
                 uint64_t b = total_batches.fetch_add(1) + 1;
-                if ((b & 0x3F) == 0)
+                //Opt-in: BATCH_STATS=1. The configured BATCH_SIZE is only an upper bound -- what
+                //matters is the batch the server actually assembles, and that depends on how fast
+                //workers produce items. Policy priors emit ONE item per expansion where child
+                //evaluations emit ~29, so the achieved batch can be far smaller, and per-position
+                //GPU cost depends almost entirely on it.
+                static const bool stats = std::getenv("BATCH_STATS") != nullptr;
+                if (stats && (b & 0x3F) == 0)
                     fprintf(stderr, "info string batches %llu mean_batch %.1f\n",
                             (unsigned long long)b, (double)total_evals_completed.load() / (double)b);
             }
@@ -405,7 +656,23 @@ public:
             // 2. GPU Inference (MPS)
             torch::NoGradGuard no_grad;
             auto gpu_input = current_batch_tensor.to(torch::kMPS).to(torch::kHalf); 
-            torch::Tensor output = model->forward(gpu_input).to(torch::kFloat32); // forward returns IValue
+            // The dual-head model returns { value (PRE-tanh), policy logits [B,4096] }.
+            // The old single-head model applied tanh inside forward(); everything downstream
+            // expects the bounded value, so apply it at this boundary instead.
+            auto [value_raw, policy_logits] = model->forward(gpu_input);
+            torch::Tensor output = torch::tanh(value_raw).to(torch::kFloat32);
+            //Only pay the [B,4096] copy when the batch actually holds a policy item:
+            //16 KB per position, 32 MB at B=2048. Masking cannot be done on-device here --
+            //inference runs in kHalf and -1e9 is infinity in fp16 -- so the softmax over
+            //legal moves happens on the CPU in policy_priors().
+            bool any_policy = false;
+            for (uint8_t k : kinds) if (k) { any_policy = true; break; }
+            torch::Tensor cpu_policy;
+            const float* pol = nullptr;
+            if (any_policy) {
+                cpu_policy = policy_logits.to(torch::kFloat32).to(torch::kCPU).contiguous();
+                pol = cpu_policy.data_ptr<float>();
+            }
             
             auto cpu_output = output.to(torch::kCPU);
             float* results_ptr = cpu_output.data_ptr<float>();
@@ -425,17 +692,41 @@ public:
                 if (leaf->terminal.load(std::memory_order_acquire) == 0)
                     leaf->cp.store(cp, std::memory_order_relaxed);
                 
-                if (!path.empty()) {
-                    auto* parent = path.back();
-                    if (parent->pending_evals.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                        finalize_priors(parent); 
-                    }
+                if (i < kinds.size() && kinds[i]) {
+                  //POLICY ITEM: `leaf` is the node that was expanded, not one of its children, and
+                  //`path` ALREADY ends with it (mcts_search pushes it at creatica-kan.cpp:516 before
+                  //calling expand). Do not push it again: backpropagate walks in reverse flipping
+                  //sign each step, so a duplicated leaf inverts the sign for EVERY ancestor and
+                  //leaks a second virtual loss into W on every simulation -- silent, and the engine
+                  //would play the moves it thinks are worst.
+                  if (pol) policy_priors(leaf, boards[i].sideToMove == ColorBlack,
+                                         pol + (size_t)i * 4096u);
+                  //Priors BEFORE the gate: runMCTS spins on root->evaluated and releases every
+                  //worker the instant it clears. Open it on zero priors and select_best_child
+                  //returns child 0 forever.
+                  leaf->evaluated.store(true, std::memory_order_release);
+                  backpropagate(eval, path);
+                  inflight_count.fetch_sub(1, std::memory_order_release);
+                  //pending_evals untouched - there are no per-child completions. pos_dedup keeps
+                  //this hash: the node is expanded now and must not be handed back for a second
+                  //expansion. The set is cleared per search.
+                } else {
+                  if (!path.empty()) {
+                      auto* parent = path.back();
+                      if (parent->pending_evals.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                          finalize_priors(parent); 
+                      }
+                  }
+                  path.push_back(leaf);
+                  backpropagate(eval, path); 
+                  leaf->evaluated.store(true, std::memory_order_release);
+                  pos_dedup.remove(leaf->hash.load(std::memory_order_relaxed));
+                  //inflight_count is the ONLY thing runMCTS waits on before cleanup()/gc() free every
+                  //node and Edge array. It must therefore be decremented LAST: dropping it before the
+                  //two lines above let the drain return while the server was still writing into `leaf`,
+                  //so those writes landed in freed memory.
+                  inflight_count.fetch_sub(1, std::memory_order_release);
                 }
-                path.push_back(leaf);
-                backpropagate(eval, path); 
-                inflight_count.fetch_sub(1, std::memory_order_release);
-                leaf->evaluated.store(true, std::memory_order_release);
-                pos_dedup.remove(leaf->hash.load(std::memory_order_relaxed));
             }
         }
     }
@@ -530,6 +821,63 @@ private:
         });
     }
     
+//Fill the edge priors from ONE policy row instead of from the children's own values.
+//
+//Index mapping: an edge move is (promoType << 12) | (src << 6) | dst, and PieceTypeNone
+//is 7, so a non-promotion carries 0x7000 in the high bits -- the policy index is the LOW
+//12 BITS ONLY. The trainer orients the board for the side to move (square ^ 56 when Black
+//is to move, dual_head_kan_train.cpp), so for Black both squares must be flipped:
+//src ^ 56 lives in bits 6-11 (^0xE00) and dst ^ 56 in bits 0-5 (^0x38), hence ^0xE38.
+//Getting this flip wrong does not crash -- it yields a mirrored policy, which plays like
+//a mediocre engine rather than a broken one.
+//
+//Promotions: four edges share one (src,dst) pair and therefore one policy entry. The
+//trainer ignored promotion type entirely, so what the model learned is "this from/to pair
+//is good", which in practice means the queen promotion. Splitting evenly would hand three
+//quarters of that mass to under-promotions, so they take a fixed logit penalty instead --
+//still reachable, but not preferred.
+static inline void policy_priors(MCTSNode* parent, bool is_black, const float* row) {
+    const size_t n = parent->num_children.load(std::memory_order_acquire);
+    if (n == 0) return;
+    Edge* edges = parent->children.load(std::memory_order_acquire);
+    if (!edges) return;
+
+    double logits[256];
+    double max_val = -std::numeric_limits<double>::infinity();
+    const size_t count = n < 256 ? n : 256;
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t m = edges[i].move.load(std::memory_order_relaxed);
+        //Oriented squares: the trainer flips both when Black is to move.
+        int src = (m >> 6) & 63, dst = m & 63;
+        if (is_black) { src ^= 56; dst ^= 56; }
+        const uint32_t promo = (m >> 12) & 7u;
+        const int pi = policy_index(src, dst, (int)promo);
+        if (pi < 0) { logits[i] = -1e9; continue; }   //shape with no plane: unreachable
+        double v = static_cast<double>(row[pi]);
+        #if !CONV_POLICY
+        //Bilinear only: four promotions share one (from,to) entry, so bias against the
+        //under-promotions. The directional head gives them their own planes and needs no
+        //such fudge.
+        if (promo != PieceTypeNone && promo != Queen) v -= 4.0;
+        #endif
+        logits[i] = v;
+        if (v > max_val) max_val = v;
+    }
+    if (!std::isfinite(max_val)) {          //nothing mappable: fall back to uniform
+        for (size_t i = 0; i < count; ++i)
+            edges[i].P.store(1.0 / (double)count, std::memory_order_release);
+        return;
+    }
+    double total = 0.0;
+    for (size_t i = 0; i < count; ++i) { logits[i] = std::exp(logits[i] - max_val); total += logits[i]; }
+    const double inv = (total > 0.0) ? 1.0 / total : 0.0;
+    for (size_t i = 0; i < count; ++i)
+        edges[i].P.store(inv == 0.0 ? 1.0 / (double)count : logits[i] * inv,
+                         std::memory_order_release);
+    //Caller sets parent->evaluated AFTER this returns -- never before, or workers descend
+    //on a node whose priors are still 0 and select_best_child returns child 0 forever.
+}
+
     void finalize_priors(MCTSNode* parent) {
         const size_t n = parent->num_children.load(std::memory_order_relaxed);
         if (n == 0) return;

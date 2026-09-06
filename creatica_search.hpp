@@ -63,6 +63,28 @@
 #define DISPLAY_FINAL_INFO_LINES true
 #define MAX_DEPTH 100
 
+//--- policy head ---------------------------------------------------------------------
+//Where to find the exported weights, overridable with the CREATICA_POLICY env var. The
+//file is produced by:  EXPORT_WEIGHTS=nnue_policy.bin ./nnue_policy_train
+#define POLICY_WEIGHTS_DEFAULT "nnue_policy.bin"
+//Buffer bounds for the trunk. policy_net_load() refuses anything larger, so these are a
+//guarantee and not a hope.
+#define POLICY_MAX_IN 2048
+#define POLICY_MAX_H2 512
+//First-play urgency, in the same tanh units as W (so the whole scale is -1..1). An
+//unvisited child is assumed to be worth this much less than its parent. 0 would mean
+//"assume every unexplored move draws", which is why the incumbent's Q=0 fallback is wrong
+//once children are born unevaluated. Override at runtime with CREATICA_FPU.
+#define FPU_REDUCTION 0.20
+//Share of the prior taken from the policy head; the remainder comes from the 1-ply child
+//evaluation. 0 reproduces the incumbent exactly, 1 is policy-only. Measured best around
+//0.4-0.5 (see the table in creatica_search.cpp). Override with CREATICA_POLICY_BLEND.
+//Ignored in "full" mode, which has no child evaluations to blend with.
+#define POLICY_BLEND 0.45
+//Restores the blended prior's concentration to the incumbent's ~0.39. Override with
+//CREATICA_BLEND_SCALE.
+#define POLICY_BLEND_SCALE 1.15
+
 struct NNUEContext {
     Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
     Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
@@ -101,6 +123,18 @@ struct Edge {
 };
 
 void runMCTS(NNUEContext& ctx);
+//Checks the invariants gc() must preserve; off unless validate_tree_enabled is set. Returns the
+//number of violations found and logs each. See the definition for what it checks and why it
+//never dereferences a pointer it suspects.
+//Tree occupancy in per-mille of Hash, from atomics -- safe to call during a search.
+int tree_occupancy();
+extern std::atomic<size_t> total_nodes;
+extern bool reuse_tree;
+extern int64_t gc_threshold;
+extern bool validate_tree_enabled;
+//`collected` says whether a collection has just run; the reachability invariant only
+//holds then, since lazy collection deliberately leaves unreachable nodes in the map.
+int validate_tree(const char * where, bool collected);
 void cleanup(); //free Hash tree
 void mcts_search(ThreadParams& params, NNUEContext& ctx);
 void uciLoop();

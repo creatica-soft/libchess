@@ -81,6 +81,17 @@ class Network {
                            AccumulatorStack&                       accumulatorStack,
                            AccumulatorCaches::Cache<FTDimensions>& cache) const;
                            
+    //Expose the feature transformer's OUTPUT -- the post-activation vector the value
+    //network's first affine layer consumes. It is maintained incrementally through
+    //AccumulatorStack/DirtyPiece, so reading it at a node costs nothing beyond what the
+    //value head already pays. Intended as the input representation for a policy head:
+    //a single position can then be scored without a batch. Returns the number of bytes
+    //written; `out` needs FeatureTransformer<FTDimensions>::BufferSize.
+    std::size_t transform_features(const Board&                            board,
+                                   AccumulatorStack&                       accumulatorStack,
+                                   AccumulatorCaches::Cache<FTDimensions>& cache,
+                                   TransformedFeatureType*                 out) const;
+
     void verify(std::string evalfilePath, const std::function<void(std::string_view)>&) const;
     /*NnueEvalTrace trace_evaluate(const Position&                         pos,
                                  AccumulatorStack&                       accumulatorStack,

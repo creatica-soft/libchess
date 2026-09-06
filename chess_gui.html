@@ -1,0 +1,2241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Creatica Chess GUI</title>
+<style>
+/* ------------------------------------------------------------------
+   Every colour is defined here on :root, in the light palette.
+   The dark block below ONLY redefines these same custom properties.
+   ------------------------------------------------------------------ */
+:root{
+  color-scheme: light dark;
+
+  --bg:#f2f2ef;
+  --panel:#ffffff;
+  --panel-alt:#f7f7f4;
+  --text:#161719;
+  --muted:#63666e;
+  --border:#d5d7dc;
+  --border-strong:#b9bcc3;
+  --accent:#2f5fd0;
+  --accent-hover:#2850b4;
+  --on-accent:#ffffff;
+  --danger:#a8231c;
+  --danger-bg:#fdecea;
+  --danger-border:#f0b5b0;
+  --ok:#1a6f45;
+  --warn:#8a6100;
+
+  --sq-light:#efd9b4;
+  --sq-dark:#b3855f;
+  --board-border:#8a6a4c;
+
+  --pw-fill:#fbfbfa;
+  --pb-fill:#1b1e24;
+  --pc-edge:#141414;
+  --pb-detail:#c9ccd1;
+
+  --hl-last:rgba(240,190,40,0.48);
+  --hl-sel:rgba(55,125,240,0.45);
+  --dot:rgba(28,36,52,0.40);
+  --check:rgba(214,48,38,0.80);
+  --coord:rgba(30,25,15,0.60);
+
+  --scrim:rgba(0,0,0,.45);
+  --shadow:0 1px 3px rgba(0,0,0,.12);
+  --focus:#2f5fd0;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#15171a;
+    --panel:#1d2024;
+    --panel-alt:#24272c;
+    --text:#e7eaed;
+    --muted:#9aa0a8;
+    --border:#343941;
+    --border-strong:#4a505a;
+    --accent:#5b8dfa;
+    --accent-hover:#7aa2ff;
+    --on-accent:#0d1016;
+    --danger:#ff9a90;
+    --danger-bg:#3a1d1b;
+    --danger-border:#6b302b;
+    --ok:#5ed09a;
+    --warn:#e0b45a;
+
+    --sq-light:#b3a184;
+    --sq-dark:#6d5844;
+    --board-border:#3a3128;
+
+    --pw-fill:#f2f1ee;
+    --pb-fill:#16181d;
+    --pc-edge:#0b0c0e;
+    --pb-detail:#aeb3ba;
+
+    --hl-last:rgba(230,180,50,0.42);
+    --hl-sel:rgba(90,150,255,0.45);
+    --dot:rgba(10,12,16,0.48);
+    --check:rgba(255,88,68,0.80);
+    --coord:rgba(20,16,10,0.66);
+
+    --scrim:rgba(0,0,0,.62);
+    --shadow:0 1px 3px rgba(0,0,0,.55);
+    --focus:#7aa2ff;
+  }
+}
+
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  overflow-x:hidden;
+}
+h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px;}
+h2{font-size:13px;margin:0 0 8px;font-weight:650;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);}
+a{color:var(--accent);}
+.hidden{display:none !important;}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;}
+
+/* ---------------- header / tabs ---------------- */
+header{
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:20;
+}
+.tabs{display:flex;gap:4px;flex-wrap:wrap;}
+.tab{
+  background:transparent;border:1px solid transparent;color:var(--muted);
+  padding:6px 14px;border-radius:7px;cursor:pointer;font-size:13px;font-weight:600;
+}
+.tab:hover{background:var(--panel-alt);color:var(--text);}
+.tab.active{background:var(--accent);color:var(--on-accent);border-color:var(--accent);}
+.spacer{flex:1 1 auto;}
+
+/* ---------------- error bar ---------------- */
+.errbar{
+  display:flex;align-items:flex-start;gap:10px;
+  background:var(--danger-bg);color:var(--danger);
+  border-bottom:1px solid var(--danger-border);
+  padding:8px 14px;font-size:13px;
+}
+.errbar .msg{flex:1 1 auto;overflow-wrap:anywhere;}
+.errbar button{
+  background:transparent;border:1px solid var(--danger-border);color:var(--danger);
+  border-radius:6px;cursor:pointer;padding:1px 8px;font-size:14px;line-height:1.4;
+}
+
+/* ---------------- layout ---------------- */
+main{padding:14px;max-width:1180px;margin:0 auto;}
+.layout{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;}
+.col-board{flex:1 1 360px;min-width:0;}
+.col-side{flex:1 1 330px;min-width:0;display:flex;flex-direction:column;gap:12px;}
+.card{
+  background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  padding:12px;box-shadow:var(--shadow);min-width:0;
+}
+
+/* ---------------- controls ---------------- */
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+.row + .row{margin-top:8px;}
+label.field{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted);
+  font-weight:600;text-transform:uppercase;letter-spacing:.4px;flex:1 1 130px;min-width:110px;}
+select,input[type=text],input[type=number],textarea{
+  font:inherit;color:var(--text);background:var(--panel-alt);
+  border:1px solid var(--border-strong);border-radius:7px;padding:5px 7px;width:100%;min-width:0;
+}
+textarea{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
+  font-size:12px;resize:vertical;min-height:76px;}
+select:focus,input:focus,textarea:focus,button:focus-visible{outline:2px solid var(--focus);outline-offset:1px;}
+button{
+  font:inherit;font-weight:600;cursor:pointer;
+  background:var(--panel-alt);color:var(--text);
+  border:1px solid var(--border-strong);border-radius:7px;padding:6px 12px;
+}
+button:hover:not(:disabled){border-color:var(--accent);color:var(--accent);}
+button:disabled{opacity:.45;cursor:not-allowed;}
+button.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent);}
+button.primary:hover:not(:disabled){background:var(--accent-hover);border-color:var(--accent-hover);color:var(--on-accent);}
+button.small{padding:4px 9px;font-size:12px;}
+.hint{font-size:11.5px;color:var(--muted);margin-top:6px;overflow-wrap:anywhere;}
+
+.envgrid{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;}
+.envrow-check{flex-direction:row !important;align-items:center;gap:7px !important;}
+.envrow-check input[type=checkbox]{width:15px;height:15px;flex:0 0 auto;margin:0;accent-color:var(--accent,#3b6ea5);}
+.envrow-check span{order:1;}
+.envrow{display:flex;flex-direction:column;gap:3px;flex:1 1 128px;min-width:112px;
+  font-size:10.5px;color:var(--muted);font-weight:600;letter-spacing:.3px;text-transform:uppercase;}
+.envinput{font-size:12.5px;padding:4px 6px;}
+
+/* ---------------- board ---------------- */
+.board-wrap{container-type:inline-size;width:100%;max-width:min(74vh,560px);margin:0 auto;}
+/* Captured material, beside the board as it would sit on a real table: pieces taken from
+   the player at the top are shown at the top, and vice versa. Only the NET imbalance is
+   shown -- a pawn each cancels, so what remains is what someone is actually up. */
+.board-row{display:flex;gap:8px;align-items:stretch;justify-content:center;}
+/* .board-wrap carries margin:0 auto for the standalone case. Inside the flex row that
+   auto margin eats all the free space and shoves the board away from the material
+   column, leaving the captured pieces stranded at the far edge. */
+.board-row > .board-wrap{margin:0;}
+.material{
+  flex:0 0 auto;width:2.2em;display:flex;flex-direction:column;
+  justify-content:space-between;padding:2px 0;font-size:17px;
+}
+.mathalf{display:flex;flex-direction:column;align-items:center;min-height:0;}
+.mathalf.bottom{justify-content:flex-end;}
+.matgroup{display:flex;flex-direction:column;align-items:center;gap:0;min-height:0;}
+.board{
+  display:grid;grid-template-columns:repeat(8,1fr);grid-template-rows:repeat(8,1fr);
+  aspect-ratio:1/1;width:100%;
+  border:3px solid var(--board-border);border-radius:6px;overflow:hidden;
+  user-select:none;-webkit-user-select:none;touch-action:manipulation;
+}
+.sq{
+  position:relative;display:flex;align-items:center;justify-content:center;
+  font-size:7vmin;                 /* fallback for browsers without container query units */
+  cursor:default;
+}
+@supports (font-size:1cqw){ .sq{font-size:10.6cqw;} }
+.sq.lightsq{background:var(--sq-light);}
+.sq.darksq{background:var(--sq-dark);}
+.sq.clickable{cursor:pointer;}
+/* last-move / selection tint */
+.sq::before{content:"";position:absolute;inset:0;background:transparent;pointer-events:none;}
+.sq.last::before{background:var(--hl-last);}
+.sq.sel::before{background:var(--hl-sel);}
+/* legal-destination markers */
+.sq::after{content:"";position:absolute;pointer-events:none;}
+.sq.target::after{
+  width:30%;height:30%;border-radius:50%;background:var(--dot);
+}
+.sq.target.capture::after{
+  width:86%;height:86%;border-radius:50%;background:transparent;
+  border:0.11em solid var(--dot);
+}
+/* king in check */
+.fx{position:absolute;inset:0;pointer-events:none;}
+.sq.check .fx{
+  background:radial-gradient(circle at 50% 50%, var(--check) 0%, var(--check) 26%, transparent 70%);
+}
+.pc{
+  display:block;width:100%;height:100%;overflow:visible;
+}
+/* The fill carries the colour; the outline is the SAME dark on both sides, so a piece is
+   read as "light" or "dark" at a glance rather than being decoded from its outline. */
+.pc .body{fill:currentColor;stroke:var(--pc-edge);stroke-width:1.15;stroke-linejoin:round;stroke-linecap:round;}
+.pc .detail{fill:none;stroke:var(--pc-detail);stroke-width:1.0;stroke-linecap:round;stroke-linejoin:round;}
+.pc.w{color:var(--pw-fill);--pc-detail:var(--pc-edge);}
+/* A dark detail on a dark piece is invisible, so the bishop's slit and the knight's eye
+   get a light stroke on black pieces. Both are identifiable from silhouette alone, but
+   the detail is what stops them looking like blanks. */
+.pc.b{color:var(--pb-fill);--pc-detail:var(--pb-detail);}
+.sq .pc{position:absolute;inset:6%;width:auto;height:auto;}
+/* Captured pieces are smaller than board pieces and overlap, so a five-pawn lead still
+   fits beside the board without the column growing taller than it. */
+.matgroup .pc{width:1.75em;height:1.75em;flex:0 0 auto;}
+.matgroup .pc + .pc{margin-top:-0.45em;}
+.co-f,.co-r{
+  position:absolute;font-size:0.235em;font-weight:700;color:var(--coord);
+  pointer-events:none;line-height:1;font-family:inherit;
+}
+.co-f{right:3%;bottom:2%;}
+.co-r{left:3%;top:2%;}
+
+.fenline{
+  margin-top:8px;font-size:11.5px;color:var(--muted);word-break:break-all;
+  background:var(--panel-alt);border:1px solid var(--border);border-radius:7px;padding:5px 7px;
+}
+.statusline{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  margin-bottom:8px;font-size:13.5px;font-weight:600;min-height:22px;
+}
+.pill{
+  display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:700;
+  border:1px solid var(--border-strong);border-radius:999px;padding:1px 9px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.4px;
+}
+.pill.warn{color:var(--warn);border-color:var(--warn);}
+.pill.bad{color:var(--danger);border-color:var(--danger);}
+.pill.good{color:var(--ok);border-color:var(--ok);}
+.spin{
+  width:12px;height:12px;border-radius:50%;
+  border:2px solid var(--border-strong);border-top-color:var(--accent);
+  display:inline-block;animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg);}}
+@media (prefers-reduced-motion:reduce){ .spin{animation-duration:2.4s;} }
+
+/* ---------------- move list ---------------- */
+.movelist{
+  max-height:230px;overflow-y:auto;overflow-x:hidden;
+  background:var(--panel-alt);border:1px solid var(--border);border-radius:8px;padding:4px 6px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-size:13px;
+}
+.mvrow{display:flex;align-items:baseline;gap:4px;}
+.mvnum{color:var(--muted);min-width:2.6em;text-align:right;font-size:12px;}
+.mv{
+  background:transparent;border:1px solid transparent;color:var(--text);
+  padding:1px 5px;border-radius:5px;font:inherit;font-weight:500;flex:1 1 0;
+  text-align:left;min-width:0;overflow:hidden;text-overflow:ellipsis;
+}
+.mv.ell{color:var(--muted);}
+.mv.active{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:700;}
+.empty{color:var(--muted);font-size:12.5px;padding:4px;}
+
+/* ---------------- eval readout ---------------- */
+.evalbig{font-size:30px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums;}
+.kv{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font-size:12.5px;}
+.kv div{min-width:0;}
+.kv b{display:block;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;font-weight:700;}
+.pvbox{
+  margin-top:9px;background:var(--panel-alt);border:1px solid var(--border);border-radius:8px;
+  padding:7px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
+  font-size:12.5px;overflow-wrap:anywhere;max-height:150px;overflow-y:auto;
+}
+.rawinfo{margin-top:7px;font-size:11px;color:var(--muted);overflow-wrap:anywhere;}
+
+/* ---------------- tables ---------------- */
+table{border-collapse:collapse;width:100%;font-size:12.5px;}
+th,td{text-align:left;padding:4px 7px;border-bottom:1px solid var(--border);}
+th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;}
+td.num{text-align:right;font-variant-numeric:tabular-nums;}
+.tablewrap{max-height:240px;overflow:auto;}
+.scoreboard{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;}
+.scorecard{flex:1 1 140px;min-width:0;background:var(--panel-alt);border:1px solid var(--border);
+  border-radius:8px;padding:7px 9px;}
+.scorecard .n{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;}
+.scorecard .l{font-size:11px;color:var(--muted);overflow-wrap:anywhere;}
+
+/* ---------------- promotion modal ---------------- */
+.modal{
+  position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;
+  background:var(--scrim);padding:14px;
+}
+.modal .box{
+  background:var(--panel);border:1px solid var(--border-strong);border-radius:12px;
+  padding:14px 16px;box-shadow:var(--shadow);max-width:340px;width:100%;
+  /* The settings editors are generated from whatever the engine advertises, so their
+     length is not known in advance -- creatica has 22 options where the old hand-written
+     list had 5, and the match modal carries two of them. Cap the box to the viewport and
+     let it scroll rather than running off the bottom of the screen. */
+  max-height:calc(100vh - 28px);
+  overflow-y:auto;
+  overscroll-behavior:contain;   /* don't scroll the page behind once the box bottoms out */
+}
+/* One scroll region, on the box. An inner scroller on the option grid as well meant two
+   nested scrollbars and a control clipped mid-row, which is worse than scrolling the whole
+   dialog. */
+.modal .box.wide{max-width:560px;}
+.modal .box.wide select,.modal .box.wide input[type=number]{width:100%;}
+/* The FEN under the board is an input now: it is both the readout and the way to load
+   a position, which is why the Position panel no longer needs its own text box. */
+input.fenline{
+  width:100%;box-sizing:border-box;
+}
+.promobtns{display:flex;gap:8px;justify-content:center;margin-top:10px;flex-wrap:wrap;}
+.promobtns button{
+  font-size:38px;line-height:1;padding:6px 12px;
+  font-family:"Apple Symbols","Segoe UI Symbol","Noto Sans Symbols2","DejaVu Sans",sans-serif;
+}
+</style>
+</head>
+<body>
+
+<div id="errbar" class="errbar hidden">
+  <span class="msg" id="errtext"></span>
+  <button type="button" id="errclose" title="Dismiss">&times;</button>
+</div>
+
+<header>
+  <h1>Creatica Chess</h1>
+  <nav class="tabs" id="tabs">
+    <button type="button" class="tab active" data-tab="play">Play</button>
+    <button type="button" class="tab" data-tab="analyse">Analyse</button>
+    <button type="button" class="tab" data-tab="tournament">Tournament</button>
+  </nav>
+  <span class="spacer"></span>
+  <button type="button" class="small" id="reloadEngines">Reload engines</button>
+</header>
+
+<main>
+
+<!-- ============================ PLAY ============================ -->
+<section id="panel-play" class="panel">
+  <div class="layout">
+    <div class="col-board">
+      <div class="card">
+        <div class="statusline" id="playStatus"></div>
+        <div class="board-row"><div class="material" id="playMat"></div><div class="board-wrap"><div id="playBoard" class="board"></div></div></div>
+        <div class="fenline mono" id="playFenLine"></div>
+        <div class="row" style="margin-top:10px;">
+          <button type="button" class="primary" id="playNew">New game</button>
+          <button type="button" id="playUndo">Undo move</button>
+          <button type="button" id="playFlip">Flip board</button>
+          <button type="button" id="playSave">Save PGN</button>
+        </div>
+        <div class="row"><span id="playSaveNote" class="hint" style="margin:0;"></span></div>
+      </div>
+    </div>
+    <div class="col-side">
+      <div class="card">
+        <h2>Opponent</h2>
+        <div class="row">
+          <label class="field">Engine
+            <select id="playEngine"></select>
+          </label>
+          <label class="field">Time / move (ms)
+            <input type="number" id="playMovetime" value="2000" min="10" step="100">
+          </label>
+          <label class="field">You play
+            <select id="playColor">
+              <option value="w" selected>White</option>
+              <option value="b">Black</option>
+            </select>
+          </label>
+        </div>
+        <details>
+          <summary class="hint" style="cursor:pointer;">Engine environment (CREATICA_* &mdash; read by creatica)</summary>
+          <div id="playEnv"></div>
+        </details>
+        <div class="hint">Click one of your pieces to select it; its legal destinations are marked.
+          Changing engine, colour or time takes effect on the next New game.</div>
+      </div>
+      <div class="card">
+        <h2>Moves</h2>
+        <div class="movelist" id="playMoves"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ ANALYSE ============================ -->
+<section id="panel-analyse" class="panel hidden">
+  <div class="layout">
+    <div class="col-board">
+      <div class="card">
+        <div class="row" style="margin-bottom:10px;">
+          <button type="button" class="primary" id="anOpenBtn">Open game…</button>
+          <button type="button" id="anEngineBtn">Engine…</button>
+          <button type="button" id="anStart">Start position</button>
+          <button type="button" class="primary" id="anRun">Analyse</button>
+          <span id="anThinking" class="pill hidden"><span class="spin"></span> thinking</span>
+        </div>
+        <div class="statusline" id="anStatus"></div>
+        <div class="board-row"><div class="material" id="anMat"></div><div class="board-wrap"><div id="anBoard" class="board"></div></div></div>
+        <input class="fenline mono" id="anFenLine" spellcheck="false"
+               title="Editable: paste a FEN here and press Enter to load it">
+        <div class="row" style="margin-top:10px;">
+          <button type="button" id="anFirst" title="Home">&#124;&laquo;</button>
+          <button type="button" id="anPrev" title="Left arrow">&laquo;</button>
+          <button type="button" id="anNext" title="Right arrow">&raquo;</button>
+          <button type="button" id="anLast" title="End">&raquo;&#124;</button>
+          <button type="button" id="anFlip">Flip board</button>
+          <span class="hint" style="margin:0;">Arrow keys step through the game.</span>
+        </div>
+        <div class="hint" id="anLoadNote" style="margin-top:6px;"></div>
+      </div>
+    </div>
+    <div class="col-side">
+      <div class="card">
+        <h2>Evaluation</h2>
+        <div id="anEval"></div>
+      </div>
+      <div class="card">
+        <h2>Moves</h2>
+        <div class="movelist" id="anMoves"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ TOURNAMENT ============================ -->
+<section id="panel-tournament" class="panel hidden">
+  <div class="layout">
+    <div class="col-board">
+      <div class="card">
+        <div class="row" style="margin-bottom:10px;">
+          <button type="button" id="tSettingsBtn">Match settings…</button>
+          <button type="button" class="primary" id="tStart">Start match</button>
+          <button type="button" id="tStop" disabled>Stop</button>
+          <span id="tPolling" class="pill hidden"><span class="spin"></span> running</span>
+        </div>
+        <div class="statusline" id="tStatus"></div>
+        <div class="board-row"><div class="material" id="tMat"></div><div class="board-wrap"><div id="tBoard" class="board"></div></div></div>
+        <div class="fenline mono" id="tFenLine"></div>
+        <div class="row" style="margin-top:10px;">
+          <button type="button" id="tFlip">Flip board</button>
+          <span id="tPgnNote" class="hint" style="margin:0;"></span>
+        </div>
+      </div>
+    </div>
+    <div class="col-side">
+      <div class="card">
+        <h2>Score</h2>
+        <div class="scoreboard" id="tScore"></div>
+        <div class="movelist" id="tMoves" style="max-height:150px;"></div>
+      </div>
+      <div class="card">
+        <h2>Finished games</h2>
+        <div class="tablewrap"><table id="tResults"><tbody></tbody></table></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<div id="tMatchModal" class="modal hidden">
+  <div class="box wide">
+    <div style="font-weight:650;">Match settings</div>
+    <div class="row" style="margin-top:10px;">
+      <label class="field" style="flex:1 1 auto;min-width:0;">Config A engine
+        <select id="tEngineA"></select>
+      </label>
+    </div>
+    <div id="tEnvA"></div>
+    <div class="row" style="margin-top:10px;">
+      <label class="field" style="flex:1 1 auto;min-width:0;">Config B engine
+        <select id="tEngineB"></select>
+      </label>
+    </div>
+    <div id="tEnvB"></div>
+    <div class="row" style="margin-top:10px;">
+      <label class="field">Time / move (ms)
+        <input type="number" id="tMovetime" value="2000" min="10" step="100">
+      </label>
+      <label class="field">Games
+        <input type="number" id="tGames" value="20" min="1" step="1">
+      </label>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <label class="field" style="flex:1 1 auto;min-width:0;">Opening positions — one FEN per line
+        <textarea id="tOpenings" spellcheck="false" style="height:120px;"></textarea>
+      </label>
+    </div>
+    <div class="hint" id="tOpeningsNote">Each position is played twice with the colours swapped, so a book entry that favours White cannot bias the score. Leave empty for the built-in ten-position book. Text after # is ignored.</div>
+    <div class="row">
+      <button type="button" id="tOpenDefault">Restore default book</button>
+      <button type="button" id="tOpenStartpos">Start position only</button>
+    </div>
+    <div class="hint">Config A has White in game 1, Config B has White in game 2, and so on.
+      Draws are adjudicated on threefold repetition, the fifty-move counter and stalemate.</div>
+    <div class="row" style="margin-top:12px;justify-content:flex-end;">
+      <button type="button" class="primary" id="tMatchOk">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="anPosModal" class="modal hidden">
+  <div class="box wide">
+    <div style="font-weight:650;">Open a game</div>
+    <div class="row" style="margin-top:10px;">
+      <select id="anPgnFile" style="flex:1 1 auto;min-width:0;" title="PGN files in the games and project directories"></select>
+      <button type="button" id="anPgnRefresh" title="Rescan for PGN files">&#8635;</button>
+    </div>
+    <div class="row">
+      <select id="anPgnGame" style="flex:1 1 auto;min-width:0;" title="Which game in that file"></select>
+    </div>
+    <div class="hint" id="anPgnNote">Parsed by libchess, so headers, comments, variations and games starting from a FEN all load correctly.</div>
+    <div class="row" style="margin-top:10px;">
+      <button type="button" id="anPickBtn">Add a PGN file…</button>
+      <input type="file" id="anPgnUpload" accept=".pgn,application/x-chess-pgn,text/plain" style="display:none;">
+      <span class="hint" id="anUploadNote" style="margin:0;"></span>
+    </div>
+    <div class="row" style="margin-top:12px;justify-content:flex-end;">
+      <button type="button" id="anPosCancel">Cancel</button>
+      <button type="button" class="primary" id="anPosOk">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="anEngModal" class="modal hidden">
+  <div class="box wide">
+    <div style="font-weight:650;">Engine</div>
+    <div class="row" style="margin-top:10px;">
+      <label style="flex:1 1 auto;min-width:0;">Engine
+        <select id="anEngine"></select>
+      </label>
+    </div>
+    <div class="row">
+      <label>Think time (ms)
+        <input type="number" id="anMovetime" value="2000" min="10" step="100">
+      </label>
+    </div>
+    <div class="hint">Environment variables for this engine, so two configurations can be compared on the same position.</div>
+    <div id="anEnv"></div>
+    <div class="row" style="margin-top:12px;justify-content:flex-end;">
+      <button type="button" class="primary" id="anEngOk">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="promoModal" class="modal hidden">
+  <div class="box">
+    <div style="font-weight:650;">Promote to</div>
+    <div class="hint" id="promoWhere"></div>
+    <div class="promobtns" id="promoBtns"></div>
+    <div class="row" style="margin-top:10px;justify-content:flex-end;">
+      <button type="button" id="promoCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ==================================================================
+   Creatica Chess GUI - single file, no external resources.
+   Talks to chess_gui.py over the fixed JSON API:
+     POST /api/legal            {fen}                -> moves,turn,check,status
+     POST /api/move             {fen,move}           -> fen,san,turn,check,status
+     GET  /api/engines                               -> engines
+     POST /api/analyse          {fen,engine,movetime_ms,env}
+                                -> bestmove,ponder,score_cp|score_mate,depth,nodes,pv,info
+     POST /api/tournament/start {white,black,movetime_ms,games} -> id
+     GET  /api/tournament/state?id=...
+     POST /api/tournament/stop  {id}
+   Every response is expected to carry "ok"; ok:false carries "error".
+   ================================================================== */
+
+const FILES = "abcdefgh";
+const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+const $ = (id) => document.getElementById(id);
+
+/* ---------------------------- errors ---------------------------- */
+let errTimer = null;
+function showError(msg){
+  const bar = $("errbar");
+  $("errtext").textContent = String(msg);
+  bar.classList.remove("hidden");
+  if (errTimer) clearTimeout(errTimer);
+  errTimer = setTimeout(() => bar.classList.add("hidden"), 12000);
+  try { console.error(msg); } catch (e) {}
+}
+function clearError(){ $("errbar").classList.add("hidden"); }
+$("errclose").addEventListener("click", clearError);
+window.addEventListener("error", (e) => showError("Script error: " + (e && e.message ? e.message : e)));
+window.addEventListener("unhandledrejection", (e) => {
+  const r = e && e.reason;
+  showError("Unhandled error: " + (r && r.message ? r.message : String(r)));
+});
+
+/* ---------------------------- API ---------------------------- */
+async function apiPost(path, body){
+  let res;
+  try {
+    res = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body)
+    });
+  } catch (e) {
+    throw new Error(path + ": cannot reach the server (" + (e && e.message ? e.message : e) + ")");
+  }
+  return unwrap(path, res);
+}
+async function apiGet(path){
+  let res;
+  try { res = await fetch(path, {method: "GET"}); }
+  catch (e) {
+    throw new Error(path + ": cannot reach the server (" + (e && e.message ? e.message : e) + ")");
+  }
+  return unwrap(path, res);
+}
+async function unwrap(path, res){
+  let text = "";
+  try { text = await res.text(); } catch (e) { text = ""; }
+  let data = null;
+  try { data = JSON.parse(text); } catch (e) {
+    throw new Error(path + ": HTTP " + res.status + ", response was not JSON: " + text.slice(0, 200));
+  }
+  if (!res.ok && (!data || data.ok !== true)) {
+    throw new Error(path + ": HTTP " + res.status + " " + ((data && data.error) || res.statusText));
+  }
+  if (!data || data.ok !== true) {
+    throw new Error(path + ": " + ((data && data.error) ? data.error : "request failed (ok was not true)"));
+  }
+  return data;
+}
+const apiLegal = (fen) => apiPost("/api/legal", {fen: fen});
+const apiMove  = (fen, move) => apiPost("/api/move", {fen: fen, move: move});
+const apiAnalyse = (fen, engine, movetime_ms, env) =>
+  apiPost("/api/analyse", {fen: fen, engine: engine, movetime_ms: movetime_ms, options: env || {}});
+
+/* ---------------------------- FEN helpers ---------------------------- */
+function parseFen(fen){
+  const parts = String(fen == null ? "" : fen).trim().split(/\s+/);
+  const board = new Array(64).fill(null);
+  const rows = (parts[0] || "").split("/");
+  if (rows.length === 8){
+    for (let r = 0; r < 8; r++){
+      let f = 0;
+      const row = rows[r];
+      for (let k = 0; k < row.length && f < 8; k++){
+        const ch = row.charAt(k);
+        if (ch >= "1" && ch <= "8") f += (ch.charCodeAt(0) - 48);
+        else { board[r * 8 + f] = ch; f++; }
+      }
+    }
+  }
+  const full = parseInt(parts[5], 10);
+  const half = parseInt(parts[4], 10);
+  return {
+    board: board,
+    turn: (parts[1] === "b") ? "b" : "w",
+    castling: parts[2] || "-",
+    ep: parts[3] || "-",
+    half: isNaN(half) ? 0 : half,
+    full: isNaN(full) ? 1 : full
+  };
+}
+function completeFen(fen){
+  const f = String(fen).trim().split(/\s+/);
+  const def = ["", "w", "-", "-", "0", "1"];
+  for (let i = 1; i < 6; i++){ if (!f[i]) f[i] = def[i]; }
+  return f.slice(0, 6).join(" ");
+}
+function looksLikeFen(text){
+  const first = String(text).trim().split(/\r?\n/)[0] || "";
+  const tok = first.trim().split(/\s+/);
+  return /^([1-8pnbrqkPNBRQK]+\/){7}[1-8pnbrqkPNBRQK]+$/.test(tok[0] || "");
+}
+/* board index 0 = a8, 63 = h1 (FEN reading order) */
+function sqName(i){ return FILES.charAt(i % 8) + String(8 - Math.floor(i / 8)); }
+function sqIndex(name){
+  if (!name || name.length < 2) return -1;
+  const f = FILES.indexOf(name.charAt(0));
+  const r = parseInt(name.charAt(1), 10);
+  if (f < 0 || !(r >= 1 && r <= 8)) return -1;
+  return (8 - r) * 8 + f;
+}
+function isWhitePiece(p){ return !!p && p === p.toUpperCase(); }
+function colorOfPiece(p){ return isWhitePiece(p) ? "w" : "b"; }
+function turnName(t){ return t === "w" ? "White" : "Black"; }
+
+/* ---------------------------- board view ---------------------------- */
+const GLYPH = {k: "♚", q: "♛", r: "♜", b: "♝", n: "♞", p: "♟"};
+
+/* ---------------------------- captured material ----------------------------
+
+   Counts what is missing from each side relative to the opening complement, then
+   cancels like for like: if White has lost two pawns and Black one, the display shows
+   ONE white pawn, on Black's side of the board. Different types do not cancel, so a
+   knight against a bishop shows both.
+
+   Promotions are why the count is clamped at zero: a side can end up with two queens,
+   which would otherwise read as "-1 queen captured".
+*/
+const PIECE_VALUE = {q: 9, r: 5, b: 3, n: 3, p: 1};
+const MAT_ORDER = ["q", "r", "b", "n", "p"];
+
+function materialDiff(fen){
+  const start = {q: 1, r: 2, b: 2, n: 2, p: 8};
+  const pos = parseFen(fen || START_FEN);
+  const have = {w: {q:0,r:0,b:0,n:0,p:0}, b: {q:0,r:0,b:0,n:0,p:0}};
+  for (const ch of pos.board){
+    if (!ch || ch === ".") continue;
+    const t = ch.toLowerCase();
+    if (!(t in start)) continue;                       /* kings are never captured */
+    have[ch === ch.toUpperCase() ? "w" : "b"][t]++;
+  }
+  /* netTaken.w[t] = white pieces of type t captured, after cancelling against black's */
+  const netTaken = {w: {}, b: {}};
+  let score = 0;
+  for (const t of MAT_ORDER){
+    const lostW = Math.max(0, start[t] - have.w[t]);
+    const lostB = Math.max(0, start[t] - have.b[t]);
+    const d = lostW - lostB;
+    netTaken.w[t] = d > 0 ? d : 0;
+    netTaken.b[t] = d < 0 ? -d : 0;
+    score += (netTaken.b[t] - netTaken.w[t]) * PIECE_VALUE[t];   /* + means White is up */
+  }
+  return {netTaken: netTaken, score: score};
+}
+
+/* Draw into the column beside a board. `orientation` decides which end is whose: the
+   pieces taken FROM the player at the top are shown at the top. */
+function drawMaterial(el, fen, orientation){
+  if (!el) return;
+  const {netTaken, score} = materialDiff(fen);
+  const topColor = (orientation === "b") ? "w" : "b";   /* who sits at the top */
+  const botColor = (topColor === "w") ? "b" : "w";
+
+  const group = (victim) => {
+    /* victim is the colour whose pieces were captured; they belong beside the opponent */
+    const g = document.createElement("div");
+    g.className = "matgroup";
+    for (const t of MAT_ORDER){
+      for (let i = 0; i < netTaken[victim][t]; i++){
+        g.appendChild(pieceEl(t, victim));
+      }
+    }
+    return g;
+  };
+
+  const badge = (forColor) => {
+    const d = document.createElement("div");
+    d.className = "matscore";
+    /* score is signed for White; show it only beside the side that is ahead */
+    const up = (forColor === "w") ? score : -score;
+    d.textContent = up > 0 ? ("+" + up) : "";
+    return d;
+  };
+
+  el.textContent = "";
+  /* Two halves, each holding a group and the badge that belongs to it. The top half
+     belongs to the player at the top of the board and holds the pieces they have
+     captured -- which are their OPPONENT's. Putting both badges adjacent in the middle,
+     as an earlier version did, made it impossible to tell whose advantage was whose. */
+  const top = document.createElement("div");
+  top.className = "mathalf";
+  top.appendChild(group(botColor));
+  top.appendChild(badge(topColor));
+  const bot = document.createElement("div");
+  bot.className = "mathalf bottom";
+  bot.appendChild(badge(botColor));
+  bot.appendChild(group(topColor));
+  el.appendChild(top);
+  el.appendChild(bot);
+}
+
+/* ---------------------------- piece artwork ----------------------------
+
+   Staunton silhouettes as inline SVG rather than Unicode glyphs. Two reasons the glyphs
+   had to go: they render differently on every platform, and telling the outline king from
+   the solid one at a glance is genuinely hard because each ends up bicolour -- a light
+   fill with a dark outline against a dark fill with a light outline. Here the FILL alone
+   carries the colour and both use the same dark outline, so a piece reads as light or
+   dark instantly.
+
+   Original artwork for this project, not derived from any existing piece set. All six
+   share viewBox "0 0 45 45" and a common baseline at y=38.6, so they line up and are
+   proportionate: king 1.41x the pawn's height, queen 1.32, knight and bishop 1.31,
+   rook 1.12.
+*/
+const PIECE_SVG = {
+  k: {body: "M 10.2 38.6 L 11.9 35.2 L 14 35.2 C 14 31.4 17 29.4 17.8 26.2 L 17.6 24.2 L 13.2 24.2 L 13.2 22 L 15.4 22 C 14.2 19.4 14.6 16.4 16.4 14.6 L 12.8 14.6 L 12.8 12.2 L 32.2 12.2 L 32.2 14.6 L 28.6 14.6 C 30.4 16.4 30.8 19.4 29.6 22 L 31.8 22 L 31.8 24.2 L 27.4 24.2 L 27.2 26.2 C 28 29.4 31 31.4 31 35.2 L 33.1 35.2 L 34.8 38.6 Z M 20.5 10.4 L 20.5 6.6 L 16.6 6.6 L 16.6 3.4 L 20.5 3.4 L 20.5 1.6 L 24.5 1.6 L 24.5 3.4 L 28.4 3.4 L 28.4 6.6 L 24.5 6.6 L 24.5 10.4 Z"},
+  q: {body: "M 10.6 38.6 L 12.3 35.2 L 14.4 35.2 C 14.4 31.6 17.2 29.6 18 26.4 L 17.8 24.4 L 13.6 24.4 L 13.6 22.2 L 15 22.2 C 13.6 19.6 12.2 16.6 11.4 13.6 L 14.2 17.4 L 17 10.6 L 19.75 16.2 L 22.5 7.8 L 25.25 16.2 L 28 10.6 L 30.8 17.4 L 33.6 13.6 C 32.8 16.6 31.4 19.6 30 22.2 L 31.4 22.2 L 31.4 24.4 L 27.2 24.4 L 27 26.4 C 27.8 29.6 30.6 31.6 30.6 35.2 L 32.7 35.2 L 34.4 38.6 Z M 13.1 13.6 C 13.1 14.54 12.34 15.3 11.4 15.3 C 10.46 15.3 9.7 14.54 9.7 13.6 C 9.7 12.66 10.46 11.9 11.4 11.9 C 12.34 11.9 13.1 12.66 13.1 13.6 Z M 18.7 10.6 C 18.7 11.54 17.94 12.3 17 12.3 C 16.06 12.3 15.3 11.54 15.3 10.6 C 15.3 9.66 16.06 8.9 17 8.9 C 17.94 8.9 18.7 9.66 18.7 10.6 Z M 24.2 7.8 C 24.2 8.74 23.44 9.5 22.5 9.5 C 21.56 9.5 20.8 8.74 20.8 7.8 C 20.8 6.86 21.56 6.1 22.5 6.1 C 23.44 6.1 24.2 6.86 24.2 7.8 Z M 29.7 10.6 C 29.7 11.54 28.94 12.3 28 12.3 C 27.06 12.3 26.3 11.54 26.3 10.6 C 26.3 9.66 27.06 8.9 28 8.9 C 28.94 8.9 29.7 9.66 29.7 10.6 Z M 35.3 13.6 C 35.3 14.54 34.54 15.3 33.6 15.3 C 32.66 15.3 31.9 14.54 31.9 13.6 C 31.9 12.66 32.66 11.9 33.6 11.9 C 34.54 11.9 35.3 12.66 35.3 13.6 Z"},
+  r: {body: "M 9.8 38.6 L 11.6 35.2 L 14.2 35.2 C 13.9 30.6 15.4 25.6 15.6 20 L 11.4 18 L 10.8 16.6 L 10.8 11 L 15 11 L 15 14.8 L 17.2 14.8 L 17.2 11 L 21.4 11 L 21.4 14.8 L 22.5 14.8 L 23.6 14.8 L 23.6 11 L 27.8 11 L 27.8 14.8 L 30 14.8 L 30 11 L 34.2 11 L 34.2 16.6 L 33.6 18 L 29.4 20 C 29.6 25.6 31.1 30.6 30.8 35.2 L 33.4 35.2 L 35.2 38.6 Z"},
+  b: {body: "M 12.6 38.6 L 14.3 35.2 L 16.4 35.2 C 16.4 31.8 19.2 29.8 19.9 26.6 L 19.7 24.6 L 15.8 24.6 L 15.8 22.4 L 17.4 22.4 C 16.0 19.6 16.2 16.4 18.0 13.4 C 19.2 11.4 21.0 9.6 22.5 8.4 C 24.0 9.6 25.8 11.4 27.0 13.4 C 28.8 16.4 29.0 19.6 27.6 22.4 L 29.2 22.4 L 29.2 24.6 L 25.3 24.6 L 25.1 26.6 C 25.8 29.8 28.6 31.8 28.6 35.2 L 30.7 35.2 L 32.4 38.6 Z M 24.1 6.0 C 24.1 6.88 23.38 7.6 22.5 7.6 C 21.62 7.6 20.9 6.88 20.9 6.0 C 20.9 5.12 21.62 4.4 22.5 4.4 C 23.38 4.4 24.1 5.12 24.1 6.0 Z", detail: "M 19.4 18.6 L 25.4 12.2"},
+  n: {body: "M 10.4 38.6 L 12.5 34.9 C 14.6 31.2 17.4 28.6 19.4 26.2 C 20.6 24.8 20.2 23.6 18.4 23.2 C 15.4 22.6 12.2 21.6 10.2 20.0 L 12.6 19.0 L 8.0 18.2 C 7.4 17.2 7.8 15.9 9.0 15.2 C 11.8 13.6 14.0 12.2 15.6 10.6 C 16.7 9.5 17.2 8.2 17.5 6.8 L 19.6 8.6 L 21.4 5.4 L 22.8 8.6 L 25.2 6.6 C 27.0 8.8 28.4 11.4 29.2 14.2 C 30.4 18.4 31.0 23.0 31.2 27.6 C 31.3 30.6 31.4 33.2 31.5 34.9 L 33.6 38.6 Z", detail: "M 14.9 14.4 C 14.9 14.95 14.45 15.4 13.9 15.4 C 13.35 15.4 12.9 14.95 12.9 14.4 C 12.9 13.85 13.35 13.4 13.9 13.4 C 14.45 13.4 14.9 13.85 14.9 14.4 Z M 9.4 16.9 L 11.0 16.5 M 19.0 12.0 C 21.4 13.6 23.0 16.4 23.6 19.6"},
+  p: {body: "M 13.2 38.6 L 14.9 35.3 L 17.3 35.3 C 17.3 31.4 19.9 29.8 20.5 28.8 L 20.5 27.6 L 17.4 27.6 L 17.4 25.7 L 20.4 25.7 C 20.3 23.6 21.02 21.83 19.68 20.34 C 18.67 19.23 18.42 17.63 19.03 16.25 C 19.64 14.88 21 14 22.5 14 C 24 14 25.36 14.88 25.97 16.25 C 26.58 17.63 26.33 19.23 25.32 20.34 C 23.98 21.83 24.7 23.6 24.6 25.7 L 27.6 25.7 L 27.6 27.6 L 24.5 27.6 L 24.5 28.8 C 25.1 29.8 27.7 31.4 27.7 35.3 L 30.1 35.3 L 31.8 38.6 Z"}
+};
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/* One piece as an <svg> node. `color` is "w" or "b". */
+function pieceEl(type, color){
+  const d = PIECE_SVG[type];
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 45 45");
+  svg.setAttribute("class", "pc " + color);
+  svg.setAttribute("aria-hidden", "true");
+  if (!d) return svg;
+  const body = document.createElementNS(SVG_NS, "path");
+  body.setAttribute("d", d.body);
+  body.setAttribute("class", "body");
+  svg.appendChild(body);
+  if (d.detail){
+    const det = document.createElementNS(SVG_NS, "path");
+    det.setAttribute("d", d.detail);
+    det.setAttribute("class", "detail");
+    svg.appendChild(det);
+  }
+  return svg;
+}
+
+function makeBoard(el, onSquareClick){
+  if (onSquareClick){
+    el.addEventListener("click", (ev) => {
+      const t = ev.target && ev.target.closest ? ev.target.closest(".sq") : null;
+      if (t && t.dataset && t.dataset.sq) onSquareClick(t.dataset.sq);
+    });
+  }
+  return {
+    el: el,
+    /* opts: fen, orientation ('w'|'b'), selected, targets (Set of square names),
+             lastMove (uci string), check (bool), clickable (bool) */
+    draw: function (opts){
+      const o = opts || {};
+      const pos = parseFen(o.fen || START_FEN);
+      const flip = (o.orientation === "b");
+      const targets = o.targets || new Set();
+      const lm = (typeof o.lastMove === "string" && o.lastMove.length >= 4) ? o.lastMove : null;
+      const lmFrom = lm ? lm.slice(0, 2) : null;
+      const lmTo = lm ? lm.slice(2, 4) : null;
+      let checkSq = null;
+      if (o.check){
+        const want = (pos.turn === "w") ? "K" : "k";
+        const ix = pos.board.indexOf(want);
+        if (ix >= 0) checkSq = sqName(ix);
+      }
+      const frag = document.createDocumentFragment();
+      for (let vis = 0; vis < 64; vis++){
+        const i = flip ? (63 - vis) : vis;
+        const name = sqName(i);
+        const file = i % 8, row = Math.floor(i / 8);
+        const d = document.createElement("div");
+        let cls = "sq " + (((file + row) % 2 === 0) ? "lightsq" : "darksq");
+        if (name === lmFrom || name === lmTo) cls += " last";
+        if (o.selected && name === o.selected) cls += " sel";
+        const piece = pos.board[i];
+        if (targets.has(name)) cls += piece ? " target capture" : " target";
+        if (checkSq && name === checkSq) cls += " check";
+        if (o.clickable) cls += " clickable";
+        d.className = cls;
+        d.dataset.sq = name;
+        const fx = document.createElement("span");
+        fx.className = "fx";
+        d.appendChild(fx);
+        if (piece){
+          d.appendChild(pieceEl(piece.toLowerCase(), colorOfPiece(piece)));
+        }
+        if (vis >= 56){
+          const cf = document.createElement("span");
+          cf.className = "co-f";
+          cf.textContent = name.charAt(0);
+          d.appendChild(cf);
+        }
+        if (vis % 8 === 0){
+          const cr = document.createElement("span");
+          cr.className = "co-r";
+          cr.textContent = name.charAt(1);
+          d.appendChild(cr);
+        }
+        frag.appendChild(d);
+      }
+      el.textContent = "";
+      el.appendChild(frag);
+    }
+  };
+}
+
+/* ---------------------------- move list ---------------------------- */
+/* sans[i] is the SAN of ply i played from startFen. activeIdx highlights one ply.
+   onClick(ply) is optional. */
+function renderMoveList(el, sans, activeIdx, startFen, onClick){
+  el.textContent = "";
+  if (!sans || sans.length === 0){
+    const e = document.createElement("div");
+    e.className = "empty";
+    e.textContent = "No moves yet.";
+    el.appendChild(e);
+    return;
+  }
+  const p = parseFen(startFen || START_FEN);
+  let num = p.full, turn = p.turn, row = null;
+  for (let i = 0; i < sans.length; i++){
+    if (turn === "w" || !row){
+      row = document.createElement("div");
+      row.className = "mvrow";
+      const n = document.createElement("span");
+      n.className = "mvnum";
+      n.textContent = num + ".";
+      row.appendChild(n);
+      if (turn === "b"){
+        const e = document.createElement("span");
+        e.className = "mv ell";
+        e.textContent = "…";
+        row.appendChild(e);
+      }
+      el.appendChild(row);
+    }
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "mv" + (i === activeIdx ? " active" : "");
+    b.textContent = sans[i];
+    b.dataset.ply = String(i);
+    row.appendChild(b);
+    if (turn === "b"){ num++; turn = "w"; row = null; } else { turn = "b"; }
+  }
+  if (onClick && !el.dataset.wired){
+    el.dataset.wired = "1";
+    el.addEventListener("click", (ev) => {
+      const t = ev.target && ev.target.closest ? ev.target.closest(".mv") : null;
+      if (t && t.dataset && t.dataset.ply !== undefined) onClick(parseInt(t.dataset.ply, 10));
+    });
+  }
+  const act = el.querySelector(".mv.active");
+  if (act) el.scrollTop = Math.max(0, act.offsetTop - el.clientHeight / 2);
+  else el.scrollTop = el.scrollHeight;
+}
+
+/* ---------------------------- CREATICA_* env editor ---------------------------- */
+/* An editor built from what the engine ACTUALLY advertises.
+ *
+ * This used to be a hand-maintained list of names, types and defaults duplicated in
+ * JavaScript (ENV_SPEC), which had to be edited by hand every time a knob was added to the
+ * engine -- and which is exactly how the weights setting came to be missing from the UI
+ * entirely while the engine had supported it for days. The engine already describes itself
+ * in reply to "uci"; the browser now asks.
+ *
+ * Values are sent as UCI options, not environment variables, so they take effect through
+ * setoption on a running process rather than requiring a restart.
+ */
+function makeEnvEditor(host){
+  const wrap = document.createElement("div");
+  wrap.className = "envgrid";
+  host.appendChild(wrap);
+  let spec = [];                 /* [{name,type,default,min,max}] from the engine */
+  const inputs = {};
+
+  function build(options){
+    spec = options || [];
+    wrap.textContent = "";
+    for (const k in inputs) delete inputs[k];
+    if (!spec.length){
+      const hint = document.createElement("div");
+      hint.className = "hint";
+      hint.style.margin = "0";
+      hint.textContent = "Pick an engine to see its settings.";
+      wrap.appendChild(hint);
+      return;
+    }
+    for (const o of spec){
+      if (o.type === "button") continue;          /* nothing to carry into a match */
+      const lab = document.createElement("label");
+      lab.className = "envrow";
+      const t = document.createElement("span");
+      t.textContent = o.name;
+      let inp;
+      if (o.type === "check"){
+        /* A real checkbox, not a three-way dropdown.
+           A checkbox has two states while the editor needs three -- true, false, and
+           "leave whatever the engine defaults to". That is resolved by starting it AT the
+           advertised default and only sending the value when it differs, so an untouched
+           control sends nothing and the engine keeps its own default. */
+        inp = document.createElement("input");
+        inp.type = "checkbox";
+        inp.checked = (String(o.default) === "true");
+        inp.dataset.def = String(o.default) === "true" ? "true" : "false";
+        lab.classList.add("envrow-check");
+      } else if (o.type === "spin"){
+        inp = document.createElement("input");
+        inp.type = "number";
+        if (o.min !== undefined) inp.min = o.min;
+        if (o.max !== undefined) inp.max = o.max;
+        inp.placeholder = "default " + (o.default !== undefined ? o.default : "");
+        if (o.min !== undefined && o.max !== undefined)
+          t.title = o.name + ": " + o.min + " to " + o.max;
+      } else {
+        inp = document.createElement("input");
+        inp.type = "text";
+        inp.placeholder = "default " + (o.default !== undefined ? o.default : "");
+      }
+      inp.className = "envinput";
+      inputs[o.name] = inp;
+      lab.appendChild(t);
+      lab.appendChild(inp);
+      wrap.appendChild(lab);
+    }
+  }
+
+  build([]);
+
+  return {
+    /* Ask the engine what it has, and rebuild. Safe to call repeatedly; the server
+       caches the probe so it costs one engine start per binary. */
+    load: async function (engineName){
+      if (!engineName){ build([]); return; }
+      try {
+        const d = await apiPost("/api/engine_options", {engine: engineName});
+        build(d.options || []);
+      } catch (e){
+        build([]);
+        showError("Engine options - " + e.message);
+      }
+    },
+    /* Blank fields are omitted so the engine keeps its own default. */
+    read: function (){
+      const out = {};
+      for (const name in inputs){
+        const el = inputs[name];
+        if (el.type === "checkbox"){
+          /* Only when the user has moved it away from the engine's own default. */
+          const v = el.checked ? "true" : "false";
+          if (v !== el.dataset.def) out[name] = v;
+          continue;
+        }
+        const v = String(el.value || "").trim();
+        if (v) out[name] = v;
+      }
+      return out;
+    },
+    summary: function (){
+      const e = this.read();
+      const ks = Object.keys(e);
+      if (!ks.length) return "engine defaults";
+      return ks.map((k) => k + "=" + e[k]).join(" ");
+    }
+  };
+}
+
+/* ---------------------------- engines ---------------------------- */
+let ENGINES = [];
+const ENGINE_SELECTS = ["playEngine", "anEngine", "tEngineA", "tEngineB"];
+/* Preferred defaults, in order, per select. */
+const ENGINE_PREF = {
+  playEngine: ["creatica-shared-root", "creatica"],
+  anEngine:   ["creatica-shared-root", "creatica"],
+  tEngineA:   ["creatica-shared-root", "creatica"],
+  tEngineB:   ["creatica", "creatica-shared-root"]
+};
+async function loadEngines(){
+  let d;
+  try {
+    d = await apiGet("/api/engines");
+  } catch (e){
+    showError("Could not list engines - " + e.message);
+    for (const id of ENGINE_SELECTS){
+      const sel = $(id);
+      sel.textContent = "";
+      const op = document.createElement("option");
+      op.value = "";
+      op.textContent = "(no engines - server unreachable)";
+      sel.appendChild(op);
+    }
+    return;
+  }
+  ENGINES = Array.isArray(d.engines) ? d.engines.slice() : [];
+  for (const id of ENGINE_SELECTS){
+    const sel = $(id);
+    const keep = sel.value;
+    sel.textContent = "";
+    if (!ENGINES.length){
+      const op = document.createElement("option");
+      op.value = "";
+      op.textContent = "(no engines found)";
+      sel.appendChild(op);
+      continue;
+    }
+    for (const name of ENGINES){
+      const op = document.createElement("option");
+      op.value = name;
+      op.textContent = name;
+      sel.appendChild(op);
+    }
+    let want = "";
+    if (keep && ENGINES.indexOf(keep) >= 0) want = keep;
+    else {
+      for (const p of (ENGINE_PREF[id] || [])){
+        if (ENGINES.indexOf(p) >= 0){ want = p; break; }
+      }
+    }
+    sel.value = want || ENGINES[0];
+  }
+}
+$("reloadEngines").addEventListener("click", () => { clearError(); loadEngines(); });
+
+/* ---------------------------- tabs ---------------------------- */
+let activeTab = "play";
+function setTab(name){
+  activeTab = name;
+  for (const b of document.querySelectorAll("#tabs .tab")){
+    b.classList.toggle("active", b.dataset.tab === name);
+  }
+  for (const t of ["play", "analyse", "tournament"]){
+    $("panel-" + t).classList.toggle("hidden", t !== name);
+  }
+}
+$("tabs").addEventListener("click", (ev) => {
+  const b = ev.target && ev.target.closest ? ev.target.closest(".tab") : null;
+  if (b && b.dataset.tab) setTab(b.dataset.tab);
+});
+
+/* ================================================================
+   PLAY
+   ================================================================ */
+const P = {
+  startFen: START_FEN,
+  plies: [],          /* {fen, uci, san} after each half move */
+  human: "w",
+  orient: "w",
+  legal: null,        /* legal move list for the current position, or null while unknown */
+  turn: "w",
+  check: false,
+  status: "ok",
+  selected: null,
+  thinking: false,
+  gen: 0,             /* bumped whenever the game state is invalidated; stale replies are dropped */
+  promo: null
+};
+const playBoard = makeBoard($("playBoard"), onPlaySquare);
+
+function playFen(){ return P.plies.length ? P.plies[P.plies.length - 1].fen : P.startFen; }
+function playLastMove(){ return P.plies.length ? P.plies[P.plies.length - 1].uci : null; }
+function humanToMove(){ return P.turn === P.human && (P.status === "ok" || P.status === "check"); }
+
+function drawPlay(){
+  const fen = playFen();
+  const targets = new Set();
+  if (P.selected && P.legal){
+    for (const m of P.legal){
+      if (m.slice(0, 2) === P.selected) targets.add(m.slice(2, 4));
+    }
+  }
+  playBoard.draw({
+    fen: fen,
+    orientation: P.orient,
+    selected: P.selected,
+    targets: targets,
+    lastMove: playLastMove(),
+    check: P.check,
+    clickable: humanToMove() && !P.thinking
+  });
+  drawMaterial($("playMat"), fen, P.orient);
+  $("playFenLine").textContent = fen;
+  renderMoveList($("playMoves"), P.plies.map((x) => x.san), P.plies.length - 1, P.startFen, null);
+
+  const st = $("playStatus");
+  st.textContent = "";
+  const add = (text, cls) => {
+    const s = document.createElement("span");
+    s.className = cls || "";
+    s.textContent = text;
+    st.appendChild(s);
+    return s;
+  };
+  if (P.status === "mate"){
+    add("Checkmate - " + turnName(P.turn === "w" ? "b" : "w") + " wins");
+    add(P.turn === P.human ? "you lost" : "you won", "pill " + (P.turn === P.human ? "bad" : "good"));
+  } else if (P.status === "stalemate"){
+    add("Stalemate - draw");
+  } else {
+    add(turnName(P.turn) + " to move");
+    add(P.turn === P.human ? "you" : "engine", "pill");
+    if (P.check) add("check", "pill bad");
+  }
+  if (P.thinking){
+    const s = add("", "pill warn");
+    const sp = document.createElement("span");
+    sp.className = "spin";
+    s.appendChild(sp);
+    s.appendChild(document.createTextNode(" engine thinking"));
+  }
+  $("playUndo").disabled = (P.plies.length === 0);
+}
+
+async function playRefreshLegal(){
+  const gen = P.gen;
+  const fen = playFen();
+  try {
+    const d = await apiLegal(fen);
+    if (gen !== P.gen) return;
+    P.legal = Array.isArray(d.moves) ? d.moves : [];
+    P.turn = d.turn;
+    P.check = !!d.check;
+    P.status = d.status;
+  } catch (e){
+    if (gen !== P.gen) return;
+    P.legal = [];
+    showError("Play - " + e.message);
+  }
+  drawPlay();
+  maybeEngineMove();
+}
+
+function maybeEngineMove(){
+  if (P.thinking) return;
+  if (P.status !== "ok" && P.status !== "check") return;
+  if (P.turn === P.human) return;
+  const engine = $("playEngine").value;
+  if (!engine){ showError("Play - no engine selected, so the engine cannot reply."); return; }
+  engineMove(engine);
+}
+
+async function engineMove(engine){
+  const gen = P.gen;
+  P.thinking = true;
+  P.selected = null;
+  drawPlay();
+  try {
+    const fen = playFen();
+    const movetime = Math.max(10, parseInt($("playMovetime").value, 10) || 2000);
+    const a = await apiAnalyse(fen, engine, movetime, playEnv.read());
+    if (gen !== P.gen) return;
+    if (!a.bestmove) throw new Error("engine returned no bestmove");
+    const m = await apiMove(fen, a.bestmove);
+    if (gen !== P.gen) return;
+    P.plies.push({fen: m.fen, uci: a.bestmove, san: m.san});
+    P.turn = m.turn;
+    P.check = !!m.check;
+    P.status = m.status;
+    P.legal = null;
+    P.thinking = false;
+    drawPlay();
+    playRefreshLegal();
+  } catch (e){
+    if (gen !== P.gen) return;
+    P.thinking = false;
+    showError("Play - engine move failed: " + e.message);
+    drawPlay();
+  }
+}
+
+function onPlaySquare(name){
+  if (P.thinking || !humanToMove()) return;
+  if (P.legal === null) return;
+  if (P.selected){
+    const cand = P.legal.filter((m) => m.slice(0, 2) === P.selected && m.slice(2, 4) === name);
+    if (cand.length === 1 && cand[0].length === 4){ doHumanMove(cand[0]); return; }
+    if (cand.length >= 1){ openPromo(P.selected, name, cand); return; }
+  }
+  const pos = parseFen(playFen());
+  const piece = pos.board[sqIndex(name)];
+  if (piece && colorOfPiece(piece) === P.human && P.legal.some((m) => m.slice(0, 2) === name)){
+    P.selected = name;
+  } else {
+    P.selected = null;
+  }
+  drawPlay();
+}
+
+async function doHumanMove(uci){
+  const gen = P.gen;
+  const fen = playFen();
+  P.selected = null;
+  try {
+    const m = await apiMove(fen, uci);
+    if (gen !== P.gen) return;
+    P.plies.push({fen: m.fen, uci: uci, san: m.san});
+    P.turn = m.turn;
+    P.check = !!m.check;
+    P.status = m.status;
+    P.legal = null;
+    drawPlay();
+    playRefreshLegal();
+  } catch (e){
+    if (gen !== P.gen) return;
+    showError("Play - " + e.message);
+    drawPlay();
+  }
+}
+
+/* ---- promotion chooser ---- */
+function openPromo(from, to, cand){
+  const letters = [];
+  for (const m of cand){
+    const p = m.length > 4 ? m.charAt(4) : "";
+    if (p && letters.indexOf(p) < 0) letters.push(p);
+  }
+  if (!letters.length){ doHumanMove(cand[0]); return; }
+  const order = ["q", "r", "b", "n"];
+  letters.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  P.promo = {from: from, to: to};
+  $("promoWhere").textContent = from + " → " + to;
+  const box = $("promoBtns");
+  box.textContent = "";
+  for (const L of letters){
+    const b = document.createElement("button");
+    b.type = "button";
+    b.appendChild(pieceEl(L, P.human));
+    b.title = L.toUpperCase();
+    b.addEventListener("click", () => {
+      closePromo();
+      doHumanMove(from + to + L);
+    });
+    box.appendChild(b);
+  }
+  $("promoModal").classList.remove("hidden");
+}
+function closePromo(){
+  P.promo = null;
+  $("promoModal").classList.add("hidden");
+}
+$("promoCancel").addEventListener("click", () => { closePromo(); drawPlay(); });
+$("promoModal").addEventListener("click", (ev) => {
+  if (ev.target === $("promoModal")){ closePromo(); drawPlay(); }
+});
+
+/* ---- play controls ---- */
+function playNewGame(){
+  P.gen++;
+  P.startFen = START_FEN;
+  P.plies = [];
+  P.human = $("playColor").value === "b" ? "b" : "w";
+  P.orient = P.human;
+  P.legal = null;
+  P.turn = "w";
+  P.check = false;
+  P.status = "ok";
+  P.selected = null;
+  P.thinking = false;
+  closePromo();
+  drawPlay();
+  playRefreshLegal();
+}
+function playUndo(){
+  if (!P.plies.length) return;
+  P.gen++;                 /* cancels any engine reply that is still in flight */
+  P.thinking = false;
+  P.selected = null;
+  /* Take back a full move pair, then keep taking back until it is the human's turn. */
+  let target = Math.max(0, P.plies.length - 2);
+  const fenAt = (n) => (n === 0 ? P.startFen : P.plies[n - 1].fen);
+  while (target > 0 && parseFen(fenAt(target)).turn !== P.human) target--;
+  P.plies.length = target;
+  P.legal = null;
+  P.turn = parseFen(playFen()).turn;
+  P.check = false;
+  P.status = "ok";
+  drawPlay();
+  playRefreshLegal();
+}
+$("playNew").addEventListener("click", () => { clearError(); playNewGame(); });
+$("playUndo").addEventListener("click", playUndo);
+$("playFlip").addEventListener("click", () => { P.orient = (P.orient === "w") ? "b" : "w"; drawPlay(); });
+const playEnv = makeEnvEditor($("playEnv"));
+
+/* ================================================================
+   ANALYSE
+   ================================================================ */
+const A = {
+  startFen: START_FEN,
+  fens: [START_FEN],   /* fens[i] = position after i plies */
+  sans: [],            /* sans[i] = SAN of the move leading to fens[i+1] */
+  ucis: [],
+  idx: 0,
+  orient: "w",
+  gen: 0,              /* current analysis generation */
+  loadGen: 0,          /* current PGN/FEN load generation */
+  thinking: false,
+  runSeq: 0,           /* id of the most recently started analysis run */
+  runId: 0,
+  posInfo: new Map(),  /* fen -> {turn, check, status} from /api/legal */
+  evals: new Map()     /* fen -> {res, engine, movetime, env, pvSan} */
+};
+const anBoard = makeBoard($("anBoard"), null);
+
+function anFen(){ return A.fens[Math.min(A.idx, A.fens.length - 1)]; }
+function anLastMove(){ return A.idx > 0 ? A.ucis[A.idx - 1] : null; }
+
+function mkEl(tag, cls, text){
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  return e;
+}
+
+function drawAn(){
+  const fen = anFen();
+  const info = A.posInfo.get(fen) || null;
+  anBoard.draw({
+    fen: fen,
+    orientation: A.orient,
+    lastMove: anLastMove(),
+    check: info ? !!info.check : false,
+    clickable: false
+  });
+  drawMaterial($("anMat"), fen, A.orient);
+  $("anFenLine").value = fen;
+
+  const st = $("anStatus");
+  st.textContent = "";
+  const pos = parseFen(fen);
+  const turn = info ? info.turn : pos.turn;
+  if (info && info.status === "mate") st.appendChild(mkEl("span", null, "Checkmate - " + turnName(turn === "w" ? "b" : "w") + " wins"));
+  else if (info && info.status === "stalemate") st.appendChild(mkEl("span", null, "Stalemate - draw"));
+  else {
+    st.appendChild(mkEl("span", null, turnName(turn) + " to move"));
+    if (info && info.check) st.appendChild(mkEl("span", "pill bad", "check"));
+  }
+  st.appendChild(mkEl("span", "pill", "ply " + A.idx + " / " + A.ucis.length));
+  if (A.thinking){
+    const p = mkEl("span", "pill warn");
+    p.appendChild(mkEl("span", "spin"));
+    p.appendChild(document.createTextNode(" thinking"));
+    st.appendChild(p);
+  }
+
+  renderMoveList($("anMoves"), A.sans, A.idx - 1, A.startFen, anJumpToPly);
+  $("anFirst").disabled = $("anPrev").disabled = (A.idx <= 0);
+  $("anNext").disabled = $("anLast").disabled = (A.idx >= A.ucis.length);
+  renderEval(fen);
+}
+
+function anJumpToPly(ply){ anGo(ply + 1); }
+function anGo(i){
+  const n = Math.max(0, Math.min(A.fens.length - 1, i));
+  A.idx = n;
+  drawAn();
+  ensurePosInfo(anFen());
+}
+async function ensurePosInfo(fen){
+  if (A.posInfo.has(fen)) return A.posInfo.get(fen);
+  let d;
+  try { d = await apiLegal(fen); }
+  catch (e){ showError("Analyse - " + e.message); return null; }
+  const info = {turn: d.turn, check: !!d.check, status: d.status, moves: d.moves || []};
+  A.posInfo.set(fen, info);
+  if (anFen() === fen) drawAn();
+  return info;
+}
+
+/* ---- eval readout ---- */
+function formatPvLine(startFen, moves, sanArr){
+  const p = parseFen(startFen);
+  let num = p.full, turn = p.turn;
+  const out = [];
+  for (let i = 0; i < moves.length; i++){
+    const txt = (sanArr && sanArr[i]) ? sanArr[i] : moves[i];
+    if (turn === "w"){ out.push(num + ". " + txt); turn = "b"; }
+    else { out.push((i === 0 ? num + "... " : "") + txt); turn = "w"; num++; }
+  }
+  return out.join(" ");
+}
+function renderEval(fen){
+  const box = $("anEval");
+  box.textContent = "";
+  const ent = A.evals.get(fen);
+  if (!ent){
+    box.appendChild(mkEl("div", "empty", A.thinking ? "Analysing…" : "Not analysed yet - press “Analyse position”."));
+    return;
+  }
+  const r = ent.res;
+  const stm = (A.posInfo.get(fen) || parseFen(fen)).turn;
+  let big = "—", note = "";
+  if (r.score_mate !== undefined && r.score_mate !== null){
+    const n = Number(r.score_mate);
+    big = (n >= 0 ? "#" : "#-") + Math.abs(n);
+    note = (n >= 0 ? turnName(stm) : turnName(stm === "w" ? "b" : "w"))
+         + " mates in " + Math.abs(n) + " moves. A positive score is good for the side to move ("
+         + turnName(stm) + ").";
+  } else if (typeof r.score_cp === "number"){
+    const pawns = r.score_cp / 100;
+    big = (pawns >= 0 ? "+" : "−") + Math.abs(pawns).toFixed(2);
+    const white = (stm === "w") ? pawns : -pawns;
+    note = "Positive is good for the side to move (" + turnName(stm) + "). "
+         + "From White's point of view: " + (white >= 0 ? "+" : "−") + Math.abs(white).toFixed(2) + " pawns.";
+  } else {
+    note = "The engine reported no score.";
+  }
+  box.appendChild(mkEl("div", "evalbig", big));
+  if (note) box.appendChild(mkEl("div", "hint", note));
+
+  const kv = mkEl("div", "kv");
+  const cell = (label, value) => {
+    const d = mkEl("div");
+    d.appendChild(mkEl("b", null, label));
+    d.appendChild(document.createTextNode(value === undefined || value === null || value === "" ? "—" : String(value)));
+    kv.appendChild(d);
+  };
+  cell("Best move", (ent.pvSan && ent.pvSan[0]) ? (ent.pvSan[0] + "  (" + r.bestmove + ")") : r.bestmove);
+  cell("Ponder", r.ponder);
+  cell("Depth", r.depth);
+  cell("Nodes", (typeof r.nodes === "number") ? r.nodes.toLocaleString() : r.nodes);
+  cell("Engine", ent.engine);
+  cell("Time", ent.movetime + " ms");
+  box.appendChild(kv);
+  box.appendChild(mkEl("div", "hint", "Settings: " + ent.settings));
+
+  if (Array.isArray(r.pv) && r.pv.length){
+    const pv = mkEl("div", "pvbox", formatPvLine(fen, r.pv, ent.pvSan));
+    box.appendChild(pv);
+  }
+  if (r.info) box.appendChild(mkEl("div", "rawinfo", "info: " + r.info));
+}
+
+/* Turn the UCI principal variation into SAN by replaying it through /api/move,
+   which returns the SAN of each move. Purely cosmetic: it runs after the eval is
+   already on screen, and any failure just leaves the UCI text in place. */
+async function convertPv(fen, pv, gen){
+  if (!Array.isArray(pv) || !pv.length) return;
+  const sans = [];
+  let cur = fen;
+  for (let i = 0; i < pv.length && i < 24; i++){
+    try {
+      const m = await apiMove(cur, pv[i]);
+      sans.push(m.san);
+      cur = m.fen;
+    } catch (e){ break; }
+    if (gen !== A.gen) return;
+  }
+  if (gen !== A.gen) return;
+  const ent = A.evals.get(fen);
+  if (!ent) return;
+  ent.pvSan = sans;
+  if (anFen() === fen) renderEval(fen);
+}
+
+async function anRun(){
+  const engine = $("anEngine").value;
+  if (!engine){ showError("Analyse - no engine selected."); return; }
+  const fen = anFen();
+  const movetime = Math.max(10, parseInt($("anMovetime").value, 10) || 2000);
+  const env = anEnv.read();
+  const gen = ++A.gen;
+  const runId = ++A.runSeq;
+  A.runId = runId;
+  A.thinking = true;
+  $("anThinking").classList.remove("hidden");
+  $("anRun").disabled = true;
+  drawAn();
+  try {
+    const d = await apiAnalyse(fen, engine, movetime, env);
+    if (gen !== A.gen) return;
+    A.evals.set(fen, {res: d, engine: engine, movetime: movetime, settings: anEnv.summary(), pvSan: null});
+    A.thinking = false;
+    drawAn();
+    convertPv(fen, d.pv, gen);
+  } catch (e){
+    if (gen !== A.gen) return;
+    A.thinking = false;
+    showError("Analyse - " + e.message);
+    drawAn();
+  } finally {
+    /* Only the newest run owns the spinner and the button, so a run that was
+       cancelled by a later one (or by loading a new position) cannot leave the
+       button disabled. */
+    if (A.runId === runId){
+      A.thinking = false;
+      $("anThinking").classList.add("hidden");
+      $("anRun").disabled = false;
+      if (activeTab === "analyse") drawAn();
+    }
+  }
+}
+
+/* ---- PGN / FEN loading ---- */
+function normSan(s){
+  return String(s).replace(/e\.p\./gi, "").replace(/[+#!?=\s]/g, "").replace(/0/g, "O");
+}
+function stripVariations(t){
+  let out = "", depth = 0;
+  for (let i = 0; i < t.length; i++){
+    const c = t.charAt(i);
+    if (c === "(") depth++;
+    else if (c === ")"){ if (depth > 0) depth--; }
+    else if (depth === 0) out += c;
+  }
+  return out;
+}
+function pgnTokens(text){
+  let t = String(text);
+  t = t.replace(/\{[^}]*\}/g, " ");     /* comments */
+  t = t.replace(/;[^\n]*/g, " ");       /* rest-of-line comments */
+  t = t.replace(/\[[^\]]*\]/g, " ");    /* headers */
+  t = stripVariations(t);               /* variations, nested */
+  t = t.replace(/\$\d+/g, " ");         /* NAGs */
+  t = t.replace(/\d+\s*\.(\s*\.\s*\.)?/g, " ");   /* move numbers, incl. "12..." */
+  t = t.replace(/\.\.\./g, " ");
+  return t.split(/\s+/).filter((x) => x && !/^(1-0|0-1|1\/2-1\/2|\*)$/.test(x));
+}
+/* Resolve one SAN token against the legal move list of the position, using the
+   pieces on the board for disambiguation. Returns null when it cannot decide. */
+function sanToUciSync(fen, san, legal){
+  const s = String(san).replace(/[+#!?]+$/, "").replace(/e\.p\.$/i, "");
+  const pos = parseFen(fen);
+  const me = pos.turn;
+  const pieceAt = (sq) => pos.board[sqIndex(sq)];
+  const short = /^(O-O|0-0)$/.test(s), long = /^(O-O-O|0-0-0)$/.test(s);
+  if (short || long){
+    const dir = short ? 1 : -1;
+    const cands = legal.filter((m) => {
+      const from = m.slice(0, 2), to = m.slice(2, 4);
+      const p = pieceAt(from);
+      if (!p || p.toLowerCase() !== "k" || colorOfPiece(p) !== me) return false;
+      if (from.charAt(1) !== to.charAt(1)) return false;
+      const ff = FILES.indexOf(from.charAt(0)), tf = FILES.indexOf(to.charAt(0));
+      if ((tf - ff) * dir <= 0) return false;
+      const dst = pieceAt(to);
+      /* classical UCI castling is e1g1 / e1c1; the rook-square form is accepted too */
+      const ontoOwnRook = !!dst && dst.toLowerCase() === "r" && colorOfPiece(dst) === me;
+      return Math.abs(tf - ff) >= 2 || ontoOwnRook;
+    });
+    return cands.length === 1 ? cands[0] : null;
+  }
+  const m = /^([KQRBN])?([a-h])?([1-8])?x?([a-h][1-8])(?:=?([QRBNqrbn]))?$/.exec(s);
+  if (!m) return null;
+  const type = (m[1] || "P").toLowerCase();
+  const df = m[2] || "", dr = m[3] || "", to = m[4], promo = (m[5] || "").toLowerCase();
+  const cands = legal.filter((u) => {
+    if (u.slice(2, 4) !== to) return false;
+    const up = (u.length > 4) ? u.charAt(4).toLowerCase() : "";
+    if (promo ? (up !== promo) : !!up) return false;
+    const from = u.slice(0, 2);
+    const p = pieceAt(from);
+    if (!p || colorOfPiece(p) !== me || p.toLowerCase() !== type) return false;
+    if (df && from.charAt(0) !== df) return false;
+    if (dr && from.charAt(1) !== dr) return false;
+    return true;
+  });
+  return cands.length === 1 ? cands[0] : null;
+}
+/* Fallback: ask the helper for the SAN of every legal move and match it. */
+async function resolveSan(fen, san, legal){
+  const direct = sanToUciSync(fen, san, legal);
+  if (direct) return direct;
+  const want = normSan(san);
+  for (const u of legal){
+    try {
+      const m = await apiMove(fen, u);
+      if (normSan(m.san) === want) return u;
+    } catch (e){ /* ignore and try the next candidate */ }
+  }
+  throw new Error("could not interpret “" + san + "”");
+}
+
+function anSetLine(startFen, fens, ucis, sans, idx){
+  A.startFen = startFen;
+  A.fens = fens;
+  A.ucis = ucis;
+  A.sans = sans;
+  A.idx = Math.max(0, Math.min(fens.length - 1, idx));
+  A.evals = new Map();
+  drawAn();
+  ensurePosInfo(anFen());
+}
+
+async function anLoadText(rawText){
+  const text = String(rawText || "").trim();
+  const note = $("anLoadNote");
+  const lg = ++A.loadGen;
+  A.gen++;                    /* drop any analysis still in flight */
+  if (!text){ note.textContent = "Nothing to load."; return; }
+
+  if (looksLikeFen(text)){
+    /* Assumption: a FEN pasted with fewer than six fields is completed with the
+       usual defaults rather than rejected. */
+    const fen = completeFen(text.split(/\r?\n/)[0].trim());
+    note.textContent = "Checking FEN…";
+    try {
+      const d = await apiLegal(fen);
+      if (lg !== A.loadGen) return;
+      A.posInfo.set(fen, {turn: d.turn, check: !!d.check, status: d.status, moves: d.moves || []});
+      anSetLine(fen, [fen], [], [], 0);
+      note.textContent = "FEN loaded.";
+    } catch (e){
+      note.textContent = "FEN rejected.";
+      showError("Analyse - " + e.message);
+    }
+    return;
+  }
+
+  const fenHeader = /\[\s*FEN\s+"([^"]+)"\s*\]/i.exec(text);
+  const startFen = fenHeader ? fenHeader[1].trim() : START_FEN;
+  const tokens = pgnTokens(text);
+  if (!tokens.length){ note.textContent = "No moves found in that text."; return; }
+
+  const fens = [startFen], ucis = [], sans = [];
+  let cur = startFen;
+  for (let i = 0; i < tokens.length; i++){
+    if (lg !== A.loadGen) return;
+    note.textContent = "Loading PGN… " + (i + 1) + " / " + tokens.length;
+    try {
+      const info = await apiLegal(cur);
+      if (lg !== A.loadGen) return;
+      const uci = await resolveSan(cur, tokens[i], info.moves || []);
+      if (lg !== A.loadGen) return;
+      const mv = await apiMove(cur, uci);
+      if (lg !== A.loadGen) return;
+      ucis.push(uci);
+      sans.push(mv.san);
+      cur = mv.fen;
+      fens.push(cur);
+    } catch (e){
+      showError("Analyse - stopped at move " + (i + 1) + " (“" + tokens[i] + "”): " + e.message);
+      break;
+    }
+  }
+  if (lg !== A.loadGen) return;
+  if (!ucis.length){ note.textContent = "Could not play any move from that PGN."; return; }
+  note.textContent = "Loaded " + ucis.length + " of " + tokens.length + " moves.";
+  anSetLine(startFen, fens, ucis, sans, fens.length - 1);
+}
+
+/* The FEN under the board is both the readout and the way to load a position, which is
+   why the Position panel no longer carries its own text box. A PGN move list pasted here
+   still works, because anLoadText() auto-detects. */
+$("anFenLine").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter") return;
+  ev.preventDefault();
+  clearError();
+  anLoadText($("anFenLine").value);
+});
+$("anStart").addEventListener("click", () => {
+  A.loadGen++;
+  A.gen++;
+  $("anLoadNote").textContent = "";
+  anSetLine(START_FEN, [START_FEN], [], [], 0);
+});
+$("anFirst").addEventListener("click", () => anGo(0));
+$("anPrev").addEventListener("click", () => anGo(A.idx - 1));
+$("anNext").addEventListener("click", () => anGo(A.idx + 1));
+$("anLast").addEventListener("click", () => anGo(A.fens.length - 1));
+$("anFlip").addEventListener("click", () => { A.orient = (A.orient === "w") ? "b" : "w"; drawAn(); });
+$("anRun").addEventListener("click", () => { clearError(); anRun(); });
+const anEnv = makeEnvEditor($("anEnv"));
+
+document.addEventListener("keydown", (ev) => {
+  if (activeTab !== "analyse") return;
+  if (!$("promoModal").classList.contains("hidden")) return;
+  if (!$("anPosModal").classList.contains("hidden")){
+    if (ev.key === "Escape") closeModal("anPosModal");
+    return;
+  }
+  if (!$("anEngModal").classList.contains("hidden")){
+    if (ev.key === "Escape") closeModal("anEngModal");
+    return;
+  }
+  if (!$("tMatchModal").classList.contains("hidden")){
+    if (ev.key === "Escape") closeModal("tMatchModal");
+    return;
+  }
+  const t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  if (ev.key === "ArrowLeft"){ ev.preventDefault(); anGo(A.idx - 1); }
+  else if (ev.key === "ArrowRight"){ ev.preventDefault(); anGo(A.idx + 1); }
+  else if (ev.key === "ArrowUp" || ev.key === "Home"){ ev.preventDefault(); anGo(0); }
+  else if (ev.key === "ArrowDown" || ev.key === "End"){ ev.preventDefault(); anGo(A.fens.length - 1); }
+});
+
+/* ================================================================
+   TOURNAMENT
+   ================================================================ */
+const T = {
+  id: null,
+  timer: null,
+  busy: false,
+  fails: 0,
+  orient: "w",
+  last: null,
+  labelA: "Config A",
+  labelB: "Config B"
+};
+const tBoard = makeBoard($("tBoard"), null);
+const tEnvA = makeEnvEditor($("tEnvA"));
+const tEnvB = makeEnvEditor($("tEnvB"));
+const TOURINFO = new Map();   /* fen -> {check,status,turn}, so the live board can show check */
+
+function tourCheckFor(fen){
+  if (TOURINFO.has(fen)) return TOURINFO.get(fen);
+  TOURINFO.set(fen, null);    /* in flight */
+  apiLegal(fen).then((d) => {
+    TOURINFO.set(fen, {check: !!d.check, status: d.status, turn: d.turn});
+    if (T.last && T.last.board && T.last.board.fen === fen) renderTour(T.last);
+  }).catch(() => {
+    TOURINFO.set(fen, {check: false, status: "ok", turn: parseFen(fen).turn});
+  });
+  if (TOURINFO.size > 600) TOURINFO.clear();
+  return null;
+}
+
+function renderTour(d){
+  T.last = d;
+  const b = (d && d.board) ? d.board : {};
+  const fen = b.fen || START_FEN;
+  const info = d ? tourCheckFor(fen) : null;
+  tBoard.draw({
+    fen: fen,
+    orientation: T.orient,
+    lastMove: b.last_move || null,
+    check: info ? info.check : false,
+    clickable: false
+  });
+  drawMaterial($("tMat"), fen, T.orient);
+  $("tFenLine").textContent = fen;
+
+  const st = $("tStatus");
+  st.textContent = "";
+  if (!d){
+    st.appendChild(mkEl("span", null, "No match running."));
+  } else {
+    st.appendChild(mkEl("span", null, "Game " + (d.game === undefined ? "?" : d.game) + " of " + (d.games === undefined ? "?" : d.games)));
+    if (b.white) st.appendChild(mkEl("span", "pill", "white: " + b.white));
+    if (b.black) st.appendChild(mkEl("span", "pill", "black: " + b.black));
+    if (d.running){
+      const p = mkEl("span", "pill warn");
+      p.appendChild(mkEl("span", "spin"));
+      p.appendChild(document.createTextNode(" running"));
+      st.appendChild(p);
+    } else {
+      st.appendChild(mkEl("span", "pill good", "finished"));
+    }
+  }
+
+  if (d && d.pgn) $("tPgnNote").textContent = "saving to games/" + d.pgn;
+  const sc = $("tScore");
+  sc.textContent = "";
+  const score = (d && d.score) ? d.score : {};
+  const card = (label, value) => {
+    const c = mkEl("div", "scorecard");
+    c.appendChild(mkEl("div", "n", (value === undefined || value === null) ? "—" : String(value)));
+    c.appendChild(mkEl("div", "l", label));
+    sc.appendChild(c);
+  };
+  card(T.labelA, score.white_config);
+  card(T.labelB, score.black_config);
+
+  renderMoveList($("tMoves"), (d && Array.isArray(d.moves)) ? d.moves : [],
+                 (d && Array.isArray(d.moves)) ? d.moves.length - 1 : -1, START_FEN, null);
+
+  const tbody = $("tResults").tBodies[0];
+  tbody.textContent = "";
+  const head = document.createElement("tr");
+  for (const h of ["#", "Result", "Plies", "Reason", "White"]){
+    head.appendChild(mkEl("th", null, h));
+  }
+  tbody.appendChild(head);
+  const results = (d && Array.isArray(d.results)) ? d.results : [];
+  if (!results.length){
+    const tr = document.createElement("tr");
+    const td = mkEl("td", null, "No finished games yet.");
+    td.colSpan = 5;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  } else {
+    for (const r of results){
+      const tr = document.createElement("tr");
+      tr.appendChild(mkEl("td", "num", r.game));
+      tr.appendChild(mkEl("td", null, r.result));
+      tr.appendChild(mkEl("td", "num", r.plies));
+      tr.appendChild(mkEl("td", null, r.reason));
+      /* Colours alternate from game 1, where the first config has White. */
+      tr.appendChild(mkEl("td", null, (Number(r.game) % 2 === 1) ? "A" : "B"));
+      tbody.appendChild(tr);
+    }
+  }
+}
+
+function tourPolling(on){
+  $("tPolling").classList.toggle("hidden", !on);
+  $("tStart").disabled = on;
+  $("tStop").disabled = !on;
+}
+function stopPolling(){
+  if (T.timer){ clearInterval(T.timer); T.timer = null; }
+  tourPolling(false);
+}
+async function pollTournament(){
+  if (T.busy || !T.id) return;
+  T.busy = true;
+  try {
+    const d = await apiGet("/api/tournament/state?id=" + encodeURIComponent(T.id));
+    T.fails = 0;
+    renderTour(d);
+    if (!d.running) stopPolling();
+  } catch (e){
+    T.fails++;
+    if (T.fails >= 5){
+      stopPolling();
+      showError("Tournament - polling stopped after 5 failures: " + e.message);
+    }
+  } finally {
+    T.busy = false;
+  }
+}
+async function tourStart(){
+  const a = $("tEngineA").value, bEng = $("tEngineB").value;
+  if (!a || !bEng){ showError("Tournament - pick an engine for both configurations."); return; }
+  const movetime = Math.max(10, parseInt($("tMovetime").value, 10) || 2000);
+  const games = Math.max(1, parseInt($("tGames").value, 10) || 1);
+  T.labelA = "A: " + a + " (" + tEnvA.summary() + ")";
+  T.labelB = "B: " + bEng + " (" + tEnvB.summary() + ")";
+  $("tStart").disabled = true;
+  try {
+    const d = await apiPost("/api/tournament/start", {
+      white: {engine: a, options: tEnvA.read()},
+      black: {engine: bEng, options: tEnvB.read()},
+      movetime_ms: movetime,
+      games: games,
+        openings: $("tOpenings").value
+    });
+    T.id = String(d.id);
+    T.fails = 0;
+    TOURINFO.clear();
+    tourPolling(true);
+    if (T.timer) clearInterval(T.timer);
+    T.timer = setInterval(pollTournament, 500);   /* about twice a second, as specified */
+    pollTournament();
+  } catch (e){
+    $("tStart").disabled = false;
+    showError("Tournament - could not start: " + e.message);
+  }
+}
+async function tourStop(){
+  if (!T.id) return;
+  $("tStop").disabled = true;
+  try {
+    await apiPost("/api/tournament/stop", {id: T.id});
+  } catch (e){
+    showError("Tournament - stop failed: " + e.message);
+    $("tStop").disabled = false;
+    return;
+  }
+  pollTournament();
+}
+$("tStart").addEventListener("click", () => { clearError(); tourStart(); });
+$("tStop").addEventListener("click", () => { clearError(); tourStop(); });
+$("tFlip").addEventListener("click", () => { T.orient = (T.orient === "w") ? "b" : "w"; if (T.last) renderTour(T.last); else { tBoard.draw({fen: START_FEN, orientation: T.orient}); drawMaterial($("tMat"), START_FEN, T.orient); } });
+
+/* ================================================================
+   start-up
+   ================================================================ */
+(async function init(){
+  setTab("play");
+  drawAn();
+  renderTour(null);
+  tourPolling(false);
+  await loadEngines();
+  playNewGame();
+  ensurePosInfo(anFen());
+})();
+
+/* ================================================================
+   SAVED GAMES (PGN)
+
+   PGN is parsed by libchess, through gui_helper, never here. The library
+   already handles comments, variations, NAGs and games that start from a FEN,
+   and a second parser in JavaScript would drift from what the engine treats as
+   a legal game. This code only moves data between the server and the board.
+   ================================================================ */
+
+async function refreshPgnFiles(){
+  const sel = $("anPgnFile");
+  try {
+    const d = await apiGet("/api/pgn/list");
+    const prev = sel.value;
+    sel.innerHTML = "";
+    if (!d.games || !d.games.length){
+      sel.appendChild(new Option("(no saved games yet)", ""));
+      $("anPgnGame").innerHTML = "";
+      return;
+    }
+    for (const g of d.games){
+      const mb = g.bytes / 1048576;
+      const size = mb >= 1 ? mb.toFixed(1) + " MB" : Math.max(1, Math.round(g.bytes / 1024)) + " kB";
+      sel.appendChild(new Option(g.name + "  (" + size + ", " + (g.where || "games") + ")", g.name));
+    }
+    if (prev && d.games.some((g) => g.name === prev)) sel.value = prev;
+    await refreshPgnGames();
+  } catch (e){ showError("Saved games - " + e.message); }
+}
+
+async function refreshPgnGames(){
+  const name = $("anPgnFile").value;
+  const gsel = $("anPgnGame");
+  gsel.innerHTML = "";
+  if (!name) return;
+  gsel.appendChild(new Option("reading…", ""));
+  try {
+    const d = await apiPost("/api/pgn/games", {name: name});
+    gsel.innerHTML = "";
+    for (const g of (d.games || [])){
+      const t = g.tags || {};
+      const label = "#" + (g.index + 1) + "  " + (t.White || "?") + " – " + (t.Black || "?") +
+                    "  " + (t.Result || "*") + "  (" + g.plies + " plies)";
+      gsel.appendChild(new Option(label, String(g.index)));
+    }
+    if (d.count) gsel.value = String(d.count - 1);   /* default to the newest game */
+    if (d.truncated){
+      $("anPgnNote").textContent = "Showing the first " + d.shown + " games of " + d.count + ".";
+    }
+  } catch (e){
+    gsel.innerHTML = "";
+    showError("Saved games - " + e.message);
+  }
+}
+
+async function loadSavedGame(){
+  const name = $("anPgnFile").value;
+  const idx = parseInt($("anPgnGame").value, 10);
+  const note = $("anPgnNote");
+  if (!name || isNaN(idx)){ note.textContent = "Pick a file and a game first."; return; }
+  note.textContent = "Loading…";
+  try {
+    const d = await apiPost("/api/pgn/game", {name: name, index: idx});
+    const fens = [d.start_fen], ucis = [], sans = [];
+    for (const m of (d.moves || [])){ fens.push(m.fen); ucis.push(m.uci); sans.push(m.san); }
+    A.gen++;                       /* drop any analysis still in flight */
+    A.loadGen++;
+    anSetLine(d.start_fen, fens, ucis, sans, 0);
+    const t = d.tags || {};
+    note.textContent = (t.White || "?") + " vs " + (t.Black || "?") + " — " + (d.plies || 0) + " plies" +
+                       (t.Result ? ", " + t.Result : "") + (d.warning ? "  [" + d.warning + "]" : "");
+  } catch (e){
+    note.textContent = "Load failed.";
+    showError("Saved games - " + e.message);
+  }
+}
+
+$("anPgnRefresh").addEventListener("click", () => { clearError(); refreshPgnFiles(); });
+$("anPgnFile").addEventListener("change", () => { clearError(); refreshPgnGames(); });
+/* ---- Position and Engine modals ----
+   Both panels used to sit above Evaluation and Moves in the side column, which pushed
+   those two so far down that the board scrolled out of view before you could read them.
+   As modals, the side column holds only Evaluation and Moves, level with the board. */
+function openModal(id){ $(id).classList.remove("hidden"); }
+function closeModal(id){ $(id).classList.add("hidden"); }
+
+$("anOpenBtn").addEventListener("click", () => {
+  clearError();
+  openModal("anPosModal");
+  refreshPgnFiles();
+});
+$("anPosCancel").addEventListener("click", () => closeModal("anPosModal"));
+$("anPosOk").addEventListener("click", async () => {
+  clearError();
+  await loadSavedGame();
+  closeModal("anPosModal");
+});
+$("anPosModal").addEventListener("click", (ev) => {
+  if (ev.target === $("anPosModal")) closeModal("anPosModal");
+});
+
+$("anEngineBtn").addEventListener("click", () => { clearError(); openModal("anEngModal"); });
+$("anEngOk").addEventListener("click", () => closeModal("anEngModal"));
+$("anEngModal").addEventListener("click", (ev) => {
+  if (ev.target === $("anEngModal")) closeModal("anEngModal");
+});
+
+/* ---- adding a PGN from anywhere on disk ----
+   The browser reads the file and posts its contents, so no path ever crosses the wire.
+   That is why the server can keep refusing paths outside its two known directories: this
+   route does not need one. */
+$("anPickBtn").addEventListener("click", () => $("anPgnUpload").click());
+$("anPgnUpload").addEventListener("change", async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  const note = $("anUploadNote");
+  if (!file) return;
+  if (file.size > 32 * 1024 * 1024){
+    note.textContent = "That file is larger than 32 MB.";
+    ev.target.value = "";
+    return;
+  }
+  note.textContent = "Reading " + file.name + "…";
+  try {
+    const text = await file.text();
+    const d = await apiPost("/api/pgn/save", {name: file.name, pgn: text});
+    note.textContent = "Added " + d.name + ".";
+    await refreshPgnFiles();
+    const sel = $("anPgnFile");
+    if ([...sel.options].some((o) => o.value === d.name)){
+      sel.value = d.name;
+      await refreshPgnGames();
+    }
+  } catch (e){
+    note.textContent = "Could not add that file.";
+    showError("Add PGN - " + e.message);
+  }
+  ev.target.value = "";
+});
+
+/* ---- saving the game from the Play tab ---- */
+async function playSavePgn(){
+  const note = $("playSaveNote");
+  if (!P.plies.length){ note.textContent = "No moves to save yet."; return; }
+  const engine = $("playEngine").value || "engine";
+  const humanIsWhite = (P.human === "w");
+  /* P.turn / P.status describe the position now on the board, which is the final
+     one, so the result comes straight from them. The side to move in a mated
+     position is the side that lost. */
+  let result = "*";
+  if (P.status === "mate")           result = (P.turn === "w") ? "0-1" : "1-0";
+  else if (P.status === "stalemate") result = "1/2-1/2";
+  note.textContent = "Saving…";
+  try {
+    const d = await apiPost("/api/pgn/save_game", {
+      sans: P.plies.map((x) => x.san),
+      start_fen: P.startFen,
+      tags: {
+        Event: "creatica GUI game",
+        White: humanIsWhite ? "Human" : engine,
+        Black: humanIsWhite ? engine : "Human",
+        Result: result
+      }
+    });
+    note.textContent = "Saved as " + d.name + " — open it from the Analyse tab.";
+    refreshPgnFiles();
+  } catch (e){
+    note.textContent = "Save failed.";
+    showError("Play - " + e.message);
+  }
+}
+$("playSave").addEventListener("click", () => { clearError(); playSavePgn(); });
+
+refreshPgnFiles();
+
+/* ================================================================
+   MATCH SETTINGS MODAL
+
+   Same reason as the Analyse panel: the settings card sat above Score and Finished
+   games, pushing both so far down that the board scrolled out of view before you could
+   read them. As a modal, the side column holds only Score and Finished games, level
+   with the board.
+   ================================================================ */
+
+/* A starting point for editing only. Leaving the box EMPTY makes the server use its own
+   DEFAULT_OPENINGS, so this copy and chess_gui.py can never silently disagree about what
+   the default book is. */
+const DEFAULT_BOOK = [
+  "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2   # 1.e4 e5",
+  "rnbqkbnr/pppp1ppp/8/4p3/3P4/8/PPP1PPPP/RNBQKBNR w KQkq - 0 2   # 1.d4 e5",
+  "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2   # Sicilian",
+  "rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2   # Caro-Kann",
+  "rnbqkbnr/pp1ppppp/8/2p5/3P4/8/PPP1PPPP/RNBQKBNR w KQkq - 0 2   # Old Benoni",
+  "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1       # start position",
+  "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1     # 1.e4",
+  "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq - 0 1     # 1.d4",
+  "rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b KQkq - 0 1     # 1.c4",
+  "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 1     # 1.Nf3"
+].join("\n");
+
+$("tSettingsBtn").addEventListener("click", () => { clearError(); openModal("tMatchModal"); });
+$("tMatchOk").addEventListener("click", () => closeModal("tMatchModal"));
+$("tMatchModal").addEventListener("click", (ev) => {
+  if (ev.target === $("tMatchModal")) closeModal("tMatchModal");
+});
+$("tOpenDefault").addEventListener("click", () => {
+  $("tOpenings").value = DEFAULT_BOOK;
+  $("tOpeningsNote").textContent = "Ten positions, each played twice with the colours swapped.";
+});
+$("tOpenStartpos").addEventListener("click", () => {
+  $("tOpenings").value = START_FEN;
+  $("tOpeningsNote").textContent = "Every game from the initial array - expect many draws, and a result dominated by one opening.";
+});
+
+/* Fill every "Weights" dropdown from the nets actually on disk, labelled with their
+   shape so the wide and narrow nets are told apart at a glance. */
+async function refreshPolicyNets(){
+  let nets = [];
+  try {
+    const d = await apiGet("/api/policy_nets");
+    nets = d.nets || [];
+  } catch (e){ return; }        /* silent: the engine's own default still applies */
+  for (const sel of document.querySelectorAll('select[data-dynamic="nets"]')){
+    const prev = sel.value;
+    sel.innerHTML = "";
+    const d0 = document.createElement("option");
+    d0.value = ""; d0.textContent = "default (nnue_policy.bin)";
+    sel.appendChild(d0);
+    for (const n of nets){
+      const op = document.createElement("option");
+      op.value = n.name;
+      op.textContent = n.name + "  (" + n.in + "→" + n.h1 + "→" + n.h2 + ")";
+      sel.appendChild(op);
+    }
+    if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  }
+}
+refreshPolicyNets();
+
+/* Keep every settings editor in step with the engine chosen beside it. The engine is the
+   authority on what it can be configured with, so switching binaries switches the controls
+   -- and an engine that does not advertise a setting simply does not show it, instead of
+   the UI offering a knob that silently does nothing. */
+function bindEnvEditor(selectId, editor){
+  const sel = $(selectId);
+  if (!sel) return;
+  const refresh = () => editor.load(sel.value);
+  sel.addEventListener("change", refresh);
+  refresh();
+}
+bindEnvEditor("playEngine", playEnv);
+bindEnvEditor("anEngine",   anEnv);
+bindEnvEditor("tEngineA",   tEnvA);
+bindEnvEditor("tEngineB",   tEnvB);
+</script>
+</body>
+</html>

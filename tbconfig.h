@@ -24,7 +24,6 @@
 #ifndef TBCONFIG_H
 #define TBCONFIG_H
 //the Fathom code is buggy - it does not work with external move generation functions!
-//#include "magic_bitboards.h"
 /****************************************************************************/
 /* BUILD CONFIG:                                                            */
 /****************************************************************************/

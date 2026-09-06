@@ -1,7 +1,8 @@
 /// 
 /// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -DUSE_PTHREADS -DNDEBUG -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -DUSE_NEON_DOTPROD -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
 
-/// DON'T FORGET to init and free magic bitboards by calling init_magic_bitboards() and cleanup_magic_bitboards()
+/// Call Stockfish::Bitboards::init() once at start -- move generation segfaults without it.
+/// (init_magic_bitboards()/cleanup_magic_bitboards() are gone; board.cpp uses attacks_bb<>.)
 
 /// use -O0 -g for debugging with lldb or gdb instead of -O3 (lldb ./test, then run, and if crashes, bt)
 
@@ -56,7 +57,6 @@
 // it is deliberately tiny: see the notes at the top of chess_types.h before
 // moving anything else into it.
 #include "chess_types.h"
-//#include "noise2.h"
 
 #define MAX_PIPE_NAME_LEN 256
 #define MAX_ENGINE_NAME_LEN 128
@@ -616,6 +616,11 @@ struct MovesContext {
   uint64_t blockingSquares = 0;
 };
 
+//DEPRECATED. These index optionSpin[]/optionString[]/optionCheck[] positionally, but
+//getOptions() fills those arrays in the order the engine advertises its options, so the
+//indices are only correct by coincidence. Use setEngineSpin()/setEngineCheck()/
+//setEngineStringOption(), which look the option up by name. Kept because engine.cpp's
+//getPV() and older unbuilt files still refer to them.
 enum EngineSpinOptions : uint8_t {Hash, Threads, MultiPV, ExplorationMin, ExplorationMax, ExplorationDepthDecay, PVPlies, Temperature, VirtualLoss, ProbabilityMass, EvalScale, EvalDepth, MaxNodes, NegamaxDepth};
 enum EngineStringOptions : uint8_t {SyzygyPath};
 enum EngineCheckOptions : uint8_t {FinalInfoLines, IntermittentInfoLines, Ponder};
@@ -814,8 +819,6 @@ CHESS_API int eTags(EcoTag, FILE *);
 
 CHESS_API uint64_t countGames(FILE *, const char *, uint64_t gameStartPositions[], uint64_t maxNumberOfGames);
 
-CHESS_API void cleanup_magic_bitboards(void);
-CHESS_API void init_magic_bitboards(void);
 
 CHESS_API int initGame(Game& game, FILE *);
 int playGame(Game& game);
@@ -834,6 +837,27 @@ CHESS_API int nametoindex(const Engine& engine, const char * option, OptionType 
 CHESS_API int getOptions(Engine& engine);
 CHESS_API int setOption(const Engine& engine, const char * option, OptionType optionType, void *);
 CHESS_API void setOptions(const Engine& engine);
+
+//Set an option BY NAME on a spawned engine, and say so when the engine does not have it.
+//
+//These replace indexing engine.optionSpin[]/optionCheck[] with the fixed EngineSpinOptions /
+//EngineCheckOptions enums below. Those arrays are filled by getOptions() in DISCOVERY ORDER --
+//the order the engine happens to advertise its options in -- so the enum only addressed the
+//right slot for engines that listed their options in exactly the enum's order. creatica does
+//not: enum index 9 (ProbabilityMass) lands on its PolicyMode, index 10 (EvalScale) on its
+//PolicyBlend, and on the check side index 0 (FinalInfoLines) lands on PerformanceCores. Writes
+//past numberOfSpinOptions were quietly dropped instead, since setOptions() only walks that far.
+//Either way the caller got no diagnostic.
+//
+//Spin values are clamped to the advertised min/max and the clamp is reported. Each returns
+//false if the engine advertises no option of that name and type.
+CHESS_API bool setEngineSpin(Engine& engine, const char * name, int64_t value);
+CHESS_API bool setEngineCheck(Engine& engine, const char * name, bool value);
+CHESS_API bool setEngineStringOption(Engine& engine, const char * name, const char * value);
+//Advertised bounds, so a caller sweeping a parameter can stay inside them and can skip a
+//parameter the engine does not have rather than tuning a value that goes nowhere.
+CHESS_API bool engineSpinRange(const Engine& engine, const char * name,
+                               int64_t& lo, int64_t& hi, int64_t& def);
 CHESS_API bool isReady(const Engine& engine);
 CHESS_API bool newGame(const Engine& engine);
 CHESS_API void stop(const Engine& engine);
