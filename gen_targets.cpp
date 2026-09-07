@@ -70,7 +70,15 @@ int main(int argc, char ** argv) {
 
     setEngineStringOption(eng, "VisitDumpFile", dumpPath);
     setEngineStringOption(eng, "GameTag",       tag);
-    setEngineCheck(eng, "ReuseTree",             false);   // see the note at the top
+    // Off by default: at any stride above 1 the positions are from different games, so there is
+    // no subtree to inherit and the tree would merely accumulate. At STRIDE=1 they ARE
+    // consecutive plies and reuse is worth having -- set REUSE=1.
+    setEngineCheck(eng, "ReuseTree",             env_l("REUSE", 0) != 0);
+    // Always off here. We are replaying positions, not playing them: whatever the engine picks,
+    // the next position is whatever the game actually played. Re-rooting onto the engine's
+    // choice and sweeping would free the branch the next search needs. set_root() finds nodes by
+    // hash, so leaving the tree alone costs nothing and the threshold collection still bounds it.
+    setEngineCheck(eng, "PostMoveCollect",       false);
     setEngineCheck(eng, "FinalInfoLines",        false);
     setEngineCheck(eng, "IntermittentInfoLines", false);
     setOptions(eng);

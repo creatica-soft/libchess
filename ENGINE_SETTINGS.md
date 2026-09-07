@@ -632,6 +632,56 @@ corrective and falling agreement with Stockfish is how you would notice the poli
 its own blind spots.
 
 
+### Reading the dataset report
+
+    python3 visit_dump_stats.py targets.tsv
+
+A real report from the first 276 records of a broadcast run at 1000 ms:
+
+    records                    276   (0 from ponder searches)
+    distinct games (tags)      1
+    repeated positions         2
+    legal moves, mean          32.8
+    simulations, mean          305721
+    seldepth, mean             23.5
+    top move's visit share     0.831
+    distribution entropy       0.586 nats  (uniform over 32.8 = 3.492)
+    search agrees with prior   36.6%
+    mean prior->visits shift   0.665
+
+**`search agrees with prior` is the number that decides.** Distillation can only teach the
+policy head what the search knows and the prior does not. At 36.6% the search picks a different
+move from the policy head on **63% of positions** — a great deal to learn. If this figure ever
+climbs above about 90%, the target has become the model's own output and training on it would be
+an expensive no-op. `prior->visits shift` corroborates it across the whole distribution rather
+than just the top move.
+
+**`legal moves, mean` at 32.8 is a good sign.** Opening positions run 25–27; this is middlegame
+material, where there is genuinely something to decide. A position with three legal moves teaches
+almost nothing.
+
+**`seldepth` is the quality dial, and 23.5 is modest** — the same positions reach ~33 at 3000 ms
+and ~36 at 5000 ms. Because it is recorded per record, a mixed-depth dataset can be filtered or
+weighted at training time rather than committed to now. That is the reason it is in the file.
+
+**`top move's visit share` of 0.831 says the target is nearly one-hot.** creatica concentrates
+hard, so distillation will mostly teach *which* move rather than *how much* better — less rich
+than AlphaZero-style targets, which stay soft because of Dirichlet noise added at the root during
+self-play. That noise deliberately weakens play, which is a fair trade for dedicated generation
+and a bad one for games you also want to win.
+
+**`repeated positions` is waste**: each duplicate FEN is a search spent twice for one sample. Two
+out of 276 is nothing; a large share would mean `STRIDE` is too small for the source.
+
+**What the report does not tell you.** A low agreement figure says the target *differs* from the
+model's current belief — not that it is *better*. A shallow or broken search also disagrees, just
+wrongly. What justifies trusting it is that the target comes from ~300k NNUE-backed simulations
+to depth ~24, against a single forward pass of the policy head. This project has already been
+burned once by a proxy that stopped predicting strength — top-1 agreement with Stockfish went
+26.7% → 33.08% → 34.83% while Elo went +108 → +113 → level — so treat every figure here as a
+necessary condition and never a sufficient one. The decisive test remains a match.
+
+
 ## Training options
 
 Not engine settings, but the policy net the engine loads comes from `nnue_policy_train.cpp`,
