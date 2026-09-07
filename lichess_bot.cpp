@@ -718,6 +718,43 @@ void StreamAndProcess(const std::string& url, std::function<void(const json&)> p
 }
 
 // Helper to compute and post move if it's our turn
+static const char * startPosFen =
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+//Any legal move, for the case where the engine gave us nothing usable. Not a good move -- a
+//legal one. The alternative is to post nothing and let the clock run out, which loses the game
+//with certainty rather than merely probably.
+//
+//Standard generation loop from the library: king moves first (they are always legal once
+//kingMoves() has filtered them), then the rest under the check mask.
+static bool firstLegalMove(Board& board, char * out) {
+  auto [king_moves, pinned, pinning, checkers, kingSquare] = kingMoves(board);
+  if (king_moves) {
+    const Square to = (Square)lsBit(king_moves);
+    std::snprintf(out, 6, "%s%s", square[kingSquare], square[to]);
+    return true;
+  }
+  if (bitCount(checkers) > 1) return false;          // double check: only the king may move
+  auto [check_mask, ep_mask] = checkers ? checkMask(board, kingSquare, checkers)
+                                        : std::make_pair(0xffffffffffffffffULL, 0ULL);
+  for (PieceType pt = Queen; pt >= Pawn; --pt) {
+    uint64_t occ = board.side[board.sideToMove] & board.pieceTypes[pt - 1];
+    while (occ) {
+      const Square from = (Square)popLSB(occ);
+      uint64_t mv = piece_moves(board, pt, from, kingSquare, pinned, pinning, check_mask, ep_mask);
+      if (!mv) continue;
+      const Square to = (Square)lsBit(mv);
+      Move probe; probe.src = from; probe.dst = to; probe.promoType = PieceTypeNone;
+      //A pawn reaching the last rank must carry a promotion letter or the move is not legal
+      //notation; queen is as good as any when we are only trying to stay in the game.
+      const bool promo = (pt == Pawn) && promoMove(board, probe);
+      std::snprintf(out, 6, "%s%s%s", square[from], square[to], promo ? "q" : "");
+      return true;
+    }
+  }
+  return false;
+}
+
 void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, const std::string& initial_fen, const std::string& moves, const long long wtime, const long long btime, const long long winc, const long long binc) {
     int gss = gameStateStatus.load();
     std::cout << "ComputeAndPostMove() debug: game state - status: " << gameSS[gss] << ", moves: " << moves << std::endl;
@@ -817,6 +854,46 @@ try_again:  if (go(creatica, evaluations)) {
                 }
             } //end of if (draw_offer)
             std::string new_move = evaluations[0]->bestmove;
+
+            //Never POST an empty or malformed move.
+            //
+            //When go() fails -- the engine hung and engineFgets() declared it dead, say --
+            //bestmove can be empty or stale, and the URL then ends in "/move/" with nothing after
+            //it. Lichess answers 404 "No such command", the bot logs a failure and carries on as
+            //though it had moved, and the clock keeps running until it flags. Falling back to any
+            //LEGAL move is strictly better than that: a poor move loses a game, a lost connection
+            //to our own clock loses it anyway and with no chance of the opponent erring.
+            auto looks_like_uci = [](const std::string& m) {
+              if (m.size() < 4 || m.size() > 5) return false;
+              if (m[0] < 'a' || m[0] > 'h' || m[2] < 'a' || m[2] > 'h') return false;
+              if (m[1] < '1' || m[1] > '8' || m[3] < '1' || m[3] > '8') return false;
+              if (m.size() == 5 && !strchr("qrbn", m[4])) return false;
+              return true;
+            };
+            if (!looks_like_uci(new_move)) {
+              std::cerr << "ComputeAndPostMove() error: engine returned no usable move ('"
+                        << new_move << "'); falling back to a legal one" << std::endl;
+              Board b = Board{};
+              if (fen2board(b, initial_fen == "startpos" ? startPosFen : initial_fen.c_str()) == 0) {
+                //Replay the game's moves onto the board, then take any legal move.
+                std::istringstream ms(moves);
+                std::string mv;
+                while (ms >> mv) {
+                  Move m2;
+                  uci2move_idx(mv.c_str(), m2);
+                  StateInfo st = {};
+                  do_move(b, m2, st);
+                }
+                char cand[6] = "";
+                if (firstLegalMove(b, cand)) new_move = cand;
+              }
+              if (!looks_like_uci(new_move)) {
+                std::cerr << "ComputeAndPostMove() error: no legal fallback either; not posting"
+                          << std::endl;
+                return;   //better to post nothing than to post nonsense
+              }
+            }
+
             std::string move_url = "https://lichess.org/api/bot/game/" + game_id + "/move/" + new_move;
             std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "..." << std::endl;
             if (!HttpRequest("POST", move_url))
