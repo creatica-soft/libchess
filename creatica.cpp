@@ -60,6 +60,7 @@ extern bool      reuse_tree;
 extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 void gc_join();
+void reap_shutdown();
 extern std::string visit_dump_path;
 extern std::string game_tag;
 extern bool      validate_tree_enabled;
@@ -551,6 +552,7 @@ public:
     void quit() override {
         //A joinable std::thread destroyed at exit calls std::terminate.
         gc_join();
+        reap_shutdown();   //same reason: the reaper is a joinable std::thread
         {
             std::lock_guard<std::mutex> lock(mtx);
             quitFlag.store(true);
