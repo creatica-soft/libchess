@@ -126,15 +126,181 @@ struct MCTSNode {
     std::atomic<uint8_t> expanding{0};  // expansion gate (test-and-set try-lock): exchange(1, acquire) == 0 acquires it, store(0, release) releases it
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
 };
-// Custom hasher that uses the key directly
-struct NoOpHash {
-    std::size_t operator()(uint64_t key) const noexcept {
-        return key; // Directly use the key as the hash
+// An OPEN-ADDRESSING hash table keyed by Zobrist hash, holding the transposition DAG.
+//
+// It replaces std::unordered_map, and the reason is measured rather than stylistic. An
+// unordered_map allocates one hash node per entry, so every erase() is an allocator free of a
+// small block scattered across a gigabyte of live tree. In an overnight run, one collection that
+// dropped 8.1M nodes spent 15.8 SECONDS in the unlink walk -- roughly 2 microseconds per erase --
+// against 229 ms of marking. Erasing here is a tombstone write into a contiguous array: no
+// allocation and no pointer chase.
+//
+// Two secondary gains. It is smaller: 16 bytes a slot at a 0.7 load factor, against a node plus a
+// next pointer plus malloc overhead plus the bucket array. And make_child() does millions of
+// lookups per search, which become a short linear probe over adjacent cache lines instead of a
+// chain walk through scattered allocations.
+//
+// The index is simply the low bits of the key, which is what NoOpHash already did for
+// unordered_map -- Zobrist hashes are well distributed, so no mixing is needed.
+//
+// LOCKING IS UNCHANGED and remains the caller's job: shared_lock on map_mutex to look up, unique
+// _lock to insert. One rule is stricter than before, though. A rehash REALLOCATES the slot array,
+// so an iterator or a Slot& is only valid while the lock is held -- copy the MCTSNode* out before
+// unlocking, never dereference an iterator afterwards.
+class NodeMap {
+  public:
+    // Named first/second so that "for (auto& [h, n] : tree)" and "it->second" both read exactly
+    // as they did with unordered_map, keeping every call site unchanged.
+    struct Slot { uint64_t first = 0; MCTSNode * second = nullptr; };
+
+    // second == nullptr means the slot was never used and terminates a probe; TOMB means it held
+    // an entry that was erased, so a probe must continue THROUGH it.
+    // 1 is never a real MCTSNode address: the type's alignment is at least 8.
+    static MCTSNode * tomb() noexcept { return reinterpret_cast<MCTSNode *>(uintptr_t(1)); }
+
+    class iterator {
+      public:
+        iterator() = default;
+        iterator(Slot * p, Slot * e) : p_(p), e_(e) { skip(); }
+        Slot &     operator*()  const { return *p_; }
+        Slot *     operator->() const { return p_; }
+        iterator & operator++()       { ++p_; skip(); return *this; }
+        bool operator==(const iterator& o) const { return p_ == o.p_; }
+        bool operator!=(const iterator& o) const { return p_ != o.p_; }
+        Slot * raw() const { return p_; }
+      private:
+        // begin() and operator++ must land on a LIVE slot; empties and tombstones are skipped.
+        void skip() { while (p_ != e_ && (p_->second == nullptr || p_->second == tomb())) ++p_; }
+        Slot * p_ = nullptr;
+        Slot * e_ = nullptr;
+    };
+
+    NodeMap() = default;
+    ~NodeMap() { delete[] slots_; }
+    NodeMap(const NodeMap&)            = delete;
+    NodeMap& operator=(const NodeMap&) = delete;
+
+    size_t size() const noexcept { return size_; }
+    bool  empty() const noexcept { return size_ == 0; }
+
+    iterator begin() { return iterator(slots_, slots_ + cap_); }
+    iterator end()   { return iterator(slots_ + cap_, slots_ + cap_); }
+
+    void clear() {
+        delete[] slots_;
+        slots_ = nullptr;
+        cap_ = size_ = used_ = 0;
     }
+
+    iterator find(uint64_t key) {
+        if (!cap_) return end();
+        size_t i = key & (cap_ - 1);
+        for (;;) {
+            Slot & s = slots_[i];
+            if (s.second == nullptr) return end();              // empty: key is absent
+            if (s.second != tomb() && s.first == key) return iterator(&s, slots_ + cap_);
+            i = (i + 1) & (cap_ - 1);                           // tombstone or collision: keep going
+        }
+    }
+
+    std::pair<iterator, bool> emplace(uint64_t key, MCTSNode * v) {
+        // Grow on PROBE occupancy (live + tombstones), not on size alone: a table full of
+        // tombstones probes just as badly as a full one.
+        if (!cap_ || (used_ + 1) * 10 >= cap_ * 7) grow();
+        size_t  i    = key & (cap_ - 1);
+        Slot *  reuse = nullptr;
+        for (;;) {
+            Slot & s = slots_[i];
+            if (s.second == nullptr) {
+                Slot * dst = reuse ? reuse : &s;
+                if (!reuse) ++used_;          // a tombstone was already counted in used_
+                dst->first  = key;
+                dst->second = v;
+                ++size_;
+                return { iterator(dst, slots_ + cap_), true };
+            }
+            if (s.second == tomb()) { if (!reuse) reuse = &s; }
+            else if (s.first == key) return { iterator(&s, slots_ + cap_), false };
+            i = (i + 1) & (cap_ - 1);
+        }
+    }
+
+    iterator erase(iterator it) {
+        Slot * p = it.raw();
+        p->second = tomb();     // used_ is unchanged: the slot still blocks probes
+        --size_;
+        return iterator(p + 1, slots_ + cap_);
+    }
+
+    // Right-size the table after a collection, which also sweeps out the tombstones.
+    //
+    // This is not an optimisation, it is the thing that makes an open-addressed table viable
+    // here at all. Iteration is O(CAPACITY), not O(size): the sweep scans every slot, live or
+    // not. std::unordered_map iterates in O(size) because libc++ threads its elements onto a
+    // linked list, so it never pays for the empty space. Measured without this: a collection
+    // that freed nothing walked 1.6M live entries in 551 ms because the table still had ~16M
+    // slots left over from before the last die-off, while unordered_map walked 4.0M in 390 ms.
+    // Per slot the flat table is about three times quicker; it was simply scanning ten times as
+    // many of them.
+    //
+    // Rebuilding is cheap precisely because this table has no per-entry allocation: it is one
+    // array allocation plus a linear reinsert of the survivors.
+    void compact() {
+        if (!cap_) return;
+        size_t want = 16;
+        while (want * 7 < size_ * 10) want <<= 1;
+        // Rehash when the table is mostly empty, OR when tombstones have taken over the probe
+        // space even though the live count has not moved much.
+        if (want < cap_ || used_ > size_ + (cap_ >> 2)) rehash(want < cap_ ? want : cap_);
+    }
+
+    void reserve(size_t n) {
+        size_t want = 16;
+        while (want * 7 < n * 10) want <<= 1;
+        if (want > cap_) rehash(want);
+    }
+
+  private:
+    void grow() {
+        // Sizing off size_ rather than used_ is what makes a rehash also SWEEP the tombstones:
+        // a table that is mostly tombstones is rebuilt at the same capacity instead of doubling.
+        size_t ncap = cap_ ? cap_ : 1024;
+        while ((size_ + 1) * 10 >= ncap * 7) ncap <<= 1;
+        rehash(ncap);
+    }
+
+    void rehash(size_t ncap) {
+        Slot * old = slots_;
+        size_t oc  = cap_;
+        slots_ = new Slot[ncap];      // Slot's default member initialisers make every slot empty
+        cap_   = ncap;
+        size_ = used_ = 0;
+        for (size_t i = 0; i < oc; ++i) {
+            MCTSNode * v = old[i].second;
+            if (v && v != tomb()) insert_fresh(old[i].first, v);
+        }
+        delete[] old;
+    }
+
+    // No tombstones exist in a table being rehashed, so the first empty slot is the destination.
+    void insert_fresh(uint64_t key, MCTSNode * v) {
+        size_t i = key & (cap_ - 1);
+        while (slots_[i].second != nullptr) i = (i + 1) & (cap_ - 1);
+        slots_[i].first  = key;
+        slots_[i].second = v;
+        ++size_;
+        ++used_;
+    }
+
+    Slot * slots_ = nullptr;
+    size_t cap_   = 0;   // always a power of two, so the modulo is a mask
+    size_t size_  = 0;   // live entries
+    size_t used_  = 0;   // live entries + tombstones, i.e. slots that block a probe
 };
+
 struct MCTSSearch {
     MCTSNode * root = nullptr;
-    std::unordered_map<uint64_t, MCTSNode *, NoOpHash> tree; //Zobrist hash and node 
+    NodeMap tree; //Zobrist hash -> node
 };
 struct Edge {
     std::atomic<int> move {0};             // The move that leads to the child position
