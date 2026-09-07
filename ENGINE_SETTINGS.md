@@ -409,6 +409,41 @@ enabling reuse. Three changes fixed it:
 The post-move collection is safe against a concurrent command because `searchFlag` is still set
 when it runs: `new_game()`, `set_position()` and `stop()` all wait for it to clear.
 
+**That was not enough, and a live session said so.** With `Ponder` on by default the background
+collection is disabled (the next `go` arrives immediately and would abort it), so collection went
+back onto the critical path. Across one session of two bots: **354 s of collection time per bot
+over 384 collections**, 102 of them over a second and the worst **36.6 s**. That worst one freed
+about 8.9 million nodes, and freeing is the whole cost — 8.9 million `delete` calls plus a
+`delete[]` per Edge array, on a machine already in swap with two bots holding ~1 GB of tree each.
+The cost tracks how many nodes **die**, not how big the tree is, so it spikes exactly when the
+game leaves the reused subtree.
+
+**The fix is to defer the frees.** The sweep was doing two jobs and only one is urgent. Unlinking
+a dead node from `search.tree` is urgent, because `make_child()` finds nodes by hash lookup and
+must not hand it back. Freeing it is not urgent at all. So the sweep now only unlinks, and a
+background thread frees the corpses *while the search runs*. This is safe because a node reaches
+that thread only after `search.tree.erase()`, and a **completed** mark guarantees no surviving
+node points at a dead one — an aborted mark still sweeps nothing. `tree_occupancy()` counts nodes
+awaiting reclamation, so the engine cannot expand into memory it has not got back.
+
+| two engines, `Hash` 1024, 44 plies | before | with deferred frees |
+|---|---|---|
+| total time in the collect block | 56.6 s | **18.9 s** |
+| worst single collection | 2420 ms | 1258 ms |
+| collections over 1 s | 14 | 3 |
+
+The same test at `Hash` 512 with a *single* engine showed nothing (6.68 s vs 7.50 s). That is the
+honest result and worth keeping: without memory pressure and large die-offs the frees are not the
+bottleneck. Run-to-run spread is around 30%, so differences smaller than about 1.5x from this
+harness mean nothing.
+
+**Two measurement traps this exposed.** First, `info string gc took N ms` was timing `set_root()`
+and `validate_tree()` as well as the collection — a run in which `gc()` never executed still
+reported 700 ms per move under that label, because `ValidateTree` was on. It now reports
+`set_root` separately and says whether a collection actually ran; `set_root` turns out to be
+negligible. Second, counting those log lines counts *searches*, not collections, because the line
+is printed whether or not anything was collected.
+
 **Measured: 9.5/12, about +232 Elo.** Head to head, same binary on both sides, `ReuseTree` the
 only difference. At 12 games that is roughly 2.5-3.0 standard errors depending on the
 win/draw split, so p is around 0.001-0.005 — significant because the margin is large, not
