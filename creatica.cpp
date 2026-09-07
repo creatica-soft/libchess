@@ -433,7 +433,19 @@ public:
         zobristHash(z);
         // Its own log. Sharing uci-mcts-nnue-policy.log with a running
         // creatica would interleave two engines' lines in one file.
-        logfile = fopen("creatica.log", "a");
+        //CREATICA_LOG, not a UCI option, because the log has to exist before the protocol does:
+        //init() writes the settings line, and an option cannot arrive until after the handshake.
+        //
+        //Per instance matters. Two engines appending to one file interleave, and the result is
+        //actively misleading rather than merely untidy -- two bots playing each other produce
+        //apparently duplicated "bestmove" lines, because creatica ponders the position where the
+        //OPPONENT is to move, which is the same position the opponent is searching for real. That
+        //artefact was read as an engine emitting two bestmoves for one go, and a driver change
+        //was made on the strength of it.
+        {
+            const char * lp = std::getenv("CREATICA_LOG");
+            logfile = fopen((lp && *lp) ? lp : "creatica.log", "a");
+        }
         srand(time(NULL));
         Stockfish::Bitboards::init();
         init_nnue();
