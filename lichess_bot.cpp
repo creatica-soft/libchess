@@ -718,6 +718,13 @@ void StreamAndProcess(const std::string& url, std::function<void(const json&)> p
 }
 
 // Helper to compute and post move if it's our turn
+//Side to move from a FEN: the second space-separated field, "w" or "b".
+static bool fenSideToMoveIsWhite(const std::string& fen) {
+  const size_t sp = fen.find(' ');
+  if (sp == std::string::npos || sp + 1 >= fen.size()) return true;   //malformed: assume white
+  return fen[sp + 1] != 'b';
+}
+
 static const char * startPosFen =
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -961,7 +968,16 @@ void HandleGame(const std::string& game_id) {
                 std::istringstream uci_moves(moves);
                 while (uci_moves >> uci_move) num_plies++;
                 // Calculate turn
-                bool white_turn = (num_plies % 2 == 0);
+                //Whose move it is depends on the INITIAL POSITION, not just the ply count.
+                //
+                //In a standard game ply 0 is White's, so `num_plies % 2 == 0` works. In a
+                //fromPosition game -- which is how an opening book is delivered -- the starting
+                //FEN carries its own side to move, and about half of any book's positions have
+                //Black to move. Reading the parity alone made the bot believe it was on move
+                //when it was not: it searched, got a legal move for the OTHER side, and posted
+                //it, which lichess rejects with "Not your turn, or game already over".
+                const bool starts_white = (initial_fen == "startpos") || fenSideToMoveIsWhite(initial_fen);
+                bool white_turn = starts_white ? (num_plies % 2 == 0) : (num_plies % 2 == 1);
                 bool our_turn = ((is_white && white_turn) || (!is_white && !white_turn));
                 std::cout << "HandleGame() debug: turn check - num plies: " << num_plies << ", white turn: " << white_turn << ", our turn: " << our_turn << std::endl;
                 long long wtime = state["state"].value("wtime", 0);
@@ -990,7 +1006,16 @@ void HandleGame(const std::string& game_id) {
                 std::istringstream uci_moves(moves);
                 while (uci_moves >> uci_move) num_plies++;
                 // Calculate turn
-                bool white_turn = (num_plies % 2 == 0);
+                //Whose move it is depends on the INITIAL POSITION, not just the ply count.
+                //
+                //In a standard game ply 0 is White's, so `num_plies % 2 == 0` works. In a
+                //fromPosition game -- which is how an opening book is delivered -- the starting
+                //FEN carries its own side to move, and about half of any book's positions have
+                //Black to move. Reading the parity alone made the bot believe it was on move
+                //when it was not: it searched, got a legal move for the OTHER side, and posted
+                //it, which lichess rejects with "Not your turn, or game already over".
+                const bool starts_white = (initial_fen == "startpos") || fenSideToMoveIsWhite(initial_fen);
+                bool white_turn = starts_white ? (num_plies % 2 == 0) : (num_plies % 2 == 1);
                 bool our_turn = ((is_white && white_turn) || (!is_white && !white_turn));
                 std::cout << "HandleGame() debug: turn check - num plies: " << num_plies << ", white turn: " << white_turn << ", our turn: " << our_turn << std::endl;
                 long long wtime = state.value("wtime", 0);
