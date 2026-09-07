@@ -590,6 +590,48 @@ one-hot target. That is the next piece, and it should not be written until the s
 say the data carries signal.
 
 
+### Generating targets from stored positions
+
+A training record needs a **position** and a **search**. Playing games is a slow way to get
+positions — you pay real time for both sides, the clock, the network and the opponent's
+thinking, and you get whatever positions the games happen to visit.
+
+    ./bin2fen <file.bin> [max] [min_abs_cp] [max_abs_cp] \
+      | VISIT_DUMP=targets.tsv MOVETIME=1000 STRIDE=13 ./gen_targets
+
+| source | records/night (10 h) |
+|---|---|
+| playing bot games at 1+1 | ~5,000 |
+| `gen_targets` at 3 s/position | ~11,000 |
+| `gen_targets` at 1 s/position | ~35,000 |
+
+Measured at 58 searches/min at 1000 ms, four threads.
+
+**`bin2fen` reads the `pgn_parser.cpp` format, which is NOT the training format.** It writes
+position and eval then aligns, with no PV block, while `nnue_policy_train.cpp` expects a PV
+count and move list next — so pointing the trainer at `lichess_db_broadcast_*.bin` segfaults.
+It is also LSB-first, and reading it MSB-first yields plausible-looking garbage rather than an
+error, which is how a format mismatch hides.
+
+**`STRIDE` matters more than it looks.** `bin2fen` emits every position of every game, so
+consecutive inputs differ by one move and their searches largely repeat each other. A stride
+spreads the same number of searches over far more distinct material.
+
+**`ReuseTree` is forced off** in `gen_targets`. Positions from a list are unrelated, so there is
+no subtree to inherit — but the tree would still accumulate across all of them, grow
+monotonically and hit the `Hash` ceiling, degrading every later search. Reuse is a win when
+positions follow each other in a game and a liability when they do not.
+
+**The Stockfish eval is kept but is not a target.** creatica already blends policy with eval at
+search time, and that blend beats both components (top-1 27% / 32.8% / **36.3%**) precisely
+because they carry different information; training the policy toward eval-derived targets makes
+it more eval-like and shrinks the diversity the ensemble depends on. The eval earns its place
+twice over elsewhere: **curation**, via `bin2fen`'s `|eval|` band, so expensive searches are not
+spent on decided positions; and **drift detection**, since self-distillation has no external
+corrective and falling agreement with Stockfish is how you would notice the policy drifting into
+its own blind spots.
+
+
 ## Training options
 
 Not engine settings, but the policy net the engine loads comes from `nnue_policy_train.cpp`,
