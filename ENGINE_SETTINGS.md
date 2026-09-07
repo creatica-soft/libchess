@@ -42,6 +42,8 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `ProbabilityMass` | spin | 1000 | 900–1000 | **Per-mille, not percent.** Keep only the moves whose policy priors sum to this share and drop the tail, gated before the child evaluations. `1000` keeps every move and is an exact no-op. `creatica` only — see below before changing it. |
 | `ReuseTree` | check | **true** | — | Keep the search tree between moves instead of rebuilding it, so the subtree under the move played is inherited already searched. `Ponder` implies this; this does not imply `Ponder`. Default changed to on after measurement — see below. `creatica` only. |
 | `GcThreshold` | spin | 700 | 0–1000 | Per-mille of `Hash` at which the tree is collected. Collection is O(tree) and reclaims only memory — an unreachable node is never traversed — so collecting every move paid a growing cost for nothing. `creatica` only. |
+| `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
+| `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
 | `Ponder` | check | false | — | Think on the opponent's clock. Implies `ReuseTree`, since a pondered subtree that is destroyed before the next search was wasted effort. |
 | `FinalInfoLines` | check | true | — | |
@@ -547,6 +549,47 @@ A result that looked convincing at 20 games has washed out at 64 twice in this p
 Plan the sample around the size of the effect being looked for.
 
 
+## Collecting a self-play dataset
+
+`VisitDumpFile` appends one tab-separated line per completed search:
+
+    tag \t fen \t simulations \t rootQ \t rootCP \t ponder \t "move:visits:prior ..."
+
+Every legal move appears, including those with zero visits — a move the search refused to visit
+is as much a part of the target as the one it chose, and dropping those would bias the
+distribution toward flatness. The line is written on the **raw** search result, before
+`select_best_moves()` applies its repetition-avoidance edits: those are a playing decision
+rather than something the search concluded, and training on them would teach the policy a
+heuristic instead of an evaluation.
+
+**Why this target rather than the current one.** The policy head is trained today on whether it
+picks Stockfish's PV1, and that has saturated — top-1 went 26.7% → 33.08% → 34.83% while Elo
+went +108 → +113 → level. Past roughly 33% the positions the model newly gets right are ones
+where several moves were comparable anyway, so agreeing about them means nothing over the
+board. A visit distribution instead says *how much better*, across every move, and it comes
+from a search that looked far deeper than the prior it would be teaching.
+
+**Each move's prior is recorded alongside its visits**, which lets the file answer the question
+that decides whether any of this is worth doing, before a single epoch is run: how often, and
+by how much, does the search actually disagree with the prior it started from? If it rarely
+does, the target is nearly the model's own output and training on it is an expensive no-op.
+
+    python3 visit_dump_stats.py visits.tsv
+
+reports exactly that, along with record counts, mean legal moves, and how concentrated the
+distributions are. Its verdict line is a go/no-go, not a summary.
+
+**Cost.** None to generate — these are searches the engine performs regardless. Roughly 600
+bytes a record, so a night of blitz is a few tens of MB. `lichess_bot` sets `GameTag` to the
+lichess game id at the start of each game, so a row joins to the result recorded in
+`results_<bot>.csv` — which is what a *value* target would need, as opposed to a policy one.
+
+**What is not built yet:** the training side. `nnue_policy_train.cpp` still trains against PV1
+identity; consuming a distribution means a cross-entropy against the visit shares rather than a
+one-hot target. That is the next piece, and it should not be written until the statistics above
+say the data carries signal.
+
+
 ## Training options
 
 Not engine settings, but the policy net the engine loads comes from `nnue_policy_train.cpp`,
@@ -557,9 +600,9 @@ there is no reason for them to be UCI options).
 |---|---|---|
 | `FEATURE_CACHE` | — | Directory of pre-extracted NNUE features. Removes 73% of the per-sample CPU cost; without it training runs at roughly half speed. |
 | `BUILD_CACHE` | — | Build that cache and exit. Resumable; a complete shard is skipped. ~48 min for all 28 shards. |
-| `BATCH_SIZE` | 2048 | 8192 measured fastest on MPS once the cache removes the CPU bottleneck. |
-| `CHUNK_SIZE` | 1000000 | Positions held in RAM per chunk. 250000 avoids the memory-compressor thrashing that halved throughput at the larger value. |
-| `LR_MAX` | 2e-4 | Peak learning rate. 2e-3 measured better at batch 8192; the original was roughly 5-10x too low. |
+| `BATCH_SIZE` | **8192** | Measured fastest on MPS once the cache removes the CPU bottleneck: CPU under 70%, GPU over 90%, ~80k positions/s. |
+| `CHUNK_SIZE` | **250000** | Positions held in RAM per chunk. 1000000 made the OS memory compressor thrash and halved throughput. |
+| `LR_MAX` | **2e-3** | Peak learning rate. Measured better at batch 8192; the previous 2e-4 was roughly 5-10x too low, and the two belong together. |
 | `EPOCHS` | 1 | Drives both the loop and `TOTAL_STEPS`, so the cosine is sized to the whole run. |
 | `TOTAL_STEPS` | 300M/batch | Steps the cosine anneals over. Must match the real run length or the schedule bottoms out early or never reaches its floor. |
 | `LABEL_SMOOTH` | 0 | Share of target mass spread uniformly over the legal moves. 0 is the original loss. |

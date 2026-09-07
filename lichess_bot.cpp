@@ -72,7 +72,12 @@
                         // exp((eval - max_eval)/(temperature/100)) / eval_sum
                         //can be tuned so that values < 100 sharpen the distribution and values > 100 flatten it
                         //another words, the cooler the temperature, the more distant move probabilities, and vice versa
-#define PONDER false
+//Default ON, measured: 44/64 against the same engine with pondering off, about +137 Elo at
+//5.2 standard errors, +27 =34 -3. It was off because before tree reuse existed a pondered
+//tree was destroyed by cleanup() at the next search, so pondering burned the opponent's time
+//for nothing -- hence the older "avoid using Ponder" note in the search. Reuse is what made it
+//worth anything. Override per instance with CREATICA_PONDER=0.
+#define PONDER true
 
 //The API token is read from the environment so that it never lives in the source tree.
 //Keep it outside the repository and export it before starting the bot, e.g.
@@ -124,6 +129,9 @@ const int         bot_increment = env_int("CREATICA_INC",   CLOCK_INCREMENT);
 //Per instance, so two bots running side by side do not interleave into one file.
 std::mutex results_mutex;
 const std::string results_path = env_str("CREATICA_RESULTS", ("results_" + bot_username + ".csv").c_str());
+//Where the engine appends its root visit distribution after each search. Empty disables it.
+//Per instance, so two bots do not interleave into one dataset.
+const std::string visits_path = env_str("CREATICA_VISITS", "");
 #define RESULTS_FILE results_path.c_str()
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
@@ -267,6 +275,7 @@ void setEngineOptions() {
 	for (const Spin& o : spins)
 		if (!setEngineSpin(creatica, o.name, o.value) && !complained)
 			fprintf(stderr, "  (%s = %lld therefore has no effect)\n", o.name, (long long)o.value);
+	if (!visits_path.empty()) setEngineStringOption(creatica, "VisitDumpFile", visits_path.c_str());
 	for (const Check& o : checks)
 		if (!setEngineCheck(creatica, o.name, o.value) && !complained)
 			fprintf(stderr, "  (%s = %s therefore has no effect)\n", o.name, o.value ? "true" : "false");
@@ -910,6 +919,13 @@ void ProcessEvent(const json& event) {
         }
     } else if (event.contains("type") && event["type"] == "gameStart") {
         std::string game_id = event["game"]["gameId"];
+        //Tag the visit records with this game, so a dataset row can be joined to the result the
+        //gameFinish handler writes. Without it the dump is usable for policy training but not for
+        //anything that needs the outcome -- calibrating the value mapping, for instance.
+        if (!visits_path.empty()) {
+          std::string tag = game_id;
+          setOption(creatica, "GameTag", String, (void *)tag.c_str());
+        }
         std::unique_lock<std::mutex> lock(mutex);
         if (game_id == current_game_id) {
             std::cout << "ProcessEvent() debug: ignoring duplicate gameStart for ongoing game: " << game_id << std::endl;

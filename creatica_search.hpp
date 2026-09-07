@@ -131,6 +131,10 @@ int tree_occupancy();
 extern std::atomic<size_t> total_nodes;
 extern bool reuse_tree;
 extern int64_t gc_threshold;
+//Visit-distribution dump: the AlphaZero-style policy training target, collected as a free
+//byproduct of searches that happen anyway. Empty path disables it.
+extern std::string visit_dump_path;
+extern std::string game_tag;
 extern bool validate_tree_enabled;
 //`collected` says whether a collection has just run; the reachability invariant only
 //holds then, since lazy collection deliberately leaves unreachable nodes in the map.
