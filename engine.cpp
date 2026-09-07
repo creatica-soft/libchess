@@ -26,16 +26,17 @@
 #define ENGINE_READ_TIMEOUT_MS 60000
 //Discard anything the engine has already written but nobody has read.
 //
-//A UCI engine must emit exactly one "bestmove" per "go". creatica does not always: measured in
-//a live game, 4.3% of its bestmove lines were immediate duplicates, with a SECOND complete
-//search between them (different visit counts, same conclusion). The driver reads one, and the
-//extra sits in the pipe until the next go consumes it instantly -- returning a move computed for
-//the PREVIOUS position, and leaving the reads one further out of step each time until one blocks
-//for the full ENGINE_READ_TIMEOUT_MS and the engine is declared dead.
+//A UCI engine emits exactly one "bestmove" per "go", and anything still unread when the next go
+//is sent can only belong to a previous command -- most plausibly a bestmove produced in response
+//to a "stop" that the caller did not consume. Reading it as this search's answer would return a
+//move computed for the previous position, and leave the reads one further out of step each time.
 //
-//Draining before each search makes the driver correct regardless of how many lines the engine
-//volunteered. It is a guard, not a cure: an engine emitting two bestmoves is still a bug worth
-//fixing at the source.
+//This was originally justified by an apparent 4.3% rate of duplicated bestmove lines in
+//creatica.log. That was an ARTEFACT: two bots shared one log file, and creatica ponders the
+//position where the opponent is to move -- the same position the opponent is searching for real
+//-- so two engines' identical conclusions interleaved into what looked like one engine answering
+//twice. The engines now log separately. The guard is kept because it is correct regardless, but
+//it is not evidence of a bug in the engine.
 static int drainEngine(FILE * f) {
 	if (!f) return 0;
 	const int fd = fileno(f);

@@ -1257,6 +1257,14 @@ int main(int argc, char ** argv) {
     for (const auto& w : accept_only) std::cout << " " << w;
     std::cout << std::endl;
   }
+  //Give this instance's engine its own log. The child inherits our environment, so setting it
+  //here is enough. Without it two bots share creatica.log and the interleaved result cannot be
+  //attributed to either engine.
+  if (!getenv("CREATICA_LOG")) {
+    const std::string lg = "creatica_" + bot_username + ".log";
+    setenv("CREATICA_LOG", lg.c_str(), 1);
+    std::cout << "main(): engine log -> " << lg << std::endl;
+  }
   load_opening_book(book_path);
   if (no_challenge) std::cout << "main(): --no-challenge, so we will not challenge anyone" << std::endl;
   else if (!challenge_target.empty())
