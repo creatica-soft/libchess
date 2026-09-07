@@ -91,7 +91,12 @@
 #define MAX_UCI_OPTION_NAME_LEN 32
 #define MAX_UCI_OPTION_TYPE_LEN 8
 #define MAX_UCI_OPTION_TYPE_NUM 5
-#define MAX_UCI_OPTION_STRING_LEN 32
+//256, not 32. These hold FILE PATHS -- SyzygyPath, PolicyWeights, VisitDumpFile -- and 32
+//bytes truncates any real one. It failed SILENTLY: setEngineStringOption() copies 31 bytes,
+//the engine receives a path that does not exist, and nothing reports it. A truncated
+//SyzygyPath in particular just falls back to slow online tablebase queries, which looks like
+//the engine being mysteriously sluggish in endgames rather than like a configuration error.
+#define MAX_UCI_OPTION_STRING_LEN 256
 #define MAX_UCI_OPTION_BUTTON_NUM 4
 #define MAX_UCI_OPTION_SPIN_NUM 16
 #define MAX_UCI_OPTION_CHECK_NUM 16
