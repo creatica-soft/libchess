@@ -24,6 +24,34 @@
 //death and restart it. fromEngine is opened unbuffered so poll() cannot miss a line
 //that stdio has already pulled into its own buffer.
 #define ENGINE_READ_TIMEOUT_MS 60000
+//Discard anything the engine has already written but nobody has read.
+//
+//A UCI engine must emit exactly one "bestmove" per "go". creatica does not always: measured in
+//a live game, 4.3% of its bestmove lines were immediate duplicates, with a SECOND complete
+//search between them (different visit counts, same conclusion). The driver reads one, and the
+//extra sits in the pipe until the next go consumes it instantly -- returning a move computed for
+//the PREVIOUS position, and leaving the reads one further out of step each time until one blocks
+//for the full ENGINE_READ_TIMEOUT_MS and the engine is declared dead.
+//
+//Draining before each search makes the driver correct regardless of how many lines the engine
+//volunteered. It is a guard, not a cure: an engine emitting two bestmoves is still a bug worth
+//fixing at the source.
+static int drainEngine(FILE * f) {
+	if (!f) return 0;
+	const int fd = fileno(f);
+	int dropped = 0;
+	char buf[4096];
+	for (;;) {
+		struct pollfd pfd = { fd, POLLIN, 0 };
+		if (poll(&pfd, 1, 0) <= 0) break;          //nothing pending
+		if (!(pfd.revents & POLLIN)) break;
+		if (!fgets(buf, sizeof buf, f)) break;
+		++dropped;
+		if (dropped > 4096) break;                 //never spin on a flood
+	}
+	return dropped;
+}
+
 static char * engineFgets(char * buf, int size, FILE * f) {
 	if (!f) return nullptr;
 	for (;;) {
@@ -772,6 +800,14 @@ int go(const Engine& engine, struct Evaluation ** eval) {
 	if (engine.ponder) strcat(line, " ponder");
 	if (engine.infinite) strcat(line, " infinite");
 
+	//Anything still unread belongs to a previous command, so it can only mislead this one.
+	{
+		const int stale = drainEngine(engine.fromEngine);
+		if (stale && engine.logfile) {
+			fprintf(engine.logfile, "go(): discarded %d stale line(s) before searching\n", stale);
+			fflush(engine.logfile);
+		}
+	}
 	fprintf(engine.toEngine, "%s\n", line);
 	fflush(engine.toEngine);
 	if (engine.logfile) {
