@@ -50,6 +50,13 @@ int main(int argc, char ** argv) {
     const long   maxn       = env_l("MAX",      0);     // 0 = no limit
     const long   skip       = env_l("SKIP",     0);     // resume: drop this many inputs first
     const long   stride     = env_l("STRIDE",   1);     // take every Nth input
+    // Where to record how far we got, rewritten as we go.
+    //
+    // Printing the resume point only at the end is not enough: Ctrl-C kills the whole foreground
+    // process group, so a wrapper script never gets to read it and the run's progress is lost.
+    // Writing it here means an interrupted run resumes from where it actually stopped instead of
+    // re-searching hours of positions and duplicating them in the dataset.
+    const char * progress = env_or("PROGRESS_FILE", "");
 
     if (argc > 1 && std::strcmp(argv[1], "--help") == 0) {
         std::fprintf(stderr,
@@ -109,6 +116,15 @@ int main(int argc, char ** argv) {
         if (go(eng, evaluations)) { ++failed; continue; }
         ++searched;
 
+        if (progress[0] && (searched % 50) == 0) {
+            // Write-and-rename so a kill mid-write cannot leave a truncated number behind.
+            std::string tmp = std::string(progress) + ".tmp";
+            if (FILE * pf = std::fopen(tmp.c_str(), "w")) {
+                std::fprintf(pf, "%ld\n", read);
+                std::fclose(pf);
+                std::rename(tmp.c_str(), progress);
+            }
+        }
         if ((searched % 200) == 0) {
             const double secs = std::chrono::duration<double>(
                                   std::chrono::steady_clock::now() - t0).count();
@@ -123,6 +139,14 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "  done: read %ld, searched %ld, failed %ld, %.0f s (%.1f/min)\n"
                          "  resume with SKIP=%ld\n",
                  read, searched, failed, secs, searched / (secs / 60.0), read);
+    if (progress[0]) {
+        std::string tmp = std::string(progress) + ".tmp";
+        if (FILE * pf = std::fopen(tmp.c_str(), "w")) {
+            std::fprintf(pf, "%ld\n", read);
+            std::fclose(pf);
+            std::rename(tmp.c_str(), progress);
+        }
+    }
     quit(eng);
     releaseChessEngine(eng);
     return 0;

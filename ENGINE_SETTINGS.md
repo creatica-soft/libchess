@@ -682,6 +682,47 @@ burned once by a proxy that stopped predicting strength — top-1 agreement with
 necessary condition and never a sufficient one. The decisive test remains a match.
 
 
+### Training on a visit dump
+
+    TRAIN_DATA=targets.tsv TEST_DATA=targets_val.tsv SELDEPTH_MIN=20 ./nnue_policy_train
+
+This is a **data source**, not a second trainer. The loss already does listwise cross-entropy
+over the legal moves against a sparse (index, weight) target, so a visit distribution slots
+straight in and the model, cosine schedule, feature cache, checkpointing and export are
+untouched.
+
+`load_shard()` detects a dump from its own `tag\t` header rather than from the file extension,
+because these two formats share no framing and reading one as the other yields plausible garbage
+rather than an error — which is exactly how the `pgn_parser` mismatch stayed hidden until it
+segfaulted.
+
+| variable | meaning |
+|---|---|
+| `TRAIN_DATA` | shard or dump; default `../lichess_db_pvs_eval.bin` |
+| `TEST_DATA` | validation set; must not overlap `TRAIN_DATA` |
+| `SELDEPTH_MIN` | drop records from searches shallower than this |
+
+**`SELDEPTH_MIN` is the quality dial.** On 799 broadcast records, a floor of 20 kept 523 of them
+and moved the training loss from 3.16 to 3.00 — deeper searches make more learnable targets.
+That is the reason seldepth is recorded per record instead of being fixed by the time control at
+generation time.
+
+Two things about the record semantics:
+
+**`share[]` carries the target directly.** When it is set, the weights are the search's visit
+shares and are used as-is rather than softmaxed out of centipawn scores — a share is not a
+centipawn score, so pushing it through that path would be meaningless. The bin reader sets
+`share[0] = -1` explicitly, because an uninitialised float that happened to be >= 0 would
+silently switch the target semantics on some fraction of samples with no error.
+
+**The value head is not trained.** The loss is `loss_policy` alone, so the `Value Loss: 0` the
+validation prints is an untouched accumulator, not a measurement. A dump does carry `value_q` —
+the search's own root value, already in tanh units and already side-to-move relative, so unlike a
+white-relative `eval_cp` it must not be sign-flipped for Black — and wiring it in would be
+`loss_policy + w * mse(...)`. Deliberately not done: the value side has never been measured, and
+adding an untested term to a loss that works is the wrong order.
+
+
 ## Training options
 
 Not engine settings, but the policy net the engine loads comes from `nnue_policy_train.cpp`,

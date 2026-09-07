@@ -35,6 +35,15 @@ THREADS=${THREADS:-4}
 HASH=${HASH:-2048}
 EVAL_LO=${EVAL_LO:-20}
 EVAL_HI=${EVAL_HI:-500}
+# OFFSET starts a pass part-way into the stride, so a later pass is DISJOINT from an earlier one
+# instead of overlapping it. Pass 1 at STRIDE=250 OFFSET=0 takes positions 0, 250, 500...; pass 2
+# at OFFSET=125 takes 125, 375, 625... and shares nothing with it. Halving the stride instead
+# would re-search every position already done -- stride 250 and stride 100 collide on every
+# multiple of 500 -- and you would pay full search cost for the duplicates.
+#
+# Use a separate STATE (and ideally a separate DATASET) per pass:
+#   DATASET=targets_p2.tsv STATE=.state_p2 OFFSET=125 ./build_dataset.sh 35000
+OFFSET=${OFFSET:-0}
 WANT=${1:-20000}
 
 [[ -f $STATE ]] || : > $STATE
@@ -50,16 +59,27 @@ for bin in $BINS; do
   [[ -f $bin ]] || continue
   base=${bin:t:r}
   skip=$(grep "^${base} " $STATE 2>/dev/null | tail -1 | awk '{print $2}')
-  skip=${skip:-0}
+  skip=${skip:-$OFFSET}
+  # A progress file ahead of the recorded state means the previous run was interrupted.
+  prog_pre=$STATE.$base.progress
+  if [[ -f $prog_pre ]]; then
+    p=$(cat $prog_pre 2>/dev/null)
+    [[ -n $p ]] && (( p > skip )) && { print "  (resuming from interrupted run at $p)"; skip=$p }
+  fi
   remaining=$(( WANT - done_total ))
 
   print "  === $base (resuming at input $skip, want $remaining more) ==="
+  # PROGRESS_FILE is rewritten by gen_targets as it runs, so Ctrl-C does not lose the run.
+  # Reading it back is the ONLY reliable resume point: an interrupt kills this script too, so the
+  # "resume with SKIP=" line it prints at the end never arrives.
+  prog=$STATE.$base.progress
   out=$(./bin2fen $bin 0 $EVAL_LO $EVAL_HI 2>/dev/null \
         | VISIT_DUMP=$DATASET GAME_TAG=$base MOVETIME=$MOVETIME THREADS=$THREADS \
-          HASH=$HASH MAX=$remaining SKIP=$skip STRIDE=$STRIDE ./gen_targets 2>&1)
+          HASH=$HASH MAX=$remaining SKIP=$skip STRIDE=$STRIDE PROGRESS_FILE=$prog ./gen_targets 2>&1)
   print $out | tail -2
 
   newskip=$(print $out | grep -o 'SKIP=[0-9]*' | tail -1 | cut -d= -f2)
+  [[ -z $newskip && -f $prog ]] && newskip=$(cat $prog)
   got=$(print $out | grep -o 'searched [0-9]*' | tail -1 | awk '{print $2}')
   got=${got:-0}
   if [[ -n $newskip ]]; then

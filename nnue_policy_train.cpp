@@ -168,6 +168,20 @@ struct CompressedPosition {
     int8_t to_sq[MAX_PVS];
     int8_t promo[MAX_PVS]; //writer: 0=none, 1=N, 2=B, 3=Q (unused here)
     int16_t cp[MAX_PVS]; //PV eval
+
+    //Visit-distribution targets (VISITS_TSV mode).
+    //
+    //share[0] >= 0 means the target is ALREADY a distribution -- the fraction of the search's
+    //root visits each move received -- and must be used directly rather than softmaxed out of
+    //cp. The two answer different questions: cp is Stockfish's opinion of a move, share is how
+    //much of its own ~24-ply search creatica spent on it. Pushing shares through the cp softmax
+    //would be meaningless, because a share is not a centipawn score.
+    //
+    //value_q is the search's own root value: already in tanh units and already relative to the
+    //side to move, so unlike a white-relative eval_cp it must NOT be sign-flipped for Black.
+    float   share[MAX_PVS];
+    float   value_q;
+    int16_t seldepth;
 };
 
 class BitReader {
@@ -210,8 +224,116 @@ public:
     }
 };
 
+//--- visit-distribution dumps (VISITS_TSV) ----------------------------------------------------
+//
+//Reads the tab-separated file creatica writes via VisitDumpFile:
+//    tag  fen  simulations  rootQ  rootCP  ponder  seldepth  "move:visits:prior ..."
+//
+//and turns each line into the same CompressedPosition the bin path produces, except that the
+//target is the visit distribution rather than a softmax over Stockfish's PV scores.
+//
+//Only the top MAX_PVS moves by visit count are kept. That loses very little: creatica
+//concentrates hard, typically 0.83-0.92 of its visits on one move, so sixteen entries carry
+//essentially all the mass. Moves with zero visits are dropped rather than kept at weight zero --
+//they contribute nothing to a cross-entropy and would only crowd out real entries.
+//
+//SELDEPTH_MIN exists because depth is what makes a record worth having. A shallow search mostly
+//restates the prior it started from -- measured on this engine, agreement with the prior was 71%
+//at 500ms against 64% at 3000ms, i.e. the shallow search had LESS to teach -- and it gets tactics
+//wrong, promoting to a queen where a deeper search found an underpromotion. Filtering here is why
+//seldepth is recorded per line.
+static bool parse_visit_line(const std::string& line, CompressedPosition& pos,
+                             Board& board, int seldepth_min) {
+    if (line.empty() || line.compare(0, 4, "tag\t") == 0) return false;
+
+    std::string f[8];
+    size_t start = 0;
+    for (int i = 0; i < 8; ++i) {
+        const size_t tab = line.find('\t', start);
+        if (i < 7) { if (tab == std::string::npos) return false; f[i] = line.substr(start, tab - start); start = tab + 1; }
+        else f[i] = line.substr(start);
+    }
+
+    const int seldepth = std::atoi(f[6].c_str());
+    if (seldepth < seldepth_min) return false;
+
+    //NON-ZERO means failure -- see test_pos.cpp, which prints "FAIL fen2board" on a truthy
+    //return. Testing it the other way round rejects every valid FEN and accepts every bad one.
+    if (fen2board(board, f[1].c_str()) != 0) return false;
+
+    struct MV { int from, to, promo; double visits; };
+    std::vector<MV> mv;
+    mv.reserve(48);
+    double total = 0.0;
+    size_t i = 0;
+    while (i < f[7].size()) {
+        while (i < f[7].size() && f[7][i] == ' ') ++i;
+        const size_t e = f[7].find(' ', i);
+        const std::string tok = f[7].substr(i, (e == std::string::npos) ? std::string::npos : e - i);
+        i = (e == std::string::npos) ? f[7].size() : e + 1;
+        if (tok.size() < 8) continue;                       // "a1a2:0:0" at minimum
+        const size_t c1 = tok.find(':');
+        const size_t c2 = (c1 == std::string::npos) ? std::string::npos : tok.find(':', c1 + 1);
+        if (c1 == std::string::npos || c2 == std::string::npos) continue;
+        const std::string uci = tok.substr(0, c1);
+        if (uci.size() < 4) continue;
+        const double v = std::atof(tok.substr(c1 + 1, c2 - c1 - 1).c_str());
+        if (v <= 0.0) continue;                             // zero-visit moves teach nothing
+        MV m;
+        m.from  = (uci[0] - 'a') + 8 * (uci[1] - '1');
+        m.to    = (uci[2] - 'a') + 8 * (uci[3] - '1');
+        m.promo = 0;
+        if (uci.size() > 4) {
+            switch (uci[4]) { case 'n': m.promo = 1; break; case 'b': m.promo = 2; break;
+                              case 'q': m.promo = 3; break; default: m.promo = 0; }   // rook: no code, ignored
+        }
+        if (m.from < 0 || m.from > 63 || m.to < 0 || m.to > 63) continue;
+        m.visits = v;
+        total += v;
+        mv.push_back(m);
+    }
+    if (mv.empty() || total <= 0.0) return false;
+
+    std::sort(mv.begin(), mv.end(), [](const MV& a, const MV& b) { return a.visits > b.visits; });
+    const int n = (int)std::min<size_t>(mv.size(), MAX_PVS);
+
+    //Carry the board in the record, because get() rebuilds it with board_from_record() rather
+    //than using the Board we just parsed. Filling these keeps the whole downstream path -- the
+    //feature cache included -- identical for both data sources.
+    for (int sq = 0; sq < 64; ++sq) pos.piecesOnSquares[sq] = (uint8_t)board.piecesOnSquares[sq];
+    pos.castling_rights = (int8_t)board.castlingRights;
+    pos.ep_file         = (int8_t)board.enPassant;
+    pos.side_to_move = (int8_t)board.sideToMove;
+    pos.eval_cp      = (int16_t)std::atoi(f[4].c_str());
+    pos.value_q      = (float)std::atof(f[3].c_str());
+    pos.seldepth     = (int16_t)seldepth;
+    pos.pvs          = (int8_t)(n - 1);                     // the field holds count-1
+    for (int k = 0; k < MAX_PVS; ++k) {
+        if (k < n) {
+            pos.from_sq[k] = (int8_t)mv[k].from;
+            pos.to_sq[k]   = (int8_t)mv[k].to;
+            pos.promo[k]   = (int8_t)mv[k].promo;
+            pos.cp[k]      = 0;                             // unused on this path
+            pos.share[k]   = (float)(mv[k].visits / total);
+        } else {
+            pos.from_sq[k] = pos.to_sq[k] = pos.promo[k] = 0;
+            pos.cp[k] = 0;
+            pos.share[k] = 0.0f;
+        }
+    }
+    return true;
+}
+
 bool read_next_position(BitReader& reader, CompressedPosition& pos) {
     if (reader.eof()) return false;
+
+    //Disable the direct-distribution path for records read from a bin shard. share[] is
+    //otherwise uninitialised, and an arbitrary float that happens to be >= 0 would silently
+    //switch the target from "softmax over Stockfish PV scores" to "a distribution made of
+    //garbage" -- with no error, on some fraction of samples.
+    pos.share[0] = -1.0f;
+    pos.value_q  = 0.0f;
+    pos.seldepth = 0;
 
     // 1. Clear the board
     std::fill(std::begin(pos.piecesOnSquares), std::end(pos.piecesOnSquares), 7); //PieceNone
@@ -341,10 +463,48 @@ public:
     static const bool on = std::getenv("PROFILE_GET") != nullptr;
     return on;
   }
+  //Visit-distribution dump. Produces the same CompressedPosition records as a shard, except
+  //they carry share[] -- the search's own visit distribution -- which get() uses directly
+  //instead of softmaxing a target out of Stockfish's centipawn scores.
+  static std::shared_ptr<std::vector<CompressedPosition>>
+  load_visits(const std::string& filepath, size_t max_samples = 0) {
+    const char* sd = std::getenv("SELDEPTH_MIN");
+    const int seldepth_min = (sd && *sd) ? std::atoi(sd) : 0;
+    std::ifstream file(filepath);
+    if (!file.is_open()) throw std::runtime_error("Could not open " + filepath);
+    auto out = std::make_shared<std::vector<CompressedPosition>>();
+    CompressedPosition pos;
+    Board board;
+    std::string line;
+    size_t lines = 0, kept = 0, rejected = 0;
+    while (std::getline(file, line)) {
+      ++lines;
+      if (parse_visit_line(line, pos, board, seldepth_min)) { out->push_back(pos); ++kept; }
+      else if (!line.empty() && line.rfind("tag\t", 0) != 0) ++rejected;
+      if (max_samples > 0 && out->size() >= max_samples) break;
+    }
+    std::cout << "Loaded " << kept << " visit records from " << lines << " lines ("
+              << rejected << " rejected";
+    if (seldepth_min > 0) std::cout << ", SELDEPTH_MIN=" << seldepth_min;
+    std::cout << ")\n";
+    if (kept == 0) throw std::runtime_error("no usable records in " + filepath);
+    return out;
+  }
+
   //Decode a whole shard. Kept as a free function so the builder and the chunked path can
   //share it without constructing a dataset.
   static std::shared_ptr<std::vector<CompressedPosition>>
   load_shard(const std::string& filepath, size_t max_samples = 0) {
+    //A visit dump is detected from its own header rather than from the file extension, so a
+    //renamed file cannot be silently fed to the wrong decoder. The two formats share no framing,
+    //and reading one as the other yields plausible garbage rather than an error -- which is
+    //exactly how the pgn_parser/trainer format mismatch hid until it segfaulted.
+    {
+      std::ifstream probe(filepath);
+      std::string first;
+      if (probe && std::getline(probe, first) && first.rfind("tag\t", 0) == 0)
+        return load_visits(filepath, max_samples);
+    }
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) throw std::runtime_error("Could not open file!");
     auto out = std::make_shared<std::vector<CompressedPosition>>();
@@ -538,11 +698,15 @@ public:
     //float normalized_score = std::max(-1000.0f, std::min(1000.0f, (float)pos.eval_cp));
     //normalized_score /= 1000.0f; // Range -1.0 to 1.0; negative score - white's loosing, positive - white's winning 
     //instead of linear clamping, use sigmoid
-    float normalized_score = tanh(static_cast<float>(pos.eval_cp) / eval_scale);
+    //With a visit dump the value target is the search's own root Q: already in tanh units and
+      //already relative to the side to move, so neither the tanh nor the Black flip applies.
+      const bool have_q = (pos.share[0] >= 0.0f);
+      float normalized_score = have_q ? pos.value_q
+                                      : tanh(static_cast<float>(pos.eval_cp) / eval_scale);
     
     // Important: If side_to_move is Black, but eval is from White's perspective, flip it!
     // NNUE usually trains on "Eval from Side-to-Move's perspective", so we do the same for our CNN
-    if (is_black) normalized_score = -normalized_score;
+    if (is_black && !have_q) normalized_score = -normalized_score;
     torch::Tensor value_target = torch::tensor({normalized_score}, torch::kFloat32);
 
     // Policy target, now JOINT. Each PV is one (from,to) index into the 64x64 table
@@ -576,7 +740,13 @@ public:
         float cp_clamped = std::max(-1000.0f, std::min(1000.0f, cp_i));
         scores[i] = cp_clamped / (100.0f * policy_temperature);
       }
-      if (num_pvs == 1) {
+      if (pos.share[0] >= 0.0f) {
+        //Already a distribution; renormalise over whatever survived the legality check.
+        float sum = 0.0f;
+        for (int i = 0; i < num_pvs; ++i) sum += (pv_idx[i] >= 0.0f) ? pos.share[i] : 0.0f;
+        for (int i = 0; i < num_pvs; ++i)
+          pv_prob[i] = (sum > 0.0f && pv_idx[i] >= 0.0f) ? pos.share[i] / sum : 0.0f;
+      } else if (num_pvs == 1) {
         pv_prob[0] = 1.0f;
       } else {
         float max_score = scores[0];   // PV1 is best by construction
@@ -624,6 +794,12 @@ std::vector<std::string> get_data_files(const std::string& base_path) {
 
   // Check for numbered splits: base_1.bin, base_2.bin...
   // We assume the extension is .bin and the prefix is everything before .bin
+  //
+  // A visit dump has no numbered siblings, and probing for base_1.bin beside a .tsv would
+  // silently pick up an unrelated shard if one existed -- mixing two target semantics in one
+  // run with nothing in the output to say so.
+  if (base_path.size() < 4 || base_path.compare(base_path.size() - 4, 4, ".bin") != 0)
+    return files;
   std::string path_no_ext = base_path.substr(0, base_path.find_last_of("."));
   
   int index = 1;
@@ -951,12 +1127,17 @@ int main() {
     //scaling argument says a larger batch wants a LARGER step, not a smaller one.
     const double LR_MAX = env_d("LR_MAX", learning_rate); 
     const double LR_MIN = 1e-5;
-    const std::string base_data_path = "../lichess_db_pvs_eval.bin";
+    //TRAIN_DATA / TEST_DATA override the defaults, which is what lets this train on a visit
+    //dump (targets.tsv) rather than the PV shards. The format is detected from the file's own
+    //header inside load_shard(), not from its name, so either kind of file works here.
+    const char * td_env = std::getenv("TRAIN_DATA");
+    const std::string base_data_path = (td_env && *td_env) ? td_env : "../lichess_db_pvs_eval.bin";
     //Was ../Downloads/lichess_db_broadcast_2026-02.bin - a PRE-PV-format file read by
     //the PV-aware reader, so every validation number this trainer has ever printed was
     //computed on garbage. lichess_db_pv_eval_test.bin is the same format as training and
     //cannot leak into it: get_data_files() only matches the base name plus _1..29.bin.
-    const std::string test_data_path = "../lichess_db_pvs_eval_test.bin";
+    const char * vd_env = std::getenv("TEST_DATA");
+    const std::string test_data_path = (vd_env && *vd_env) ? vd_env : "../lichess_db_pvs_eval_test.bin";
     //Overridable so a differently-shaped model can be trained without colliding with the
     //current one. The architecture is also encoded in every checkpoint name, and the size
     //guard on load refuses a checkpoint trained for other dimensions, so the two cannot be
@@ -1283,6 +1464,16 @@ int main() {
                     //Policy only: NNUE supplies the value, better than anything trainable
                     //alongside it. Nothing to weight against, so the loss IS the policy
                     //cross-entropy. Random baseline is log(~29) = 3.37.
+                    //Policy only. The value head exists and is fed a target, but no value term
+                    //is added here, so it is not trained -- and the "Value Loss: 0" the
+                    //validation prints is an untouched accumulator, not a measurement. Worth
+                    //knowing before reading anything into that line.
+                    //
+                    //A visit dump carries value_q, the search's own root value, which is a
+                    //better value target than a single static eval; wiring it in would be
+                    //`loss_policy + w * mse(value_pred, value_target)`. Not done, because the
+                    //value side has never been measured and adding an untested term to a loss
+                    //that currently works is the wrong order to do things in.
                     auto loss = loss_policy;
         
                     loss.backward();
