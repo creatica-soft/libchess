@@ -1407,14 +1407,26 @@ void undo_move(Board& board, const Move& move, const StateInfo& state) {
 		srcRookSquare = lsBit(board.castlingRooks & base_rank_bb[board.sideToMove]);
 	}
 	if (srcRookSquare != SquareNone) {
-		//restore castling rook in its source square
-		board.piecesOnSquares[srcRookSquare] = castlingRook[board.sideToMove];
-		uint64_t bitSq = SQ_BIT(srcRookSquare);
+		//Clear the rook's DESTINATION before restoring it to its SOURCE, which is the same order
+		//do_move() and ff_move() use. It matters only in Chess960, and only there because the two
+		//squares can be THE SAME: castling queenside with the rook already on d1/d8, or kingside
+		//with it already on f1/f8, leaves the rook exactly where it started. Restoring first and
+		//clearing second then deleted it from the mailbox -- the square was written with the rook
+		//and immediately overwritten with PieceNone.
+		//
+		//The bitboards survived it, because the two XORs of the same bit cancel. That is why this
+		//was invisible to every count-based test: all 960 start positions pass perft to depth 4
+		//against Stockfish, in all three make modes, with the bug present. Only reconcile() sees
+		//it -- and it matters because piecesOnSquares[] is what NNUE reads, so the evaluation
+		//would have been taken from a board with a rook missing.
+		const Square rookDstSquare = castlingRookSquare[board.sideToMove][move.type - 1];
+		board.piecesOnSquares[rookDstSquare] = PieceNone;
+		uint64_t bitSq = SQ_BIT(rookDstSquare);
 		board.side[board.sideToMove] ^= bitSq;
 		board.pieceTypes[Rook - 1] ^= bitSq;
-		//and remove it from its destination square
-		board.piecesOnSquares[castlingRookSquare[board.sideToMove][move.type - 1]] = PieceNone;
-		bitSq = SQ_BIT(castlingRookSquare[board.sideToMove][move.type - 1]);
+		//restore castling rook in its source square
+		board.piecesOnSquares[srcRookSquare] = castlingRook[board.sideToMove];
+		bitSq = SQ_BIT(srcRookSquare);
 		board.side[board.sideToMove] ^= bitSq;
 		board.pieceTypes[Rook - 1] ^= bitSq;
 	}
