@@ -39,10 +39,12 @@ rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8 ;D1 44 ;D2 1486 ;D3 62
 r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10 ;D1 46 ;D2 2079 ;D3 89890 ;D4 3894594 ;D5 164075551
 
 # --- Chess960 ---
-# Deliberately absent. libchess encodes 960 castling as king-takes-own-rook
-# (board.cpp:692/705), so any 960 line must be generated against Stockfish with
-# 'setoption name UCI_Chess960 value true' before it is trusted. Do not add
-# recalled numbers here: a wrong expectation would be indistinguishable from a
-# generator bug. Note also fen.cpp:175 - fen2board() never clears
-# board.isChess960 - so only ./perft (fresh Board per FEN) is safe to mix
+# Lives in its own file now: perft_suite_960.txt, all 960 start positions with
+# counts generated against Stockfish under UCI_Chess960, exactly as the old note
+# here demanded. Run it with -f (a positional argument containing '/' is read as
+# a FEN, not a filename).
+# libchess encodes 960 castling as king-takes-own-rook (board.cpp:692/705), which
+# is also what Stockfish prints with UCI_Chess960 on, so --divide output lines up.
+# The old caveat that fen2board() never clears board.isChess960 no longer holds -
+# fen.cpp does reset it per parse - but ./perft still uses a fresh Board per FEN
 # Shredder FENs with standard ones.
