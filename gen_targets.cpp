@@ -41,7 +41,11 @@ static long env_l(const char * k, long d) {
 
 int main(int argc, char ** argv) {
     const char * enginePath = env_or("CREATICA_ENGINE", "/Users/ap/libchess/creatica");
-    const char * dumpPath   = env_or("VISIT_DUMP",      "targets.tsv");
+    // Defaults to EMPTY, meaning "no dump, report on stdout". An empty environment variable is
+    // indistinguishable from an unset one here, so VISIT_DUMP= could not have selected that mode
+    // if the default were a filename -- it would silently fall back to writing targets.tsv and
+    // print nothing, which is exactly what happened the first time.
+    const char * dumpPath   = env_or("VISIT_DUMP",      "");
     const char * tag        = env_or("GAME_TAG",        "positions");
     const char * syzygy     = env_or("SYZYGY_PATH",     "/Users/ap/syzygy");
     const long   movetime   = env_l("MOVETIME", 3000);
@@ -75,8 +79,10 @@ int main(int argc, char ** argv) {
     initChessEngine(eng, enginePath, movetime, 0, (int)hash_mb, (int)threads,
                     syzygy, 1, false, false, 0);
 
-    setEngineStringOption(eng, "VisitDumpFile", dumpPath);
-    setEngineStringOption(eng, "GameTag",       tag);
+    if (dumpPath[0]) {
+        setEngineStringOption(eng, "VisitDumpFile", dumpPath);
+        setEngineStringOption(eng, "GameTag",       tag);
+    }
     // Off by default: at any stride above 1 the positions are from different games, so there is
     // no subtree to inherit and the tree would merely accumulate. At STRIDE=1 they ARE
     // consecutive plies and reuse is worth having -- set REUSE=1.
@@ -115,6 +121,22 @@ int main(int argc, char ** argv) {
         // the pacing we want: one search per position, no queueing.
         if (go(eng, evaluations)) { ++failed; continue; }
         ++searched;
+
+        // With no VISIT_DUMP the engine is not creatica and cannot dump anything, so report its
+        // choice on stdout instead. That makes this a generic "search these positions with this
+        // engine" tool -- which is how Stockfish gets used as an ARBITER over the mistake set.
+        //
+        // Its verdict is not a training target. Agreement with Stockfish across all positions is
+        // the metric that saturated (top-1 26.7% -> 33.08% -> 34.83% while Elo went +108 -> +113
+        // -> level). On the narrow set where creatica's deep search overruled its own shallow one,
+        // it answers a different and still-useful question: is the move genuinely good, or do both
+        // creatica searches share an NNUE blind spot? The second kind must not be trained on.
+        if (!dumpPath[0]) {
+            std::printf("%s\t%s\t%d\n", line,
+                        evaluations[0]->bestmove[0] ? evaluations[0]->bestmove : "(none)",
+                        evaluations[0]->scorecp);
+            std::fflush(stdout);
+        }
 
         if (progress[0] && (searched % 50) == 0) {
             // Write-and-rename so a kill mid-write cannot leave a truncated number behind.

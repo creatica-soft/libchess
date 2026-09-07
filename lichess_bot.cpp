@@ -4,6 +4,7 @@
 #include <iostream>
 #include <string>
 #include <sstream>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -126,12 +127,69 @@ const bool        bot_ponder   = env_bool("CREATICA_PONDER", PONDER);
 //instance has no effect.
 const int         bot_clock     = env_int("CREATICA_CLOCK", CLOCK_LIMIT);
 const int         bot_increment = env_int("CREATICA_INC",   CLOCK_INCREMENT);
+const std::string book_path   = env_str("CREATICA_BOOK", "");
+//Opponent rating band. Overridable because the right band depends on what the games are FOR.
+//
+//For measuring strength you want opponents near creatica's own rating -- games against much
+//weaker or much stronger bots carry little information per game.
+//
+//For collecting TRAINING data the opposite is true: games against stronger opponents contain
+//more of creatica's mistakes, and a mistake is the only thing a distillation target can teach.
+//An easy win produces a long sequence of positions where the search agrees with the prior and
+//there is nothing to learn.
+const int         min_elo       = env_int("CREATICA_MIN_ELO", MIN_ELO);
+const int         max_elo       = env_int("CREATICA_MAX_ELO", MAX_ELO);
 //Per instance, so two bots running side by side do not interleave into one file.
 std::mutex results_mutex;
 const std::string results_path = env_str("CREATICA_RESULTS", ("results_" + bot_username + ".csv").c_str());
 //Where the engine appends its root visit distribution after each search. Empty disables it.
 //Per instance, so two bots do not interleave into one dataset.
 const std::string visits_path = env_str("CREATICA_VISITS", "");
+
+//--- opening book -----------------------------------------------------------------------------
+//
+//Two bots running the same engine and settings play very similar games from the start position,
+//so a night of self-play revisits a handful of lines. That wastes the games twice: as an Elo
+//measurement the effective sample is far smaller than the game count, and as training data the
+//positions are mostly duplicates, each of which cost a full search to produce.
+//
+//CREATICA_BOOK points at the file make_book.py writes from eco.pgn: "fen<TAB>eco<TAB>name<TAB>plies".
+//Only the FEN is used here.
+//
+//Each opening is played TWICE, colours swapped. Paired sampling like this removes whatever
+//advantage the position itself carries, which is the largest single source of variance in a
+//short match -- without it, an unbalanced opening dealt to one side is indistinguishable from
+//that side being stronger.
+std::vector<std::string> opening_book;
+std::atomic<long> games_started{0};   //advanced only when a game actually STARTS
+//The opponent of the first leg of a pair, so the second leg can go to the SAME bot.
+//
+//Without this, a randomly chosen opponent differs between the two legs, and the colour swap
+//cancels nothing -- you have changed the position's owner AND the opponent at once. Pairing is
+//only meaningful against a fixed opponent, which --challenge=<user> gives for free and random
+//selection does not.
+std::string pair_opponent;
+std::mutex  pair_mutex;
+
+static void load_opening_book(const std::string& path) {
+  if (path.empty()) return;
+  std::ifstream f(path);
+  if (!f) { std::cerr << "opening book: cannot read " << path << std::endl; return; }
+  std::string line;
+  while (std::getline(f, line)) {
+    const size_t tab = line.find('\t');
+    std::string fen = (tab == std::string::npos) ? line : line.substr(0, tab);
+    if (fen.size() > 10) opening_book.push_back(fen);
+  }
+  //Shuffled once, then walked in order. Picking at random each time would revisit some
+  //openings and never reach others; walking a shuffled list covers the book evenly while still
+  //differing between runs.
+  std::srand((unsigned)time(nullptr));
+  for (size_t i = opening_book.size(); i > 1; --i)
+    std::swap(opening_book[i - 1], opening_book[(size_t)rand() % i]);
+  std::cout << "opening book: " << opening_book.size() << " positions from " << path
+            << " (shuffled; each played twice, colours swapped)" << std::endl;
+}
 #define RESULTS_FILE results_path.c_str()
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
@@ -432,11 +490,36 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
     }
     std::string url = "https://lichess.org/api/challenge/" + opponent;
     std::stringstream fields;
+    //Pick the opening and the colour together. Each book position is played TWICE with the
+    //colours swapped, so the position's own bias cancels instead of being credited to whichever
+    //side happened to receive it -- the largest single source of variance in a short match.
+    std::string use_colour = color, use_fen;
+    if (!opening_book.empty()) {
+      //Derived from the number of games STARTED, not from a counter this function advances.
+      //
+      //An earlier version flipped a leg counter on every challenge SENT, so a challenge that was
+      //declined, expired or failed silently consumed a leg -- after which the pairing was
+      //desynchronised (opening X as White, opening Y as Black) with nothing to show it. Deriving
+      //both values from a counter that only moves when a game really begins makes a failed
+      //challenge cost nothing: the next attempt asks for exactly the same position and colour.
+      const long g = games_started.load(std::memory_order_relaxed);
+      use_fen    = opening_book[(size_t)((g / 2) % (long)opening_book.size())];
+      use_colour = (g % 2 == 0) ? "white" : "black";
+    }
+
     fields << "rated=" << (rated ? "true" : "false")
            << "&clock.limit=" << time_sec
            << "&clock.increment=" << inc_sec
-           << "&color=" << color
-           << "&variant=" << variant;
+           << "&color=" << use_colour;
+    if (!use_fen.empty()) {
+      //A FEN contains spaces and slashes, so it must be percent-encoded or the POST body is
+      //truncated at the first space and lichess rejects the challenge.
+      char * esc = curl_easy_escape(nullptr, use_fen.c_str(), 0);
+      fields << "&variant=fromPosition&fen=" << (esc ? esc : "");
+      if (esc) curl_free(esc);
+    } else {
+      fields << "&variant=" << variant;
+    }
     std::string postfields = fields.str();
 
     std::string response;
@@ -498,7 +581,7 @@ void GetAndProcessBots(int nb) {
                           if (bot_username == data.value("username", "")) continue; //don't challenge itself
                           if (data.contains("perfs") && data["perfs"].contains("blitz")) {
                               int rating = data["perfs"]["blitz"].value("rating", 0);
-                              if ((rating > MIN_ELO && rating < MAX_ELO) || data.value("username", "") == "creaticachessbot2") {
+                              if ((rating > min_elo && rating < max_elo) || data.value("username", "") == "creaticachessbot2") {
                                   Bot bot;
                                   bot.botname = data.value("username", "");
                                   bot.games = data["perfs"]["blitz"].value("games", 0);
@@ -549,6 +632,14 @@ void GetAndProcessBots(int nb) {
                 } else tried_bots.emplace(i);
               }
               std::string botname = bots[i].botname;
+              //Second leg of a pair: re-challenge whoever played the first, so the only thing
+              //that changed between the two games is which side of the position we hold.
+              if (!opening_book.empty()) {
+                std::lock_guard<std::mutex> lk(pair_mutex);
+                const long g = games_started.load(std::memory_order_relaxed);
+                if ((g % 2) == 1 && !pair_opponent.empty()) botname = pair_opponent;
+                else pair_opponent = botname;
+              }
               std::cout << "Bot " << i << " name " << botname << ". Elo " << bots[i].elo << " +/- " << bots[i].rd << " after " << bots[i].games << " games." << std::endl; 
               std::string challengeId;
               res = CreateChallenge(botname, challenge_rated, bot_clock, bot_increment, challengeId);
@@ -919,6 +1010,7 @@ void ProcessEvent(const json& event) {
         }
     } else if (event.contains("type") && event["type"] == "gameStart") {
         std::string game_id = event["game"]["gameId"];
+        games_started.fetch_add(1, std::memory_order_relaxed);
         //Tag the visit records with this game, so a dataset row can be joined to the result the
         //gameFinish handler writes. Without it the dump is usable for policy training but not for
         //anything that needs the outcome -- calibrating the value mapping, for instance.
@@ -1072,6 +1164,7 @@ int main(int argc, char ** argv) {
     for (const auto& w : accept_only) std::cout << " " << w;
     std::cout << std::endl;
   }
+  load_opening_book(book_path);
   if (no_challenge) std::cout << "main(): --no-challenge, so we will not challenge anyone" << std::endl;
   else if (!challenge_target.empty())
     std::cout << "main(): challenging only " << challenge_target
