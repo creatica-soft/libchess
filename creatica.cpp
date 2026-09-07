@@ -59,6 +59,8 @@ extern double    probability_mass;
 extern bool      reuse_tree;
 extern int64_t   gc_threshold;
 void gc_join();
+extern std::string visit_dump_path;
+extern std::string game_tag;
 extern bool      validate_tree_enabled;
 
 extern std::mutex mtx, log_mtx, print_mtx, pool_mutex, search_done_mtx, probe_mutex;
@@ -415,6 +417,10 @@ public:
         // Per-mille of Hash at which the tree is collected. Collection is O(tree) and only
         // reclaims memory, so running it every move paid a growing cost for nothing.
         o.spin("GcThreshold", &gc_threshold, 700, 0, 1000);
+        // Where to append the root visit distribution after each search, and a tag written on
+        // every line so records can be joined back to a game and its result. Empty = off.
+        o.string("VisitDumpFile", &visit_dump_path, "");
+        o.string("GameTag",       &game_tag,        "");
         o.check("ValidateTree", &validate_tree_enabled, false);
     }
 

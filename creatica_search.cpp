@@ -251,6 +251,25 @@ void cleanup() {
 //and tests membership, which touches nothing.
 bool validate_tree_enabled = false;
 
+//--- visit-distribution dump ------------------------------------------------------------------
+//
+//Writes the root's visit distribution after every completed search: the position, and how many
+//visits the search gave each legal move.
+//
+//This is the training target AlphaZero uses, and it is a far richer signal than the one the
+//policy head is trained on today. Training against "did we pick Stockfish's PV1" saturated --
+//top-1 went 26.7% -> 33.1% -> 34.8% while Elo went +108 -> +113 -> level, because past a point
+//the positions the model newly gets right are ones where several moves were comparable anyway.
+//A visit distribution says *how much better*, over every move, and it comes from a search that
+//looked deeper than the prior it is teaching.
+//
+//It is a byproduct of searches that are happening regardless, so it costs nothing to collect.
+//Written from select_best_moves(), which runs after the workers have been joined -- single
+//threaded, so no locking is needed beyond keeping two engine processes out of one file (give
+//each its own path).
+std::string   visit_dump_path;   //empty disables it entirely
+std::string   game_tag;          //set per game by the driver, so records can be joined to results
+
 //Tree occupancy in per-mille of the configured Hash, from counters already maintained -- O(1),
 //no walk, so it is safe to consult before deciding whether a walk is worth doing.
 int tree_occupancy() {
@@ -637,6 +656,55 @@ int most_visited_child(const MCTSNode * parent) {
 
 //no locking, call only when search threads finished
 //called from runMCTS()
+//One line per search. Tab-separated, because a FEN contains spaces:
+//  tag \t fen \t simulations \t rootQ \t rootCP \t ponder \t seldepth \t "move:N:prior ..."
+//
+//The move list is EVERY legal move with its visit count, including zeros -- a move the search
+//refused to visit is as much a part of the target as the one it chose, and dropping those would
+//bias the distribution toward flatness.
+static void dump_visits(const std::vector<std::tuple<uint64_t, int>>& visits, const Edge * children) {
+  if (visit_dump_path.empty() || !search.root) return;
+  FILE * f = fopen(visit_dump_path.c_str(), "a");
+  if (!f) return;
+
+  //Header once, so the file explains itself.
+  fseek(f, 0, SEEK_END);
+  if (ftell(f) == 0) fprintf(f, "tag\tfen\tsimulations\trootQ\trootCP\tponder\tseldepth\tvisits\n");
+
+  char fen[MAX_FEN_STRING_LEN];
+  const uint64_t rootN = search.root->N.load(std::memory_order_relaxed);
+  const double   rootW = search.root->W.load(std::memory_order_relaxed);
+  //seldepth is recorded because simulation count alone does not say how far the search
+  //actually looked, and depth is what decides whether a record teaches anything a shallow
+  //search could not. It lets the trainer weight or filter by the quality of each record.
+  fprintf(f, "%s\t%s\t%llu\t%.6f\t%d\t%d\t%d\t",
+          game_tag.empty() ? "-" : game_tag.c_str(),
+          board2fen(board, fen),
+          (unsigned long long)rootN,
+          rootN ? rootW / (double)rootN : 0.0,
+          search.root->cp.load(std::memory_order_relaxed),
+          chessEngine.ponder ? 1 : 0,
+          seldepth.load(std::memory_order_relaxed));
+
+  char uci[6];
+  bool first = true;
+  for (const auto& v : visits) {
+    const int idx = std::get<1>(v);
+    idx2uci(children[idx].move.load(std::memory_order_relaxed), uci);
+    //move:visits:prior. The prior is what the policy head believed BEFORE the search; the visits
+    //are what the search concluded after looking deeper. Recording both makes the file answer the
+    //question that decides whether distillation is worth doing at all -- how often, and by how
+    //much, does the search actually disagree with the prior it started from? If it rarely does,
+    //there is nothing here to teach and no amount of training will help.
+    fprintf(f, "%s%s:%llu:%.6f", first ? "" : " ", uci,
+            (unsigned long long)std::get<0>(v),
+            children[idx].P.load(std::memory_order_relaxed));
+    first = false;
+  }
+  fprintf(f, "\n");
+  fclose(f);
+}
+
 int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) { 
   int num_children = search.root->num_children.load(std::memory_order_relaxed);
   if (!num_children) {
@@ -662,6 +730,10 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
     if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
     return std::get<1>(a) < std::get<1>(b);
   });
+  //Dumped HERE, on the raw search result. The loop below can drop moves (the repetition-avoidance
+  //in winning positions), and those edits are a playing decision rather than something the search
+  //concluded -- training on them would teach the policy a heuristic instead of an evaluation.
+  dump_visits(visits, children);
   while (visits.size() > 1) {
     int idx = std::get<1>(visits[0]); //index of the most visited child
     int next_idx = std::get<1>(visits[1]); //index of the next most visited child
