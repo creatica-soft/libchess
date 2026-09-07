@@ -190,6 +190,10 @@ std::atomic<int> pool_generation{0};   // Increments every new search
 std::atomic<int> active_workers{0};    // Count of currently working threads
 std::atomic<bool> search_done{false}; // Signals search completion
 std::atomic<uint64_t> total_children{0};
+//Unlinked from the tree but not yet freed by the reaper (declared further down). Defined here
+//because tree_occupancy() counts them: that memory is still held by the process.
+std::atomic<size_t>   reap_pending{0};
+std::atomic<uint64_t> reap_pending_edges{0};
 std::atomic<uint64_t> tbhits{0};
 std::atomic<int> generation{0};
 std::atomic<int> hash_full{0};
@@ -225,7 +229,8 @@ MCTSSearch search;
 std::vector<std::thread> pool_threads;
 std::vector<ThreadParams> pool_params;
 
-void gc_join();         //both defined with the collector below
+void gc_join();         //all three defined with the collector below
+void reap_drain();      //waits for the deferred frees; defined with the reaper below
 void cleanup_locked();
 
 //The body, with no join. Callable from the background collector itself, which must not try
@@ -247,6 +252,10 @@ void cleanup_locked() {
 void cleanup() {
   gc_join();
   cleanup_locked();
+  //Wait for the deferred frees too. The reaper's nodes are disjoint from the map, so this is not
+  //needed for safety -- it is needed so that "cleanup" means the memory is actually back before
+  //a new game starts filling the tree again.
+  reap_drain();
 }
 
 //we run gc() in runMCTS() before starting search threads, so no locking
@@ -290,8 +299,14 @@ std::string   game_tag;          //set per game by the driver, so records can be
 //Tree occupancy in per-mille of the configured Hash, from counters already maintained -- O(1),
 //no walk, so it is safe to consult before deciding whether a walk is worth doing.
 int tree_occupancy() {
-  const size_t total_memory = total_nodes.load(std::memory_order_relaxed) * (sizeof(MCTSNode) + 24)
-                            + (size_t)total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+  //Nodes already unlinked but not yet freed by the reaper still hold their memory, so they are
+  //counted here. Leaving them out would report room the process does not have, and the engine
+  //would keep expanding into it.
+  const size_t total_memory =
+      (total_nodes.load(std::memory_order_relaxed) + reap_pending.load(std::memory_order_relaxed))
+          * (sizeof(MCTSNode) + 24)
+    + (size_t)(total_children.load(std::memory_order_relaxed)
+               + reap_pending_edges.load(std::memory_order_relaxed)) * sizeof(Edge);
   const size_t max_capacity = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
   return max_capacity ? (int)((total_memory * 1000) / max_capacity) : 0;
 }
@@ -425,8 +440,98 @@ std::atomic<bool> gc_abort{false};
 //is no work there to defer.
 std::atomic<double> last_gc_freed{1.0};   //start optimistic so the first collection always runs
 #define GC_MIN_YIELD 0.05                 //below this the previous collection was not worth its cost
+#define GC_MAX_SKIPS 4                    //but re-check this often, so a stale verdict cannot starve collection
 
 void gc(MCTSNode * from = nullptr);
+
+//--- deferred reclamation: the reaper ---------------------------------------------------------
+//
+//The sweep used to do two unrelated jobs in one pass, and only one of them is urgent.
+//
+//UNLINKING a dead node from search.tree is urgent: the search must not be able to find it.
+//FREEING its memory is not urgent at all, and it is where all the time went. Measured on a live
+//pair of bots: 384 collections costing 354 s in total, 102 of them over a second, the worst
+//36.6 s -- and that one freed about 8.9 million nodes, which is 8.9 million delete calls plus a
+//delete[] per Edge array, all of it inline before the search was allowed to start, on a machine
+//already deep in swap. The cost tracks how many nodes DIE, not how big the tree is, so it spikes
+//exactly when the game leaves the reused subtree and orphans most of the tree at once.
+//
+//So the sweep now only unlinks, and hands the corpses to this thread to free while the search
+//runs. That is safe for a precise reason, and the reason is worth stating because it is the
+//whole justification:
+//
+//  * A node reaches the reaper only after search.tree.erase(), and make_child() finds nodes by
+//    HASH LOOKUP in that map. Once erased it can never be handed out again.
+//  * A COMPLETED mark guarantees no surviving node points at a dead one: if one did, the dead
+//    node would have been reachable from the root and would have been marked. The mark is still
+//    all-or-nothing -- an aborted mark sweeps nothing -- so this holds whenever we get here.
+//
+//Therefore nothing the search can reach touches these nodes, and freeing them concurrently with
+//the search is not a race. What is NOT safe is letting them outlive the map they came from
+//unaccounted, so reap_pending keeps their memory in the occupancy figure until it is really gone.
+std::mutex                           reap_mtx;
+std::condition_variable              reap_cv;
+std::vector<std::vector<MCTSNode *>> reap_queue;
+std::thread                          reap_thread;
+std::atomic<bool>                    reap_quit{false};
+
+static void reaper_func() {
+  for (;;) {
+    std::vector<MCTSNode *> batch;
+    {
+      std::unique_lock<std::mutex> lk(reap_mtx);
+      reap_cv.wait(lk, [] { return reap_quit.load(std::memory_order_relaxed) || !reap_queue.empty(); });
+      if (reap_queue.empty()) return;              //asked to quit with nothing left to do
+      batch = std::move(reap_queue.front());
+      reap_queue.erase(reap_queue.begin());
+    }
+    uint64_t edges = 0;
+    for (MCTSNode * n : batch) {
+      const int nc = n->num_children.load(std::memory_order_relaxed);
+      if (nc > 0) edges += (uint64_t)nc;
+      delete[] n->children.load(std::memory_order_relaxed);
+      delete n;
+    }
+    //Under the mutex, because reap_drain() waits on exactly this condition while holding it.
+    {
+      std::lock_guard<std::mutex> lk(reap_mtx);
+      reap_pending.fetch_sub(batch.size(), std::memory_order_relaxed);
+      reap_pending_edges.fetch_sub(edges, std::memory_order_relaxed);
+    }
+    reap_cv.notify_all();
+  }
+}
+
+void reap_enqueue(std::vector<MCTSNode *>&& dead, uint64_t edges) {
+  if (dead.empty()) return;
+  {
+    std::lock_guard<std::mutex> lk(reap_mtx);
+    if (!reap_thread.joinable()) {
+      reap_quit.store(false, std::memory_order_relaxed);
+      reap_thread = std::thread(reaper_func);
+    }
+    reap_pending.fetch_add(dead.size(), std::memory_order_relaxed);
+    reap_pending_edges.fetch_add(edges, std::memory_order_relaxed);
+    reap_queue.push_back(std::move(dead));
+  }
+  reap_cv.notify_one();
+}
+
+//Block until every deferred free has actually happened. Needed only where the memory itself
+//must be gone -- cleanup() and shutdown -- never on the search path, which is the entire point.
+void reap_drain() {
+  std::unique_lock<std::mutex> lk(reap_mtx);
+  reap_cv.wait(lk, [] { return reap_pending.load(std::memory_order_relaxed) == 0; });
+}
+
+void reap_shutdown() {
+  {
+    std::lock_guard<std::mutex> lk(reap_mtx);
+    reap_quit.store(true, std::memory_order_relaxed);
+  }
+  reap_cv.notify_all();
+  if (reap_thread.joinable()) reap_thread.join();
+}
 
 void gc_join() {
   gc_abort.store(true, std::memory_order_relaxed);
@@ -465,6 +570,9 @@ void gc(MCTSNode * from) {
   int current_gen = generation.fetch_add(1, std::memory_order_relaxed) + 1;
   // BFS traversal to mark reachable nodes with the current generation.
   // Use queue to avoid recursion and potential stack overflow in deep trees.
+  const auto gc_t0 = std::chrono::steady_clock::now();
+  size_t gc_marked = 0, gc_freed = 0, gc_edges_freed = 0;
+  const size_t gc_before = search.tree.size();
   std::queue<MCTSNode *> q;
   // Update generation for root and push it to the queue
   gc_root->generation.store(current_gen, std::memory_order_relaxed);
@@ -492,8 +600,10 @@ void gc(MCTSNode * from) {
               //them although a surviving parent still points at them. exchange() makes the mark
               //independent of what was there before, so a partial mark is harmless and the
               //collector can be interrupted.
-              if (child->generation.exchange(current_gen, std::memory_order_relaxed) != current_gen)
+              if (child->generation.exchange(current_gen, std::memory_order_relaxed) != current_gen) {
+                  ++gc_marked;
                   q.push(child);
+              }
           }
       }
   }
@@ -511,20 +621,43 @@ void gc(MCTSNode * from) {
   //Deleting a parent and its children in the same sweep is what prevents that, so the sweep is
   //all-or-nothing. Interruption is confined to the mark phase above, where abandoning the whole
   //collection frees nothing and leaves the tree exactly as it was.
+  const auto gc_t1 = std::chrono::steady_clock::now();
+  //UNLINK ONLY -- no delete anywhere in this loop. See the reaper above for why handing the
+  //frees to another thread is safe, and for the measurements that made it necessary. This still
+  //has to run to completion before the search starts, because a dead node left in the map can be
+  //handed back by make_child(); but it is now a map walk with no allocator work in it.
+  std::vector<MCTSNode *> dead;
   for (auto it = search.tree.begin(); it != search.tree.end();) {
     MCTSNode * node = it->second;
     if (node->generation.load(std::memory_order_relaxed) < current_gen) {
-      // Clean up dynamically allocated children if any.
-      Edge * children = node->children.load(std::memory_order_relaxed);
-      int num_children = node->num_children.load(std::memory_order_relaxed);
+      const int num_children = node->num_children.load(std::memory_order_relaxed);
       if (num_children > 0) {
         total_children.fetch_sub(num_children, std::memory_order_relaxed); //update total_children count
-        delete[] children;
+        gc_edges_freed += (size_t)num_children;
       }
       it = search.tree.erase(it);
-      delete node;
+      dead.push_back(node);
+      ++gc_freed;
     } else ++it;
   }
+  const auto gc_t2 = std::chrono::steady_clock::now();
+  reap_enqueue(std::move(dead), (uint64_t)gc_edges_freed);
+  //Record the yield HERE, not only in gc_start(). last_gc_freed existed already but was written
+  //solely by the background collector and read solely by the background decision, so the inline
+  //path -- the only one that runs with Ponder on -- had no futile-collection guard at all.
+  last_gc_freed.store(gc_before ? (double)gc_freed / (double)gc_before : 1.0,
+                      std::memory_order_relaxed);
+  //One line per collection that actually runs, which is now rare. Kept because the question it
+  //answers -- how much of a collection is marking, how much is walking the map, and how many
+  //nodes really died -- has to be re-asked every time collection feels slow, and it cannot be
+  //reconstructed from "gc took N ms" alone. mark is a pointer-chase over live nodes; sweep is
+  //the unlink walk, which visits every entry in the map whether or not anything dies. The frees
+  //no longer appear here at all -- they are the reaper's, and they happen during the search.
+  log_file("info string gc breakdown: %zu nodes -> %zu, marked %zu, freed %zu nodes + %zu edges, "
+           "mark %.1f ms, sweep %.1f ms\n",
+           gc_before, search.tree.size(), gc_marked, gc_freed, gc_edges_freed,
+           std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
+           std::chrono::duration<double, std::milli>(gc_t2 - gc_t1).count());
   total_nodes.store(search.tree.size(), std::memory_order_relaxed);
   //update hash_full
   size_t total_memory = search.tree.size() * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
@@ -1474,8 +1607,14 @@ void runMCTS(NNUEContext& ctx) {
     //Ponder implies reuse: a pondered subtree destroyed before the next search was wasted.
     const bool reusing_tree = reuse_tree || chessEngine.optionCheck[Ponder].value;
     bool collected = !reusing_tree;   //cleanup() always "collects": it empties the tree entirely
+    double set_root_ms = 0.0;
     if (reusing_tree) {
-      set_root(ctx);      
+      {
+        const auto t = std::chrono::steady_clock::now();
+        set_root(ctx);
+        set_root_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t).count();
+      }
       //Normally: only when the tree is actually filling up. Most moves skip the walk entirely,
       //because the collection after bestmove keeps occupancy below the threshold. This is the
       //safety net for what that cannot cover -- a position jump, a takeback, or a root that is
@@ -1487,14 +1626,41 @@ void runMCTS(NNUEContext& ctx) {
       //threshold, firing as one large synchronous stall at an arbitrary moment. Collecting
       //here instead costs the opponent's time, which is time already being spent on a
       //speculative search, and keeps each collection small.
-      collected = pondering || tree_occupancy() >= gc_threshold;
-      if (collected) gc();
+      //Threshold only. This used to read "pondering || occupancy >= gc_threshold", which forced
+      //a full collection before EVERY ponder search -- and with Ponder on by default that is every
+      //move. It was added when a collection meant millions of inline delete calls and the
+      //background collector had to be disabled to avoid an unbounded gc_join(); collecting inline
+      //on the opponent's clock was the lesser evil. The reaper removes that premise: the inline
+      //part is now a map walk with no frees in it. Measured cost of the old behaviour, over one
+      //session of two bots: 384 collections and 354 s of collection time per bot.
+      //Two conditions, not one. The tree must be full enough to be worth walking, AND the last
+      //walk must have actually freed something.
+      //
+      //The second is what the measurements demanded. With reuse the tree sits permanently above
+      //the threshold, so "occupancy >= gc_threshold" is true on every single search -- 60 of 60
+      //in an instrumented game -- and a full mark-and-sweep ran every move whether or not there
+      //was anything to collect. Repeatedly there was not: consecutive collections freed EXACTLY
+      //ZERO nodes while still paying 160-200 ms each to walk 4.7M of them. That is what a
+      //transposition DAG does to a mark-and-sweep. Advancing the root orphans very little,
+      //because almost everything stays reachable through some other path.
+      //
+      //A futile collection is not deferred work, it is no work, so skipping costs nothing. But
+      //never skip forever: after GC_MAX_SKIPS refusals collect anyway, so that a tree which HAS
+      //become collectable is not held indefinitely by a stale verdict.
+      static int gc_skips = 0;
+      const bool full  = tree_occupancy() >= gc_threshold;
+      const bool worth = last_gc_freed.load(std::memory_order_relaxed) >= GC_MIN_YIELD;
+      collected = full && (worth || ++gc_skips > GC_MAX_SKIPS);
+      if (collected) { gc_skips = 0; gc(); }
     } else {
       //Usually a no-op: the background wipe started after the last bestmove has already
       //emptied the tree, and gc_join() above waited for it. This remains as the fallback
       //for the first move of a game and for any move where the wipe was interrupted.
       cleanup_locked();
-      set_root(ctx);      
+      const auto t = std::chrono::steady_clock::now();
+      set_root(ctx);
+      set_root_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t).count();
     }
     //Both paths, so a run with ValidateTree on says whether reuse specifically is what breaks
     //the invariants, rather than leaving it ambiguous.
@@ -1502,9 +1668,17 @@ void runMCTS(NNUEContext& ctx) {
                             : "before search (collection skipped)", collected);
     //What the collection actually cost. It runs inline, before the search starts, so it is dead
     //time on the clock; logging it turns "gc feels slow" into a number.
-    log_file("info string %s took %.1f ms, %zu nodes\n", reusing_tree ? "gc" : "cleanup",
+    //Report set_root SEPARATELY. This line used to time the whole block and call the result
+    //"gc", which is three different things added together: set_root() -- which expands a childless
+    //root, so it can run a full NNUE expansion -- the collection, and validate_tree(), which walks
+    //every edge in the tree when ValidateTree is on. A run where gc() did not execute at ALL still
+    //reported 700 ms per move under that label. Anyone reading the log to decide whether
+    //collection is expensive needs these apart.
+    log_file("info string %s took %.1f ms (set_root %.1f ms, collect %s), %zu nodes\n",
+             reusing_tree ? "gc" : "cleanup",
              std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - collect_start).count(),
+             set_root_ms, collected ? "yes" : "SKIPPED",
              search.tree.size());
     search_simulations.store(0, std::memory_order_relaxed);
     //Charge the collection to this move's budget instead of adding to it. iter_start is taken
