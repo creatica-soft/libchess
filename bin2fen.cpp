@@ -71,6 +71,16 @@ int main(int argc, char** argv) {
     const long   maxn   = argc > 2 ? std::strtol(argv[2], nullptr, 10) : 0;
     const int    mincp  = argc > 3 ? (int)std::strtol(argv[3], nullptr, 10) : 0;
     const int    maxcp  = argc > 4 ? (int)std::strtol(argv[4], nullptr, 10) : 1000000;
+    //Minimum piece count. Below 8 the engine does not search at all: creatica probes its local
+    //tablebases at <= TB_LARGEST pieces and, between that and 7, asks lichess over HTTP. Either
+    //way it returns a tablebase move without building a tree, so the position yields NO visit
+    //distribution -- and the online path is rate-limited, so a run of them stalls the generator
+    //for up to the driver's 60 s watchdog each.
+    //
+    //Measured on broadcast data: 1.0% of curated positions, and 1 record in 29,161 came from one.
+    //Skipping them costs nothing and removes the stall.
+    const char * mp_env = std::getenv("MIN_PIECES");
+    const int    minpc  = (mp_env && *mp_env) ? (int)std::strtol(mp_env, nullptr, 10) : 8;
 
     Stockfish::Bitboards::init();
 
@@ -122,6 +132,8 @@ int main(int argc, char** argv) {
         // Both kings, or it is not a position.
         if (!(board.side[ColorWhite] & board.pieceTypes[King - 1]) ||
             !(board.side[ColorBlack] & board.pieceTypes[King - 1])) { ++skipped_bad; continue; }
+
+        if (np < minpc) { ++skipped_filter; continue; }
 
         const int acp = cp < 0 ? -cp : cp;
         if (acp < mincp || acp > maxcp) { ++skipped_filter; continue; }
