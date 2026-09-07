@@ -494,9 +494,18 @@ public:
     // and in ponder mode the engine has to think about the position BEFORE it -- so the
     // decision to apply it belongs to "go", exactly as in handlePosition().
     void set_position(const std::string& fen, const std::vector<std::string>& moves) override {
-        //Same reason as new_game(): this rewrites board, zh and position_history, all of which a
-        //running search reads on every simulation. Wait for it to finish first.
-        stop();
+        //Deliberately does NOT stop a running search.
+        //
+        //A stop() here looks like cheap safety -- this rewrites board, zh and position_history,
+        //which a running search reads -- but stop() makes that search EMIT A BESTMOVE. The GUI
+        //sent "position", not "stop", so it is not reading for one; the extra line sits in the
+        //pipe and is consumed by the next command, which then returns a move computed for the
+        //previous position. Every subsequent read is one further out of step.
+        //
+        //UCI forbids sending "position" while the engine is searching, so the case this guarded
+        //against is a GUI error -- and turning a rare error into a corrupted stream every time it
+        //occurs is the worse trade. new_game() keeps its stop(), because there the alternative is
+        //cleanup() freeing nodes underneath live worker threads.
         last_move.clear();
         if (fen == startPos && moves.empty()) position_history.clear();
         fen2board(board, fen.c_str());

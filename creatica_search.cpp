@@ -1323,7 +1323,26 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
     else { //unable to lock the node, see if it's already evaluated
       scorecp = node->cp.load(std::memory_order_relaxed);
       if (scorecp == NO_MATE_SCORE) { //node has not been evaluated yet, return without a backprop (a bit of a waste)
-        printf("mcts_search() warning: unevaluated child - skipping expansion\n");
+        //NEVER printf() from the search. stdout is the UCI channel: this line goes into the
+        //protocol stream, and worse, this branch can fire on EVERY simulation. Two threads
+        //spinning on it fill the pipe, the engine blocks on write(), the search thread stops,
+        //stop() never returns, readyok never arrives, and the driver declares the engine dead
+        //after 60 s. That is the stall.
+        //
+        //It became far more likely today. Repetition children are now created unevaluated
+        //(cp == NO_MATE_SCORE) rather than born permanently drawn, which is this exact
+        //condition; and the worker loop no longer ends when the tree is full, so a full tree
+        //keeps reaching this branch instead of stopping the search.
+        //
+        //Logged, and only once in a while: a counter that fires every 100000th occurrence says
+        //the same thing without the flood.
+        {
+          static std::atomic<uint64_t> warned{0};
+          const uint64_t k = warned.fetch_add(1, std::memory_order_relaxed);
+          if ((k % 100000) == 0)
+            log_file("mcts_search() warning: unevaluated child - skipping expansion (%llu so far)\n",
+                     (unsigned long long)(k + 1));
+        }
         for (size_t j = 1; j < path.size(); ++j) {  // From first child to leaf reverse virtual loss
           MCTSNode * nd = path[j];
           nd->N.fetch_sub(1, std::memory_order_relaxed);
