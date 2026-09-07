@@ -57,6 +57,7 @@ extern bool      seed_children;
 extern bool      node_minimax;
 extern double    probability_mass;
 extern bool      reuse_tree;
+extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 void gc_join();
 extern std::string visit_dump_path;
@@ -414,6 +415,9 @@ public:
         // Keep the tree between moves rather than rebuilding it. Ponder implies this; this
         // does not imply Ponder. Default off until it has been measured, not merely validated.
         o.check("ReuseTree", &reuse_tree, true);
+        // Turn OFF when the engine's chosen move is not what comes next -- replaying a game,
+        // or searching a position list. See the note in creatica_search.cpp.
+        o.check("PostMoveCollect", &post_move_collect, true);
         // Per-mille of Hash at which the tree is collected. Collection is O(tree) and only
         // reclaims memory, so running it every move paid a growing cost for nothing.
         o.spin("GcThreshold", &gc_threshold, 700, 0, 1000);

@@ -130,6 +130,7 @@ void runMCTS(NNUEContext& ctx);
 int tree_occupancy();
 extern std::atomic<size_t> total_nodes;
 extern bool reuse_tree;
+extern bool post_move_collect;
 extern int64_t gc_threshold;
 //Visit-distribution dump: the AlphaZero-style policy training target, collected as a free
 //byproduct of searches that happen anyway. Empty path disables it.

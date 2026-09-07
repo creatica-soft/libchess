@@ -142,6 +142,23 @@ double        probability_mass = 1.0;
 //and the collector competed for CPU in local self-play), which together account for
 //perhaps 15-25 Elo of it.
 bool          reuse_tree = true;
+
+//Whether the move this engine CHOOSES is the move that will actually be played next.
+//
+//True when playing: the post-move step re-roots onto the chosen move and collects, which frees
+//the sibling subtrees and is exactly right.
+//
+//False when REPLAYING someone else's game, or analysing a position list. Then the next position
+//is whatever was actually played, which is a sibling of the engine's choice whenever the two
+//disagree -- and the post-move collection frees precisely the subtree the next search needs.
+//That is why tree reuse measured worthless during target generation: not because consecutive
+//positions are unrelated, but because the collector was throwing away the inheritance.
+//
+//With this off, nothing collects after the move. set_root() then advances to the position that
+//really came next -- it finds nodes by HASH LOOKUP, so it does not care where the root pointed --
+//and the threshold collection before the search frees from the correct root. Slower to reclaim,
+//but there is no clock during generation.
+bool          post_move_collect = true;
 //Collect only when the tree is actually filling up, in per-mille of the Hash allocation.
 //
 //gc() is O(tree) and was measured at 100 ms on 410k nodes rising to 442 ms on 5.1M -- 37% of a
@@ -1682,7 +1699,10 @@ void runMCTS(NNUEContext& ctx) {
     //takeback, a new game) set_root() simply builds a fresh root and this subtree is collected
     //later by the threshold check.
     const bool reuse_active = reuse_tree || chessEngine.optionCheck[Ponder].value;
-    if (pondering) {
+    if (!post_move_collect) {
+      //Replaying: leave the tree entirely alone. The next set_root() will find whatever position
+      //actually follows, and the pre-search threshold collection reclaims from there.
+    } else if (pondering) {
       //No background collection after a ponder search: the next "go" is imminent and would
       //abort it before it finished anything. The search that follows collects inline instead.
     } else if (!reuse_active) {

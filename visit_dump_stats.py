@@ -4,14 +4,54 @@
 The point of this file is not to convert data -- it is to answer, BEFORE any training is run,
 whether the data contains anything worth learning.
 
-Policy distillation can only teach the policy head what the SEARCH knows that the PRIOR does
-not. If the search's preferred move is nearly always the prior's preferred move, the target is
-almost the model's own output and training on it is a very expensive no-op. That has already
-happened once in this project: top-k agreement with Stockfish rose from 26.7% to 34.8% while
-Elo went +108, +113, level, because the extra agreement was on positions where several moves
-were comparable anyway.
+READING THE REPORT
+------------------
 
-So the number to look at first is `search disagrees with prior`. If it is small, stop.
+  records / distinct games / repeated positions
+      Coverage. `repeated positions` counts duplicate FENs: every one is a search spent twice
+      for one training sample. A few are inevitable (transpositions, repeated theory); a large
+      share means STRIDE is too small for the source.
+
+  legal moves, mean
+      How much there was to decide. Opening positions run 25-27; middlegames 32-35. Higher is
+      better for policy training -- a position with three legal moves teaches almost nothing.
+
+  simulations / seldepth, mean
+      How hard the search worked, and how far it actually looked. seldepth is the one that
+      matters and the one to filter on later: a shallow search mostly restates the prior, so
+      its record teaches little. Measured on this engine, ~20 at 500ms, ~25 at 1000ms, ~33 at
+      3000ms, ~36 at 5000ms.
+
+  top move's visit share / distribution entropy
+      How peaked the target is. creatica concentrates hard -- typically 0.83-0.92 on one move --
+      so the target is close to one-hot rather than a nuanced ranking. That is worth knowing:
+      it means distillation mostly teaches WHICH move, not HOW MUCH better. AlphaZero keeps its
+      distributions softer by adding Dirichlet noise at the root during self-play, which
+      deliberately weakens play; that is a trade worth making for dedicated generation and not
+      for games you also want to be good.
+
+  search agrees with prior          <- THE NUMBER THAT DECIDES
+      How often the search's most-visited move is the prior's most-preferred move. This is the
+      go/no-go. Distillation can only teach the policy head what the SEARCH knows and the PRIOR
+      does not; if they already agree, the target is nearly the model's own output and training
+      on it is an expensive no-op.
+
+  mean prior->visits shift
+      Total-variation distance between the two distributions, 0 = identical. Corroborates the
+      agreement figure over the whole distribution rather than just the top move.
+
+WHAT THE ANSWER DOES NOT TELL YOU
+---------------------------------
+A low agreement figure says the target DIFFERS from the model's current belief. It does not by
+itself say the target is BETTER -- a shallow or broken search also disagrees, just wrongly.
+What justifies believing the search is right is that it is hundreds of thousands of NNUE-backed
+simulations to depth ~25 against a single forward pass of the policy head. If you ever want that
+checked rather than assumed, compare the search's move against a stronger reference (Stockfish's
+eval travels with these positions) rather than against the prior.
+
+This project has already been burned by a proxy that stopped predicting strength: top-1 agreement
+with Stockfish's PV1 went 26.7% -> 33.08% -> 34.83% while Elo went +108 -> +113 -> level. Treat
+every number here as a necessary condition, never a sufficient one.
 
 Usage:  python3 visit_dump_stats.py visits.tsv [more.tsv ...]
 """
