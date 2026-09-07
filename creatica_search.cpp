@@ -904,6 +904,11 @@ void get_prob(std::vector<std::tuple<double, int, int, int, uint64_t>>& move_eva
 //calls compute_move_evals(), make_child() and expand_node()
 //returns the result in pawns from the temp_board.sideToMove perspective
 double process_check(Board& temp_board, const ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, int iter) {
+  //A check chain this long is a perpetual, and a perpetual is a draw -- so the cap returns the
+  //right value rather than merely a safe one. Without it the recursion is unbounded: see
+  //MAX_CHECK_EXTENSION in creatica_search.hpp for why a repeated position inside the chain
+  //recurses forever, and what it would have overflowed.
+  if (iter >= MAX_CHECK_EXTENSION) return 0.0;
   MCTSNode * node = make_child(board_hash.hash, NO_MATE_SCORE, -1);
   int stored_cp = node->cp.load(std::memory_order_relaxed);
   if (stored_cp == NO_MATE_SCORE) { //make_child() returned new node without a parent, let's update its cp and expand it

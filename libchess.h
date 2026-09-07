@@ -325,11 +325,16 @@ inline constexpr T& operator++(T& e) {
     return e = static_cast<T>(to_underlying(e) + 1);
 }
 // 1. Postfix Increment: sq++, pt++
+// Returns the OLD value BY VALUE and leaves e incremented, as postfix must.
+// The previous version did "T temp = e; ++e; return e = temp;" -- it incremented and then
+// assigned the old value straight back, so sq++ left sq unchanged and returned a reference to
+// it. Any "for (Square s = A; s < B; s++)" written against it was an infinite loop. Nothing in
+// the built targets used it, which is the only reason this never surfaced.
 template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
-inline constexpr T& operator++(T& e, int) {
-    T temp = e;
-    ++e;
-    return e = static_cast<T>(to_underlying(temp));
+inline constexpr T operator++(T& e, int) {
+    const T temp = e;
+    e = static_cast<T>(to_underlying(e) + 1);
+    return temp;
 }
 // 2. Prefix Decrement: --sq, --pt
 template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
@@ -346,20 +351,29 @@ template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>:
 inline constexpr int operator-(T e, int i) {
     return static_cast<int>(to_underlying(e) - i);
 }
-// &
-template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
-inline constexpr T operator&(T e, int i) {
-    return static_cast<T>(to_underlying(e) & 1);
-}
+// & is deliberately NOT overloaded for enums.
+//
+// There used to be an operator&(T, int) here whose body was "to_underlying(e) & 1" -- it threw
+// its second operand away and always masked with one, so "piece & 7" silently evaluated to 0
+// for every piece. It cost a real debugging session: a castling fix that tested
+// "PC_TYPE(mover) == King" as "(mover & 7) == King" simply never fired, with no warning.
+//
+// Removing it is better than correcting it. Without an overload, "piece & 7" promotes to int
+// and yields the right number, and anything that wants the result back as an enum has to say
+// so with a cast -- which is where the intent belongs. For Piece specifically, use the named
+// helpers PC_TYPE() and PC_COLOR() rather than masking by hand.
 // 1. Addition Assignment: sq += 8
 template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
 inline constexpr T& operator+=(T& e, int i) {
     return e = static_cast<T>(to_underlying(e) + i);
 }
 // 2. Subtraction Assignment: sq -= 8
+// Returns T&, like every other compound assignment. It was declared to return int while
+// assigning an int to a T&, which is not a valid conversion for an unscoped enum -- so this
+// template failed to compile the moment anything instantiated it. Nothing did.
 template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
-inline constexpr int operator-=(T& e, int i) {
-    return e = static_cast<int>(to_underlying(e) - i);
+inline constexpr T& operator-=(T& e, int i) {
+    return e = static_cast<T>(to_underlying(e) - i);
 }
 // Difference: Square - Square -> returns SIGNED int
 template<typename T, typename = typename std::enable_if<std::is_enum<T>::value>::type>
