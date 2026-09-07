@@ -437,7 +437,48 @@ honest result and worth keeping: without memory pressure and large die-offs the 
 bottleneck. Run-to-run spread is around 30%, so differences smaller than about 1.5x from this
 harness mean nothing.
 
-**Two measurement traps this exposed.** First, `info string gc took N ms` was timing `set_root()`
+**What remained was the map itself.** With the frees deferred, an overnight run still showed a
+collection that dropped 8.1M nodes spending **15.8 seconds** in the unlink walk against 229 ms of
+marking — roughly 2 microseconds per erase. `std::unordered_map` allocates a hash node per entry,
+so every `erase()` is an allocator free of a small block scattered across a gigabyte of live tree.
+`search.tree` is now `NodeMap`, an open-addressed table: one contiguous slot array, index from the
+low bits of the Zobrist key, linear probing, erase as a tombstone write, no per-entry allocation.
+
+**The first attempt at it was slower, for a reason worth remembering.** Open addressing iterates in
+O(*capacity*); `std::unordered_map` iterates in O(*size*), because libc++ threads every element
+onto a linked list and never pays for empty space. After a large die-off the flat table still held
+~16M slots for 1.6M live entries, and every later sweep rescanned all of them — a collection that
+freed *nothing* walked 1.6M live entries in 551 ms, where `unordered_map` walked 4.0M in 390 ms.
+Per slot the flat table was about three times quicker; it was simply scanning ten times as many.
+`NodeMap::compact()` rehashes down to fit the survivors after each sweep, which also sweeps out the
+tombstones, and is cheap precisely because there is no per-entry allocation.
+
+| `bench_map`, identical keys and erasures | `unordered_map` | `NodeMap` |
+|---|---|---|
+| 2M entries, 80% killed — sweep | 982 ms | **265 ms** |
+| 2M entries, 20% killed — sweep | 859 ms | **239 ms** |
+| 4M entries, 85% killed — sweep | 1337 ms | **339 ms** |
+| 4M entries — `find` + `emplace` | 2167 ms | **978 ms** |
+
+The fill row matters beyond collection: `make_child()` does millions of lookups per search, and
+they become a short probe over adjacent cache lines instead of a chain walk through scattered
+allocations.
+
+**A third measurement trap, and the most expensive one.** A game-level A/B *cannot* compare two
+collector implementations. Two engines started from the same position diverge into different games,
+so they perform different numbers of collections over different tree sizes; the run that first
+appeared to show the flat table losing had simply done nearly twice the collections and freed 1.5x
+the nodes. Two things fix this. `bench_map.cpp` replays `gc()`'s inner loop against both tables
+with identical keys and identical erasures. And in-game, compare **rates** rather than totals,
+since those divergence cannot distort:
+
+| in-game, normalised | `unordered_map` | `NodeMap` |
+|---|---|---|
+| per node scanned | 151 ns | **62 ns** |
+| per node freed | 336 ns | **189 ns** |
+| mark, per live node | 61 ns | 56 ns |
+
+**Two further measurement traps this exposed.** First, `info string gc took N ms` was timing `set_root()`
 and `validate_tree()` as well as the collection — a run in which `gc()` never executed still
 reported 700 ms per move under that label, because `ValidateTree` was on. It now reports
 `set_root` separately and says whether a collection actually ran; `set_root` turns out to be
