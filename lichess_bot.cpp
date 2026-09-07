@@ -991,11 +991,18 @@ void ProcessEvent(const json& event) {
             //commented out here, so with CREATICA_BOOK set on one bot the other declined every
             //challenge with reason=variant and no games were played at all.
             //
+            //chess960 is NOT accepted, though it was for a long time. libchess is meant to
+            //support it -- Board carries castlingRooks rather than assuming h1/a1 -- but nothing
+            //has ever tested it: all 37 positions in test_fen_strings are standard, none with
+            //castling rights held by a side whose king is off its home square. A passing bot
+            //could therefore have challenged us to 960 and been accepted into a game the engine
+            //may not play legally. Re-enable once the harness covers it.
+            //
             //Safe: the gameFull event carries initialFen, which flows into creatica.position,
             //and position() sends "position fen <...>" for anything longer than 25 characters
             //and "position startpos" otherwise -- so both a custom position and a normal game
             //are handled by the same path.
-            if ((!game_in_progress.load() && !challengeStillOutstanding() && (variant == "standard" || variant == "fromPosition" || variant == "chess960")) &&
+            if ((!game_in_progress.load() && !challengeStillOutstanding() && (variant == "standard" || variant == "fromPosition")) &&
                 (speed == "blitz" || speed == "rapid" || speed == "classical") && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
@@ -1007,7 +1014,7 @@ void ProcessEvent(const json& event) {
                 std::string decline_url = "https://lichess.org/api/challenge/" + challenge_id + "/decline";
                 std::string reason = "reason=";
                 if (game_in_progress.load() || challengeStillOutstanding()) reason += "later";
-                else if (variant != "standard" && variant != "fromPosition" && variant != "chess960") reason += "variant";
+                else if (variant != "standard" && variant != "fromPosition") reason += "variant";
                 else if (speed != "blitz" && speed != "rapid" && speed != "classical") reason += "timeControl";
                 else reason += "generic";
                 if (HttpRequest("POST", decline_url, reason)) {
