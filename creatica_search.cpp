@@ -1702,7 +1702,26 @@ void runMCTS(NNUEContext& ctx) {
     if (!post_move_collect) {
       //Replaying: leave the tree entirely alone. The next set_root() will find whatever position
       //actually follows, and the pre-search threshold collection reclaims from there.
-    } else if (pondering) {
+    } else if (pondering || chessEngine.optionCheck[Ponder].value) {
+      //No background collection whenever pondering is in play -- not just after a ponder search,
+      //but after a REAL one too, because the ponder "go" follows within milliseconds.
+      //
+      //gc_start() spawns a collection over a multi-million-node tree; the next go calls
+      //gc_join(); and the SWEEP cannot be interrupted, because stopping it half way leaves a
+      //parent pointing at a freed child. So a search could block for a whole sweep with nothing
+      //bounding the wait -- measured at up to 11.9 s on an 8.3M-node tree.
+      //
+      //With Ponder on, the ponder go follows a real search within milliseconds, so that join
+      //happens EVERY move. Before today only one bot pondered, so the go did not arrive
+      //immediately and the collection finished on idle time, which is why a full night of games
+      //ran clean and today did not.
+      //
+      //Honest limit: an 11.9 s worst case does not by itself reach the driver's 60 s watchdog,
+      //so this removes a real unbounded wait but is not proven to be the whole story. The
+      //engines now log separately, so the next occurrence can be attributed rather than guessed.
+      //
+      //The ponder path collects INLINE before its search instead (see the pre-search branch), so
+      //the tree is still bounded; it is paid on the opponent's clock rather than on a join.
       //No background collection after a ponder search: the next "go" is imminent and would
       //abort it before it finished anything. The search that follows collects inline instead.
     } else if (!reuse_active) {
