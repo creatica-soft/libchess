@@ -96,6 +96,10 @@
 //the engine receives a path that does not exist, and nothing reports it. A truncated
 //SyzygyPath in particular just falls back to slow online tablebase queries, which looks like
 //the engine being mysteriously sluggish in endgames rather than like a configuration error.
+//CHANGING THIS CHANGES THE LAYOUT OF struct Engine, so everything linking libchess must be
+//rebuilt together -- `make -j` plus every compile line in the root. A binary built against the
+//old layout and linked against the new library does not fail to load; it reads the wrong bytes.
+//Raising 32 to 256 made test_pos report 678 failures until it was rebuilt, and 0 after.
 #define MAX_UCI_OPTION_STRING_LEN 256
 #define MAX_UCI_OPTION_BUTTON_NUM 4
 #define MAX_UCI_OPTION_SPIN_NUM 16
