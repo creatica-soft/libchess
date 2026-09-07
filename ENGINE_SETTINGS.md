@@ -510,6 +510,7 @@ being tested as this is written; the last is waiting on an idle machine.
 | Is `BlendScale 1.15` right? | running now, sweeping 0.85–1.45 | it was set analytically to match the old prior's concentration and has never been tested at all |
 | Does the ProbabilityMass gate pay? | running now, sweeping 985–1000 | new mechanism: gating before the child evaluations rather than after (see **ProbabilityMass** above). Skips ~35% of evaluations at 990 for ~3% more nodes and a distinctly deeper tree — an untested trade |
 | Is `creatica` equal to its predecessor? | 40+ games on an idle machine | gate before renaming it to `creatica` and pointing the bot and harnesses at it |
+| Does chess960 work at all? | add 960 positions to `test_fen_strings`, run `test_pos` | libchess is *meant* to support it — `Board` carries `castlingRooks` rather than assuming h1/a1 — but **all 37 regression positions are standard**, none with castling rights held by a side whose king is off its home square. `lichess_bot` accepted 960 challenges for a long time on that untested basis; now removed until the harness covers it |
 
 The first four are being swept by `self-play-optimization.cpp` at 40 games and 500 ms per
 comparison. See **Tuning parameters by self-play** at the end of this document for how to
