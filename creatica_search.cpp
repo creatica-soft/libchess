@@ -640,6 +640,10 @@ void gc(MCTSNode * from) {
       ++gc_freed;
     } else ++it;
   }
+  //Right-size the table now that the survivors are known. Without this the sweep's cost is set
+  //by the capacity the tree reached at its PEAK rather than by what it currently holds, and every
+  //later collection rescans that empty space. See NodeMap::compact().
+  search.tree.compact();
   const auto gc_t2 = std::chrono::steady_clock::now();
   reap_enqueue(std::move(dead), (uint64_t)gc_edges_freed);
   //Record the yield HERE, not only in gc_start(). last_gc_freed existed already but was written
@@ -720,13 +724,24 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
       child->N.store(1, std::memory_order_relaxed);
       child->W.store(tanh(cp * 0.01 / eval_scale), std::memory_order_relaxed);
     }
-    std::unique_lock insert_lock(map_mutex);
-    auto [it, inserted] = search.tree.emplace(hash, child);
-    insert_lock.unlock();
+    //Read the winner's pointer WHILE STILL HOLDING THE LOCK. This used to unlock first and then
+    //dereference the iterator, which is a use-after-invalidate: a concurrent insert can rehash
+    //the table, and a rehash reallocates, so the iterator no longer points at anything. It was
+    //already undefined with unordered_map -- rehashing invalidates iterators there too -- and the
+    //open-addressed table makes it reliably fatal rather than merely unlucky, because the whole
+    //slot array moves. Nothing is dereferenced outside the lock now.
+    MCTSNode * winner = nullptr;
+    bool inserted = false;
+    {
+      std::unique_lock insert_lock(map_mutex);
+      auto [it, ins] = search.tree.emplace(hash, child);
+      inserted = ins;
+      winner   = it->second;
+    }
     if (!inserted) {
       // Another thread inserted first; use the existing node and clean up ours.
       delete child;
-      child = it->second; //it.second - is a pointer to the existing node (it.first is a hash)
+      child = winner;
     } else {
       total_nodes.fetch_add(1, std::memory_order_relaxed);
     }
