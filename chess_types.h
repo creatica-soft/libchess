@@ -12,11 +12,16 @@
 //    with Stockfish's enum File { FILE_A.. } in nnue/types.h and silently
 //    miscompile edge_distance() in nnue/bitboard.h -- measured: it returns the
 //    wrong distance for files E..H, with no warning.
-//  * NOT the global enum operator templates (operator++/--/+/-/& in
+//  * NOT the global enum operator templates (operator++/--/+/- in
 //    libchess.h). They are constrained only by std::is_enum, so they apply to
-//    every Stockfish enum, and two of them are broken: operator&(T,int)
-//    ignores its second argument and always masks with 1, and postfix
-//    operator++ is a no-op.
+//    every Stockfish enum as well as libchess's own, which is why nnue/ must
+//    not see them. The three that were outright broken have been repaired:
+//    operator&(T,int) ignored its second argument and always masked with 1 and
+//    is now GONE entirely (mask with a plain int, or use PC_TYPE/PC_COLOR);
+//    postfix operator++ incremented and then assigned the old value back, so it
+//    left its operand unchanged, and now returns the old value by value; and
+//    operator-= was declared to return int while assigning to a T&, so it did
+//    not compile when instantiated. None of the three had a live call site.
 //  * NOT noise.h, the MAX_* macros, the char* name tables, or the SQ_*/PC_*
 //    helpers. None of them is referenced from nnue/.
 //

@@ -62,6 +62,26 @@
 #define DISPLAY_INTERMITTENT_INFO_LINES true
 #define DISPLAY_FINAL_INFO_LINES true
 #define MAX_DEPTH 100
+//Hard ceiling on the check extension in process_check() -> eval_and_expand().
+//
+//That recursion had no limit at all. It descends one level for every consecutive check, and each
+//level holds an accumulator_stack_push() for the whole descent, so its depth is charged against
+//AccumulatorStack::MaxSize (MAX_PLY + 1 = 247) on top of the MCTS path itself. It is genuinely
+//unbounded rather than merely deep: process_check() recurses whenever make_child() hands back a
+//node whose cp is still NO_MATE_SCORE, and a position repeated inside the chain returns THE SAME
+//node, still unevaluated because its eval_and_expand() has not returned yet. A perpetual check
+//therefore recurses forever. pos_history does not stop it -- that holds the GAME history, and the
+//extension chain never adds to it.
+//
+//Nothing bounded it. AccumulatorStack::push() guards MaxSize with an assert(), which the release
+//dylib compiles out, so overflow would have been a silent heap overwrite rather than a crash at
+//the point of failure.
+//
+//32 keeps the worst case (MAX_DEPTH 100 + 32) far under 247 and under the 512 KB thread stack,
+//while being far deeper than any real forcing sequence, so ordinary play is unaffected. Hitting
+//the cap returns 0.0, which is also the right answer: a check chain this long is a perpetual, and
+//a perpetual is a draw.
+#define MAX_CHECK_EXTENSION 32
 
 //--- policy head ---------------------------------------------------------------------
 //Where to find the exported weights, overridable with the CREATICA_POLICY env var. The

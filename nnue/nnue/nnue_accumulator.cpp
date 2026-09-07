@@ -20,6 +20,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <new>
 #include <type_traits>
 
@@ -140,6 +141,24 @@ void AccumulatorStack::reset() noexcept {
 
 std::pair<DirtyPiece&, DirtyThreats&> AccumulatorStack::push() noexcept {
     assert(size < MaxSize);
+    // The assert above is the ONLY bound, and the shared library is built -O3 with NDEBUG, so in
+    // every shipped build it is compiled out and this writes past the end of two std::arrays --
+    // a silent heap overwrite whose first visible symptom is a wild-address crash somewhere else
+    // entirely. creatica's check extension was unbounded until MAX_CHECK_EXTENSION was added, so
+    // this was reachable rather than theoretical. Reuse the top slot instead: the evaluation at
+    // that depth is wrong, which is bad, but it is bounded and diagnosable rather than corrupting
+    // memory. Warned once so it cannot pass unnoticed if a caller ever gets here again.
+    if (size >= MaxSize) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "AccumulatorStack::push(): depth %zu reached the %zu-entry limit; "
+                         "reusing the top slot. A caller is recursing without a bound.\n",
+                         size, MaxSize);
+        }
+        --size;
+    }
     auto& dp  = psq_accumulators[size].reset();
     auto& dts = threat_accumulators[size].reset();
     new (&dts) DirtyThreats;
