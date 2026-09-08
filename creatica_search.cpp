@@ -303,15 +303,26 @@ std::string   game_tag;          //set per game by the driver, so records can be
 
 //Tree occupancy in per-mille of the configured Hash, from counters already maintained -- O(1),
 //no walk, so it is safe to consult before deciding whether a walk is worth doing.
+//Occupancy of the TREE, deliberately excluding memory already handed to the reaper.
+//
+//It counted reap_pending, on the reasoning that the memory is genuinely not back yet. That is
+//true of the process, and false of the decision this feeds. hash_full drives the expansion gate
+//in mcts_search(): at 1000 the search stops creating nodes entirely and merely re-visits what
+//exists, which is how a move accumulates visits without ever being searched. Counting the dead
+//set there stops the engine growing its tree in order to protect memory that is in the act of
+//being returned -- and the inflation lands exactly when it hurts, during the search immediately
+//after a collection, when the reaper is at its busiest. A collection that sheds five million
+//nodes was charging the gate for five million phantom ones.
+//
+//Measured in a live match: 9.2% of this engine's searches ran at hashfull >= 1000 with expansion
+//blocked outright, against an opponent build with no reaper and therefore exact accounting.
+//
+//The reaper's backlog is still worth seeing, so it is logged in the gc breakdown line instead of
+//being folded into a number that decides whether to keep searching.
 int tree_occupancy() {
-  //Nodes already unlinked but not yet freed by the reaper still hold their memory, so they are
-  //counted here. Leaving them out would report room the process does not have, and the engine
-  //would keep expanding into it.
   const size_t total_memory =
-      (total_nodes.load(std::memory_order_relaxed) + reap_pending.load(std::memory_order_relaxed))
-          * (sizeof(MCTSNode) + 24)
-    + (size_t)(total_children.load(std::memory_order_relaxed)
-               + reap_pending_edges.load(std::memory_order_relaxed)) * sizeof(Edge);
+      total_nodes.load(std::memory_order_relaxed) * (sizeof(MCTSNode) + 24)
+    + (size_t)total_children.load(std::memory_order_relaxed) * sizeof(Edge);
   const size_t max_capacity = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
   return max_capacity ? (int)((total_memory * 1000) / max_capacity) : 0;
 }
@@ -662,8 +673,9 @@ void gc(MCTSNode * from) {
   //the unlink walk, which visits every entry in the map whether or not anything dies. The frees
   //no longer appear here at all -- they are the reaper's, and they happen during the search.
   log_file("info string gc breakdown: %zu nodes -> %zu, marked %zu, freed %zu nodes + %zu edges, "
-           "mark %.1f ms, sweep %.1f ms\n",
+           "reaper backlog %zu, mark %.1f ms, sweep %.1f ms\n",
            gc_before, search.tree.size(), gc_marked, gc_freed, gc_edges_freed,
+           reap_pending.load(std::memory_order_relaxed),
            std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
            std::chrono::duration<double, std::milli>(gc_t2 - gc_t1).count());
   total_nodes.store(search.tree.size(), std::memory_order_relaxed);
@@ -702,43 +714,6 @@ void set_root(NNUEContext& ctx) {
     //roughly a factor of eval_scale near zero and unbounded instead of confined to [-1, 1].
     root->W.store(tanh(result / eval_scale), std::memory_order_relaxed);
     root->N.store(1, std::memory_order_relaxed);
-  }
-
-  //Make the repetition verdict AUTHORITATIVE for the root's children instead of letting it be
-  //averaged against statistics gathered before the verdict existed.
-  //
-  //A simulation that ends on the repetition break increments N and adds exactly 0 to W. With
-  //tree reuse the node arrives carrying W and N from an EARLIER search, run before this position
-  //entered position_history -- when it was not a repetition at all and was scored on its merits.
-  //Q = W/N then decays only as 1/N, so the zeros have to outvote the whole stale sum before the
-  //move stops looking attractive. Measured in a real game: a losing rook sacrifice held 37.4M of
-  //38.1M visits at Q 0.0906 with W frozen at 3,391,754; it needed N > 44.6M to fall behind the
-  //correct move and the clock ran out first. select_best_moves() picks by VISIT COUNT, which is
-  //precisely the counter this inflates, so the engine played a move its own cp scored at -322.
-  //
-  //Resetting to N=1, W=0 states the verdict directly: Q = 0, a draw, which is what the descent
-  //break already scores it. It does not suppress the move -- if every alternative is worse than a
-  //draw, Q=0 still wins and the repetition is played, which is correct.
-  //
-  //Safe at the root because position_history does not change during a search: it is written by
-  //select_best_moves() after the search and by set_position(). So "this child's position has
-  //already occurred in the game" is fixed for the search's whole duration. The path-local half of
-  //the rule (pos_history, genuinely path-dependent) is untouched.
-  {
-    const int nc = root->num_children.load(std::memory_order_relaxed);
-    Edge * kids = root->children.load(std::memory_order_acquire);
-    int reset = 0;
-    for (int i = 0; i < nc && kids; ++i) {
-      MCTSNode * child = kids[i].child.load(std::memory_order_relaxed);
-      if (!child) continue;
-      if (position_history.count(child->hash.load(std::memory_order_relaxed)) == 0) continue;
-      if (child->N.load(std::memory_order_relaxed) <= 1) continue;   //nothing stale to discard
-      child->N.store(1, std::memory_order_relaxed);
-      child->W.store(0.0, std::memory_order_relaxed);
-      ++reset;
-    }
-    if (reset) log_file("info string repetition: reset %d stale root child%s to Q=0\n",
-                        reset, reset == 1 ? "" : "ren");
   }
 
   search.root = root;    
