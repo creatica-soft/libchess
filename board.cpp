@@ -681,6 +681,29 @@ uint64_t getCheckers(const Board& board, const Square kingSq) {
          (Stockfish::PseudoAttacks[board.sideToMove][kingSq] & board.pieceTypes[Pawn - 1])) & board.side[OPP_COLOR(board.sideToMove)];    
 }
 
+//Chess960 only: moving the castling ROOK can DISCOVER a check on the king's landing square.
+//
+//attackedSquares is computed with the rook still standing where it is, so an enemy slider
+//behind it on the back rank is invisible to that test. Concretely, from a position this was
+//actually found in: white king d1, white castling rook b1, BLACK QUEEN a1. Castling queenside
+//vacates b1, the queen then attacks c1 along the rank, and the king would be castling into
+//check -- yet libchess generated d1b1 and Stockfish did not.
+//
+//Standard chess cannot produce this: the queenside rook starts on a1, so there is no square
+//behind it for an attacker to hide on. That is why it survived every standard-chess test.
+//
+//Only ROOK-type attacks need checking. The castling rook stands on the back rank, so removing
+//it can only open a rank or a file, and both are covered by a rook-attack probe from the king's
+//destination. The intermediate path squares are already covered by attackedSquares: the king
+//moves TOWARDS the rook, and after castling the rook occupies a square between the king's
+//destination and any attacker on that side, so no new line opens onto them.
+static inline bool castlingDiscoversCheck(const Board& board, const Square kingDst, const Square rookSrc) {
+  const uint64_t occ = occupations(board) ^ SQ_BIT(rookSrc);
+  const uint64_t enemyRQ = (board.pieceTypes[Rook - 1] | board.pieceTypes[Queen - 1])
+                         & board.side[OPP_COLOR(board.sideToMove)];
+  return (Stockfish::attacks_bb<Stockfish::ROOK>(static_cast<Stockfish::Square>(kingDst), occ) & enemyRQ) != 0;
+}
+
 uint64_t castlingMoves(const Board& board, const Square kingSq, uint64_t attackedSquares) {
   uint64_t moves = 0;
   uint64_t rooks = board.castlingRooks & board.side[board.sideToMove];
@@ -693,7 +716,8 @@ uint64_t castlingMoves(const Board& board, const Square kingSq, uint64_t attacke
   if (kRookSq > kingSq) { 
     const auto& cp = CastlingPath[board.sideToMove][0];
     //printf("castlingMoves() debug: cp.path %llx, cp.checkZone %llx\n", cp.path, cp.checkZone);
-    if (!(cp.path & occupations(board)) && !(cp.checkZone & attackedSquares)) {
+    if (!(cp.path & occupations(board)) && !(cp.checkZone & attackedSquares)
+        && !(board.isChess960 && castlingDiscoversCheck(board, castlingKingSquare[board.sideToMove][0], kRookSq))) {
       //moves = board.isChess960 ? SQ_BIT(castlingRookSquare[board.sideToMove][0]) : SQ_BIT(castlingKingSquare[board.sideToMove][0]);
       moves = board.isChess960 ? SQ_BIT(kRookSq) : SQ_BIT(castlingKingSquare[board.sideToMove][0]);
     }
@@ -705,7 +729,8 @@ uint64_t castlingMoves(const Board& board, const Square kingSq, uint64_t attacke
   if (qRookSq < kingSq) { 
     const auto& cp = CastlingPath[board.sideToMove][1];
     //printf("castlingMoves() debug: cp.path %llx, cp.checkZone %llx\n", cp.path, cp.checkZone);
-    if (!(cp.path & occupations(board)) && !(cp.checkZone & attackedSquares)) {
+    if (!(cp.path & occupations(board)) && !(cp.checkZone & attackedSquares)
+        && !(board.isChess960 && castlingDiscoversCheck(board, castlingKingSquare[board.sideToMove][1], qRookSq))) {
       //moves |= board.isChess960 ? SQ_BIT(castlingRookSquare[board.sideToMove][1]) : SQ_BIT(castlingKingSquare[board.sideToMove][1]);
       moves |= board.isChess960 ? SQ_BIT(qRookSq) : SQ_BIT(castlingKingSquare[board.sideToMove][1]);
     }

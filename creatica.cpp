@@ -550,16 +550,31 @@ public:
     }
 
     void quit() override {
-        //A joinable std::thread destroyed at exit calls std::terminate.
-        gc_join();
-        reap_shutdown();   //same reason: the reaper is a joinable std::thread
+        //ORDER MATTERS, and getting it wrong aborted the process about one run in twenty.
+        //
+        //A joinable std::thread destroyed at exit calls std::terminate, which is why the
+        //collector and the reaper have to be joined. But they were joined FIRST, before the
+        //search thread was stopped -- and the search thread starts a post-move collection
+        //immediately after emitting bestmove, which spawns the collector again, and that
+        //collection hands its dead nodes to reap_enqueue(), which spawns the reaper again.
+        //Both were then joinable at exit with nobody left to join them. The symptom was a
+        //clean bestmove followed by SIGABRT and a bare "libc++abi: terminating" -- no message,
+        //because nothing threw; std::terminate was called directly by ~thread.
+        //
+        //So: stop the search FIRST and join the thread that can create them, and only then
+        //join what it may have created. stopFlag is set as well as quitFlag, because quitFlag
+        //alone does not end a search already running inside runMCTS().
         {
             std::lock_guard<std::mutex> lock(mtx);
+            stopFlag.store(true);
             quitFlag.store(true);
         }
         cv.notify_all();
         if (search_thread_.joinable()) search_thread_.join();
         shutdown_thread_pool();
+        //Nothing can start a collector or a reaper any more.
+        gc_join();
+        reap_shutdown();
         curl_global_cleanup();
         cleanup_nnue();
         if (logfile) { fclose(logfile); logfile = nullptr; }
@@ -605,6 +620,13 @@ private:
     //may castle long> moves e8a8" then "go" is a SIGSEGV, while the identical "e8c8" is not.
     static void normalise_castling(const Board& b, Move& move) {
         if (move.promoType != PieceTypeNone) return;
+        //NOT in a real Chess960 game. There the king-takes-rook form is what libchess itself
+        //wants: castlingMoves() generates it, and do_move() recognises castling by exactly the
+        //test below (board.cpp: isChess960 && castlingRooks & SQ_BIT(move.dst)). Rewriting
+        //"e8a8" to "e8c8" there would turn a castling move into a plain king move to c8, which
+        //is not even legal. The conversion exists only because lichess speaks the 960 castling
+        //dialect in STANDARD games created from a position, where isChess960 is false.
+        if (b.isChess960) return;
         const Piece mover = static_cast<Piece>(b.piecesOnSquares[move.src]);
         const Piece onDst = static_cast<Piece>(b.piecesOnSquares[move.dst]);
         //PC_TYPE/PC_COLOR, never "& 7" or ">> 3". libchess.h defines a global
