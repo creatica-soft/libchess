@@ -440,7 +440,6 @@ std::atomic<bool> gc_abort{false};
 //is no work there to defer.
 std::atomic<double> last_gc_freed{1.0};   //start optimistic so the first collection always runs
 #define GC_MIN_YIELD 0.05                 //below this the previous collection was not worth its cost
-#define GC_MAX_SKIPS 4                    //but re-check this often, so a stale verdict cannot starve collection
 
 void gc(MCTSNode * from = nullptr);
 
@@ -834,7 +833,7 @@ static void dump_visits(const std::vector<std::tuple<uint64_t, int>>& visits, co
 
   //Header once, so the file explains itself.
   fseek(f, 0, SEEK_END);
-  if (ftell(f) == 0) fprintf(f, "tag\tfen\tsimulations\trootQ\trootCP\tponder\tseldepth\tvisits\n");
+  if (ftell(f) == 0) fprintf(f, "tag\tfen\tsimulations\trootQ\trootCP\tponder\tseldepth\thashfull\tvisits\n");
 
   char fen[MAX_FEN_STRING_LEN];
   const uint64_t rootN = search.root->N.load(std::memory_order_relaxed);
@@ -842,14 +841,19 @@ static void dump_visits(const std::vector<std::tuple<uint64_t, int>>& visits, co
   //seldepth is recorded because simulation count alone does not say how far the search
   //actually looked, and depth is what decides whether a record teaches anything a shallow
   //search could not. It lets the trainer weight or filter by the quality of each record.
-  fprintf(f, "%s\t%s\t%llu\t%.6f\t%d\t%d\t%d\t",
+  fprintf(f, "%s\t%s\t%llu\t%.6f\t%d\t%d\t%d\t%d\t",
           game_tag.empty() ? "-" : game_tag.c_str(),
           board2fen(board, fen),
           (unsigned long long)rootN,
           rootN ? rootW / (double)rootN : 0.0,
           search.root->cp.load(std::memory_order_relaxed),
           chessEngine.ponder ? 1 : 0,
-          seldepth.load(std::memory_order_relaxed));
+          seldepth.load(std::memory_order_relaxed),
+          //hash_full at the end of the search. A full tree sets tree_full in mcts_search(), which
+          //blocks expansion outright: the search keeps accumulating VISITS without adding depth,
+          //and select_best_moves() picks by visit count. Without this column the condition has to
+          //be inferred from a simulations-to-seldepth ratio, which is only suggestive.
+          hash_full.load(std::memory_order_relaxed));
 
   char uci[6];
   bool first = true;
@@ -1661,25 +1665,16 @@ void runMCTS(NNUEContext& ctx) {
       //on the opponent's clock was the lesser evil. The reaper removes that premise: the inline
       //part is now a map walk with no frees in it. Measured cost of the old behaviour, over one
       //session of two bots: 384 collections and 354 s of collection time per bot.
-      //Two conditions, not one. The tree must be full enough to be worth walking, AND the last
-      //walk must have actually freed something.
-      //
-      //The second is what the measurements demanded. With reuse the tree sits permanently above
-      //the threshold, so "occupancy >= gc_threshold" is true on every single search -- 60 of 60
-      //in an instrumented game -- and a full mark-and-sweep ran every move whether or not there
-      //was anything to collect. Repeatedly there was not: consecutive collections freed EXACTLY
-      //ZERO nodes while still paying 160-200 ms each to walk 4.7M of them. That is what a
-      //transposition DAG does to a mark-and-sweep. Advancing the root orphans very little,
-      //because almost everything stays reachable through some other path.
-      //
-      //A futile collection is not deferred work, it is no work, so skipping costs nothing. But
-      //never skip forever: after GC_MAX_SKIPS refusals collect anyway, so that a tree which HAS
-      //become collectable is not held indefinitely by a stale verdict.
-      static int gc_skips = 0;
-      const bool full  = tree_occupancy() >= gc_threshold;
-      const bool worth = last_gc_freed.load(std::memory_order_relaxed) >= GC_MIN_YIELD;
-      collected = full && (worth || ++gc_skips > GC_MAX_SKIPS);
-      if (collected) { gc_skips = 0; gc(); }
+      //Threshold only. A futile-collection guard used to sit here, skipping the walk when the
+      //previous one freed less than GC_MIN_YIELD. It showed NO measurable benefit in an A/B, and
+      //it has a cost that was not appreciated at the time: skipping keeps the tree FULL, and a
+      //full tree sets tree_full, which blocks expansion entirely (see mcts_search). A search that
+      //cannot expand still accumulates visits, and select_best_moves() picks by VISIT COUNT -- so
+      //the engine can pour 38M visits into a move whose refutation it never expanded and then
+      //play it. That is exactly what happened in a live game: f5f3 took 98% of the visits with a
+      //2.3% prior, at seldepth 16 after 38M simulations, and the engine's own cp for it was -322.
+      collected = tree_occupancy() >= gc_threshold;
+      if (collected) gc();
     } else {
       //Usually a no-op: the background wipe started after the last bestmove has already
       //emptied the tree, and gc_join() above waited for it. This remains as the fallback

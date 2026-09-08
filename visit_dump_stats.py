@@ -65,7 +65,7 @@ def read(path):
             if not line or line.startswith("tag\t"):
                 continue
             parts = line.split("\t")
-            if len(parts) != 8:
+            if len(parts) not in (8, 9):   #9 since hashfull was added; the move list is always last
                 yield None, n + 1, "expected 8 fields, got %d" % len(parts)
                 continue
             tag, fen, sims, rootq, rootcp, ponder, seldep, visits = parts
