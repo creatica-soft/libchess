@@ -1304,13 +1304,79 @@ int main(int argc, char ** argv) {
       if (!added) { fprintf(stderr, "%s: --accept-only= needs at least one username\n", argv[0]); return 1; }
     }
     else if (arg == "-h" || arg == "--help") {
-      printf("usage: %s [--no-challenge] [--challenge=<user>] [--casual]\n"
-             "            [--accept-only=<user>[,<user>...]]\n"
-             "  --no-challenge         do not challenge other bots; only respond to incoming challenges\n"
-             "  --challenge=<user>     challenge this opponent instead of a random online bot\n"
-             "  --casual               send unrated challenges\n"
-             "  --accept-only=<a>[,<b>...]  only accept challenges from these users.\n"
-             "                         May be repeated. Omit entirely to accept anyone.\n", argv[0]);
+      //Everything configurable, in one place. Almost all of this bot's configuration is
+      //ENVIRONMENT, not flags, and none of it used to appear here -- so the only way to find
+      //out what could be set was to read the source. Defaults shown are the compile-time
+      //#defines at the top of this file; change them there, not here, or the two drift apart.
+      char d_threads[16], d_hash[16], d_clock[16], d_inc[16], d_minelo[16], d_maxelo[16];
+      snprintf(d_threads, sizeof d_threads, "(%d)", THREADS);
+      snprintf(d_hash, sizeof d_hash, "(%d)", HASH);
+      snprintf(d_clock, sizeof d_clock, "(%d)", CLOCK_LIMIT);
+      snprintf(d_inc, sizeof d_inc, "(%d)", CLOCK_INCREMENT);
+      snprintf(d_minelo, sizeof d_minelo, "(%d)", MIN_ELO);
+      snprintf(d_maxelo, sizeof d_maxelo, "(%d)", MAX_ELO);
+      printf(
+        "usage: %s [flags]\n"
+        "\n"
+        "Plays lichess games with creatica. Configuration is mostly ENVIRONMENT VARIABLES;\n"
+        "the flags below cover only what changes between runs of the same setup.\n"
+        "\n"
+        "FLAGS\n"
+        "  --no-challenge              do not challenge anyone; only answer incoming challenges\n"
+        "  --challenge=<user>          challenge this opponent instead of a random online bot\n"
+        "  --casual                    send unrated challenges\n"
+        "  --accept-only=<a>[,<b>...]  only accept challenges from these users. May be\n"
+        "                              repeated. Omit entirely to accept anyone.\n"
+        "  --print-challenge           print the challenge POST body this configuration would\n"
+        "                              send, then exit. No token, no network. Use it to check a\n"
+        "                              setup BEFORE committing a night of games to it.\n"
+        "  -h, --help                  this text\n"
+        "\n"
+        "REQUIRED\n"
+        "  LICHESS_TOKEN               API token of the bot account. No default; the bot exits\n"
+        "                              without it. Keep it out of the repo -- *token*.txt is\n"
+        "                              gitignored.\n"
+        "\n"
+        "ACCOUNT AND ENGINE\n"
+        "  LICHESS_USERNAME  (%s)\n"
+        "                              bot account name, lowercase as in the lichess API\n"
+        "  CREATICA_ENGINE   (%s)\n"
+        "                              path to the engine binary\n"
+        "  CREATICA_THREADS  %-10sengine Threads\n"
+        "  CREATICA_HASH     %-10sengine Hash in MB. Two bots on one 8 GB machine at 1024\n"
+        "                              each will swap; 512 is the safer pairing.\n"
+        "  CREATICA_PONDER   %-10sthink on the opponent's clock. Measured +137 Elo.\n"
+        "\n"
+        "WHAT TO PLAY  (challenging side only -- the accepting side plays what it is offered,\n"
+        "               except CREATICA_VARIANT, which BOTH sides use)\n"
+        "  CREATICA_VARIANT  (standard)\n"
+        "                              'standard' or 'chess960'. Decides what is challenged AND\n"
+        "                              what is accepted, so set it on both bots of a pair. A bot\n"
+        "                              set to standard declines 960, so a stranger cannot pull it\n"
+        "                              into a variant it is not configured for.\n"
+        "  CREATICA_CLOCK    %-10sinitial clock, seconds\n"
+        "  CREATICA_INC      %-10sincrement, seconds\n"
+        "  CREATICA_BOOK     (unset)   opening book, one FEN per line (tab-separated; only the\n"
+        "                              first field is read). Each position is played twice with\n"
+        "                              the colours swapped, so its bias cancels. IGNORED when\n"
+        "                              CREATICA_VARIANT is not standard, because a book FEN is\n"
+        "                              sent as variant=fromPosition and would silently override\n"
+        "                              the variant. With no book, colours simply alternate.\n"
+        "  CREATICA_MIN_ELO  %-10s\\ rating band for picking a RANDOM opponent; ignored\n"
+        "  CREATICA_MAX_ELO  %-10s/ when --challenge= names one.\n"
+        "\n"
+        "OUTPUT\n"
+        "  CREATICA_RESULTS  (results_<username>.csv)\n"
+        "                              per-game results, appended. Timestamps are UTC.\n"
+        "  CREATICA_VISITS   (unset)   root visit distribution per search, for training. Give\n"
+        "                              each bot its OWN file or two engines interleave into one.\n"
+        "  CREATICA_LOG      (creatica_<username>.log)\n"
+        "                              engine log. Set by this bot for its engine child, so two\n"
+        "                              bots do not interleave into one file -- which once made a\n"
+        "                              normal ponder search look like a duplicated bestmove and\n"
+        "                              sent a whole debugging session the wrong way.\n",
+        argv[0], BOT_USERNAME, CREATICA_PATH, d_threads, d_hash, PONDER ? "(true)" : "(false)",
+        d_clock, d_inc, d_minelo, d_maxelo);
       return 0;
     } else {
       fprintf(stderr, "%s: unknown argument '%s' (try --help)\n", argv[0], argv[i]);

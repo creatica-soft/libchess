@@ -627,6 +627,63 @@ A result that looked convincing at 20 games has washed out at 64 twice in this p
 Plan the sample around the size of the effect being looked for.
 
 
+## The lichess bot
+
+`./lichess_bot --help` is the authoritative list and prints the compile-time defaults straight
+from the `#define`s, so it cannot drift from the code the way a table here would. Almost all of
+the configuration is **environment variables**; the command-line flags only cover what changes
+between runs of the same setup.
+
+Check a configuration before committing a night to it:
+
+```sh
+./lichess_bot --print-challenge          # prints the challenge POST body, then exits
+```
+
+No token and no network. This exists because the failure it catches is invisible until the games
+have been played — a book FEN is sent as `variant=fromPosition`, which silently overrides
+`CREATICA_VARIANT=chess960`, and the logs of the resulting standard match look completely normal.
+
+**Two bots playing each other, standard, with an opening book:**
+
+```sh
+LICHESS_USERNAME=creaticachessbot  CREATICA_VISITS=bot1_visits.tsv CREATICA_THREADS=2 \
+  CREATICA_HASH=1024 CREATICA_PONDER=1 CREATICA_CLOCK=120 CREATICA_INC=2 \
+  CREATICA_BOOK=/Users/ap/libchess/book.tsv \
+  ./lichess_bot --challenge=creaticachessbot2 --casual --accept-only=creaticachessbot2
+
+LICHESS_USERNAME=creaticachessbot2 CREATICA_VISITS=bot2_visits.tsv CREATICA_THREADS=2 \
+  CREATICA_HASH=1024 CREATICA_PONDER=1 \
+  ./lichess_bot --no-challenge --accept-only=creaticachessbot
+```
+
+**The same pair playing Chess960** — drop the book and set the variant on *both* sides, since it
+decides what is accepted as well as what is challenged:
+
+```sh
+LICHESS_USERNAME=creaticachessbot  CREATICA_VARIANT=chess960 CREATICA_VISITS=bot1_visits.tsv \
+  CREATICA_THREADS=2 CREATICA_HASH=1024 CREATICA_PONDER=1 CREATICA_CLOCK=120 CREATICA_INC=2 \
+  ./lichess_bot --challenge=creaticachessbot2 --casual --accept-only=creaticachessbot2
+
+LICHESS_USERNAME=creaticachessbot2 CREATICA_VARIANT=chess960 CREATICA_VISITS=bot2_visits.tsv \
+  CREATICA_THREADS=2 CREATICA_HASH=1024 CREATICA_PONDER=1 \
+  ./lichess_bot --no-challenge --accept-only=creaticachessbot
+```
+
+Things that have actually cost time here:
+
+- **Give each bot its own `CREATICA_VISITS` and let it have its own `CREATICA_LOG`.** Two engines
+  appending to one log is not merely untidy: creatica ponders the position where the OPPONENT is
+  to move, which is the same position the opponent is searching for real, so a shared log shows
+  what looks like one engine emitting two `bestmove` lines. That artefact was read as a protocol
+  violation and a driver change was made on the strength of it. The bot now sets `CREATICA_LOG`
+  per instance by default.
+- **`CREATICA_HASH=1024` on both bots swaps an 8 GB machine.** Trees reach 10M nodes, which is
+  about a gigabyte each. 512 is the safer pairing.
+- **Only the challenging side's clock settings are used.** Setting `CREATICA_CLOCK` on the
+  `--no-challenge` instance does nothing.
+- **`--accept-only=` on both sides** keeps a passing bot out of a self-play experiment.
+
 ## Collecting a self-play dataset
 
 `VisitDumpFile` appends one tab-separated line per completed search:
