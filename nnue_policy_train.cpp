@@ -246,13 +246,19 @@ static bool parse_visit_line(const std::string& line, CompressedPosition& pos,
                              Board& board, int seldepth_min) {
     if (line.empty() || line.compare(0, 4, "tag\t") == 0) return false;
 
-    std::string f[8];
-    size_t start = 0;
-    for (int i = 0; i < 8; ++i) {
+    //Split on ALL tabs rather than assuming a fixed field count. The dump grew a hashfull column
+    //between seldepth and the move list, and a parser hardcoded to eight fields would silently
+    //read that number as the move list and reject every record. The move list is always LAST,
+    //and everything before it is positional, so index from both ends.
+    std::vector<std::string> f;
+    for (size_t start = 0;;) {
         const size_t tab = line.find('\t', start);
-        if (i < 7) { if (tab == std::string::npos) return false; f[i] = line.substr(start, tab - start); start = tab + 1; }
-        else f[i] = line.substr(start);
+        if (tab == std::string::npos) { f.push_back(line.substr(start)); break; }
+        f.push_back(line.substr(start, tab - start));
+        start = tab + 1;
     }
+    if (f.size() < 8) return false;
+    const std::string& moves_field = f.back();
 
     const int seldepth = std::atoi(f[6].c_str());
     if (seldepth < seldepth_min) return false;
@@ -266,11 +272,11 @@ static bool parse_visit_line(const std::string& line, CompressedPosition& pos,
     mv.reserve(48);
     double total = 0.0;
     size_t i = 0;
-    while (i < f[7].size()) {
-        while (i < f[7].size() && f[7][i] == ' ') ++i;
-        const size_t e = f[7].find(' ', i);
-        const std::string tok = f[7].substr(i, (e == std::string::npos) ? std::string::npos : e - i);
-        i = (e == std::string::npos) ? f[7].size() : e + 1;
+    while (i < moves_field.size()) {
+        while (i < moves_field.size() && moves_field[i] == ' ') ++i;
+        const size_t e = moves_field.find(' ', i);
+        const std::string tok = moves_field.substr(i, (e == std::string::npos) ? std::string::npos : e - i);
+        i = (e == std::string::npos) ? moves_field.size() : e + 1;
         if (tok.size() < 8) continue;                       // "a1a2:0:0" at minimum
         const size_t c1 = tok.find(':');
         const size_t c2 = (c1 == std::string::npos) ? std::string::npos : tok.find(':', c1 + 1);

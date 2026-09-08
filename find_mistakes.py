@@ -63,10 +63,10 @@ def load(path):
             if not line or line.startswith("tag\t"):
                 continue
             p = line.split("\t")
-            if len(p) != 8:
+            if len(p) not in (8, 9):   #9 since hashfull was added; the move list is always last
                 continue
             mv = []
-            for tok in p[7].split():
+            for tok in p[-1].split():
                 b = tok.split(":")
                 if len(b) == 3:
                     try:
