@@ -1525,7 +1525,22 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
                                 //if the gate is already taken, another thread is expanding this node right now
                                 //(unlike try_lock(), an atomic exchange cannot fail spuriously or be blocked by readers)
       if (terminal == -1) { //node in check
-        log_file("mcts_search() warning: leaf node in check!\n"); //leaf node should not be in check because of process_check()
+        //Rate-limited, for the same reason the unevaluated-child warning is: log_file() takes a
+        //mutex and fflush()es, and this branch fires on the order of 350,000 times per bot in an
+        //overnight run -- so the "impossible" case was costing a flushing syscall inside the
+        //search, hundreds of thousands of times.
+        //
+        //It is also not actually impossible, which is why the count is that high. eval_and_expand
+        //handles an in-check node correctly below (it skips the policy path and minimaxes over
+        //the children), so this is a stale assertion about process_check() rather than a defect.
+        //Kept as a counter because the RATE is worth knowing if it ever changes sharply.
+        {
+          static std::atomic<uint64_t> in_check{0};
+          const uint64_t k = in_check.fetch_add(1, std::memory_order_relaxed);
+          if ((k % 1000000) == 0)
+            log_file("mcts_search() note: leaf node in check (%llu so far)\n",
+                     (unsigned long long)(k + 1));
+        }
       } else {
         evaluate_nnue(sim_board, ctx); //the leaf node is evaluated but we call it to make subsequent evals faster
       }
