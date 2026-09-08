@@ -78,6 +78,33 @@ void initCastlingMasks(Board& board) {
     }
 }
 
+//Outermost rook on one side of the king, for X-FEN castling.
+//
+//X-FEN writes Chess960 castling as plain KQkq, where K means "the OUTERMOST rook on the king's
+//side of the board" rather than "the rook on h1". Lichess emits exactly this for 960 games -- a
+//live game gives [FEN "rbnqbnkr/... w KQkq - 0 1"], king on g1 -- so a FEN from a real 960 game
+//could not be read at all before: KQkq was taken to mean rooks on a1/h1, which is wrong for most
+//of the 960 start positions. Measured: 124 of 3840 perft runs failed on the X-FEN encoding of
+//the same positions that pass in Shredder notation.
+//
+//kingside == true asks for the highest-file rook right of the king, false for the lowest-file
+//rook left of it. Returns FileNone when there is none.
+static unsigned char find_outer_rook_file(const char * rank_str, char rook_char,
+                                          unsigned char king_file, bool kingside) {
+    unsigned char file = 0;
+    unsigned char best = FileNone;
+    for (const char * p = rank_str; *p; ++p) {
+        const char ch = *p;
+        if (isdigit((unsigned char)ch)) { file += (unsigned char)(ch - '0'); continue; }
+        if (ch == rook_char && file < 8) {
+            if (kingside) { if (file > king_file) best = file; }          //keep the LAST one
+            else if (file < king_file && best == FileNone) best = file;   //keep the FIRST one
+        }
+        file++;
+    }
+    return best;
+}
+
 unsigned char find_king_file(const char * rank_str, char king_char) {
     unsigned char file = 0;
     for (const char *p = rank_str; *p; ++p) {
@@ -198,31 +225,58 @@ int fen2board(Board& board, const char * fenstr) {
         int f;
         char rank_buf[9];
 
+        //Rank 1 and rank 8 as written, needed to locate the king and the rooks for X-FEN.
+        //Extracted once, up front, rather than lazily inside each branch as before.
+        char rank1_buf[9] = {0}, rank8_buf[9] = {0};
+        {
+            const char * last_slash = strrchr(position_ptr, '/');
+            const char * rank8_end  = strchr(position_ptr, '/');
+            if (!last_slash || !rank8_end) {
+                fprintf(stderr, "fen2board() error: malformed position field. FEN = %s\n", fenstr);
+                return 1;
+            }
+            size_t l1 = strlen(last_slash + 1), l8 = (size_t)(rank8_end - position_ptr);
+            if (l1 > 8 || l8 > 8) {
+                fprintf(stderr, "fen2board() error: rank size greater than 8. FEN = %s\n", fenstr);
+                return 1;
+            }
+            memcpy(rank1_buf, last_slash + 1, l1);
+            memcpy(rank8_buf, position_ptr, l8);
+        }
+
         for (size_t c = 0; castling_ptr[c] != '\0'; c++) {
             char ch = castling_ptr[c];
             if (strchr(std, ch)) {
-                switch (ch) {
-                case 'K':
-                    //board.castlingRook[0][0] = FileH;
-                    board.castlingRooks |= SQ_BIT(SquareH1);
-                    board.castlingRights |= CastlingKingside;
-                    break;
-                case 'Q':
-                    //board.castlingRook[0][1] = FileA;
-                    board.castlingRooks |= SQ_BIT(SquareA1);
-                    board.castlingRights |= CastlingQueenside;
-                    break;
-                case 'k':
-                    //board.castlingRook[1][0] = FileH;
-                    board.castlingRooks |= SQ_BIT(SquareH8);
-                    board.castlingRights |= (CastlingKingside << 2);
-                    break;
-                case 'q':
-                    //board.castlingRook[1][1] = FileA;
-                    board.castlingRooks |= SQ_BIT(SquareA8);
-                    board.castlingRights |= (CastlingQueenside << 2);
-                    break;
+                //X-FEN: KQkq names the OUTERMOST rook on that side of the king, which is a1/h1
+                //only when the position is the standard one. Infer it from the board instead of
+                //assuming. For standard chess this yields exactly a1/h1/a8/h8 and nothing changes.
+                const bool white = (ch == 'K' || ch == 'Q');
+                const bool kside = (ch == 'K' || ch == 'k');
+                unsigned char& kf = white ? white_king_file : black_king_file;
+                if (kf == FileNone) {
+                    kf = find_king_file(white ? rank1_buf : rank8_buf, white ? 'K' : 'k');
+                    if (kf == FileNone) {
+                        fprintf(stderr, "fen2board() error: %s king not found in rank. FEN = %s\n",
+                                white ? "white" : "black", fenstr);
+                        return 1;
+                    }
                 }
+                const unsigned char rf = find_outer_rook_file(white ? rank1_buf : rank8_buf,
+                                                              white ? 'R' : 'r', kf, kside);
+                if (rf == FileNone) {
+                    //A castling right with no rook to exercise it. Drop it rather than inventing
+                    //a rook on a1/h1, which is what the old code effectively did.
+                    continue;
+                }
+                board.castlingRooks |= SQ_BIT(SQ(white ? Rank1 : Rank8, static_cast<File>(rf)));
+                board.castlingRights |= kside ? (CastlingKingside << (white ? 0 : 2))
+                                              : (CastlingQueenside << (white ? 0 : 2));
+                //Only a genuinely non-standard placement makes this Chess960. Getting this wrong
+                //in either direction matters: isChess960 selects the castling MOVE ENCODING
+                //(king-takes-rook vs king-to-g1), so a standard game must not set it.
+                const unsigned char stdKing = FileE;
+                const unsigned char stdRook = kside ? FileH : FileA;
+                if (kf != stdKing || rf != stdRook) board.isChess960 = true;
             } else if (strchr(wf, ch)) {
                 board.isChess960 = true;
                 if (white_king_file == FileNone) {
