@@ -72,6 +72,7 @@ extern std::atomic<bool> searchFlag;
 extern std::atomic<bool> stopFlag;
 extern std::atomic<bool> quitFlag;
 extern std::atomic<bool> ponderHit;
+extern std::atomic<bool> searchAborted;
 extern std::atomic<bool> pool_quit;
 extern std::atomic<int> pool_generation;
 extern std::atomic<int> active_workers;
@@ -494,19 +495,50 @@ public:
     // The last move is deliberately NOT played here. It is usually the opponent's move,
     // and in ponder mode the engine has to think about the position BEFORE it -- so the
     // decision to apply it belongs to "go", exactly as in handlePosition().
+    //Stop a running search WITHOUT letting it emit a bestmove, and wait for it to finish.
+    //
+    //set_position() rewrites board, zh and position_history, all of which a running search reads
+    //on every simulation -- position_history is consulted by the repetition test in mcts_search()
+    //for EVERY simulation. Mutating a std::unordered_set while another thread reads it is a data
+    //race, and ThreadSanitizer catches it immediately: ten races, all on position_history,
+    //between play() here and select_best_moves() on the search thread, including a read of the
+    //bucket array while the other thread was rehashing.
+    //
+    //The consequence is not a crash but wrong ANSWERS: a corrupted set makes the repetition test
+    //return nonsense, the descent breaks as a "repetition" on positions that are not one, and
+    //those simulations backpropagate 0 while still incrementing N. Since select_best_moves()
+    //ranks by visit count, the move accumulating those hollow visits gets played -- which is how
+    //the engine came to play a rook sacrifice holding 37.4M of 38.1M visits that its own
+    //evaluation scored at -322 centipawns.
+    //
+    //A plain stop() cannot be used: it makes the search EMIT a bestmove, and the GUI sent
+    //"position", not "stop", so it is not reading for one -- the extra line then sits in the pipe
+    //and every later read is one out of step. searchAborted suppresses that emission, the same
+    //mechanism ponderHit already uses.
+    void quiesce_search() {
+        std::unique_lock<std::mutex> lock(mtx);
+        //Even when nothing is running this is not a no-op: taking mtx orders everything below
+        //after the search thread's final store to searchFlag, which it makes under this same
+        //mutex. That acquire/release pair is what removes the race, which is why ThreadSanitizer
+        //goes to zero on runs where the wait never actually fires.
+        if (!searchFlag.load()) return;
+        searchAborted.store(true);
+        stopFlag.store(true);
+        cv.wait(lock, [] { return !searchFlag.load(); });
+        searchAborted.store(false);
+    }
+
     void set_position(const std::string& fen, const std::vector<std::string>& moves) override {
-        //Deliberately does NOT stop a running search.
+        //Quiesce FIRST. This rewrites board, zh and position_history, every one of which a
+        //running search reads -- see quiesce_search() for what happened when it did not.
         //
-        //A stop() here looks like cheap safety -- this rewrites board, zh and position_history,
-        //which a running search reads -- but stop() makes that search EMIT A BESTMOVE. The GUI
-        //sent "position", not "stop", so it is not reading for one; the extra line sits in the
-        //pipe and is consumed by the next command, which then returns a move computed for the
-        //previous position. Every subsequent read is one further out of step.
-        //
-        //UCI forbids sending "position" while the engine is searching, so the case this guarded
-        //against is a GUI error -- and turning a rare error into a corrupted stream every time it
-        //occurs is the worse trade. new_game() keeps its stop(), because there the alternative is
-        //cleanup() freeing nodes underneath live worker threads.
+        //The previous comment here argued that "UCI forbids sending position while the engine is
+        //searching, so the case this guards against is a GUI error". That was wrong twice over.
+        //The GUI here is lichess_bot, which pipelines commands; and an engine must not corrupt
+        //its own search because a driver sent something early. The real objection to the old
+        //stop() was only that it emitted a spurious bestmove, and searchAborted fixes that
+        //without leaving the shared state unprotected.
+        quiesce_search();
         last_move.clear();
         if (fen == startPos && moves.empty()) position_history.clear();
         fen2board(board, fen.c_str());
