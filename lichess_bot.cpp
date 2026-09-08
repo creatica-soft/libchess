@@ -137,6 +137,9 @@ const int         bot_increment = env_int("CREATICA_INC",   CLOCK_INCREMENT);
 //sent as variant=fromPosition and override the 960 request anyway.
 const std::string bot_variant = env_str("CREATICA_VARIANT", "standard");
 const std::string book_path   = env_str("CREATICA_BOOK", "");
+//Reject book openings further from equal than this, in centipawns, using the cp column
+//the book carries. 0 disables the filter and plays the book as written.
+const long        book_max_cp = (long)env_int("CREATICA_BOOK_MAXCP", 100);
 //Opponent rating band. Overridable because the right band depends on what the games are FOR.
 //
 //For measuring strength you want opponents near creatica's own rating -- games against much
@@ -185,11 +188,43 @@ static void load_opening_book(const std::string& path) {
   std::ifstream f(path);
   if (!f) { std::cerr << "opening book: cannot read " << path << std::endl; return; }
   std::string line;
+  long dropped = 0, unscored = 0;
   while (std::getline(f, line)) {
-    const size_t tab = line.find('\t');
-    std::string fen = (tab == std::string::npos) ? line : line.substr(0, tab);
-    if (fen.size() > 10) opening_book.push_back(fen);
+    if (line.empty() || line[0] == '#') continue;
+    //Columns: fen, eco, name, plies, cp. Only the FEN is needed to play; cp is a Stockfish
+    //evaluation of the position, from White's point of view, used to reject lopsided lines.
+    std::vector<std::string> col;
+    for (size_t start = 0;;) {
+      const size_t tab = line.find('\t', start);
+      if (tab == std::string::npos) { col.push_back(line.substr(start)); break; }
+      col.push_back(line.substr(start, tab - start));
+      start = tab + 1;
+    }
+    if (col.empty() || col[0].size() <= 10) continue;
+    //Reject openings that are already decided.
+    //
+    //The colour-swapped pairing cancels the BIAS of a lopsided line -- each position is played
+    //twice with the colours reversed -- but it cannot make a decided position informative. A
+    //+300cp opening yields two games whose result was settled before either engine thought, so
+    //it measures conversion rather than strength, and as training data it is positions creatica
+    //will never reach in its own games. The book carries several: the Muzio family alone is nine
+    //entries, and they are around -300cp by construction, White having given up a piece.
+    //
+    //make_book.py always said this filtering was a separate step ("Whether they are BALANCED is
+    //a separate question this script does not answer"); this is that step, done at load time so
+    //the threshold is a knob rather than something baked into the file.
+    if (col.size() >= 5) {
+      try {
+        const long cp = std::stol(col[4]);
+        if (book_max_cp > 0 && std::labs(cp) > book_max_cp) { ++dropped; continue; }
+      } catch (...) { ++unscored; }
+    } else ++unscored;
+    opening_book.push_back(col[0]);
   }
+  if (dropped)  std::cout << "opening book: dropped " << dropped
+                          << " lopsided position(s) beyond +/-" << book_max_cp << "cp" << std::endl;
+  if (unscored) std::cout << "opening book: " << unscored << " position(s) carry no cp column and"
+                             " were kept unfiltered -- regenerate with tools_evalbook.py" << std::endl;
   //Shuffled once, then walked in order. Picking at random each time would revisit some
   //openings and never reach others; walking a shuffled list covers the book evenly while still
   //differing between runs.
@@ -1356,12 +1391,19 @@ int main(int argc, char ** argv) {
         "                              into a variant it is not configured for.\n"
         "  CREATICA_CLOCK    %-10sinitial clock, seconds\n"
         "  CREATICA_INC      %-10sincrement, seconds\n"
-        "  CREATICA_BOOK     (unset)   opening book, one FEN per line (tab-separated; only the\n"
-        "                              first field is read). Each position is played twice with\n"
-        "                              the colours swapped, so its bias cancels. IGNORED when\n"
-        "                              CREATICA_VARIANT is not standard, because a book FEN is\n"
-        "                              sent as variant=fromPosition and would silently override\n"
-        "                              the variant. With no book, colours simply alternate.\n"
+        "  CREATICA_BOOK     (unset)   opening book, tab-separated:\n"
+        "                                fen, eco, name, plies, cp\n"
+        "                              Each position is played twice with the colours swapped, so\n"
+        "                              its bias cancels. IGNORED when CREATICA_VARIANT is not\n"
+        "                              standard, because a book FEN is sent as\n"
+        "                              variant=fromPosition and would silently override the\n"
+        "                              variant. With no book, colours simply alternate.\n"
+        "  CREATICA_BOOK_MAXCP (100)   reject book lines further from equal than this, using the\n"
+        "                              cp column (Stockfish, White's point of view). 0 keeps the\n"
+        "                              book as written. Swapping colours cancels a lopsided\n"
+        "                              line's BIAS but cannot make it informative: a +300cp\n"
+        "                              opening is two games decided before either engine thinks.\n"
+        "                              Regenerate the cp column with tools_evalbook.py.\n"
         "  CREATICA_MIN_ELO  %-10s\\ rating band for picking a RANDOM opponent; ignored\n"
         "  CREATICA_MAX_ELO  %-10s/ when --challenge= names one.\n"
         "\n"
@@ -1399,7 +1441,10 @@ int main(int argc, char ** argv) {
     setenv("CREATICA_LOG", lg.c_str(), 1);
     std::cout << "main(): engine log -> " << lg << std::endl;
   }
-  load_opening_book(book_path);
+  //Not loaded for a non-standard variant: CreateChallenge() ignores the book there (a book
+  //FEN would be sent as variant=fromPosition and override the variant), so loading it would
+  //only print a reassuring "opening book: N positions" line for a book that is never used.
+  if (bot_variant == "standard") load_opening_book(book_path);
   if (no_challenge) std::cout << "main(): --no-challenge, so we will not challenge anyone" << std::endl;
   else if (!challenge_target.empty())
     std::cout << "main(): challenging only " << challenge_target
@@ -1412,7 +1457,8 @@ int main(int argc, char ** argv) {
   //variant, clock and colour I think it is? A book FEN, for instance, silently rewrites the
   //variant to fromPosition.
   if (print_challenge) {
-    if (!book_path.empty() && bot_variant == "standard") load_opening_book(book_path);
+    //No load here: main() has already done it above. Loading again APPENDED to the same vector,
+    //so --print-challenge reported the book twice and at double its size.
     std::string id;
     CreateChallenge(challenge_target.empty() ? "OPPONENT" : challenge_target,
                     challenge_rated, bot_clock, bot_increment, id, "random", bot_variant, true);
