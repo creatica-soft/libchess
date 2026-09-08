@@ -1231,19 +1231,32 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
 
   auto evaluate = [&](Move& m) {
     uint64_t child_hash = 0;
+    //Read src/dst BEFORE the move is made. make_move() and make_move_policy() take Move& and
+    //hand it to do_move_dp()/do_move(), which REWRITE move.dst for castling: in Chess960 the
+    //generator produces the king-takes-rook form (dst = the rook's square) and do_move rewrites
+    //it to the standard king square, g8/c8 (board.cpp: "if (board.isChess960) move.dst =
+    //castlingKingSquare[...]"). Storing the rewritten value put the STANDARD notation into the
+    //edge, so the engine answered a 960 game with "e8g8" where lichess wanted "e8f8" and
+    //rejected it with {"error":"Piece on e8 cannot move to g8"} -- every castling move in every
+    //960 game. perft.cpp documents this trap for exactly the same reason.
+    //
+    //Harmless in standard chess, which is why it survived: there isChess960 is false, the
+    //generator already emits g1/c1, and do_move's rewrite is skipped, so dst never changes.
+    const Square   pre_dst  = static_cast<Square>(m.dst);
+    const int      move_idx = (m.promoType << 12) | (m.src << 6) | m.dst;
     if (use_policy && policy_mode == POLICY_FULL) {
       auto [cp, terminal] = make_move_policy(chess_board, board_hash, m, child_hash, pos_history, iter);
-      move_evals.push_back({policy_score(policy_net, pctx, m.src, m.dst, flip) * pscale,
-                            (m.promoType << 12) | (m.src << 6) | m.dst, cp, terminal, child_hash});
+      move_evals.push_back({policy_score(policy_net, pctx, m.src, pre_dst, flip) * pscale,
+                            move_idx, cp, terminal, child_hash});
     } else {
       auto [res, terminal] = make_move(chess_board, board_hash, m, ctx, child_hash, pos_history, iter);
       //get_prob() divides by `temperature`, so push temperature * (the logit we want).
       const double prior = use_policy
           ? temperature * policy_blend_scale
-                * (policy_blend * policy_score(policy_net, pctx, m.src, m.dst, flip) / policy_temperature
+                * (policy_blend * policy_score(policy_net, pctx, m.src, pre_dst, flip) / policy_temperature
                    + (1.0 - policy_blend) * res / temperature)
           : res;
-      move_evals.push_back({prior, (m.promoType << 12) | (m.src << 6) | m.dst,
+      move_evals.push_back({prior, move_idx,
                             static_cast<int>(-res * 100), terminal, child_hash});
     }
   };
