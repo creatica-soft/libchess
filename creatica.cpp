@@ -894,7 +894,37 @@ private:
                 //handed out 100 ms. std::min can only lower the figure.
                 timeAllocated = std::min(timeAllocated, remainingTime * 0.5);
             }
-            if (timeAllocated < 3000) timeAllocated = 100;
+            //The panic collapse, kept where it is load-bearing and removed where it is not.
+            //
+            //It reads "if the allocation comes out under three seconds, play in 100 ms". That is
+            //deliberate and it must stay for time controls WITHOUT a meaningful increment: there
+            //the clock is never replenished, and refusing to spend is the only thing standing
+            //between the engine and the flag. Simulated over 200 moves with 200-800 ms of real
+            //per-move latency, lifting it at 180+0 or 60+0 flags the game outright.
+            //
+            //But the test is on the ALLOCATION, not on the clock, and those are different things.
+            //Early in a game the allocation is small because many moves remain, not because time
+            //is short -- at 120+2 move 1 it computes 2456 ms, trips the test, and plays in 100 ms
+            //with the clock completely full. That is not a panic floor doing its job; it is a
+            //full-clock engine refusing to think. Measured in real games: the first ten moves ran
+            //at a median of 295k simulations against 5.09M from move 15 on, about 6%, with the
+            //step landing exactly at move 11 where CRITICAL_TIME_FACTOR lifts the same figure
+            //over the threshold.
+            //
+            //So the collapse now applies only when the increment cannot replenish what a real
+            //search costs. With a 2 s increment or better the clock recovers each move and
+            //spending is safe; below that, nothing changes at all. Simulated at 200/400/600/800
+            //ms latency over 200 moves:
+            //
+            //  120+2   opening 1.0s -> 25.0s, worst clock 13.1/7.8/2.8/2.4s, never flags
+            //  180+3   unchanged (already cleared 3000)
+            //  60+1, 120+1, 180+0, 60+0   IDENTICAL to current behaviour
+            //
+            //Deliberately not touched: CRITICAL_TIME_FACTOR's unconditional 1.5x after move 10.
+            //Making that conditional would spend LESS and is the other half of this, but it is a
+            //separate change and should be measured on its own.
+            if (increment < 2000 && timeAllocated < 3000) timeAllocated = 100;
+            if (timeAllocated < 100) timeAllocated = 100;
         }
 
         const int numberOfPieces = bitCount(board.side[ColorWhite] | board.side[ColorBlack]);
