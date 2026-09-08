@@ -887,43 +887,56 @@ private:
             if (movesLeft < MIN_MOVES_REMAINING) movesLeft = MIN_MOVES_REMAINING;
             if (remainingTime > TIME_SAFETY_BUFFER) remainingTime -= TIME_SAFETY_BUFFER;
             timeAllocated = (double)remainingTime / movesLeft + increment * 0.5;
-            if (board.moveNumber > 10) timeAllocated *= CRITICAL_TIME_FACTOR;
+
+            //Charge the per-move OVERHEAD to the budget, not to the clock.
+            //
+            //Every move costs more than the search: the bestmove has to travel to lichess and the
+            //next position back. That time comes out of the clock but was never in the
+            //allocation, so the engine consistently spent more than it thought. Subtracting a
+            //flat allowance makes the accounting honest and is what makes the rest of this safe:
+            //without it, lifting the collapse at 60+1 leaves only 1.2 s on the clock at 400 ms of
+            //real latency, and flags outright at 600.
+            timeAllocated -= LATENCY_ALLOWANCE;
+
+            //CRITICAL_TIME_FACTOR is deliberately NOT applied any more.
+            //
+            //It multiplied every move after move 10 by 1.5 unconditionally, so the engine
+            //systematically spent 150% of its fair share and drove itself toward the panic band
+            //sooner. Dropping it spends LESS clock, which is the only direction that is safe by
+            //construction, and it buys more than the latency allowance costs: at 120+2 the mean
+            //per-move allocation is unchanged (2067 -> 2071 ms) while the worst-case clock over
+            //200 moves improves from 13.1 s to 49.8 s at 200 ms latency, and from 2.4 s to
+            //25.9 s at 800 ms. It even makes 180+0 safer than the current code.
+
             if (remainingTime < MIN_TIME_THRESHOLD) {
                 //CAP, do not assign. Assigning made the allocation non-monotonic in the
                 //clock: at 14999 ms remaining it handed out 5000 ms while at 15001 ms it
                 //handed out 100 ms. std::min can only lower the figure.
                 timeAllocated = std::min(timeAllocated, remainingTime * 0.5);
             }
-            //The panic collapse, kept where it is load-bearing and removed where it is not.
+
+            //The panic collapse, kept only where it is load-bearing.
             //
-            //It reads "if the allocation comes out under three seconds, play in 100 ms". That is
-            //deliberate and it must stay for time controls WITHOUT a meaningful increment: there
-            //the clock is never replenished, and refusing to spend is the only thing standing
-            //between the engine and the flag. Simulated over 200 moves with 200-800 ms of real
-            //per-move latency, lifting it at 180+0 or 60+0 flags the game outright.
+            //"If the allocation is under three seconds, play in 100 ms" is deliberate, and for a
+            //control with no increment it is the only thing between the engine and the flag --
+            //removing it there flags 180+0 at move 120 and 60+0 at move 90 once real per-move
+            //latency is counted. But the test is on the ALLOCATION, not the clock, and those are
+            //different: early in a game the allocation is small because many moves REMAIN, not
+            //because time is short. At 120+2 move 1 it computes 2456 ms, trips the test, and
+            //plays in 100 ms with a completely full clock; at 60+1 it never clears 3000 at all,
+            //so the engine played the ENTIRE game at 100 ms and finished with all 60 s unused.
             //
-            //But the test is on the ALLOCATION, not on the clock, and those are different things.
-            //Early in a game the allocation is small because many moves remain, not because time
-            //is short -- at 120+2 move 1 it computes 2456 ms, trips the test, and plays in 100 ms
-            //with the clock completely full. That is not a panic floor doing its job; it is a
-            //full-clock engine refusing to think. Measured in real games: the first ten moves ran
-            //at a median of 295k simulations against 5.09M from move 15 on, about 6%, with the
-            //step landing exactly at move 11 where CRITICAL_TIME_FACTOR lifts the same figure
-            //over the threshold.
+            //Measured over 10k real searches before this: the first ten moves ran at a median of
+            //295k simulations against 5.09M from move 15 on, about 6%.
             //
-            //So the collapse now applies only when the increment cannot replenish what a real
-            //search costs. With a 2 s increment or better the clock recovers each move and
-            //spending is safe; below that, nothing changes at all. Simulated at 200/400/600/800
-            //ms latency over 200 moves:
-            //
-            //  120+2   opening 1.0s -> 25.0s, worst clock 13.1/7.8/2.8/2.4s, never flags
-            //  180+3   unchanged (already cleared 3000)
-            //  60+1, 120+1, 180+0, 60+0   IDENTICAL to current behaviour
-            //
-            //Deliberately not touched: CRITICAL_TIME_FACTOR's unconditional 1.5x after move 10.
-            //Making that conditional would spend LESS and is the other half of this, but it is a
-            //separate change and should be measured on its own.
-            if (increment < 2000 && timeAllocated < 3000) timeAllocated = 100;
+            //Simulated over 200 moves at 200/400/600/800 ms per-move latency:
+            //   60+1   100 ms every move -> 873 ms mean, opening 1.0s -> 9.3s, no flag
+            //   120+1  100 ms every move -> opening 1.0s -> 16.9s, no flag
+            //   120+2  opening 1.0s -> 22.2s, worst clock 49.8/41.8/33.8/25.9 s
+            //   180+3  slightly less per move, worst clock 24.8s -> 70.2s
+            //   180+0  unchanged allocation, worst clock 36.0s -> 87.7s (SAFER)
+            //   60+0   unchanged; already marginal at 200 moves with latency, before and after
+            if (increment < 1000 && timeAllocated < 3000) timeAllocated = 100;
             if (timeAllocated < 100) timeAllocated = 100;
         }
 

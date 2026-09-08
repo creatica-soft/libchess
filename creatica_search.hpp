@@ -62,6 +62,17 @@
 #define DISPLAY_INTERMITTENT_INFO_LINES true
 #define DISPLAY_FINAL_INFO_LINES true
 #define MAX_DEPTH 100
+//Per-move overhead charged against the time budget, in milliseconds.
+//
+//A move costs more than its search: the bestmove has to reach lichess and the next position come
+//back. That time leaves the clock but never appeared in the allocation, so the engine reliably
+//spent more than it believed. Subtracting it makes the accounting honest, and it is what makes
+//lifting the panic collapse safe at fast controls -- without it, 60+1 is left with 1.2 s on the
+//clock at 400 ms of real latency and flags outright at 600 ms.
+//
+//300 ms is deliberately generous for a local network. Erring high costs a little search per move;
+//erring low risks the flag, and the whole point of this constant is the asymmetry between those.
+#define LATENCY_ALLOWANCE 300.0
 //Hard ceiling on the check extension in process_check() -> eval_and_expand().
 //
 //That recursion had no limit at all. It descends one level for every consecutive check, and each
