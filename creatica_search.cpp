@@ -185,6 +185,11 @@ std::atomic<bool> searchFlag {false};
 std::atomic<bool> stopFlag {false};
 std::atomic<bool> quitFlag {false};
 std::atomic<bool> ponderHit {false};
+//Set while set_position() is quiescing a search it found still running. It suppresses the
+//bestmove of the search being torn down, exactly as ponderHit does, but for a different
+//reason: the GUI sent "position", so it is not reading for a bestmove, and an extra line in
+//the pipe desynchronises every subsequent read.
+std::atomic<bool> searchAborted {false};
 std::atomic<bool> pool_quit{false};    // True when engine exits
 std::atomic<int> pool_generation{0};   // Increments every new search
 std::atomic<int> active_workers{0};    // Count of currently working threads
@@ -698,6 +703,44 @@ void set_root(NNUEContext& ctx) {
     root->W.store(tanh(result / eval_scale), std::memory_order_relaxed);
     root->N.store(1, std::memory_order_relaxed);
   }
+
+  //Make the repetition verdict AUTHORITATIVE for the root's children instead of letting it be
+  //averaged against statistics gathered before the verdict existed.
+  //
+  //A simulation that ends on the repetition break increments N and adds exactly 0 to W. With
+  //tree reuse the node arrives carrying W and N from an EARLIER search, run before this position
+  //entered position_history -- when it was not a repetition at all and was scored on its merits.
+  //Q = W/N then decays only as 1/N, so the zeros have to outvote the whole stale sum before the
+  //move stops looking attractive. Measured in a real game: a losing rook sacrifice held 37.4M of
+  //38.1M visits at Q 0.0906 with W frozen at 3,391,754; it needed N > 44.6M to fall behind the
+  //correct move and the clock ran out first. select_best_moves() picks by VISIT COUNT, which is
+  //precisely the counter this inflates, so the engine played a move its own cp scored at -322.
+  //
+  //Resetting to N=1, W=0 states the verdict directly: Q = 0, a draw, which is what the descent
+  //break already scores it. It does not suppress the move -- if every alternative is worse than a
+  //draw, Q=0 still wins and the repetition is played, which is correct.
+  //
+  //Safe at the root because position_history does not change during a search: it is written by
+  //select_best_moves() after the search and by set_position(). So "this child's position has
+  //already occurred in the game" is fixed for the search's whole duration. The path-local half of
+  //the rule (pos_history, genuinely path-dependent) is untouched.
+  {
+    const int nc = root->num_children.load(std::memory_order_relaxed);
+    Edge * kids = root->children.load(std::memory_order_acquire);
+    int reset = 0;
+    for (int i = 0; i < nc && kids; ++i) {
+      MCTSNode * child = kids[i].child.load(std::memory_order_relaxed);
+      if (!child) continue;
+      if (position_history.count(child->hash.load(std::memory_order_relaxed)) == 0) continue;
+      if (child->N.load(std::memory_order_relaxed) <= 1) continue;   //nothing stale to discard
+      child->N.store(1, std::memory_order_relaxed);
+      child->W.store(0.0, std::memory_order_relaxed);
+      ++reset;
+    }
+    if (reset) log_file("info string repetition: reset %d stale root child%s to Q=0\n",
+                        reset, reset == 1 ? "" : "ren");
+  }
+
   search.root = root;    
 }
 
@@ -1881,7 +1924,7 @@ void runMCTS(NNUEContext& ctx) {
       print("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", depth.load(std::memory_order_relaxed), seldepth.load(std::memory_order_relaxed), i + 1, pvs[i].first, nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, pvs[i].second.c_str());
     }
   }
-  if (!ponderHit.load(std::memory_order_relaxed)) {
+  if (!ponderHit.load(std::memory_order_relaxed) && !searchAborted.load(std::memory_order_relaxed)) {
     std::string bestmove;
     std::string ponder;
     if (!pvs.empty()) {
