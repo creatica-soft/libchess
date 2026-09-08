@@ -64,6 +64,20 @@ static void run(const char * name, size_t N, int rounds, double kill_fraction) {
         }
         walk_ms += ms_since(t0);
         erased_total += erased;
+
+        // INTEGRITY: every survivor must still be findable and map to its OWN node, and every
+        // casualty must be gone. A table that returns the wrong node for a key would corrupt
+        // the search silently -- evaluations attached to the wrong position -- so this is
+        // checked directly rather than inferred from node counts.
+        for (size_t i = 0; i < N; ++i) {
+            auto it = tree.find(keys[i]);
+            const bool alive = (i < survivors);
+            if (alive) {
+                if (it == tree.end())        { printf("    INTEGRITY FAIL: survivor %zu missing\n", i); return; }
+                if (it->second != nodes[i])  { printf("    INTEGRITY FAIL: key %zu -> WRONG node\n", i); return; }
+            } else if (it != tree.end())     { printf("    INTEGRITY FAIL: casualty %zu still found\n", i); return; }
+        }
+        if (tree.size() != survivors) { printf("    INTEGRITY FAIL: size %zu != %zu\n", tree.size(), survivors); return; }
     }
 
     printf("  %-16s fill %7.0f ms   sweep %7.0f ms   (%zu erased over %d rounds)\n",
