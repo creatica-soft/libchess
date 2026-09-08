@@ -1525,20 +1525,32 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
                                 //if the gate is already taken, another thread is expanding this node right now
                                 //(unlike try_lock(), an atomic exchange cannot fail spuriously or be blocked by readers)
       if (terminal == -1) { //node in check
-        //Rate-limited, for the same reason the unevaluated-child warning is: log_file() takes a
-        //mutex and fflush()es, and this branch fires on the order of 350,000 times per bot in an
-        //overnight run -- so the "impossible" case was costing a flushing syscall inside the
-        //search, hundreds of thousands of times.
+        //NOT a warning, and not impossible. The old text claimed process_check() made this
+        //unreachable; it fired about 350,000 times per bot in an overnight run, each time taking
+        //a mutex and an fflush() inside the search.
         //
-        //It is also not actually impossible, which is why the count is that high. eval_and_expand
-        //handles an in-check node correctly below (it skips the policy path and minimaxes over
-        //the children), so this is a stale assertion about process_check() rather than a defect.
-        //Kept as a counter because the RATE is worth knowing if it ever changes sharply.
+        //Where it comes from, confirmed by logging the position: TABLEBASE nodes. position_eval()
+        //calls process_check() for an in-check child only on the paths that do not have an exact
+        //answer -- when the probe is out of range, or when it FAILS. On a successful probe it
+        //takes the WDL result and returns, so the child is created by make_child() with a real cp
+        //and no children, and it is in check. Every hit sampled looked like this:
+        //
+        //   8/6K1/8/3k1nP1/8/8/8/8 w   pieces 4  castling 0  nodeCp 0      terminal -1
+        //   8/4r1K1/8/5kP1/8/8/8/8 w   pieces 4  castling 0  nodeCp -2000  terminal -1
+        //
+        //-- four pieces, no castling rights, cp already set. process_check() then declines to
+        //expand it a second time, because its "already evaluated" branch returns the stored cp.
+        //
+        //That is CORRECT. A tablebase result is exact; searching underneath it can only lose
+        //information, and checks are ubiquitous in a four-piece endgame, which is why the count
+        //is so large. The node is expanded on its first visit here anyway, so nothing is stuck.
+        //Kept as a rate-limited counter purely because a sharp change in the rate would mean
+        //something else had started producing unexpanded in-check leaves.
         {
           static std::atomic<uint64_t> in_check{0};
           const uint64_t k = in_check.fetch_add(1, std::memory_order_relaxed);
           if ((k % 1000000) == 0)
-            log_file("mcts_search() note: leaf node in check (%llu so far)\n",
+            log_file("mcts_search() note: leaf node in check, %llu so far (expected: tablebase nodes)\n",
                      (unsigned long long)(k + 1));
         }
       } else {
