@@ -127,6 +127,15 @@ const bool        bot_ponder   = env_bool("CREATICA_PONDER", PONDER);
 //instance has no effect.
 const int         bot_clock     = env_int("CREATICA_CLOCK", CLOCK_LIMIT);
 const int         bot_increment = env_int("CREATICA_INC",   CLOCK_INCREMENT);
+//Variant this bot plays. "standard" or "chess960"; set it on BOTH bots for a 960 match,
+//because it decides what is CHALLENGED and what is ACCEPTED. Chess960 was declined outright
+//until the library was actually tested against Stockfish -- see perft_suite_960*.txt, which
+//found three real defects, two in move generation/unmake and one in FEN parsing.
+//
+//For a 960 match no opening book is wanted or possible: lichess randomises the start position
+//for every game, which gives more opening variety than a book does, and a book FEN would be
+//sent as variant=fromPosition and override the 960 request anyway.
+const std::string bot_variant = env_str("CREATICA_VARIANT", "standard");
 const std::string book_path   = env_str("CREATICA_BOOK", "");
 //Opponent rating band. Overridable because the right band depends on what the games are FOR.
 //
@@ -478,12 +487,12 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
 
 // Function to create a challenge to another bot
 
-bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int inc_sec, std::string& challengeId, const std::string& color = "random", const std::string& variant = "standard") {
-    if (game_in_progress.load()) {
+bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int inc_sec, std::string& challengeId, const std::string& color = "random", const std::string& variant = "standard", bool dry_run = false) {
+    if (!dry_run && game_in_progress.load()) {
         std::cout << "CreateChallenge(): Skipping - game already in progress" << std::endl;
         return false;
     }
-    if (challengeStillOutstanding()) {
+    if (!dry_run && challengeStillOutstanding()) {
         std::cout << "CreateChallenge(): Skipping - a challenge we sent "
                   << (nowMs() - challenge_sent_ms.load()) << " ms ago is still outstanding" << std::endl;
         return false;
@@ -494,7 +503,16 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
     //colours swapped, so the position's own bias cancels instead of being credited to whichever
     //side happened to receive it -- the largest single source of variance in a short match.
     std::string use_colour = color, use_fen;
-    if (!opening_book.empty()) {
+    //Alternate colours even with no book. The book path already does this, because playing each
+    //position twice with the colours swapped cancels its bias; with lichess randomising the 960
+    //start position there is no position to pair up, but the COLOUR bias is still worth removing
+    //from an overnight match, and alternating costs nothing.
+    if ((opening_book.empty() || bot_variant != "standard") && color == "random")
+      use_colour = (games_started.load(std::memory_order_relaxed) % 2 == 0) ? "white" : "black";
+    //A book FEN goes out as variant=fromPosition, which would SILENTLY OVERRIDE a chess960
+    //request: the challenge would become a standard game from a standard book position. In
+    //960 a book is meaningless anyway, because lichess randomises the start position itself.
+    if (!opening_book.empty() && bot_variant == "standard") {
       //Derived from the number of games STARTED, not from a counter this function advances.
       //
       //An earlier version flipped a leg counter on every challenge SENT, so a challenge that was
@@ -521,6 +539,13 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
       fields << "&variant=" << variant;
     }
     std::string postfields = fields.str();
+    //Logged because a challenge that goes out as the wrong variant is otherwise invisible until
+    //the games have already been played: the FEN branch above sets variant=fromPosition, and a
+    //silently overridden 960 request would just look like a normal match.
+    std::cout << "CreateChallenge(): POST " << url << " " << postfields << std::endl;
+    //--print-challenge stops here: the body is what a misconfiguration corrupts, and finding
+    //that out from the log after a night of games is expensive.
+    if (dry_run) return true;
 
     std::string response;
     bool success = HttpRequest("POST", url, postfields, &response);
@@ -642,7 +667,8 @@ void GetAndProcessBots(int nb) {
               }
               std::cout << "Bot " << i << " name " << botname << ". Elo " << bots[i].elo << " +/- " << bots[i].rd << " after " << bots[i].games << " games." << std::endl; 
               std::string challengeId;
-              res = CreateChallenge(botname, challenge_rated, bot_clock, bot_increment, challengeId);
+              res = CreateChallenge(botname, challenge_rated, bot_clock, bot_increment, challengeId,
+                                    "random", bot_variant);
               if (res) {
                 while (!challenge_accepted.load() && !challenge_declined.load()) {
                   std::cout << "GetAndProcessBots() debug: challenge_accepted " << challenge_accepted.load() << ", challenge_declined " << challenge_declined.load() << std::endl;
@@ -1093,18 +1119,23 @@ void ProcessEvent(const json& event) {
             //commented out here, so with CREATICA_BOOK set on one bot the other declined every
             //challenge with reason=variant and no games were played at all.
             //
-            //chess960 is NOT accepted, though it was for a long time. libchess is meant to
-            //support it -- Board carries castlingRooks rather than assuming h1/a1 -- but nothing
-            //has ever tested it: all 37 positions in test_fen_strings are standard, none with
-            //castling rights held by a side whose king is off its home square. A passing bot
-            //could therefore have challenged us to 960 and been accepted into a game the engine
-            //may not play legally. Re-enable once the harness covers it.
+            //chess960 is accepted only when this bot is CONFIGURED for it (CREATICA_VARIANT),
+            //so a passing stranger cannot pull a standard-configured bot into a 960 game.
+            //
+            //It was declined outright for a while, because nothing had ever tested 960. That has
+            //now been done properly -- perft against Stockfish under UCI_Chess960 over all 960
+            //start positions plus 900 generated midgame positions in which castling is legal --
+            //and it found three real defects: castling into a discovered check when the castling
+            //rook was shielding an enemy slider, undo_move() erasing the rook from the mailbox
+            //when its castling destination was its own square, and fen2board() being unable to
+            //read X-FEN at all, which is the notation lichess actually sends.
             //
             //Safe: the gameFull event carries initialFen, which flows into creatica.position,
             //and position() sends "position fen <...>" for anything longer than 25 characters
             //and "position startpos" otherwise -- so both a custom position and a normal game
             //are handled by the same path.
-            if ((!game_in_progress.load() && !challengeStillOutstanding() && (variant == "standard" || variant == "fromPosition")) &&
+            const bool variant_ok = (variant == "standard" || variant == "fromPosition" || variant == bot_variant);
+            if ((!game_in_progress.load() && !challengeStillOutstanding() && variant_ok) &&
                 (speed == "blitz" || speed == "rapid" || speed == "classical") && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
@@ -1116,7 +1147,7 @@ void ProcessEvent(const json& event) {
                 std::string decline_url = "https://lichess.org/api/challenge/" + challenge_id + "/decline";
                 std::string reason = "reason=";
                 if (game_in_progress.load() || challengeStillOutstanding()) reason += "later";
-                else if (variant != "standard" && variant != "fromPosition") reason += "variant";
+                else if (!variant_ok) reason += "variant";
                 else if (speed != "blitz" && speed != "rapid" && speed != "classical") reason += "timeControl";
                 else reason += "generic";
                 if (HttpRequest("POST", decline_url, reason)) {
@@ -1231,13 +1262,25 @@ void signal_handler(int sig) {
 }
 
 int main(int argc, char ** argv) {
+  //Reject an unknown variant here rather than discovering it from declined challenges hours
+  //later. Only these two are supported: everything else is untested against libchess.
+  if (bot_variant != "standard" && bot_variant != "chess960") {
+    fprintf(stderr, "CREATICA_VARIANT=%s is not supported; use standard or chess960\n",
+            bot_variant.c_str());
+    return 1;
+  }
+  if (bot_variant != "standard" && !book_path.empty())
+    fprintf(stderr, "warning: CREATICA_BOOK is ignored with CREATICA_VARIANT=%s "
+                    "(lichess randomises the start position itself)\n", bot_variant.c_str());
   //--no-challenge lets the bot answer incoming challenges without hunting for opponents,
   //which is what you want while verifying it by challenging it yourself. Previously this
   //meant commenting out the thread and rebuilding.
   bool no_challenge = false;
+  bool print_challenge = false;
   for (int i = 1; i < argc; i++) {
     const std::string arg = argv[i];
     if (arg == "--no-challenge") no_challenge = true;
+    else if (arg == "--print-challenge") print_challenge = true;
     else if (arg == "--casual") challenge_rated = false;
     else if (arg.rfind("--challenge=", 0) == 0) {
       challenge_target = arg.substr(12);
@@ -1296,6 +1339,19 @@ int main(int argc, char ** argv) {
     std::cout << "main(): challenging only " << challenge_target
               << (challenge_rated ? " (rated)" : " (casual)") << std::endl;
   else std::cout << "main(): will challenge a RANDOM online bot" << std::endl;
+
+  //--print-challenge builds the challenge exactly as the challenge thread would and prints the
+  //POST body, then exits. No token and no network. It answers the one question that a night of
+  //games cannot easily be un-wasted over: is this configuration actually going to ask for the
+  //variant, clock and colour I think it is? A book FEN, for instance, silently rewrites the
+  //variant to fromPosition.
+  if (print_challenge) {
+    if (!book_path.empty() && bot_variant == "standard") load_opening_book(book_path);
+    std::string id;
+    CreateChallenge(challenge_target.empty() ? "OPPONENT" : challenge_target,
+                    challenge_rated, bot_clock, bot_increment, id, "random", bot_variant, true);
+    return 0;
+  }
 
   if (token.empty()) {
     fprintf(stderr, "lichess_bot: LICHESS_TOKEN is not set.\n"
