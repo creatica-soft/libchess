@@ -109,6 +109,10 @@ queried from the online lichess tablebase.** A missing path therefore *increases
 dependence rather than removing it, in the phase of the game where it hurts most, and those
 queries are slow and rate limited.
 
+Those queries no longer block the search — see *The online tablebase probe: from blocking to
+concurrent* under **What has been measured** — but they are still rate limited, so a missing path
+is still the wrong kind of problem to have.
+
 The tables also help during the search, not only at the end of a game: `position_eval()`
 probes whenever the piece count drops to `TB_LARGEST` or below, so a middlegame line that
 simplifies into a five-piece ending gets an exact result instead of an evaluation. Removing
@@ -169,6 +173,75 @@ be: the truncated node now survives across moves instead of being rebuilt every 
 bad gating decision persists for the rest of the game.
 
 The option is kept, at 1000, as a record of a measured decision rather than a live tunable.
+
+### RepetitionGuard
+
+How many prior occurrences of a position make the engine refuse a winning move that returns to
+it. **Leave it at 1** unless you are running the comparison below.
+
+| value | behaviour |
+|---|---|
+| 0 | filter off — play whatever the search chose, repetition or not |
+| 1 | default — refuse a winning move returning to a position seen once |
+| 2 | refuse only a move handing the opponent an immediate threefold claim |
+
+**Why 1 rather than the legal 2.** The laws of chess draw on the third occurrence, so `1` is
+deliberately stricter than the rules require. The reason is search depth: with creatica's priors
+the search cannot see two full repetition cycles ahead, so by the time a threefold-correct rule
+noticed the danger the opponent would already be able to force it. Steering away one cycle early
+is the safe direction for the side that is winning. Stockfish scores a twofold repetition inside
+its search as a draw for the same reason.
+
+**Why not relax it, having built the machinery to.** The counting history makes `2` expressible,
+and the question was reopened deliberately. It was closed again on this argument: when we are
+winning, refusing a repetition costs at most a wasted tempo *whether or not* the opponent is
+actually playing for a draw. Knowing their intent buys nothing, so the strict rule is close to
+free insurance. The damage in the endgame that prompted all of this was never caused by the
+threshold — see the diagnosis under *What has been measured*.
+
+**What this option does NOT control.** Three repairs in the same function are unconditional,
+because they fix things that were wrong rather than expressing a policy:
+
+- the winning guard reads **Q**, not raw `W` (a sum repetitions can never lower);
+- a **visit floor** stops the filter landing on a move with under 1% of the chosen move's visits;
+- the **initial position is counted**, so a move returning to the position a game started from
+  is now recognised as a recurrence.
+
+**The 0 arm exists to be measured.** This filter is what discarded a move holding 907,491 in
+accumulated value in favour of one holding 2,223. Whether it earns its place at all has been
+assumed rather than tested, and `0` makes that answerable from one binary.
+
+### EdgeVisits
+
+Rank the root's moves by *N(s,a)* — how often each **edge** was taken — instead of by the child
+node's lifetime visit count, and use the same figure as the PUCT exploration denominator.
+**Off by default.**
+
+**What it fixes is real.** `select_best_moves()` ranks by visits, and under `ReuseTree` a node's
+`N` is a lifetime total including everything it earned while it was itself the search root or the
+ponder root. So the ranking that chooses the move played is partly decided by numbers no
+simulation in the current search produced. The exploration term had the same problem from the
+other side: its denominator was the child's lifetime `N`, so a child carrying a million inherited
+visits had a bonus so small it could never be re-examined from a new parent.
+
+**What it costs is measured**, on the same position, same binary, five seconds each:
+
+| | simulations |
+|---|---|
+| `EdgeVisits=false` | 2,095,429 |
+| `EdgeVisits=true` | 892,901 |
+
+**The bookkeeping is not the cost.** A build that maintained both counters and never read them
+ran 2,280,402 simulations against 2,170,841 for one without them at all — free, within noise. The
+halving is the search genuinely exploring more and paying for expansions it used to skip, at
+roughly 33 NNUE child evaluations each. Both counters live in padding that already existed, so
+`sizeof(MCTSNode)` stays 56 and `sizeof(Edge)` stays 24 and the collector's accounting is
+unchanged.
+
+**Whether better-directed search at half the volume beats worse-directed search at full volume is
+not known.** It is a switch rather than a decision for that reason, and it is runtime rather than
+compile-time specifically so both sides of a match can be the same binary — two builds risk
+differing in something other than the flag. Set `CREATICA_EDGE_VISITS=1` on one bot of a pair.
 
 ### Options that are gone
 
@@ -517,6 +590,154 @@ the reported `nps` wrong while reuse is on, since it divides inherited visits by
 elapsed time. Strength has not been measured at all.
 
 
+### Why a won endgame drew, and what actually caused it
+
+A rook-and-knight endgame two pawns up was drawn on lichess. The engine's own log showed its
+repetition filter discarding its chosen move on six of ten moves, so the filter looked like the
+culprit. It was not, and the diagnosis is worth recording because two plausible readings of the
+log turned out to be wrong.
+
+**Wrong reading one: the evaluation collapsed.** The `skipping move` lines showed cp falling from
+332 to 15 across the sequence. Those are the stale one-ply `cp` fields of the successive *fallback
+moves*, not the engine's opinion of the position. The search's own value held at Q ≈ 0.50
+throughout — about +3.35 pawns at `EvalScale` 6.1. The engine never thought it was losing its
+advantage.
+
+**Wrong reading two: the two repetition tests disagreed about the hash.** They do not. The
+descent's `sim_zh.hash` and the node's cached `child->hash` are the same Zobrist key over the same
+components, and the tree map is keyed by it.
+
+**What was actually happening.** `N` and `W` are lifetime totals that nothing resets, so under
+`ReuseTree` a node keeps them for the whole game. The proof is in the log: one child carries a
+bit-identical `W` of 660667.106507 at move 56 and again at move 62, six moves apart. Those
+statistics were banked while that node was itself the ponder root, immediately after the engine
+played that very move — which is exactly why the inflated nodes are the same set of positions that
+are now in the repetition history. `select_best_moves()` ranks by visits, so those frozen nodes
+sat at the top of the list every move, the filter deleted the top of a ranking history had already
+decided, and with no floor on what it landed on it once took a move holding 2,223 in accumulated
+value over one holding 907,491.
+
+**And several of those searches barely ran.** Collections in that game cost 1.5 to 2.25 seconds —
+one took 1,810 ms and left 97 nodes — and since the per-move latency change that time comes out of
+the move's own clock. The cause was a one-line defect in the eviction budget: `keep_visits` is
+`root_visits / 1000`, which is zero whenever a root has under a thousand visits, and
+`node->N < keep_visits` on an unsigned `N` is never true against zero. The soft budget switched
+itself off and the collector fell back to plain reachability marking — the exact behaviour the
+eviction was written to replace — so the tree only ever grew, reaching 14.3 million nodes.
+
+**A fifth cause that has nothing to do with repetitions.** In that endgame every root child sat at
+Q ≈ 0.50. The search rated every legal move the same, so it had no opinion for the filter to
+override and a one-ply hash lookup was effectively choosing the move. Being two pawns up and
+unable to distinguish a winning attempt from a shuffle is a conversion problem, and none of the
+repairs below touch it.
+
+**What was repaired:** the eviction floor; a visit floor on the filter; the reported score reading
+the search's value instead of the stale one-ply `cp`; the filter's winning guard reading Q instead
+of raw `W`; and the repetition history learning to count. **What was not:** the fossil ranking
+itself, which is what `EdgeVisits` addresses and which remains unmeasured.
+
+### The reported score, and why it could agree to a draw
+
+`node->cp` is a one-ply value written once at expansion and never refreshed, and it was what the
+engine reported as `score cp`. On the same position, old build against new:
+
+| | reported score, top five moves |
+|---|---|
+| before | 55, 49, 44, 125, 62 |
+| after | **325, 325, 324, 324, 316** |
+
+The search's Q sat at about 0.50 throughout, so +3.2 pawns is what the engine actually believed and
+the old figures were an estimate frozen millions of simulations earlier. This is not only a display
+problem: `lichess_bot.cpp` accepts a draw offer when the reported score is below `DRAW_CP`, 30
+centipawns, and in the drawn game the stale figures on some moves read 15, 20 and 26. Mate and
+tablebase scores are still reported exactly rather than pushed through `atanh`.
+
+### The online tablebase probe: from blocking to concurrent
+
+Local Syzygy covers five pieces; lichess covers seven. Every six- and seven-piece endgame therefore
+went to `tablebase.lichess.ovh` over HTTP — **synchronously, on the move's own clock**, and on
+failure the engine then searched anyway, so a timed-out probe cost its timeout *and* a full-length
+search. One self-play session logged 26 timeouts in one engine and 8 in the other at three seconds
+each, in games with a 120 second base clock, and one was lost on time.
+
+**Gating the probe on having spare clock was tried and rejected.** Probes only happen in endgames,
+and endgames are exactly where the clock is already tight, so a rule that skips the probe below
+some threshold disables it precisely when it fires most often. The asymmetry decides it: the
+tablebase returns perfect play, while the search in a simplified endgame rates every move the same.
+
+**The probe now runs beside the search.** The search starts immediately with its full allocation
+and never waits; if an answer arrives first it replaces the search's move and the search is stopped
+early, so a successful probe *saves* time. A late answer is discarded by move id. Measured: 396,472
+simulations completed during the 883 ms one probe was in flight.
+
+Three things make the answers arrive in time. The curl handle is **reused**, so a warm probe is one
+round trip — 379 to 459 ms, against 3,000 ms timeouts before. Answers are **cached per position**
+and cleared per game. And after our own move the engine **prefetches one move ahead** on the
+opponent's clock, but only when the tablebase leaves them a single best reply: on a tie it stops
+rather than spending requests on a guess, because that endpoint rate-limits and two bots on one
+machine share an IP.
+
+**The remaining limit.** On a very tight clock the allocation can collapse to 100 ms, and the
+search then finishes before any probe can answer. The prefetch closes that only when the opponent's
+reply was forced.
+
+**The invariant, and how it was broken.** A probe answer carries the id of the move that asked for
+it, and the bestmove site uses it only when that id still matches. The guard was written for a late
+reply arriving after its own move had passed — and it missed the easier case, a move that never
+asked at all. `want` was set inside the tablebase branch and cleared nowhere, so once a game ended
+in a six- or seven-piece ending whose probe had answered, `want` and `have` stayed equal for the
+life of the process. The next game skips that branch entirely, thirty pieces on the board, but the
+bestmove site saw a matching pair and substituted the **previous game's** tablebase move. In a real
+game the engine posted `f3f4` into an opening position with f3 empty, and lichess replied
+`Piece on f3 cannot move to f4`.
+
+The reset now lives at the top of `run_go()` rather than in the branch, because the branch is
+exactly the code that does not run in the failing case — a reset placed there could never have
+fixed it. A `want` of 0 means "no answer applies to this move", which is what every non-tablebase
+move must say.
+
+**The regression test is a sequence, not a position**, which is why nothing caught it: every test
+stayed inside one regime. Search a six-piece ending until its probe answers, then search an
+unrelated thirty-piece position, and check the second move is legal in the second position. It runs
+in about sixteen seconds:
+
+```
+position fen 8/8/8/1k6/8/8/2PPPP2/4K3 w - - 0 1
+go wtime 180000 btime 180000 winc 3000 binc 3000
+position fen rnbqkb1r/pp2pppp/5n2/3p4/2PP4/2N5/PP3PPP/R1BQKBNR b KQkq - 2 5
+go wtime 180000 btime 180000 winc 3000 binc 3000
+```
+
+Broken, both searches answer `e2e4`. Fixed, the second answers a legal Black move.
+
+### The repetition history learns to count
+
+`position_history` was an `unordered_set`, which can answer "has this position occurred" but never
+"how many times", so the engine could not distinguish a first recurrence from a third or reason
+about whether a repetition was being forced on it. It is now an `unordered_map<uint64_t,int>`.
+
+**Keyed by the full hash, side to move included.** A turn-neutral key would be wrong twice over. It
+overcounts — a board occurring twice with White to move and once with Black reads as three
+occurrences when neither position has occurred three times — and it overcounts exactly where it
+hurts, because reaching the same board with the *opposite* side to move is **triangulation**, the
+standard winning method in these endgames. An engine that scores its own triangulation as a
+repetition will refuse the move that wins.
+
+**Two ledgers, one map.** Because the hash carries side to move, the positions each side faces are
+disjoint key sets. `rep_count(h)` asks about the opponent's ledger — they are the side who would
+complete a cycle on their own move. `rep_count_flipped(h)`, one XOR away via `z.blackMove`, asks the
+same question of the other parity; it is a tempo signal rather than a draw signal and is kept as a
+diagnostic only.
+
+**One trap that counting introduced.** `set_position()` replays the whole move list on every
+`position` command. That was harmless for a set, where re-inserting is a no-op, but with counts it
+would add the entire game prefix again every move — after ten moves a position played once would
+read as ten occurrences. The history is now cleared and rebuilt unconditionally.
+
+**And the initial position is counted**, which it never was: `play()` only recorded positions after
+a move, so a game that manoeuvred back to its own starting position had, by the engine's reckoning,
+never been there.
+
 ### What a full tree does, and what collection is worth
 
 Two defects that only tree reuse makes reachable, both found in live bot-vs-bot games and both
@@ -565,6 +786,23 @@ built from what each engine advertises, so two configurations of the same binary
 matched with no code change. There are no environment variables any more; an earlier version
 of this section said there were. `tournament.cpp` takes per-side named option lists for the
 same purpose, and `self-play-optimization.cpp` sweeps one option at a time.
+
+**The binaries left by the 2026-09-10 work**, oldest first, each adding to the one before, so a
+result can be attributed to a step rather than to the whole stack:
+
+| binary | adds |
+|---|---|
+| `creatica_base` | nothing — the engine as it was when the endgame drew |
+| `creatica_cp` | eviction floor; repetition-filter visit floor; honest reported score |
+| `creatica_edge` | search-summary logging; edge-local *N(s,a)* |
+| `creatica_tb` | async tablebase probe, warm connection, cache, one-move prefetch |
+| `creatica` | the above plus repetition counting, the Q guard, and both new options |
+
+`creatica` against `creatica_base` compares everything from that day *except* the two experiments,
+since `EdgeVisits` defaults off and `RepetitionGuard` defaults to the old threshold. One caveat when
+reading such a result: `creatica_base` carries the old blocking tablebase probe, and in a self-play
+match the two bots share an IP and rate-limit each other at that endpoint, which penalises the old
+engine harder than a real opponent would.
 
 Two practical notes on sample size. Draw rates run 55–75% between configurations this
 similar, so a 20-game match cannot separate a 50-Elo gap from zero — a result that looks
@@ -884,6 +1122,12 @@ optimizer step, so a killed run continues its cosine instead of jumping back to 
 Delete it to start a schedule over. Note that changing `BATCH_SIZE` invalidates it, since a
 step no longer means the same number of positions.
 
+
+### CREATICA_EDGE_VISITS
+
+Sets the `EdgeVisits` UCI option on that bot's engine, so a head-to-head can run both sides from one
+binary rather than two builds that might differ in something else. Off unless set. See the option's
+own section for what it changes and what it costs.
 
 ## Setting options from a driver
 
