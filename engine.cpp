@@ -147,8 +147,13 @@ int getOptions(Engine& engine) {
 								if (engine.numberOfButtonOptions < MAX_UCI_OPTION_BUTTON_NUM)
 									strcpy(engine.optionButton[engine.numberOfButtonOptions++].name, name);
 								else {
-									fprintf(stderr, "getOptions() error: number of button options exceeded the maximum of %d\n", MAX_UCI_OPTION_BUTTON_NUM);
-									return 1;
+									fprintf(stderr, "getOptions() warning: number of button options exceeded the maximum of %d; ignoring it and continuing\n", MAX_UCI_OPTION_BUTTON_NUM);
+									//NOT a return. Aborting the parse here discarded every option after this one, of
+									//every type: creatica's seventeenth SPIN option is advertised before its
+									//VisitDumpFile STRING option, so overflowing the spin array silently lost an
+									//unrelated string option and the driver reported only that the engine did not
+									//advertise it. Losing the one option that does not fit is bad; losing the rest of
+									//the list because of it is worse, and far harder to diagnose.
 								}
 								break;
 							case 1: //check
@@ -168,8 +173,13 @@ int getOptions(Engine& engine) {
 										engine.optionCheck[engine.numberOfCheckOptions++].value = true;
 									}
 								} else {
-									fprintf(stderr, "getOptions() error: number of check options exceeded the maximum of %d\n", MAX_UCI_OPTION_CHECK_NUM);
-									return 1;
+									fprintf(stderr, "getOptions() warning: number of check options exceeded the maximum of %d; ignoring it and continuing\n", MAX_UCI_OPTION_CHECK_NUM);
+									//NOT a return. Aborting the parse here discarded every option after this one, of
+									//every type: creatica's seventeenth SPIN option is advertised before its
+									//VisitDumpFile STRING option, so overflowing the spin array silently lost an
+									//unrelated string option and the driver reported only that the engine did not
+									//advertise it. Losing the one option that does not fit is bad; losing the rest of
+									//the list because of it is worse, and far harder to diagnose.
 								}
 								break;
 							case 2: //combo
@@ -193,8 +203,13 @@ int getOptions(Engine& engine) {
 									}
 									engine.numberOfComboOptions++;
 								} else {
-									fprintf(stderr, "getOptions() error: number of combo options exceeded the maximum of %d\n", MAX_UCI_OPTION_COMBO_NUM);
-									return 1;
+									fprintf(stderr, "getOptions() warning: number of combo options exceeded the maximum of %d; ignoring it and continuing\n", MAX_UCI_OPTION_COMBO_NUM);
+									//NOT a return. Aborting the parse here discarded every option after this one, of
+									//every type: creatica's seventeenth SPIN option is advertised before its
+									//VisitDumpFile STRING option, so overflowing the spin array silently lost an
+									//unrelated string option and the driver reported only that the engine did not
+									//advertise it. Losing the one option that does not fit is bad; losing the rest of
+									//the list because of it is worse, and far harder to diagnose.
 								}
 								break;
 							case 3: //spin
@@ -210,8 +225,13 @@ int getOptions(Engine& engine) {
 									engine.optionSpin[engine.numberOfSpinOptions].min = minValue;
 									engine.optionSpin[engine.numberOfSpinOptions++].max = maxValue;
 								} else {
-									fprintf(stderr, "getOptions() error: number of spin options exceeded the maximum of %d\n", MAX_UCI_OPTION_SPIN_NUM);
-									return 1;
+									fprintf(stderr, "getOptions() warning: number of spin options exceeded the maximum of %d; ignoring it and continuing\n", MAX_UCI_OPTION_SPIN_NUM);
+									//NOT a return. Aborting the parse here discarded every option after this one, of
+									//every type: creatica's seventeenth SPIN option is advertised before its
+									//VisitDumpFile STRING option, so overflowing the spin array silently lost an
+									//unrelated string option and the driver reported only that the engine did not
+									//advertise it. Losing the one option that does not fit is bad; losing the rest of
+									//the list because of it is worse, and far harder to diagnose.
 								}
 								break;
 							case 4: //string
@@ -225,8 +245,13 @@ int getOptions(Engine& engine) {
 									strcpy(engine.optionString[engine.numberOfStringOptions].defaultValue, defaultStringValue);
 									strcpy(engine.optionString[engine.numberOfStringOptions++].value, defaultStringValue);
 								} else {
-									fprintf(stderr, "getOptions() error: number of string options exceeded the maximum of %d\n", MAX_UCI_OPTION_STRING_NUM);
-									return 1;
+									fprintf(stderr, "getOptions() warning: number of string options exceeded the maximum of %d; ignoring it and continuing\n", MAX_UCI_OPTION_STRING_NUM);
+									//NOT a return. Aborting the parse here discarded every option after this one, of
+									//every type: creatica's seventeenth SPIN option is advertised before its
+									//VisitDumpFile STRING option, so overflowing the spin array silently lost an
+									//unrelated string option and the driver reported only that the engine did not
+									//advertise it. Losing the one option that does not fit is bad; losing the rest of
+									//the list because of it is worse, and far harder to diagnose.
 								}
 								break;
 							}
