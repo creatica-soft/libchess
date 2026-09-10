@@ -94,6 +94,15 @@
 //a perpetual is a draw.
 #define MAX_CHECK_EXTENSION 32
 
+//How much of Hash a collection is allowed to keep, in per-mille, soft limit and hard limit.
+//Past the soft limit only nodes holding at least a thousandth of the root's visits keep their
+//children; past the hard limit nothing does. See the long note in gc() for why retention has to
+//be bounded at all: with tree reuse the collector could mark the entire tree as reachable, free
+//nothing, and leave the search permanently unable to expand. 600 leaves 40% headroom, which is
+//several moves' growth at observed rates, and 850 bounds how far the PV exemption may overshoot.
+#define GC_EVICT_SOFT 600
+#define GC_EVICT_HARD 850
+
 //--- policy head ---------------------------------------------------------------------
 //Where to find the exported weights, overridable with the CREATICA_POLICY env var. The
 //file is produced by:  EXPORT_WEIGHTS=nnue_policy.bin ./nnue_policy_train
@@ -135,6 +144,14 @@ struct MCTSNode {
     std::atomic<int> generation{0};
     std::atomic<int> terminal{0}; //0 (not terminal), 1 (mate), 2 (stalemate), 3 (repetition), -1 (check)
     std::atomic<uint8_t> expanding{0};  // expansion gate (test-and-set try-lock): exchange(1, acquire) == 0 acquires it, store(0, release) releases it
+    //How many times the search has DESCENDED THROUGH this node, i.e. the sum of its edges' n.
+    //It is the numerator of the exploration term, and it has to be edge-consistent with the
+    //denominator or the two are on different scales: N below counts every arrival at this
+    //POSITION from any parent and across the whole game, which under tree reuse can be millions
+    //while a fresh edge is still at zero. Lives in the seven bytes of padding that already sat
+    //between `expanding` and `children`, so sizeof(MCTSNode) stays 56 and the gc accounting in
+    //tree_occupancy() is unchanged.
+    std::atomic<uint32_t> descents{0};
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
 };
 // An OPEN-ADDRESSING hash table keyed by Zobrist hash, holding the transposition DAG.
@@ -315,9 +332,44 @@ struct MCTSSearch {
 };
 struct Edge {
     std::atomic<int> move {0};             // The move that leads to the child position
+    //N(s,a): how many times THIS edge has been taken, as distinct from how many times the child
+    //POSITION has been reached. The two differ for any transposition, and they differ enormously
+    //under ReuseTree, where a child keeps every visit it ever earned -- including the visits it
+    //earned while it was itself the search root or the ponder root. Ranking and exploration both
+    //want the per-edge count; only the value estimate Q wants the per-position one. Occupies the
+    //four bytes of padding that already sat between `move` and `P`, so sizeof(Edge) stays 24.
+    std::atomic<uint32_t> n {0};
     std::atomic<double> P {0.0};            // Prior probability - model move_probs for a given move in the node
     std::atomic<struct MCTSNode *> child {nullptr}; // Pointer to the child node
 };
+
+//ASYNC ONLINE TABLEBASE PROBE.
+//
+//The probe used to run BEFORE the search, blocking, on the move's own clock: a failed one cost its
+//full timeout and then a full-length search on top, which is how a probe turned into a loss on
+//time. It now runs BESIDE the search instead. The search starts immediately and never waits, so a
+//slow or failed probe costs exactly nothing; if an answer arrives first it replaces the search's
+//move at emission time, and since a tablebase answer is perfect play the search is stopped early
+//rather than spending the rest of its allocation on a question already settled.
+//
+//`want` is the id of the move currently being searched and `have` the id the stored answer belongs
+//to. They must match for the answer to be used, which is what makes a late reply from a previous
+//move harmless instead of catastrophic.
+struct TbProbe {
+    std::atomic<uint64_t> want{0};
+    std::atomic<uint64_t> have{0};
+    std::mutex            mtx;      //guards move/score, held only to copy a short string
+    std::string           move;
+    int                   score{0};
+};
+extern TbProbe tb_probe;
+//Repetition counts for the actual game, keyed by the full hash (side to move included).
+//rep_count_flipped() asks the same question of the other parity -- see the notes on the definitions.
+int rep_count(uint64_t h);
+int rep_count_flipped(uint64_t h);
+//Enqueue a speculative probe of the position the opponent must now answer, one step ahead of the
+//search. Called immediately after our own move is applied to the board; costs nothing on our clock.
+void tb_prefetch_after_our_move();
 
 void runMCTS(NNUEContext& ctx);
 //Checks the invariants gc() must preserve; off unless validate_tree_enabled is set. Returns the
