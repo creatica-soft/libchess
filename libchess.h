@@ -102,7 +102,10 @@
 //Raising 32 to 256 made test_pos report 678 failures until it was rebuilt, and 0 after.
 #define MAX_UCI_OPTION_STRING_LEN 256
 #define MAX_UCI_OPTION_BUTTON_NUM 4
-#define MAX_UCI_OPTION_SPIN_NUM 16
+//32, not 16. creatica advertises 17 spin options as of RepetitionGuard, and the seventeenth used
+//to abort getOptions() outright -- see the note there. Headroom rather than exactly enough, because
+//the failure mode of being one over is silent option loss in an unrelated category.
+#define MAX_UCI_OPTION_SPIN_NUM 32
 #define MAX_UCI_OPTION_CHECK_NUM 16
 #define MAX_UCI_OPTION_COMBO_NUM 4
 #define MAX_UCI_OPTION_COMBO_VARS 8
