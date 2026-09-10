@@ -122,6 +122,10 @@ const std::string engine_path  = env_str("CREATICA_ENGINE",  CREATICA_PATH);
 const int         bot_threads  = env_int("CREATICA_THREADS", THREADS);
 const int         bot_hash     = env_int("CREATICA_HASH",    HASH);
 const bool        bot_ponder   = env_bool("CREATICA_PONDER", PONDER);
+//Rank the root and drive PUCT by N(s,a) rather than the child's lifetime visit count. Off by
+//default because it costs about half the simulation rate. Exposed per bot so a head-to-head can run
+//both sides from ONE binary -- two builds risk differing in something other than the flag.
+const bool        bot_edge_visits = env_bool("CREATICA_EDGE_VISITS", false);
 //Time control of challenges this bot SENDS. Only the challenging side's values are used --
 //the accepting side plays whatever it is offered -- so setting these on the --no-challenge
 //instance has no effect.
@@ -371,6 +375,7 @@ void setEngineOptions() {
 		{"FinalInfoLines",        FINAL_INFO_LINES},
 		{"IntermittentInfoLines", INTERMITTENT_INFO_LINES},
 		{"Ponder",                bot_ponder},
+		{"EdgeVisits",            bot_edge_visits},
 	};
 
 	//setEngineSpin()/setEngineCheck() print their own warning naming the engine and the option.
@@ -1381,6 +1386,12 @@ int main(int argc, char ** argv) {
         "  CREATICA_HASH     %-10sengine Hash in MB. Two bots on one 8 GB machine at 1024\n"
         "                              each will swap; 512 is the safer pairing.\n"
         "  CREATICA_PONDER   %-10sthink on the opponent's clock. Measured +137 Elo.\n"
+        "  CREATICA_EDGE_VISITS (0)    rank the root by how often each EDGE was taken rather than\n"
+        "                              by the child's lifetime visit count, and use the same figure\n"
+        "                              as the PUCT exploration denominator. Costs about half the\n"
+        "                              simulation rate, buys a ranking that reflects this search\n"
+        "                              rather than earlier ones. Set it on one bot of a pair to\n"
+        "                              measure it head to head.\n"
         "\n"
         "WHAT TO PLAY  (challenging side only -- the accepting side plays what it is offered,\n"
         "               except CREATICA_VARIANT, which BOTH sides use)\n"
