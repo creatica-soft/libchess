@@ -117,6 +117,45 @@ static inline int policy_index(int from_i, int to_i, int promo) {
 #define POLICY_H2 128
 #endif
 
+// LEGAL_BIAS -- the legal move set as a bias on the readout, not as extra trunk input.
+//
+// WHY AT ALL. The head scores a move as dot(ctx, emb[move]). ctx depends only on the position
+// and emb[move] is a fixed table, so a move's score is the same whatever ELSE is available --
+// the head cannot express "this move is worth more because that other move also exists". It also
+// cannot see the legal set at all: legality is applied to the 4096 output logits, after the trunk
+// has finished. Measured, that set carries information the 1024 NNUE values do not: a ridge probe
+// over 79,884 positions separates legal from occupancy-blocked at AUC 0.87 but sits at 0.56 on
+// moves that would expose the king and 0.39 on moves of a pinned piece, both no better than
+// guessing. Castling rights and en passant are absent outright -- two positions differing only in
+// those produce byte-identical 1024-value inputs, verified directly.
+//
+// WHAT IT COMPUTES. S is the MEAN embedding over the legal moves, mapped by Wl and added to ctx:
+//     score(i) = dot(ctx + Wl * mean_{j legal} emb[j], emb[i])
+// Expanding the second term, move i picks up sum_j dot(Wl*emb[j], emb[i]) / n_legal: a learned
+// pairwise term between each candidate and every other move on the menu.
+//
+// WHY "TIED". The table summed over the legal moves IS the readout table emb, so this adds no
+// [4096,h2] weights of its own -- only Wl, which is [h2,h2] = 16,384 numbers, 2% of the model.
+// At inference it also touches exactly the emb rows the per-move scoring is about to load anyway.
+//
+// MEAN, not sum: a position with 50 legal moves must not swamp ctx relative to one with 5.
+//
+// TWO FORMS, selected by the value:
+//   LEGAL_BIAS=1  TIED.   The summed table IS emb, mapped by Wl [h2,h2] = 16,384 numbers. Adds no
+//                         per-move table of its own and touches only emb rows the per-move scoring
+//                         is about to load anyway. Measured: +18% of the head, +0.23 points Top-6.
+//   LEGAL_BIAS=2  UNTIED. A separate table Cl [4096,h2] = 524,288 numbers, 64% more parameters.
+//                         Wl disappears here rather than being kept alongside: a linear map applied
+//                         after summing an unconstrained table is a reparametrisation of that same
+//                         table, since Wl * mean(c_j) == mean(Wl * c_j), so carrying both would add
+//                         parameters that cannot express anything the table alone cannot.
+//                         Cheaper in arithmetic than the tied form -- no [h2,h2] product -- but it
+//                         reads a SECOND 2 MB table at scattered rows, so cache behaviour, not
+//                         operation count, decides which is actually faster. Measure, do not assume.
+#ifndef LEGAL_BIAS
+#define LEGAL_BIAS 1
+#endif
+
 //Policy over NNUE features. The trunk is small and dense because the expensive part --
 //turning a board into 1024 numbers -- has already been paid for by the value network.
 //
@@ -130,6 +169,11 @@ static inline int policy_index(int from_i, int to_i, int promo) {
 //transformer uses. Training keeps it dense; the GPU does not care.
 struct NNUEPolicyImpl : torch::nn::Module {
     torch::Tensor W1, b1, W2, b2, emb;
+#if LEGAL_BIAS == 1
+    torch::Tensor Wl;
+#elif LEGAL_BIAS == 2
+    torch::Tensor Cl;
+#endif
     NNUEPolicyImpl(int in = NNUE_DIMS, int h1 = POLICY_H1, int h2 = POLICY_H2,
                    int nmoves = POLICY_OUT) {
         auto u = [](std::initializer_list<int64_t> shp, int fan) {
@@ -141,11 +185,51 @@ struct NNUEPolicyImpl : torch::nn::Module {
         W2  = register_parameter("W2",  u({h1, h2}, h1));
         b2  = register_parameter("b2",  torch::zeros({h2}));
         emb = register_parameter("emb", u({nmoves, h2}, h2));
+#if LEGAL_BIAS
+        //ZERO, deliberately. With the term's weights at 0 it contributes exactly nothing and the
+        //output is identical to a net trained without it, so a fine-tune STARTS at the incumbent's
+        //behaviour and can only move away by learning something. That is the right prior when the
+        //training set is 100,000 records, and it makes the change falsifiable: if held-out Top-1
+        //does not move, the term learned nothing rather than having damaged what was there.
+#if LEGAL_BIAS == 1
+        Wl = register_parameter("Wl", torch::zeros({h2, h2}));
+#else
+        Cl = register_parameter("Cl", torch::zeros({nmoves, h2}));
+#endif
+#endif
     }
-    // x [B, NNUE_DIMS] -> [B, POLICY_OUT]
+    // x [B, NNUE_DIMS] -> [B, POLICY_H2]
+    torch::Tensor trunk(torch::Tensor x) {
+        auto h = torch::relu(torch::matmul(x, W1) + b1);
+        return torch::relu(torch::matmul(h, W2) + b2);
+    }
+    // x [B, NNUE_DIMS] -> [B, POLICY_OUT]. No legality: BENCH_FORWARD times the trunk alone,
+    // and a caller without a mask gets exactly the pre-LEGAL_BIAS behaviour.
     torch::Tensor forward(torch::Tensor x) {
-        auto h   = torch::relu(torch::matmul(x, W1) + b1);
-        auto ctx = torch::relu(torch::matmul(h, W2) + b2);
+        return torch::matmul(trunk(x), emb.transpose(0, 1));
+    }
+    // mask [B, POLICY_OUT], 1.0 on each legal move. See the LEGAL_BIAS note above.
+    // If `share` is non-null it receives the mean |legality term| / mean |ctx| for this batch --
+    // the one number that says whether the term is doing anything at all. A variant that scores
+    // like the baseline because Wl never left zero is not evidence about legality; it is evidence
+    // that nothing was tested. Report it rather than infer it.
+    torch::Tensor forward(torch::Tensor x, const torch::Tensor& mask, double* share = nullptr) {
+        auto ctx = trunk(x);
+#if LEGAL_BIAS
+        auto n = mask.sum(1, /*keepdim=*/true).clamp_min(1.0f);   // [B,1] legal move count
+#if LEGAL_BIAS == 1
+        auto L = torch::matmul(torch::matmul(mask, emb) / n, Wl); // mean legal emb row, mapped
+#else
+        auto L = torch::matmul(mask, Cl) / n;                     // mean legal row of its own table
+#endif
+        if (share) {
+            const double a = ctx.abs().mean().item<double>();
+            *share = a > 0.0 ? L.abs().mean().item<double>() / a : 0.0;
+        }
+        ctx = ctx + L;
+#else
+        if (share) *share = 0.0;
+#endif
         return torch::matmul(ctx, emb.transpose(0, 1));
     }
 };
@@ -864,6 +948,18 @@ static PolicyBatch unpack_targets(const torch::Tensor& t) {
 // Dense [B,4096] legality mask from the padded index list. Padding is -1, clamped to
 // index 0 and written with value 0 -- safe because index 0 means a1->a1, which is
 // never a real move, so no padding entry can mark a square pair as legal.
+static torch::Tensor legality_mask_dims(int64_t B, int64_t W, const torch::TensorOptions& opt,
+                                        const torch::Tensor& legal_idx) {
+    //Same construction as legality_mask() below, but sized from explicit dimensions rather than
+    //from a logits tensor. LEGAL_BIAS needs the mask BEFORE the readout runs, so it cannot derive
+    //the shape from the logits the way the loss does.
+    auto mask  = torch::zeros({B, W + 1}, opt);
+    auto idx   = torch::where(legal_idx >= 0, legal_idx,
+                              torch::full_like(legal_idx, (double)W)).to(torch::kLong);
+    auto valid = (legal_idx >= 0).to(opt.dtype().toScalarType());
+    mask.scatter_(1, idx, valid);
+    return mask.narrow(1, 0, W).contiguous();
+}
 static torch::Tensor legality_mask(const torch::Tensor& logits, const torch::Tensor& legal_idx) {
     //Padding is -1. Clamping it to 0 was safe only for the bilinear scheme, where index 0
     //is a1->a1 and never a real move. Under the directional scheme index 0 is "a1, north,
@@ -1114,6 +1210,13 @@ int main() {
     //the schedule each time -- so the anneal never completed. EPOCHS drives both the loop and
     //TOTAL_STEPS below, keeping the cosine sized to the whole run.
     const int num_epochs = (int)(std::getenv("EPOCHS") ? std::atoll(std::getenv("EPOCHS")) : 1);
+    //EPOCHS=0 scores the loaded weights against TEST_DATA and exits without touching them. There
+    //was no way to do this before: measuring what a checkpoint scores BEFORE fine-tuning it needs
+    //a run that takes zero optimizer steps, and the smallest training file the loader accepts is
+    //one row -- which is one step, and one step is worth more than a point of held-out Top-1.
+    //Without a clean baseline, "the fine-tune gained 1.5 points" cannot be distinguished from
+    //measurement noise. The training file is not read at all in this mode.
+    const bool eval_only = (num_epochs == 0);
     //The loader, not the GPU, is the bottleneck: MPS sits around 75% while CPU exceeds
     //100%, because every sample costs board reconstruction, full legal-move generation,
     //NNUE feature extraction (6.6 us) and a tensor allocation -- all on one thread with
@@ -1126,8 +1229,8 @@ int main() {
     const int num_workers = (int)env_i("NUM_WORKERS", NUM_WORKERS);
     //2e-3, not 2e-4. Measured better at batch 8192; the original was roughly 5-10x too low, and
     //the two belong together -- a larger batch wants a larger peak rate. Only ever used as the
-    //default for LR_MAX and as the optimizer's initial value, which the cosine schedule
-    //overwrites on the first step.
+    //DEFAULT for LR_MAX. It used to be handed to the optimizer as its initial value too, which
+    //meant the first step of every run ignored LR_MAX; the optimizer now takes LR_MAX directly.
     double learning_rate = 2e-3; 
     //2e-4 is conservative for Adam on a model this size at batch 2048, where the usual
     //scaling argument says a larger batch wants a LARGER step, not a smaller one.
@@ -1221,17 +1324,52 @@ int main() {
             {
               int64_t np = 0;
               for (const auto& t : model->parameters()) np += t.numel();
+              //A checkpoint written before LEGAL_BIAS existed is SHORTER by exactly Wl, and it is
+              //a legitimate thing to resume from -- Wl then stays zero and the model reproduces
+              //that checkpoint exactly. Accept either width; reject anything else.
+              int64_t np_pre = np;
+#if LEGAL_BIAS
+#if LEGAL_BIAS == 1
+              np_pre -= model->Wl.numel();
+#else
+              np_pre -= model->Cl.numel();
+#endif
+#endif
               const auto sz  = (int64_t)std::filesystem::file_size(weights_file);
               const auto exp = np * 4;
-              if (sz < exp || sz - exp > 65536) {
+              const auto exp_pre = np_pre * 4;
+              const bool fits     = (sz >= exp     && sz - exp     <= 65536);
+              const bool fits_pre = (sz >= exp_pre && sz - exp_pre <= 65536);
+              if (!fits && !fits_pre) {
                 std::cerr << "FATAL: " << weights_file << " is " << sz << " bytes but this build\n"
                           << "       has " << np << " parameters (" << exp << " bytes of tensors).\n"
                           << "       That checkpoint was trained with a different architecture.\n";
                 return 3;
               }
             }
-            torch::load(model, weights_file);
-            std::cout << "Loaded weights from " << weights_file << std::endl;
+            //PER PARAMETER, not whole-module. A pre-LEGAL_BIAS archive has no "Wl", and a
+            //whole-module torch::load() throws on the missing key -- whereupon the catch below
+            //prints a warning and CONTINUES WITH AN UNTRAINED MODEL, which is the worst outcome
+            //available: a run that looks fine and has thrown the incumbent away. Reading key by
+            //key makes a missing tensor mean "leave it at its initial value", which for Wl = 0
+            //is exactly "behave like the checkpoint that predates this term".
+            {
+              torch::serialize::InputArchive ar;
+              ar.load_from(weights_file);
+              int got = 0;
+              for (auto& kv : model->named_parameters()) {
+                torch::Tensor t;
+                if (ar.try_read(kv.key(), t)) {
+                  torch::NoGradGuard ng;
+                  kv.value().copy_(t);
+                  ++got;
+                } else {
+                  std::cout << "  no '" << kv.key() << "' in this checkpoint; left at its "
+                               "initial value" << std::endl;
+                }
+              }
+              std::cout << "Loaded " << got << " tensors from " << weights_file << std::endl;
+            }
         } catch (const c10::Error& e) {
             std::cerr << "Error loading weights: " << e.what() << std::endl;
             std::cerr << "Continuing with untrained model..." << std::endl;
@@ -1254,6 +1392,7 @@ int main() {
               << " H1=" << POLICY_H1 << " H2=" << POLICY_H2
               << " POLICY_OUT=" << POLICY_OUT
               << " CONV_POLICY=" << CONV_POLICY
+              << " LEGAL_BIAS=" << LEGAL_BIAS
               << " MAX_PVS=" << MAX_PVS << " MAX_TRAIN_PVS=" << MAX_TRAIN_PVS
               << " POLICY_TEMP=" << POLICY_TEMP << std::endl;
     std::cout << "Total number of parameters: " << param_count << std::endl;
@@ -1267,15 +1406,42 @@ int main() {
     // loops want: W1 is [in][h1] so a sparse pass accumulates whole contiguous rows, and
     // emb is [out][h2] so scoring one move is one contiguous dot product.
     if (const char* xp = std::getenv("EXPORT_WEIGHTS")) {
+        //EXPORT IS A MODE, NOT A STEP. This block returns, so it exports the weights that were
+        //just LOADED and never trains. Setting EXPORT_WEIGHTS on what looks like a training
+        //command therefore writes the input checkpoint under the output name and says nothing --
+        //it produced a "distilled" net byte-identical to the incumbent. Train first, then export
+        //the checkpoint the run saved. Warn rather than fail, because the two-step flow is fine.
+        if (std::getenv("TRAIN_DATA") || std::getenv("EPOCHS"))
+            std::cerr << "WARNING: EXPORT_WEIGHTS exports the LOADED weights and exits; no "
+                         "training runs. Point WEIGHTS at the checkpoint you want exported."
+                      << std::endl;
         auto& m = *model;
+#if LEGAL_BIAS
+        //Version 2 = the five original tensors followed by Wl [h2,h2]. The engine must know,
+        //because a v2 net whose Wl is ignored is not the net that was trained -- so
+        //policy_net_load() refuses a version it cannot apply rather than quietly dropping it.
+#if LEGAL_BIAS == 1
+        const int32_t fmt_version = 2;                            // + Wl [h2,h2]
+        const torch::Tensor ts[6] = { m.W1, m.b1, m.W2, m.b2, m.emb, m.Wl };
+        const char* nm[6] = { "W1", "b1", "W2", "b2", "emb", "Wl" };
+#else
+        const int32_t fmt_version = 3;                            // + Cl [out,h2]
+        const torch::Tensor ts[6] = { m.W1, m.b1, m.W2, m.b2, m.emb, m.Cl };
+        const char* nm[6] = { "W1", "b1", "W2", "b2", "emb", "Cl" };
+#endif
+        const int n_ts = 6;
+#else
+        const int32_t fmt_version = 1;
         const torch::Tensor ts[5] = { m.W1, m.b1, m.W2, m.b2, m.emb };
         const char* nm[5] = { "W1", "b1", "W2", "b2", "emb" };
+        const int n_ts = 5;
+#endif
         FILE* f = std::fopen(xp, "wb");
         if (!f) { std::cerr << "EXPORT_WEIGHTS: cannot write " << xp << std::endl; return 4; }
-        const int32_t hdr[7] = { 0x4C4F5043 /*"CPOL"*/, 1, NNUE_DIMS, POLICY_H1, POLICY_H2,
-                                 POLICY_OUT, CONV_POLICY };
+        const int32_t hdr[7] = { 0x4C4F5043 /*"CPOL"*/, fmt_version, NNUE_DIMS, POLICY_H1,
+                                 POLICY_H2, POLICY_OUT, CONV_POLICY };
         std::fwrite(hdr, sizeof(int32_t), 7, f);
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < n_ts; ++i) {
             auto t = ts[i].detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
             std::fwrite(t.data_ptr<float>(), sizeof(float), t.numel(), f);
             std::cout << "  " << nm[i] << " " << t.sizes() << " -> " << t.numel() << " floats" << std::endl;
@@ -1313,7 +1479,29 @@ int main() {
         return 0;
     }
     
-    torch::optim::Adam optimizer(model->parameters(), torch::optim::AdamOptions(learning_rate));
+    //The optimizer's initial rate must be LR_MAX, not the 2e-3 default sitting behind it. The
+    //cosine at the bottom of the loop sets the rate AFTER optimizer.step(), so whatever is passed
+    //here is what the FIRST step of every run actually uses -- LR_MAX was silently ignored for
+    //exactly one step. That is not cosmetic: with LR_MAX=1e-4 the first step ran at 2e-3, twenty
+    //times the requested rate, and measured, one such step moves held-out Top-1 on a 16,637
+    //position visit dump by 1.2 points. Two baseline runs differing only in which single training
+    //row they saw scored 26.53% and 27.77%, a spread larger than the effect being tested.
+    //TWO PARAMETER GROUPS, so the legality term can be driven independently of the pretrained
+    //weights. Wl starts at zero and has to travel to be worth anything, while W1/W2/emb are
+    //already converged and want a small step. Sharing one rate confounds the two: raising the rate
+    //to make the legality term grow also degrades the trunk, so "bigger term scored worse" cannot
+    //be told apart from "bigger rate scored worse". LR_WL is a multiplier on the base rate,
+    //applied to Wl alone.
+    const double LR_WL = env_d("LR_WL", 1.0);
+    std::vector<torch::Tensor> g_base, g_wl;
+    for (auto& kv : model->named_parameters()) {
+        if (kv.key() == "Wl" || kv.key() == "Cl") g_wl.push_back(kv.value());
+        else                                      g_base.push_back(kv.value());
+    }
+    std::vector<torch::optim::OptimizerParamGroup> groups;
+    groups.emplace_back(g_base);
+    if (!g_wl.empty()) groups.emplace_back(g_wl);
+    torch::optim::Adam optimizer(groups, torch::optim::AdamOptions(LR_MAX));
 
     // 6. Training Loop
     std::cout << "Starting training..." << std::endl;       
@@ -1348,10 +1536,12 @@ int main() {
     std::cout << "Schedule: TOTAL_STEPS=" << TOTAL_STEPS
               << " batch_size=" << batch_size
               << " num_epochs=" << num_epochs
-              << " LR " << LR_MAX << " -> " << LR_MIN << std::endl;
+              << " LR " << LR_MAX << " -> " << LR_MIN
+              << (g_wl.empty() ? std::string() : (" LR_WL x" + std::to_string(LR_WL)))
+              << std::endl;
     // -----------------------------------
     
-    for (int epoch = 1; epoch <= num_epochs; ++epoch) {        
+    for (int epoch = 1; epoch <= std::max(1, num_epochs); ++epoch) {        
         // Optional: Shuffle file order to mix data slightly better
         std::random_device rd;
         std::mt19937 g(rd());
@@ -1368,7 +1558,11 @@ int main() {
         constexpr float policy_weight = 1.0f;
         for (const auto& filepath : file_list) {
             std::cout << "  Processing file " << ++file_number << ": " << filepath << std::endl;
-            auto shard_samples = ChessDataset::load_shard(filepath);
+            //eval_only never reads the training file: an empty shard leaves shard_n at 0, so the
+            //chunk loop below does not execute and no gradient is ever computed.
+            auto shard_samples = eval_only
+                               ? std::make_shared<std::vector<CompressedPosition>>()
+                               : ChessDataset::load_shard(filepath);
             const size_t shard_n = shard_samples->size();
             const std::string cpath = cache_dir.empty() ? std::string()
                                                         : feat_cache_path(cache_dir, filepath);
@@ -1401,9 +1595,12 @@ int main() {
 
                     optimizer.zero_grad();
 
-                    auto policy_logits = model->forward(data);            // [batch, POLICY_OUT]
+                    //The mask is built BEFORE the forward pass now, because LEGAL_BIAS feeds it in.
+                    //It is the same tensor the loss masks with, so nothing is computed twice.
+                    auto mask   = legality_mask_dims(data.size(0), POLICY_OUT, data.options(),
+                                                     tg.legal_idx);
+                    auto policy_logits = model->forward(data, mask);      // [batch, POLICY_OUT]
 
-                    auto mask   = legality_mask(policy_logits, tg.legal_idx);
                     auto masked = policy_logits.masked_fill(mask < 0.5f, -1e9f);
                     auto logp   = torch::log_softmax(masked, 1);
 
@@ -1493,8 +1690,12 @@ int main() {
                     // Cosine annealing (unchanged)
                     double progress = std::min(1.0, (double)global_step / TOTAL_STEPS);
                     double current_lr = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + std::cos(progress * M_PI));
-                    for (auto& group : optimizer.param_groups()) {
-                        static_cast<torch::optim::AdamOptions&>(group.options()).lr(current_lr);
+                    //Group 0 is everything pretrained; group 1, when present, is Wl alone.
+                    {
+                        auto& gs = optimizer.param_groups();
+                        for (size_t gi = 0; gi < gs.size(); ++gi)
+                            static_cast<torch::optim::AdamOptions&>(gs[gi].options())
+                                .lr(current_lr * (gi == 1 ? LR_WL : 1.0));
                     }
                             
                     epoch_total_loss += loss.item<double>();
@@ -1519,7 +1720,7 @@ int main() {
 
             //Written next to the checkpoint below, and for the same reason: a run that dies
             //between files must resume the schedule, not restart it.
-            {
+            if (!eval_only) {
                 FILE * sf = std::fopen(step_file.c_str(), "w");
                 if (sf) { std::fprintf(sf, "%lld\n", (long long)global_step); std::fclose(sf); }
             }
@@ -1529,7 +1730,7 @@ int main() {
             // for the whole run, overwritten after every file -- and shared across builds, so
             // an attention run's weights were silently replaced by a no-attention diagnostic.
             // Encode the architecture and the file index instead.
-            {
+            if (!eval_only) {
               char ckpt[256];
               //The name must carry EVERY flag that changes the architecture, or runs overwrite each
               //other: a hidden=128 conv run silently walked over a hidden=256 bilinear run's
@@ -1572,6 +1773,12 @@ int main() {
             torch::NoGradGuard no_grad;
         
             double test_value_loss = 0.0, test_src_loss = 0.0, test_dst_loss = 0.0f;
+            //Accumulate the loss NUMERATOR and its position count separately and divide once at
+            //the end. Averaging per-batch means weights a short final batch as heavily as a full
+            //one and makes the result depend on how the positions were partitioned; summing does
+            //not, so this is both deterministic and the mean it always claimed to be.
+            double test_pol_sum = 0.0, test_pol_n = 0.0;
+            double lb_share_sum = 0.0; size_t lb_share_n = 0;
             double mean_cp_error_total = 0.0, sign_accuracy_total = 0.0;
             double pol_top1 = 0.0, pol_top4 = 0.0, pol_top6 = 0.0, pol_total = 0.0;
             // Same metrics split by how many PV moves the position carries. 57% of records
@@ -1590,7 +1797,14 @@ int main() {
                                    ? (size_t)std::atoll(std::getenv("VALIDATE_N")) : 1000000;
                 auto test_dataset = ChessDataset(test_data_path, val_n).map(torch::data::transforms::Stack<>());
                 positions = test_dataset.size();
-                auto test_loader = torch::data::make_data_loader(
+                //SEQUENTIAL, explicitly. make_data_loader() defaults its sampler to RandomSampler,
+                //so validation used to shuffle -- and because the loss below was a mean of
+                //per-batch means, each normalised by its own count, a different shuffle gave a
+                //different number. Measured on identical weights and an identical file, four runs
+                //reported 2.46923, 2.46011, 2.44282 and 2.44089 while Top-1 was bit-identical
+                //every time. A validation metric that moves by 0.03 between runs of the same model
+                //cannot measure a fine-tune that moves it by 0.08.
+                auto test_loader = torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
                     std::move(test_dataset),
                     torch::data::DataLoaderOptions().batch_size(batch_size).workers(num_workers)
                 );
@@ -1604,11 +1818,13 @@ int main() {
                     auto value_target = tg.value.to(torch::kFloat32);
 
                     // Cast BEFORE masking: -1e9 is not representable in half.
-                    auto policy_logits = model->forward(data).to(torch::kFloat32);
-
+                    auto mask   = legality_mask_dims(data.size(0), POLICY_OUT, data.options(),
+                                                     tg.legal_idx);
+                    double lb_share = 0.0;
+                    auto policy_logits = model->forward(data, mask, &lb_share).to(torch::kFloat32);
+                    lb_share_sum += lb_share; ++lb_share_n;
 
                     // --- Policy metrics, over legal moves only ---
-                    auto mask   = legality_mask(policy_logits, tg.legal_idx);
                     auto masked = policy_logits.masked_fill(mask < 0.5f, -1e9f);
                     auto logp   = torch::log_softmax(masked, 1);
 
@@ -1646,7 +1862,8 @@ int main() {
                     }
 
                     auto loss       = loss_policy;
-                
+                    test_pol_sum += (per_sample * has_pv).sum().item<double>();
+                    test_pol_n   += n_have.item<double>();
                                         test_src_loss += loss_policy.item<double>();
                                         test_total_batches++;
                 }
@@ -1656,19 +1873,56 @@ int main() {
             auto avg = [&](double x) { return test_total_batches > 0 ? x / test_total_batches : 0.0; };
         
             std::cout << "    Value  Loss:     " << avg(test_value_loss)  << "\n";
-            std::cout << "    Policy Loss:     " << avg(test_src_loss) << "\n";
+            std::cout << "    Policy Loss:     "
+                      << (test_pol_n > 0 ? test_pol_sum / test_pol_n : 0.0) << "\n";
+#if LEGAL_BIAS
+            std::cout << "    Legality term:   "
+                      << (lb_share_n ? 100.0 * lb_share_sum / lb_share_n : 0.0)
+                      << "% of |ctx|  (0% = the term is still at zero, so nothing was tested)\n";
+#endif
             
             std::cout << "    Avg CP Error:    " << avg(mean_cp_error_total) << " centipawns\n";
             std::cout << "    Sign Accuracy:   " << avg(sign_accuracy_total) << "%\n";
-            std::cout << "    --- policy vs Stockfish PV1, " << (size_t)pol_total << " positions ---\n";
+            //WHICH TARGET, AND WHICH BASELINE. The 26.9/65.5/77.4 figures were measured by
+            //bench_prior_acc.cpp against Stockfish's PV1 move on the lichess_db_pv_eval shards.
+            //They describe that test set and no other. Printed beside a visit-dump result they
+            //invert the conclusion: on targets_test.tsv a head scoring 28.6% Top-1 reads as
+            //beating a 26.9% prior, when the prior's own agreement with the visit target on that
+            //same file is 33.3% and the head is four and a half points BEHIND it. Detect the
+            //format from the file's own header, exactly as load_shard() does, and quote the
+            //baselines only where they apply. For a visit dump the comparable baseline is the
+            //"search agrees with prior" line that visit_dump_stats.py prints for that file.
+            bool test_is_visit_dump = false;
+            {
+                std::ifstream probe(test_data_path);
+                std::string first;
+                test_is_visit_dump = (bool)(probe && std::getline(probe, first)
+                                            && first.rfind("tag\t", 0) == 0);
+            }
+            const char * base1 = test_is_visit_dump ? "" : "   (engine's current NNUE prior: 26.9%)";
+            const char * base4 = test_is_visit_dump ? "" : "   (engine's current NNUE prior: 65.5%)";
+            const char * base6 = test_is_visit_dump ? "" : "   (engine's current NNUE prior: 77.4%)";
+            std::cout << "    --- policy vs "
+                      << (test_is_visit_dump ? "creatica's most-visited root move"
+                                             : "Stockfish PV1")
+                      << ", " << (size_t)pol_total << " positions ---\n";
             std::cout << "    Top-1:  " << (pol_total > 0 ? 100.0 * pol_top1 / pol_total : 0.0)
-                      << "%   (engine's current NNUE prior: 26.9%)\n";
+                      << "%" << base1 << "\n";
             std::cout << "    Top-4:  " << (pol_total > 0 ? 100.0 * pol_top4 / pol_total : 0.0)
-                      << "%   (engine's current NNUE prior: 65.5%)\n";
+                      << "%" << base4 << "\n";
             std::cout << "    Top-6:  " << (pol_total > 0 ? 100.0 * pol_top6 / pol_total : 0.0)
-                      << "%   (engine's current NNUE prior: 77.4%)\n";
-            static const char * bname[3] = {"1 PV   ", "2-3 PVs", "4+ PVs "};
-            std::cout << "    --- split by how many PVs the position carries ---\n";
+                      << "%" << base6 << "\n";
+            if (test_is_visit_dump)
+                std::cout << "    (baseline: run visit_dump_stats.py on the test file and read"
+                             " 'search agrees with prior')\n";
+            //On a visit dump "PVs" is the number of moves that received at least one root
+            //visit, capped at MAX_PVS -- not a Stockfish multi-PV count.
+            static const char * bname_pv[3] = {"1 PV   ", "2-3 PVs", "4+ PVs "};
+            static const char * bname_vd[3] = {"1 move ", "2-3 mvs", "4+ mvs "};
+            const char * const * bname = test_is_visit_dump ? bname_vd : bname_pv;
+            std::cout << "    --- split by how many "
+                      << (test_is_visit_dump ? "visited moves" : "PVs")
+                      << " the position carries ---\n";
             for (int b = 0; b < 3; ++b) {
               if (b_tot[b] < 1) continue;
               std::printf("    %s  n=%-9.0f Top-1 %5.2f%%  Top-4 %5.2f%%  Top-6 %5.2f%%\n",
