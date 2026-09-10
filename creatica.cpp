@@ -96,7 +96,9 @@ extern double eval_scale;
 extern double temperature;
 
 extern std::string last_move;
-extern std::unordered_set<unsigned long long> position_history;
+extern std::unordered_map<unsigned long long, int> position_history;
+extern int64_t repetition_guard;
+extern bool    edge_visits;
 extern Board board;
 extern ZobristHash zh;
 extern Zobrist z;
@@ -157,8 +159,44 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
 
 //it appears that lichess allows no more than 10 requests per minute or so, then it will reply with 429 code - too many requests
 //therefore, it can't be used during search
-bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move) {
-    CURL* curl = curl_easy_init();
+//timeout_ms is the caller's, because this is spent on the MOVE'S CLOCK. A fixed three seconds is
+//affordable at the start of a blitz game and ruinous near the end of one -- but the answer is
+//never to skip the probe, only to ask for less time. See the note at the call site.
+//ONLINE TABLEBASE CACHE, keyed by the position. An endgame revisits the same positions -- and the
+//engine re-queries on the real search after having queried while pondering -- so without this the
+//same three-second stall is paid repeatedly for an answer already known. Failures are cached too,
+//and deliberately: a position that just failed will very likely fail again within the same game,
+//and paying the timeout a second time to find that out is exactly what loses on time. Cleared per
+//game alongside position_history. Only run_go() touches it, and only on the UCI thread.
+static std::unordered_map<std::string, std::pair<int, std::string>> tb_cache;
+static std::mutex                                                   tb_cache_mtx;
+//Identifies the move a probe answer belongs to, so a reply arriving after its move is discarded
+//rather than played. Incremented once per go that starts a probe.
+static uint64_t tb_move_id = 0;
+//The probe worker's request slot. One thread owns the curl handle, so it is never touched
+//concurrently and the connection it holds stays warm from one endgame position to the next.
+static std::mutex              tb_req_mtx;
+static std::condition_variable tb_req_cv;
+static std::string             tb_req_fen;
+static uint64_t                tb_req_id   = 0;
+static bool                    tb_req_live = false;
+//A prefetch is speculative and belongs to no move: its answer goes into the cache and nowhere else.
+static bool                    tb_req_prefetch = false;
+static std::thread             tb_worker;
+//NOT tb_worker.joinable(): the thread is detached, after which joinable() is false, so guarding on
+//it would start a fresh worker on every move -- each with its own curl handle, losing the warm
+//connection that makes a short probe possible, and racing on the request slot.
+static std::atomic<bool>       tb_worker_started{false};
+
+bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move, long timeout_ms,
+                    bool* unique_best) {
+    //ONE HANDLE, REUSED. A fresh curl_easy_init() per probe threw away the connection every time,
+    //so each probe paid a DNS lookup and a TCP handshake before it could ask anything. That fixed
+    //overhead is most of what makes a probe slow, and it is what made a short timeout unusable.
+    //Keeping the handle lets curl hold the connection open between probes, so a warm probe is a
+    //single round trip. Only run_go() calls this, on the UCI thread, so one static handle is safe.
+    static CURL* curl = nullptr;
+    if (!curl) curl = curl_easy_init();
     if (!curl) return false;
 
     char errbuf[CURL_ERROR_SIZE] = "";
@@ -168,8 +206,14 @@ bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move)
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L); // in sec
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L); // in sec
+    //MILLISECONDS, not seconds. The second-granularity options cannot express the short budgets
+    //a tight endgame clock allows, and rounding a 400 ms budget up to one second is the whole
+    //problem restated.
+    if (timeout_ms < 100) timeout_ms = 100;
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    //The connect must fit inside the total, with room left for the request itself. On a reused
+    //connection this costs nothing, because there is nothing to connect.
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms > 400 ? timeout_ms / 2 : timeout_ms);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
     CURLcode res = curl_easy_perform(curl);
@@ -191,8 +235,24 @@ bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move)
                 }
             }
             if (data.contains("moves") && data["moves"].is_array() && !data["moves"].empty()) {
-                if (data["moves"][0].contains("uci")) {
-                    uci_move = data["moves"][0].value("uci", "");
+                const auto& ms = data["moves"];
+                if (ms[0].contains("uci")) uci_move = ms[0].value("uci", "");
+                //IS THE BEST MOVE UNAMBIGUOUS? The list comes back ranked, but ranking is not the
+                //same as a strict preference: in one real position e2e4 and f2f4 were both mate in
+                //30 with identical dtz, so which one is "best" is a tie-break the tablebase does
+                //not actually make. That matters for prefetching -- predicting the opponent's
+                //reply is only sound when the tablebase leaves them one choice.
+                if (unique_best) {
+                    if (ms.size() < 2) *unique_best = true;
+                    else {
+                        const auto& a = ms[0]; const auto& b = ms[1];
+                        auto differs = [&](const char* k) {
+                            if (!a.contains(k) || !b.contains(k)) return false;
+                            if (a[k].is_null() || b[k].is_null()) return false;
+                            return a[k] != b[k];
+                        };
+                        *unique_best = differs("category") || differs("dtz") || differs("dtm");
+                    }
                 }
             }
         } catch (const json::parse_error& e) {
@@ -203,7 +263,7 @@ bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move)
         log_file("sendGetRequest() error: curl error: %s (%s) or HTTP code %ld or empty response \"%s\"\n", curl_easy_strerror(res), errbuf, http_code, response.c_str());
     }
 
-    curl_easy_cleanup(curl);
+    //NOT cleaned up: the handle is reused, which is what keeps the connection warm.
 
     if (res != CURLE_OK) {
         log_file("sendGetRequest() error: curl error: %s\n", curl_easy_strerror(res));
@@ -411,6 +471,15 @@ public:
         // (0.99 and 0.999 behave very differently) and a percent scale cannot express them.
         // 1000 = keep every move, which is the default and an exact no-op.
         o.real("ProbabilityMass", &probability_mass, 1.0, 0.90, 1.0, 1000);
+        // How many prior occurrences of a position make the engine refuse a winning move that
+        // returns to it. 0 turns the filter off entirely and plays whatever the search chose;
+        // 1 keeps today's conservative behaviour; 2 uses the full legal allowance and refuses only
+        // an immediate threefold claim. See the note on repetition_guard.
+        o.spin("RepetitionGuard", &repetition_guard, 1, 0, 2);
+        // Rank the root and drive PUCT exploration by N(s,a) -- how often THIS edge was taken --
+        // instead of the child's lifetime visit count. Off by default: it costs about half the
+        // simulation rate. See the note on edge_visits.
+        o.check("EdgeVisits", &edge_visits, false);
         // Diagnostic, not a tunable. Walks the whole tree after every collection and reports
         // any broken invariant on stderr and in the log. Costs a full map walk per move, so it
         // is for runs that are asking whether tree reuse is sound, not for playing.
@@ -471,8 +540,26 @@ public:
         init_thread_pool((int)chessEngine.optionSpin[Threads].value);
         search_thread_ = std::thread(search_thread_func);
 
-        print("info string settings: %s\n", opts_->summary().c_str());
-        log_file("info string settings: %s\n", opts_->summary().c_str());
+        //NOT the settings line. init() runs before uci_main() reads its first command, so every
+        //option here still holds its compiled-in default and the line reported fiction: it said
+        //"Hash 2048, Ponder false" for a match that actually ran at Hash 1024 with pondering on.
+        //That is worse than no line at all, because the log looks like it answers the question.
+        //It is written from run_go() instead, where the options are settled. See log_settings().
+    }
+
+    //One line naming every option's CURRENT value, written the first time a search starts and
+    //again whenever anything has changed since. That is the point of it -- "which settings did
+    //that match actually run with" has to be answerable from the log afterwards, and a line
+    //printed before the GUI has sent a single setoption cannot answer it. Comparing against the
+    //last line written keeps a normal game to exactly one, while still recording a mid-game
+    //change on the move it takes effect.
+    void log_settings() {
+        if (!opts_) return;
+        std::string now = opts_->summary();
+        if (now == last_settings_) return;
+        last_settings_ = std::move(now);
+        print("info string settings: %s\n", last_settings_.c_str());
+        log_file("info string settings: %s\n", last_settings_.c_str());
     }
 
     void new_game() override {
@@ -489,6 +576,9 @@ public:
         stop();
         cleanup();
         position_history.clear();
+        tb_cache.clear();          //a new game; last game's endgames are not this one's
+        tb_probe.want.store(0, std::memory_order_release);
+        tb_probe.have.store(0, std::memory_order_release);
         last_move.clear();
     }
 
@@ -540,9 +630,24 @@ public:
         //without leaving the shared state unprotected.
         quiesce_search();
         last_move.clear();
-        if (fen == startPos && moves.empty()) position_history.clear();
+        //CLEAR AND REBUILD, unconditionally.
+        //
+        //This used to clear only for a bare "position startpos", and that was safe only because
+        //position_history was a SET: the loop below replays the whole move list on every position
+        //command, and re-inserting a hash a set already holds does nothing. Now that it counts,
+        //the same replay would add the entire game prefix again on every move, so after ten moves
+        //a position played once would read as having occurred ten times and the engine would see
+        //repetitions everywhere. Rebuilding from scratch is O(moves) on a list the driver sends us
+        //anyway, and it is the only version that is correct for both containers.
+        position_history.clear();
         fen2board(board, fen.c_str());
         getHash(zh, board, z);
+        //THE STARTING POSITION COUNTS. play() only records the position AFTER a move, so the
+        //position the game began from was never in the history at all -- a game that manoeuvred
+        //back to its own start had, by the engine's reckoning, never been there. Recording it here
+        //makes the history exactly the set of positions that have occurred, which is what the draw
+        //rule is about and what the forcing test has to reason over.
+        ++position_history[zh.hash];
         if (!moves.empty()) {
             for (size_t i = 0; i + 1 < moves.size(); ++i) play(moves[i]);
             last_move = moves.back();
@@ -630,6 +735,7 @@ public:
 
 private:
     uci::Options * opts_ = nullptr;
+    std::string    last_settings_;   //what log_settings() wrote last, so it only speaks on a change
     std::string    syzygy_path_;
     std::string    policy_weights_;
     std::string    policy_loaded_;      // what policy_net actually holds
@@ -706,7 +812,97 @@ private:
             return;
         }
         updateHash(zh, board, move, ff_move(board, move), z);
-        position_history.insert(zh.hash);
+        ++position_history[zh.hash];
+    }
+
+    //Called from the search the moment our own move has been made on the board, so `board` is the
+    //position the opponent now has to answer. Costs nothing on our clock: the engine is idle until
+    //they reply. Does nothing unless a probe worker already exists, which it will, because this is
+    //only reached for positions run_go() has just probed.
+    friend void tb_prefetch_after_our_move();
+
+    //Started on the first probe request and left running. A detached thread per move would
+    //overlap, share the curl handle unsafely, and lose the warm connection.
+    void start_tb_worker() {
+        if (tb_worker_started.exchange(true)) return;
+        tb_worker = std::thread([] {
+            for (;;) {
+                std::string fen; uint64_t id; bool prefetch = false;
+                {
+                    std::unique_lock<std::mutex> lk(tb_req_mtx);
+                    tb_req_cv.wait(lk, [] { return tb_req_live; });
+                    fen = tb_req_fen; id = tb_req_id; prefetch = tb_req_prefetch;
+                    tb_req_live = false;
+                }
+                int score = 0; std::string move; bool answered = false; bool unique = false;
+                {   //cache first: an endgame revisits positions, and a cached answer is instant
+                    std::lock_guard<std::mutex> lk(tb_cache_mtx);
+                    auto it = tb_cache.find(fen);
+                    if (it != tb_cache.end()) { score = it->second.first; move = it->second.second;
+                                                answered = !move.empty(); }
+                }
+                if (move.empty()) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    //A GENEROUS timeout, because nothing waits for this any more. The clock no
+                    //longer needs protecting from a request that costs the search nothing.
+                    answered = sendGetRequest("http://tablebase.lichess.ovh/standard?fen=" + fen,
+                                              score, move, 3000L, &unique);
+                    const double ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - t0).count();
+                    { std::lock_guard<std::mutex> lk(tb_cache_mtx);
+                      tb_cache[fen] = { score, answered ? move : std::string() }; }
+                    log_file("tb worker: probe %s in %.0f ms\n", answered ? "answered" : "FAILED", ms);
+                }
+                if (prefetch) {
+                    //ONE STEP AHEAD, AND ONLY WHEN CERTAIN. `fen` here is the position after our
+                    //own move, so its answer is the opponent's ranked replies -- not something we
+                    //need ourselves. What we want is the position we will actually face, which is
+                    //one more move away. Predicting it is only sound when the tablebase leaves the
+                    //opponent a single best move; on a tie we stop and wait for them to choose,
+                    //rather than spending requests on guesses. That cap matters because
+                    //tablebase.lichess.ovh rate-limits, and two bots on one machine share an IP.
+                    log_file("tb worker: prefetch root %s, best %s, unambiguous %s\n",
+                             answered ? "answered" : "FAILED",
+                             move.empty() ? "(none)" : move.c_str(), unique ? "yes" : "no -- stopping");
+                    if (!answered || move.empty() || !unique) continue;
+                    Board b{};
+                    std::string plain = fen;
+                    for (auto& c : plain) if (c == '_') c = ' ';
+                    if (fen2board(b, plain.c_str()) != 0) continue;
+                    Move m{};
+                    if (uci2move_idx(move.c_str(), m) != 0) continue;
+                    if (!is_legal(b, m)) continue;
+                    ff_move(b, m);
+                    char buf[MAX_FEN_STRING_LEN];
+                    std::string child(board2fen(b, buf));
+                    while (!child.empty() && std::isspace(child.back())) child.pop_back();
+                    for (size_t q = child.rfind(" "); q != std::string::npos; q = child.rfind(" "))
+                        child.replace(q, 1, "_");
+                    {   //already known? then there is nothing to fetch
+                        std::lock_guard<std::mutex> lk(tb_cache_mtx);
+                        if (tb_cache.count(child)) continue;
+                    }
+                    int cscore = 0; std::string cmove; bool cunique = false;
+                    const bool got = sendGetRequest(
+                        "http://tablebase.lichess.ovh/standard?fen=" + child,
+                        cscore, cmove, 3000L, &cunique);
+                    { std::lock_guard<std::mutex> lk(tb_cache_mtx);
+                      tb_cache[child] = { cscore, got ? cmove : std::string() }; }
+                    log_file("tb worker: prefetched the position after %s -- %s\n",
+                             move.c_str(), got ? "cached" : "no answer");
+                    continue;
+                }
+                if (!answered || move.empty()) continue;     //nothing to offer; the search decides
+                if (tb_probe.want.load(std::memory_order_acquire) != id) continue;  //too late
+                { std::lock_guard<std::mutex> lk(tb_probe.mtx);
+                  tb_probe.move = move; tb_probe.score = score; }
+                tb_probe.have.store(id, std::memory_order_release);
+                //Perfect play is in hand, so there is nothing left for the search to find. Ending
+                //it here is what turns a probe from a cost into a saving.
+                if (!chessEngine.ponder) stopFlag.store(true, std::memory_order_relaxed);
+            }
+        });
+        tb_worker.detach();
     }
 
     void init_tablebases() {
@@ -845,6 +1041,23 @@ private:
     // absent "wtime" from "wtime 0", so a zero clock is read as absent and becomes the
     // same 1e9 default handleGo() started from -- no GUI sends wtime 0.
     void run_go(const uci::Limits& lim) {
+        log_settings();
+        //INVALIDATE ANY STANDING TABLEBASE ANSWER, before anything can consult one.
+        //
+        //want was set only inside the tablebase branch below and cleared nowhere, so once a game
+        //ended in a six- or seven-piece ending whose probe had answered, want and have stayed
+        //equal for the life of the process. The next game skips that branch entirely -- thirty
+        //pieces on the board -- but the check at the bestmove site does not know that, sees a
+        //matching pair, and substitutes the PREVIOUS game's tablebase move. Observed in a real
+        //game: an opening position where the engine posted f3f4 with f3 empty, and lichess
+        //answered "Piece on f3 cannot move to f4".
+        //
+        //Clearing here rather than in the branch is deliberate: the branch is exactly the code
+        //that does not run in the failing case, so a reset placed there could never have fixed it.
+        //A want of 0 means "no answer applies to this move", which is what every non-tablebase
+        //move should say.
+        tb_probe.want.store(0, std::memory_order_release);
+        tb_probe.have.store(0, std::memory_order_release);
         chessEngine.wtime     = lim.wtime ? lim.wtime : (int64_t)1e9;
         chessEngine.btime     = lim.btime ? lim.btime : (int64_t)1e9;
         chessEngine.winc      = lim.winc;
@@ -944,23 +1157,41 @@ private:
         if (numberOfPieces > 7) {
             start_search();
         } else if ((unsigned)numberOfPieces > TB_LARGEST) {
-            // Between the local tablebases and 7 pieces, ask lichess.
-            if (drop_ponder()) return;   // no need to query tablebases for the opponent
+            //Between the local 5-piece tables and lichess's 7-piece ones, ask lichess -- but ask
+            //ASYNCHRONOUSLY, and search at the same time.
+            //
+            //This used to block here, on the move's own clock, and on failure searched afterwards
+            //anyway, so a timed-out probe cost its timeout AND a full search. Measured over one
+            //self-play session: 26 timeouts in one engine's log against 8 in the other's, at three
+            //seconds each, in games with a 120 second base clock -- and one was lost on time.
+            //Gating the probe on having spare clock was the wrong repair, because probes only
+            //happen in endgames and endgames are exactly where the clock is already tight.
+            //
+            //So the probe no longer competes with the search for time; it runs beside it. The
+            //search starts immediately with its full allocation and never waits for the answer. If
+            //the answer arrives first it replaces the search's move at emission time and the search
+            //is cut short, so a successful probe SAVES time. If it is slow or fails, nothing is
+            //lost, because the search was running all along.
+            ++tb_move_id;
+            tb_probe.want.store(tb_move_id, std::memory_order_release);
+            tb_probe.have.store(0, std::memory_order_release);
+            { std::lock_guard<std::mutex> lk(tb_probe.mtx); tb_probe.move.clear(); }
+
             char fenString[MAX_FEN_STRING_LEN];
             std::string fen_string(board2fen(board, fenString));
             while (!fen_string.empty() && std::isspace(fen_string.back())) fen_string.pop_back();
             for (size_t pos = fen_string.rfind(" "); pos != std::string::npos; pos = fen_string.rfind(" "))
                 fen_string.replace(pos, 1, "_");
-            std::string syzygy_tb_url = "http://tablebase.lichess.ovh/standard?fen=" + fen_string;
-            int score_cp = 0;
-            std::string uci_move = "";
-            if (sendGetRequest(syzygy_tb_url, score_cp, uci_move)) {
-                strncpy(best_move, uci_move.c_str(), 6);
-                report_tb_move(score_cp);
-            } else {
-                log_file("run_go() error: failed to send Syzygy TB request to lichess\n");
-                start_search();
+
+            start_tb_worker();
+            {
+                std::lock_guard<std::mutex> lk(tb_req_mtx);
+                tb_req_fen = fen_string; tb_req_id = tb_move_id;
+                tb_req_prefetch = false; tb_req_live = true;
             }
+            tb_req_cv.notify_one();
+
+            start_search();
         } else {
             if (drop_ponder()) return;
             best_move[0] = '\0';
@@ -1014,6 +1245,26 @@ private:
         play(best_move);
     }
 };
+
+//See the declaration inside CreaticaEngine and the prefetch note in the worker loop.
+void tb_prefetch_after_our_move() {
+    if (!tb_worker_started.load(std::memory_order_relaxed)) return;
+    const int pieces = bitCount(board.side[ColorWhite] | board.side[ColorBlack]);
+    if (pieces > 7 || (unsigned)pieces <= TB_LARGEST) return;   //local tables or out of range
+    char buf[MAX_FEN_STRING_LEN];
+    std::string fen(board2fen(board, buf));
+    while (!fen.empty() && std::isspace(fen.back())) fen.pop_back();
+    for (size_t q = fen.rfind(" "); q != std::string::npos; q = fen.rfind(" "))
+        fen.replace(q, 1, "_");
+    {
+        std::lock_guard<std::mutex> lk(tb_req_mtx);
+        //A live probe for the next move always outranks a speculative one; if one is already
+        //queued, leave it alone.
+        if (tb_req_live) return;
+        tb_req_fen = fen; tb_req_id = 0; tb_req_prefetch = true; tb_req_live = true;
+    }
+    tb_req_cv.notify_one();
+}
 
 int main(int argc, char ** argv) {
     CreaticaEngine engine;

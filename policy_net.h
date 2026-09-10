@@ -39,6 +39,19 @@ inline bool policy_net_load(PolicyNet& net, const char* path, char* err, size_t 
   if (hdr[0] != 0x4C4F5043) {
     snprintf(err, errlen, "%s: bad magic %08x", path, hdr[0]); std::fclose(f); return false;
   }
+  //REFUSE A FORMAT THIS ENGINE CANNOT APPLY. hdr[1] is the format version and was previously read
+  //into nothing. Version 2 appends Wl and version 3 appends Cl -- the LEGAL_BIAS term, which
+  //biases the move readout by the legal move set. Loading such a file with the code below would
+  //succeed, because the extra tensor simply sits unread at the end of the file, and the engine
+  //would then play with a net that is NOT the one that was trained: every weight was fitted with
+  //that term contributing, and dropping it silently changes every score. Fall back to the NNUE
+  //prior with a message rather than play a net we are only partly running.
+  if (hdr[1] != 1) {
+    snprintf(err, errlen, "%s: policy format version %d needs the legality-bias term, which this "
+                          "engine does not implement; rebuild with it or export a v1 net",
+             path, hdr[1]);
+    std::fclose(f); return false;
+  }
   net.in = hdr[2]; net.h1 = hdr[3]; net.h2 = hdr[4]; net.out = hdr[5]; net.conv = hdr[6];
   if (net.conv != 0) {
     snprintf(err, errlen, "%s: CONV_POLICY=1 export is not supported by this engine", path);
