@@ -257,6 +257,99 @@ std::atomic<bool> challenge_outstanding {false};
 //challenging anyone, permanently and silently. This makes that failure self-heal.
 #define CHALLENGE_OUTSTANDING_TIMEOUT_MS 30000
 std::atomic<long long> challenge_sent_ms {0};
+//WALL clock, in seconds. nowMs() below is a steady clock, which is right for measuring how long a
+//challenge has been outstanding and useless for comparing against a timestamp lichess sends us.
+static long long nowEpochSeconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+//PER-OPPONENT COOLDOWN.
+//
+//lichess caps bot-versus-bot games at 100 per bot per day and says so precisely when it refuses a
+//challenge: "RavenEngine played 100 games against other bots today, please wait until
+//2026-09-10T10:15:41.571Z to challenge them." Without this the bot keeps drawing that opponent out
+//of the random pool and keeps being refused, which costs a round trip each time and, worse, counts
+//against the outstanding-challenge logic while achieving nothing. Honouring the timestamp it hands
+//us is free.
+struct Cooldown { long long until = 0; std::string why; };
+static std::mutex                                  cooldown_mtx;
+static std::unordered_map<std::string, Cooldown>   bot_cooldown;         //name -> when and why
+static std::unordered_map<std::string, int>        bot_declines;         //consecutive declines
+
+//DECLINES ARE EVIDENCE, NOT A VERDICT.
+//
+//Some bots decline every challenge -- three Leela variants and Boris-Trapsky did so in one round --
+//and each attempt costs a POST, a challenge id, and five seconds of waiting before the pool is
+//re-drawn. But a decline can equally mean the bot is simply busy, so this backs off rather than
+//blacklisting: ten minutes, doubling per consecutive decline, capped at six hours. A bot that was
+//busy returns quickly; one that never accepts falls out of the rotation on its own.
+//
+//Naming is deliberately not used. A prefix rule aimed at "Leela" would have missed Boris-Trapsky,
+//which declined in the same round, and would wrongly exclude a Leela variant that does accept.
+static void noteDecline(const std::string& name) {
+    std::lock_guard<std::mutex> lk(cooldown_mtx);
+    const int n = ++bot_declines[name];
+    long long mins = 10LL << (n - 1 < 5 ? n - 1 : 5);
+    if (mins > 360) mins = 360;
+    bot_cooldown[name] = { nowEpochSeconds() + mins * 60,
+                           "declined " + std::to_string(n) + (n == 1 ? " time" : " times") };
+    std::cout << "GetAndProcessBots(): " << name << " declined; not challenging them again for "
+              << mins << " minutes" << std::endl;
+}
+
+//An accepted challenge clears the history: whatever the earlier declines meant, it was temporary.
+static void noteAccept(const std::string& name) {
+    std::lock_guard<std::mutex> lk(cooldown_mtx);
+    bot_declines.erase(name);
+    bot_cooldown.erase(name);
+}
+
+//Parses the instant out of that message. The timestamp is ISO 8601 UTC with milliseconds; the
+//seconds are enough, so the fractional part is simply not consumed.
+static long long parseWaitUntil(const std::string& msg) {
+    static const std::string key = "please wait until ";
+    const size_t at = msg.find(key);
+    if (at == std::string::npos) return 0;
+    if (msg.size() < at + key.size() + 19) return 0;
+    const std::string ts = msg.substr(at + key.size(), 19);   //YYYY-MM-DDTHH:MM:SS
+    struct tm tm = {};
+    if (!strptime(ts.c_str(), "%Y-%m-%dT%H:%M:%S", &tm)) return 0;
+    return (long long)timegm(&tm);                            //the timestamp is UTC, so not mktime
+}
+
+//Returns the reason if the bot is still cooling down, or an empty string if it is available.
+static std::string botOnCooldown(const std::string& name) {
+    std::lock_guard<std::mutex> lk(cooldown_mtx);
+    auto it = bot_cooldown.find(name);
+    if (it == bot_cooldown.end()) return "";
+    if (nowEpochSeconds() >= it->second.until) { bot_cooldown.erase(it); return ""; }
+    return it->second.why;
+}
+
+//An explicit, configurable skip list, because sometimes you just know. CREATICA_SKIP_BOTS is a
+//comma-separated list of case-insensitive name PREFIXES: "Leela,Boris" skips every bot whose name
+//starts with either. Kept separate from the automatic backoff above, which is the mechanism that
+//should normally do this job.
+static bool botIsSkipped(const std::string& name) {
+    static const std::string list = env_str("CREATICA_SKIP_BOTS", "");
+    if (list.empty()) return false;
+    std::string lower;
+    for (char c : name) lower += (char)std::tolower((unsigned char)c);
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(',', start);
+        std::string pat = list.substr(start, comma == std::string::npos ? std::string::npos
+                                                                        : comma - start);
+        std::string plow;
+        for (char c : pat) if (!std::isspace((unsigned char)c)) plow += (char)std::tolower((unsigned char)c);
+        if (!plow.empty() && lower.rfind(plow, 0) == 0) return true;
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return false;
+}
+
 static long long nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -613,6 +706,19 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
           return false;
       }
       std::cerr << "CreateChallenge(): Failed to send challenge to " << opponent << "Error: " << error << std::endl;
+      //Take lichess at its word about when this opponent is available again.
+      long long until = parseWaitUntil(error);
+      if (!until && error.find("against other bots today") != std::string::npos)
+          until = nowEpochSeconds() + 3600;   //capped but no parsable time: back off an hour
+      if (until) {
+          {
+              std::lock_guard<std::mutex> lk(cooldown_mtx);
+              bot_cooldown[opponent] = { until, "at its daily bot-game limit" };
+          }
+          const long long mins = (until - nowEpochSeconds() + 59) / 60;
+          std::cout << "CreateChallenge(): " << opponent << " is at its daily bot-game limit; "
+                    << "not challenging them again for about " << mins << " minutes" << std::endl;
+      }
     }
     return success;
 }
@@ -697,6 +803,18 @@ void GetAndProcessBots(int nb) {
                 } else tried_bots.emplace(i);
               }
               std::string botname = bots[i].botname;
+              //Already refused us today. It stays in tried_bots, so the loop moves on to someone
+              //else and gives up on this round only when every candidate is exhausted.
+              if (botIsSkipped(botname)) {
+                  std::cout << "Bot " << i << " name " << botname
+                            << " is in CREATICA_SKIP_BOTS; skipping" << std::endl;
+                  continue;
+              }
+              if (const std::string why = botOnCooldown(botname); !why.empty()) {
+                  std::cout << "Bot " << i << " name " << botname << " " << why
+                            << "; skipping" << std::endl;
+                  continue;
+              }
               //Second leg of a pair: re-challenge whoever played the first, so the only thing
               //that changed between the two games is which side of the position we hold.
               if (!opening_book.empty()) {
@@ -733,6 +851,8 @@ void GetAndProcessBots(int nb) {
                     //}
                   }
                 } //end of while (!challenge_accepted && !challenge_declined)
+                if (challenge_declined.load())      noteDecline(botname);
+                else if (challenge_accepted.load()) noteAccept(botname);
               } //end of if (res)
           } //end of while(playing && !challenge_accepted)
           bots.clear();
@@ -1386,6 +1506,11 @@ int main(int argc, char ** argv) {
         "  CREATICA_HASH     %-10sengine Hash in MB. Two bots on one 8 GB machine at 1024\n"
         "                              each will swap; 512 is the safer pairing.\n"
         "  CREATICA_PONDER   %-10sthink on the opponent's clock. Measured +137 Elo.\n"
+        "  CREATICA_SKIP_BOTS (unset)  comma-separated, case-insensitive name PREFIXES never to\n"
+        "                              challenge, e.g. Leela,Boris. Usually unnecessary: a bot that\n"
+        "                              declines is backed off automatically, ten minutes doubling\n"
+        "                              per consecutive decline to a six hour cap, and cleared the\n"
+        "                              moment it accepts one.\n"
         "  CREATICA_EDGE_VISITS (0)    rank the root by how often each EDGE was taken rather than\n"
         "                              by the child's lifetime visit count, and use the same figure\n"
         "                              as the PUCT exploration denominator. Costs about half the\n"
