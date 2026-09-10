@@ -46,9 +46,39 @@ EVAL_HI=${EVAL_HI:-500}
 OFFSET=${OFFSET:-0}
 WANT=${1:-20000}
 
+# WHICH ENGINE. gen_targets defaults to /Users/ap/libchess/creatica, and this script used to say
+# nothing about it, so a dataset was searched by whatever binary happened to be sitting at that
+# path -- which is rebuilt constantly. The 65k records of 2026-09-08 were produced by an engine
+# that no longer exists, and nothing in the run recorded what it was. Two changes fix that: the
+# engine is named here and passed explicitly, and the run refuses to start if that binary is older
+# than the sources it was built from. A silently stale engine is the failure this guards against:
+# it produces a perfectly well-formed dataset that simply came from different code.
+ENGINE=${ENGINE:-$PWD/creatica}
+if [[ ! -x $ENGINE ]]; then
+  print "  ERROR: engine $ENGINE not found or not executable"
+  print "         set ENGINE=... to choose a different one"
+  exit 1
+fi
+stale=()
+for src in creatica_search.cpp creatica_search.hpp creatica.cpp uci_frontend.cpp libchess.h; do
+  [[ -f $src && $src -nt $ENGINE ]] && stale+=($src)
+done
+if (( ${#stale} )); then
+  print "  ERROR: $ENGINE:t is older than ${#stale} of its sources: ${stale}"
+  print "         rebuild it, or pass ENGINE=/path/to/another to use a specific binary."
+  print "         A stale engine still produces a well-formed dataset -- from the wrong code."
+  exit 1
+fi
+export CREATICA_ENGINE=$ENGINE
+# Provenance, appended rather than overwritten, so a dataset built over several sessions keeps
+# the record of every engine that contributed to it.
+engine_id="$(date -u +%Y-%m-%dT%H:%M:%SZ) $ENGINE $(shasum -a 256 $ENGINE | cut -c1-16) mtime=$(date -u -r $ENGINE +%Y-%m-%dT%H:%M:%SZ) movetime=${MOVETIME} hash=${HASH} threads=${THREADS} stride=${STRIDE} offset=${OFFSET} band=${EVAL_LO}..${EVAL_HI}"
+print "$engine_id" >> ${DATASET:h}/.dataset_provenance
+
 [[ -f $STATE ]] || : > $STATE
 
 print "  dataset   $DATASET"
+print "  engine    $ENGINE  ($(shasum -a 256 $ENGINE | cut -c1-16), built $(date -r $ENGINE '+%Y-%m-%d %H:%M'))"
 print "  movetime  ${MOVETIME}ms   stride $STRIDE   eval band ${EVAL_LO}..${EVAL_HI}cp"
 print "  target    $WANT records this run"
 print ""

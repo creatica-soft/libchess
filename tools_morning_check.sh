@@ -32,6 +32,16 @@ for f in creatica_creaticachessbot.log creatica_creaticachessbot2.log; do
   printf "   repetition skips           %s   (winning position steered away from a draw)\n"   "$(grep -c 'skipping move' $f)"
   echo "   slowest collections:"
   grep -oE "gc took [0-9.]+ ms" $f | awk '{print $3}' | sort -g | tail -3 | sed 's/^/     /'
+
+  # The collector now evicts to a budget instead of keeping everything reachable. Three things
+  # would say that went wrong, and none of them shows up in the score.
+  printf "   collections that freed nothing  %s   (was the whole bug: a tree that cannot shrink stops expanding)\n" \
+    "$(grep -c 'freed 0 nodes' $f)"
+  printf "   searches ending at hashfull 1000 %s / %s   (a single search filling the tree; recoverable, but watch the ratio)\n" \
+    "$(grep -c 'hashfull 1000' $f)" "$(grep -c 'hashfull ' $f)"
+  echo "   truncation, largest and smallest kept sets:"
+  grep -oE 'truncated [0-9]+ nodes.*kept [0-9]+ nodes' $f | awk '{print $2, $6}' \
+    | sort -k2 -n | sed -n '1p;$p' | awk '{printf "     truncated %s, kept %s\n", $1, $2}'
   echo
 done
 
