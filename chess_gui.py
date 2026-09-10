@@ -574,9 +574,24 @@ class UciEngine:
 
     # -- searching --------------------------------------------------------
 
-    def search(self, fen, movetime_ms):
+    def search(self, fen, movetime_ms, root_fen=None, uci_moves=None):
+        # SEND THE MOVE LIST, not just the current FEN.
+        #
+        # A bare "position fen <current>" tells the engine where the pieces are and nothing about
+        # how they got there, so creatica's position_history -- the set the repetition test reads
+        # -- is fed only by the insert it does for its OWN bestmove (creatica_search.cpp:2062).
+        # The opponent's replies are never recorded, so repetition was detected on every other
+        # ply and a local match could not reproduce what the lichess bot sees. lichess_bot sends
+        # the full list; now so do we.
+        #
+        # Tree reuse was never the problem and is unaffected: the root is looked up by board hash
+        # at the start of every search (creatica_search.cpp:784), so it is found either way.
+        # Ponder is still not exercised here -- this driver never sends "go ponder".
         self.reader.drain()
-        self._send("position fen " + fen)
+        if root_fen and uci_moves:
+            self._send("position fen %s moves %s" % (root_fen, " ".join(uci_moves)))
+        else:
+            self._send("position fen " + (root_fen or fen))
         self._send("go movetime %d" % int(movetime_ms))
 
         deadline = time.time() + movetime_ms / 1000.0 + SEARCH_TIMEOUT_SLACK
@@ -778,11 +793,17 @@ def clamp_movetime(value):
     return max(10, min(ms, 600000))
 
 
-def run_search(name, env_overrides, fen, movetime_ms, options=None):
-    """Acquire an engine, search, and always release it."""
+def run_search(name, env_overrides, fen, movetime_ms, options=None,
+               root_fen=None, uci_moves=None):
+    """Acquire an engine, search, and always release it.
+
+    root_fen/uci_moves are optional: given both, the engine is sent the game from its start
+    rather than the current position alone, which is what a repetition test needs. Callers that
+    only have a position (the analyse endpoint) may omit them and get the old behaviour.
+    """
     eng = POOL.acquire(name, env_overrides, options)
     try:
-        return eng.search(fen, movetime_ms)
+        return eng.search(fen, movetime_ms, root_fen, uci_moves)
     except EngineError:
         POOL.forget(eng)
         raise
@@ -1036,6 +1057,8 @@ class Tournament:
         was stopped part way through this game.
         """
         fen = opening or START_FEN
+        root_fen = fen          # the position the game started from, for "position fen ... moves"
+        uci_moves = []          # every move played so far, in UCI, for the same
         plies = 0
         reps = {}
 
@@ -1081,7 +1104,8 @@ class Tournament:
                 # nothing but ucinewgame. A match run that way compares nothing while
                 # looking entirely normal.
                 res = run_search(cfg["engine"], cfg["env"], fen,
-                                 self.movetime_ms, cfg.get("options"))
+                                 self.movetime_ms, cfg.get("options"),
+                                 root_fen, uci_moves)
             except (EngineError, ApiError) as exc:
                 return loser_result, "engine error: %s" % exc, plies
 
@@ -1096,6 +1120,7 @@ class Tournament:
                 return "1/2-1/2", "helper error: %s" % moved.get("error"), plies
 
             fen = moved.get("fen") or fen
+            uci_moves.append(best)   # only reached once the move is known legal and applied
             plies += 1
             with self.lock:
                 self.state["moves"].append(moved.get("san") or best)
