@@ -66,9 +66,17 @@ def read(path):
                 continue
             parts = line.split("\t")
             if len(parts) not in (8, 9):   #9 since hashfull was added; the move list is always last
-                yield None, n + 1, "expected 8 fields, got %d" % len(parts)
+                yield None, n + 1, "expected 8 or 9 fields, got %d" % len(parts)
                 continue
-            tag, fen, sims, rootq, rootcp, ponder, seldep, visits = parts
+            # Unpack from BOTH ENDS, not by a fixed arity. hashfull was inserted as the
+            # second-to-last column, and the dump writes its header only when the file is empty,
+            # so a dataset that spans an engine change holds both widths under one stale header --
+            # targets.tsv has 64,964 eight-column rows and 4,315 nine-column rows. Reading `visits`
+            # by fixed position would take hashfull as the move list on the newer rows and report
+            # every one of them as malformed, or worse, silently parse nothing.
+            tag, fen, sims, rootq, rootcp, ponder, seldep = parts[:7]
+            hashfull = int(parts[7]) if len(parts) == 9 else None
+            visits = parts[-1]
             moves = []
             bad = None
             for tok in visits.split():
@@ -86,7 +94,8 @@ def read(path):
                 continue
             yield {
                 "tag": tag, "fen": fen, "sims": int(sims), "rootq": float(rootq),
-                "rootcp": int(rootcp), "ponder": ponder == "1", "seldepth": int(seldep), "moves": moves,
+                "rootcp": int(rootcp), "ponder": ponder == "1", "seldepth": int(seldep),
+                "hashfull": hashfull, "moves": moves,
             }, n + 1, None
 
 
