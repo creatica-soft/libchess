@@ -152,6 +152,25 @@ struct MCTSNode {
     //between `expanding` and `children`, so sizeof(MCTSNode) stays 56 and the gc accounting in
     //tree_occupancy() is unchanged.
     std::atomic<uint32_t> descents{0};
+    //EVIDENCE: visits that actually produced information, as distinct from N, which counts every
+    //time the search came here.
+    //
+    //In textbook MCTS the two are the same number, because every visit runs a fresh rollout and so
+    //adds a new sample. Creatica replaced rollouts with a deterministic evaluator, and the moment a
+    //node cannot be expanded -- the tree is full, so there is no memory for its children -- every
+    //further visit re-backpropagates the SAME evaluation. N climbs, Q does not move, and the visit
+    //count stops measuring confidence and starts measuring attention.
+    //
+    //That is not a rare corner. Observed in a real game: a root child reached 16,025,716 visits
+    //with no children and Q frozen at exactly its birth value, the engine ranked by N, played it,
+    //and lost a queen from a winning position. Across two bots' logs, 0.1% and 0.6% of all moves
+    //were played with no searched continuation at all.
+    //
+    //So N keeps driving SELECTION -- it must, or the exploration term never decays and the search
+    //live-locks on the node it cannot expand -- while `evidence` drives Q and the root ranking.
+    //W pairs with evidence, not with N: a visit that learned nothing adds to neither, so Q simply
+    //does not move rather than being cemented in place by repetition.
+    std::atomic<uint64_t> evidence{0};
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
 };
 // An OPEN-ADDRESSING hash table keyed by Zobrist hash, holding the transposition DAG.

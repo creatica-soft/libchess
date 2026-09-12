@@ -197,6 +197,9 @@ std::atomic<uint64_t> search_simulations{0};
 //opposite responses. Recording both makes the difference readable afterwards instead of having
 //to be reconstructed from two visit-dump rows.
 std::atomic<double> last_gc_ms{0.0};
+//Simulations that reached a leaf the tree had no room to expand. If this is not near zero the
+//search is spending its time re-reading numbers it already had.
+std::atomic<uint64_t> uninformed_sims{0};
 TbProbe tb_probe;
 //EDGE VISITS, at RUNTIME rather than compile time.
 //
@@ -214,6 +217,35 @@ TbProbe tb_probe;
 //Runtime rather than a #define specifically so both sides of that match can be the same binary:
 //two builds risk differing in something other than the flag.
 bool          edge_visits = false;
+
+//GC TRAVERSAL ORDER.
+//
+//The collector walks the tree and keeps whatever it reaches before its byte budget runs out. With
+//a FIFO that walk is BREADTH-FIRST, so retention is decided by DEPTH rather than by value: the
+//shallow layers are reached first and survive, and the deepest line -- which is the most heavily
+//searched one, the principal variation -- is reached last and is therefore cut first.
+//
+//Observed consequence, from a real game: a 48 second ponder built 20,343,257 nodes and filled the
+//hash to 1000 per-mille. The line the opponent then played had its subtree truncated, so re-rooting
+//into it left 176 nodes. The children were still in the map and were re-adopted WITH their lifetime
+//statistics, so select_best_moves() ranked a move claiming 16,025,716 visits inside a 307-node
+//tree, and the engine played it. It was a queen blunder from a +5 position.
+//
+//Best-first spends the same budget on the most-visited lines instead, so the cut lands on the
+//fringe the search never cared about. One container serves both: with best_first off the key is a
+//decreasing sequence number, which makes the max-heap behave exactly as the old FIFO did.
+bool          gc_best_first = true;
+
+//Rank and value by evidence rather than by attention. See MCTSNode::evidence. Default ON: it
+//restores the invariant the algorithm assumes rather than adding a special case around its
+//absence. Switchable so it can be measured head to head from one binary.
+bool          use_evidence = true;
+
+//The denominator of Q and of the root ranking: N when the split is off, evidence when it is on.
+static inline uint64_t ev_of(const MCTSNode * n) {
+    return use_evidence ? n->evidence.load(std::memory_order_relaxed)
+                        : n->N.load(std::memory_order_relaxed);
+}
 int           nnue_feature_dims();
 int           nnue_features(const Board&, NNUEContext&, unsigned char*);
 
@@ -281,7 +313,7 @@ std::unordered_map<uint64_t, int> position_history;
 //A child's value from the PARENT's point of view, which is what "is this winning" means at the
 //root. Zero visits has no value yet, so it is not winning as far as we know.
 static inline double child_q(const MCTSNode * c) {
-    const uint64_t n = c->N.load(std::memory_order_relaxed);
+    const uint64_t n = ev_of(c);
     return n ? -c->W.load(std::memory_order_relaxed) / (double)n : 0.0;
 }
 
@@ -666,72 +698,25 @@ void gc(MCTSNode * from) {
   const auto gc_t0 = std::chrono::steady_clock::now();
   size_t gc_marked = 0, gc_freed = 0, gc_edges_freed = 0;
   const size_t gc_before = search.tree.size();
-  std::queue<MCTSNode *> q;
-  // Update generation for root and push it to the queue
+  //key: visit count when best-first, a decreasing counter when not (which reproduces FIFO order).
+  struct QItem { uint64_t key; MCTSNode * node; };
+  struct QCmp  { bool operator()(const QItem& a, const QItem& b) const { return a.key < b.key; } };
+  std::priority_queue<QItem, std::vector<QItem>, QCmp> q;
+  uint64_t fifo_key = ~0ULL;                       //counts DOWN, so earliest push wins the max-heap
+  const bool best_first = gc_best_first;
+  auto push_node = [&](MCTSNode * n) {
+      q.push({ best_first ? n->N.load(std::memory_order_relaxed) : fifo_key--, n });
+  };
   gc_root->generation.store(current_gen, std::memory_order_relaxed);
-  q.push(gc_root);
+  push_node(gc_root);
 
-  //RETENTION IS BOUNDED BY A BUDGET, NOT BY REACHABILITY.
-  //
-  //Marking everything reachable is the obvious rule and it is the wrong one here, because with
-  //tree reuse a transposition DAG keeps almost everything reachable from the new root: reversible
-  //moves lead back to positions already in the tree, so there is no garbage to find. A real
-  //collection on a full tree logged
-  //
-  //    gc breakdown: 10031474 nodes -> 10031474, marked 10031473, freed 0 nodes + 0 edges
-  //
-  //and freeing nothing is not a wasted collection, it is a broken engine. mcts_search() gates
-  //expansion on hash_full < 1000, so a tree that can never shrink never expands another leaf for
-  //the rest of the game. What that does to the moves: a root child keeps accumulating visits
-  //while it is still UNEXPANDED, so every one of those visits backpropagates the static
-  //evaluation of a position whose refutation has never been searched, and select_best_moves()
-  //ranks by visit count. From a real game, move 26, hashfull 1000, seldepth 12:
-  //
-  //    e7h4: 10,787,898 visits (99.5%)  prior 0.0099  Q -0.0082  and no children at all
-  //    e6e5:      6,692 visits          prior 0.0955
-  //
-  //Q was exactly tanh(-5cp / eval_scale) -- the score of the position after the bishop went to
-  //h4 and before g3 took it. The engine gave a piece away, at 99.5% confidence, because it never
-  //looked one ply further. Six of that game's 36 moves came from a search in this state.
-  //
-  //So the mark keeps what FITS rather than what it can reach, and TRUNCATES the rest: a node at
-  //the cut keeps its own statistics but loses its children array, which makes its whole subtree
-  //unreachable and lets the ordinary sweep below reclaim it. num_children drops to 0, so the
-  //descent in mcts_search() treats it as a leaf again and re-expands it if the search still wants
-  //it; the expanding flag is a released try-lock, not a "has been expanded" mark, so nothing
-  //blocks that.
-  //
-  //The sweep's safety invariant is unchanged. It relies on a survivor never pointing at a swept
-  //node, and that still holds exactly: a surviving node either was not truncated, in which case
-  //every child it points at was stamped, or it was truncated, in which case it points at nothing.
-  //
-  //Which 40% to throw away. The queue is breadth-first, so nodes are reached in order of distance
-  //from the root, and the cut therefore falls on the deep fringe -- the newest, least-visited,
-  //cheapest-to-recompute nodes. That is the right first cut, but on its own it would also sever
-  //the tail of the principal variation, which is deep AND heavily visited. So between the soft
-  //and hard budgets only well-visited nodes keep their children: a node holding at least a
-  //thousandth of the root's visits survives the cut, which in a 10M-visit tree is a few thousand
-  //nodes along and beside the PV. Past the hard budget everything is truncated, so the overshoot
-  //this allows is bounded rather than open-ended.
-  const size_t gc_capacity  = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
+  /*const size_t gc_capacity  = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
   const size_t soft_bytes   = gc_capacity ? (gc_capacity * (size_t)GC_EVICT_SOFT) / 1000 : 0;
   const size_t hard_bytes   = gc_capacity ? (gc_capacity * (size_t)GC_EVICT_HARD) / 1000 : 0;
-  //Same accounting as tree_occupancy(), so "600 per-mille" here and "600 per-mille" there mean
-  //the same thing; a mismatch would let the collector believe it had made room that hashfull
-  //does not see.
   const uint64_t root_visits = gc_root->N.load(std::memory_order_relaxed);
-  //FLOOR OF 1. root_visits/1000 is zero whenever the root has fewer than 1,000 visits, and the
-  //test below is `node->N < keep_visits` on an UNSIGNED N -- which is never true against zero. The
-  //soft budget therefore switched itself off entirely on a small root and the collector fell back
-  //to plain reachability marking, the exact behaviour this eviction was written to replace. That
-  //is how the tree reached 14.3 million nodes in one game: with eviction dead the tree only grows,
-  //and a collection over a tree that size costs seconds (measured 1,504 to 2,252 ms, and one that
-  //took 1,810 ms and left 97 nodes). Since commit 2d87326 that time is charged to the move's own
-  //clock, so the real search that followed got almost nothing and ranked its moves on visit counts
-  //inherited from earlier searches.
   const uint64_t keep_visits = std::max<uint64_t>(1, root_visits / 1000);
+  bool   is_root    = true;*/
   size_t kept_nodes = 1, kept_edges = 0, truncated = 0;
-  bool   is_root    = true;
 
   while (!q.empty()) {
       //Abandoning during the MARK means nothing may be swept: the marks are incomplete, so a
@@ -740,13 +725,13 @@ void gc(MCTSNode * from) {
       //Truncations already performed are safe to leave in place -- they free only Edge arrays,
       //and the subtrees they orphan stay intact in the map until the next collection reaches them.
       if (gc_abort.load(std::memory_order_relaxed)) return;
-      MCTSNode * node = q.front();
+      MCTSNode * node = q.top().node;
       q.pop();
       int num_children = node->num_children.load(std::memory_order_relaxed);
       Edge * children = node->children.load(std::memory_order_relaxed);
 
       //The root always keeps its children: without them there is no move to choose.
-      if (!is_root && num_children > 0 && soft_bytes) {
+      /*if (!is_root && num_children > 0 && soft_bytes) {
           const size_t kept_bytes = kept_nodes * (sizeof(MCTSNode) + 24)
                                   + kept_edges * sizeof(Edge);
           const bool over = kept_bytes >= hard_bytes
@@ -764,7 +749,7 @@ void gc(MCTSNode * from) {
               continue;
           }
       }
-      is_root = false;
+      is_root = false;*/
 
       if (num_children > 0) kept_edges += (size_t)num_children;
       for (int i = 0; i < num_children; ++i) {
@@ -783,7 +768,7 @@ void gc(MCTSNode * from) {
               if (child->generation.exchange(current_gen, std::memory_order_relaxed) != current_gen) {
                   ++gc_marked;
                   ++kept_nodes;
-                  q.push(child);
+                  push_node(child);
               }
           }
       }
@@ -884,6 +869,7 @@ void set_root(NNUEContext& ctx) {
     //roughly a factor of eval_scale near zero and unbounded instead of confined to [-1, 1].
     root->W.store(tanh(result / eval_scale), std::memory_order_relaxed);
     root->N.store(1, std::memory_order_relaxed);
+    root->evidence.store(1, std::memory_order_relaxed);
   }
 
   search.root = root;    
@@ -909,6 +895,7 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
     //something other than the look-ahead.
     if (cp != NO_MATE_SCORE && (seed_children || terminal > 0)) {
       child->N.store(1, std::memory_order_relaxed);
+      child->evidence.store(1, std::memory_order_relaxed);   //the evaluation it was born with
       child->W.store(tanh(cp * 0.01 / eval_scale), std::memory_order_relaxed);
     }
     //Read the winner's pointer WHILE STILL HOLDING THE LOCK. This used to unlock first and then
@@ -1008,18 +995,11 @@ int most_visited_child(const MCTSNode * parent) {
   return idx; //this will be negative for the last node
 }
 
-//no locking, call only when search threads finished
-//called from runMCTS()
-//One line per search. Tab-separated, because a FEN contains spaces:
-//  tag \t fen \t simulations \t rootQ \t rootCP \t ponder \t seldepth \t "move:N:prior ..."
 //
-//The move list is EVERY legal move with its visit count, including zeros -- a move the search
-//refused to visit is as much a part of the target as the one it chose, and dropping those would
-//bias the distribution toward flatness.
 //THE SCORE TO REPORT for a child, from the PARENT's point of view.
 //
-//node->cp is a ONE-PLY value, written once when the node is expanded (the "look-ahead update"
-//store further down) and never refreshed by anything the search subsequently learns. Under
+//node->cp is a ONE-PLY value, written once when the node is expanded 
+//and never refreshed by anything the search subsequently learns. Under
 //ReuseTree a node keeps it for the rest of the game, so the number the engine printed could be
 //millions of simulations and several moves out of date. Measured in a won endgame: the search's
 //own value was about +335 centipawns while the reported score read 125, and on neighbouring moves
@@ -1038,7 +1018,7 @@ static int report_cp(MCTSNode * child) {
   const int stored = -raw;                       // the caller's point of view
   const bool unset = (raw == NO_MATE_SCORE || raw == -NO_MATE_SCORE);
   if (!unset && std::abs(stored) >= MATE_SCORE) return stored;   // exact; keep it
-  const uint64_t n = child->N.load(std::memory_order_relaxed);
+  const uint64_t n = ev_of(child);
   if (n == 0) return unset ? 0 : stored;
   double q = -child->W.load(std::memory_order_relaxed) / (double)n;
   //atanh is infinite at the ends, and Q can reach them through mate backups.
@@ -1095,6 +1075,8 @@ static void dump_visits(const std::vector<std::tuple<uint64_t, int>>& visits, co
   fclose(f);
 }
 
+//no locking, call only when search threads finished
+//called from runMCTS()
 int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) { 
   int num_children = search.root->num_children.load(std::memory_order_relaxed);
   if (!num_children) {
@@ -1111,7 +1093,7 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
     //it banked as the ponder root, so it outranked moves the current search had actually worked
     //on, and the repetition filter below then deleted the top of a ranking history had decided.
     visits.push_back({edge_visits ? (uint64_t)children[i].n.load(std::memory_order_relaxed)
-                                  : child->N.load(std::memory_order_relaxed), i});
+                                  : ev_of(child), i});
   }
   //Descending by visits, and on a TIE the lower child index wins.
   //
@@ -1241,9 +1223,9 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
     const int stale_cp = -child->cp.load(std::memory_order_relaxed); //kept for the debug line below
     double parent_N = static_cast<double>(search.root->N.load(std::memory_order_relaxed));
     double prior = children[index].P.load(std::memory_order_relaxed);
-    uint64_t N = child->N.load(std::memory_order_relaxed);
+    uint64_t N = ev_of(child);
     double W = -child->W.load(std::memory_order_relaxed);
-    double Q = W / N;
+    double Q = N ? W / N : 0.0;
     double U = exploration_max * prior * sqrt(parent_N) / (1 + N);
     std::string pv(uci_move);
     std::string pv2(uci_move);
@@ -1304,11 +1286,13 @@ int select_best_child(MCTSNode * parent, const int depth) {
   const uint32_t parentD = parent->descents.load(std::memory_order_relaxed);
   const bool     use_edge = edge_visits;   //hoisted out of the child loop below
   const double   parentW = parent->W.load(std::memory_order_relaxed);
-  const double   parentQ = parentN ? parentW / parentN : 0.0;
+  const uint64_t parentE = ev_of(parent);
+  const double   parentQ = parentE ? parentW / parentE : 0.0;
   for (int i = 0; i < num_children; i++) {
     double P = children[i].P.load(std::memory_order_relaxed);
     MCTSNode * child = children[i].child.load(std::memory_order_relaxed);
-    uint64_t N = child->N.load(std::memory_order_relaxed);
+    uint64_t N = child->N.load(std::memory_order_relaxed);   //attention: drives exploration
+    const uint64_t Ne = ev_of(child);                        //evidence: drives Q
     //N(s,a) for this edge, which is NOT the child's visit count. See the note on Edge::n.
     const uint32_t en = children[i].n.load(std::memory_order_relaxed);
     double W = -child->W.load(std::memory_order_relaxed); //parent perspective
@@ -1320,7 +1304,7 @@ int select_best_child(MCTSNode * parent, const int depth) {
     //slightly below its parent instead, which is the honest guess before any evidence.
     //Q still comes from the POSITION: a node's accumulated value is about the position, and a
     //transposition legitimately shares it. Only the exploration term moves to the edge.
-    double Q = N ? W / N : (parentQ - fpu_reduction);
+    double Q = Ne ? W / Ne : (parentQ - fpu_reduction);
     //PUCT formula. Numerator and denominator are both edge counts now. Using the child's lifetime
     //N as the denominator meant a child carrying a million inherited visits had an exploration
     //term so small it could never be re-examined from a new parent, which is how a node frozen
@@ -1570,17 +1554,21 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
     //Harmless in standard chess, which is why it survived: there isChess960 is false, the
     //generator already emits g1/c1, and do_move's rewrite is skipped, so dst never changes.
     const Square   pre_dst  = static_cast<Square>(m.dst);
+    //And the MOVING PIECE, for the same reason and one more: after make_move() the from-square is
+    //empty, so reading it later yields PieceTypeNone. A piece-indexed policy net keys its move
+    //table on this, so getting it wrong scores every move against an unrelated embedding row.
+    const int      pre_pt   = chess_board.piecesOnSquares[m.src] & 7;
     const int      move_idx = (m.promoType << 12) | (m.src << 6) | m.dst;
     if (use_policy && policy_mode == POLICY_FULL) {
       auto [cp, terminal] = make_move_policy(chess_board, board_hash, m, child_hash, pos_history, iter);
-      move_evals.push_back({policy_score(policy_net, pctx, m.src, pre_dst, flip) * pscale,
+      move_evals.push_back({policy_score(policy_net, pctx, pre_pt, m.src, pre_dst, flip) * pscale,
                             move_idx, cp, terminal, child_hash});
     } else {
       auto [res, terminal] = make_move(chess_board, board_hash, m, ctx, child_hash, pos_history, iter);
       //get_prob() divides by `temperature`, so push temperature * (the logit we want).
       const double prior = use_policy
           ? temperature * policy_blend_scale
-                * (policy_blend * policy_score(policy_net, pctx, m.src, pre_dst, flip) / policy_temperature
+                * (policy_blend * policy_score(policy_net, pctx, pre_pt, m.src, pre_dst, flip) / policy_temperature
                    + (1.0 - policy_blend) * res / temperature)
           : res;
       move_evals.push_back({prior, move_idx,
@@ -1627,7 +1615,8 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
     std::vector<double> logit(n);
     double mx = -1e300;
     for (size_t i = 0; i < n; ++i) {
-      logit[i] = policy_score(policy_net, pctx, legal[i].src, legal[i].dst, flip) / policy_temperature;
+      logit[i] = policy_score(policy_net, pctx, chess_board.piecesOnSquares[legal[i].src] & 7,
+                              legal[i].src, legal[i].dst, flip) / policy_temperature;
       if (logit[i] > mx) mx = logit[i];
     }
     //Softmax over the policy logits alone. Shifted by the maximum before exponentiating, so a
@@ -1788,6 +1777,7 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
   // We could actually improve the eval by using move_evals calculated later in the code for the children nodes before expansion for evaluating its parent (this node), kind of look ahead eval
   int scorecp = 0;
   double result = 0.0;
+  bool informed = true;      //see the note at the leaf below
   if (terminal <= 0) {
     //A full tree stops the search GROWING, not the search THINKING.
     //
@@ -1810,6 +1800,11 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
     //over the tree that exists. That is degraded -- no new nodes -- but it still sharpens the
     //statistics of the moves already under consideration, which is enormously better than
     //abandoning the search.
+    //DID THIS SIMULATION LEARN ANYTHING? Expanding a leaf produces new evaluations, and a terminal
+    //or tablebase value is exact -- both inform. Re-reading a stored evaluation because the node
+    //could not be expanded informs nothing: it backpropagates a number already counted. Decided
+    //once, here at the leaf, and applied to the whole path, because a simulation that ends on a
+    //hollow leaf taught the nodes it passed through nothing either.
     const bool tree_full = hash_full.load(std::memory_order_relaxed) >= 1000;
     if (!tree_full && node->expanding.exchange(1, std::memory_order_acquire) == 0) { //the leaf node is gated only for expansion
                                 //nodes traversed in the selection phase are not leaf nodes, i.e. nodes without children
@@ -1851,7 +1846,25 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
       result = tanh(result / eval_scale);
       node->expanding.store(0, std::memory_order_release);
     } //end of if (node.expanding.exchange(1, acquire) == 0)
-    else { //unable to lock the node, see if it's already evaluated
+    else {
+      //ONLY A FULL TREE MEANS NOTHING CAN BE LEARNED HERE.
+      //
+      //This branch is reached for two quite different reasons and I originally treated them the
+      //same, which was wrong and cost real games. Losing the try-lock means ANOTHER THREAD IS
+      //EXPANDING THIS NODE RIGHT NOW and will finish in microseconds -- with four threads MCTS
+      //deliberately converges on the same promising leaves, which is the entire reason virtual
+      //loss exists, so contention here is normal and frequent rather than exceptional. The value
+      //backpropagated is a real evaluation and counting it is what the engine has always done.
+      //
+      //Marking those uninformed thinned the statistics on exactly the busiest lines -- and because
+      //the flag applies to the WHOLE path, one contended leaf discarded the backpropagation for
+      //every ancestor up to the root. Q then saturated on far fewer samples: measured against the
+      //control arm in the same match, cp 2799 where the control said 2039 from the same one-ply
+      //value of 830.
+      //
+      //A full tree is the opposite case: the node can NEVER be expanded, so every visit re-reads
+      //the same number forever. That, and only that, is a visit which teaches nothing.
+      if (tree_full) { informed = false; uninformed_sims.fetch_add(1, std::memory_order_relaxed); }
       scorecp = node->cp.load(std::memory_order_relaxed);
       if (scorecp == NO_MATE_SCORE) { //node has not been evaluated yet, return without a backprop (a bit of a waste)
         //NEVER printf() from the search. stdout is the UCI channel: this line goes into the
@@ -1893,8 +1906,11 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
   // Backpropagation: update node visits and results regardless of whether we expand the node or not
   for (auto n = path.rbegin(); n != path.rend(); ++n) {
     node = *n;
-    node->N.fetch_add(1, std::memory_order_relaxed);
-    node->W.fetch_add(result, std::memory_order_relaxed);
+    node->N.fetch_add(1, std::memory_order_relaxed);      //attention, always
+    if (informed) {
+      node->evidence.fetch_add(1, std::memory_order_relaxed);
+      node->W.fetch_add(result, std::memory_order_relaxed);
+    }
     result = -result;
   }
   // Revert virtual loss for the selected path (skip root, as no loss was applied to it) regardless of expansion
@@ -1989,13 +2005,8 @@ void runMCTS(NNUEContext& ctx) {
 	isCheckMateStaleMate(board); //it calculates board.num_moves as well as part of all legal moves generation
   if (board.num_moves > 1) { //run MCTS using multiple threads
     tbhits.store(0, std::memory_order_relaxed);
-    //it seems there rarely is some kind of contamination or corruption of the tree
-    //so let's try cleanup() instead of gc() if UCI Ponder option is false
-    //avoid using Ponder option, sometimes called "permanent brain", i.e. thinking during opponent's time
-    //Ponder implies reuse: a pondered subtree that gets destroyed before the next search was
-    //wasted effort. Reuse no longer implies Ponder.
     //Stop and join any collection still running from the last move. This is the "go" edge of
-    //Arkadi's signal pair: bestmove starts the collector, the next search stops it. Whatever it
+    //signal pair: bestmove starts the collector, the next search stops it. Whatever it
     //managed to free is kept; whatever it did not is collected next time.
     gc_join();
     const auto collect_start = std::chrono::steady_clock::now();
@@ -2150,6 +2161,7 @@ void runMCTS(NNUEContext& ctx) {
       const double secs = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - iter_start).count();
       const uint64_t sims = search_simulations.load(std::memory_order_relaxed);
+      const uint64_t hollow = uninformed_sims.exchange(0, std::memory_order_relaxed);
       //The repetition history's shape, which is the cheap way to see that the counts are real and
       //that the per-command replay is not multiplying them: `positions` should track the ply count
       //and `max rep` should stay small. `flipped` is how many of those boards have also occurred
@@ -2161,12 +2173,14 @@ void runMCTS(NNUEContext& ctx) {
       }
       log_file("info string search: %llu simulations in %.0f ms (%.0f/s), "
                "last collection %.1f ms, tree %zu nodes, %d permille, "
-               "history %zu positions, max rep %d, %d also seen with the tempo flipped\n",
+               "history %zu positions, max rep %d, %d also seen with the tempo flipped, "
+               "%llu hollow (%.1f%%)\n",
                (unsigned long long)sims, secs * 1000.0,
                secs > 0 ? sims / secs : 0.0,
                last_gc_ms.load(std::memory_order_relaxed),
                search.tree.size(), tree_occupancy(),
-               position_history.size(), max_rep, flipped);
+               position_history.size(), max_rep, flipped,
+               (unsigned long long)hollow, sims ? 100.0 * hollow / sims : 0.0);
     }
     if (chessEngine.optionCheck[FinalInfoLines].value) {    
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();

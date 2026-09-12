@@ -24,7 +24,7 @@ CMake targets: `chess` (the shared library), `test_pos`, `test_nnue`, `test_tb`,
 Notes:
 - The library is ~110 MB because both NNUE nets are embedded at compile time via `incbin`. Net filenames are `#define`s in `nnue/evaluate.h` (`EvalFileDefaultNameBig` / `EvalFileDefaultNameSmall`); switching nets means editing that header and rebuilding `chess`.
 - `CMakeLists.txt` hardcodes `-rpath /Users/ap/libchess` and `-O3 -march=native`. Adjust the rpath when building elsewhere.
-- Files outside CMake carry their exact compile command in the **first comment line of the file** — that is the convention here. E.g. `creatica.cpp` starts with the `c++ -std=c++20 ... creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica` line. Use it rather than inventing flags.
+- Files outside CMake carry their exact compile command in the **first comment line of the file** — that is the convention here. E.g. `creatica.cpp` starts with the `c++ -std=c++20 ... creatica_search.cpp creatica.cpp uci_frontend.cpp tbcore.c tbprobe.c -o creatica` line. Use it rather than inventing flags.
 
 ## Tests
 
@@ -82,9 +82,11 @@ Move bitboards are consumed with `lsBit(moves)` / `moves &= moves - 1`. Promotio
 
 **External-engine driver** (`engine.cpp`) — spawns and drives a *separate* UCI engine over a pair of named pipes (`mkfifo` + `fork`/`execlp` on POSIX, `CreateNamedPipe` + `CreateProcess` on Win32): `initChessEngine`, `isReady`, `newGame`, `position`, `go`, `eval`, `getPV`, `stop`, `quit`, filling `struct Evaluation`. This is how `test_pos`, `tournament`, and `lichess_bot` obtain a reference eval or an opponent. It is unrelated to creatica's own search.
 
-**Creatica engine** — `creatica.cpp` (MCTS) + `uci.cpp` (UCI protocol), sharing `creatica.hpp`. Per-thread trees held as flat `std::vector<MCTSNode>` with index-based `Edge`s, shared root statistics in atomic `root_N`/`root_W`, virtual loss, softmax move priors over NNUE evals (temperature), node value `W = tanh(eval / eval_scale)`, an exploration constant decaying linearly with depth, quiescence at leaves, Syzygy probing at ≤5 pieces, and libcurl lookups against online eval/tablebase endpoints. Every tunable is exposed as a UCI spin option (`EngineSpinOptions` in `libchess.h`) with a `#define` default in `creatica.hpp`.
+**Creatica engine** — `creatica_search.cpp` (the MCTS search) + `creatica.cpp` (options, tablebase, game state) + `uci_frontend.cpp` (UCI protocol), sharing `creatica_search.hpp`. **One tree shared by all search threads**, not per-thread trees: `MCTSSearch::tree` is a `NodeMap`, a flat open-addressed table from Zobrist hash to `MCTSNode *`, so transpositions make it a DAG rather than a tree. `Edge` holds an atomic `MCTSNode *` child. Virtual loss, softmax move priors (from the NNUE policy head in `policy_net.h`, or from child evaluations when it is off), node value `W = tanh(eval / eval_scale)`, an exploration constant decaying linearly with depth, quiescence at leaves, Syzygy probing at ≤5 pieces, and libcurl lookups against online eval/tablebase endpoints. Every tunable is exposed as a UCI option (`EngineSpinOptions` in `libchess.h`) with a `#define` default in `creatica_search.hpp`.
 
-> **`creatica.cpp` and `uci.cpp` do not currently compile against the reworked library.** They call the pre-rework signatures: `do_move_dp` without `DirtyThreats`, `checkMask` as returning a single mask rather than a `pair`, and `piece_moves` without `ep_mask`. That is why the `creatica` target is commented out in `CMakeLists.txt`. `test_smp.cpp` holds the up-to-date version of the same MCTS search — port from it rather than guessing.
+Memory is reclaimed by a mark-sweep collector, `gc()`, which frees **only nodes unreachable from the root** — the visit-count eviction that once truncated live subtrees is commented out. A background "reaper" thread does the actual `delete`s off the search's clock.
+
+The engine builds and is a live CMake target. It used to be commented out, because the old `creatica.cpp` + `uci.cpp` pair called pre-rework signatures (`do_move_dp` without `DirtyThreats`, `checkMask` returning a single mask, `piece_moves` without `ep_mask`); those files now live in `attic/` and the current three-file engine has replaced them.
 
 **PGN / game layer** (`pgn.cpp`, `tag.cpp`, `move.cpp`) — `countGames`, `initGame`, `playGame`, `ecoClassify` over fixed-size `Game`/`Tag`/`EcoLine` structures sized by the `MAX_*` macros at the top of `libchess.h`; SAN ↔ `Move` ↔ UCI conversion lives in `move.cpp`.
 
@@ -98,5 +100,5 @@ The root directory is a working scratchpad, not a curated source tree. Numbered 
 
 - Configuration is `#define`s at the top of the relevant `.cpp`, not flags or config files.
 - Boards are passed by reference; move generators return `uint64_t` bitboards; multi-value returns use `std::pair`/`std::tuple` with structured bindings.
-- Logging is C-style `printf`/`fprintf`; the engine writes `uci.log` and `print()`/`log_file()` in `uci.cpp` are the mutex-guarded wrappers.
+- Logging is C-style `printf`/`fprintf`; the engine writes `creatica.log` by default (overridable, and the lichess bot gives each account its own `creatica_<name>.log`), and `print()`/`log_file()` are the mutex-guarded wrappers.
 - Public library symbols are marked `CHESS_API` in `libchess.h` (a no-op outside Win32).
