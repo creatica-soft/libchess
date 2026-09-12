@@ -73,9 +73,60 @@ const float eval_scale = 600.0f; // conversion scale from cp to cnn target and b
 #ifndef CONV_POLICY
 #define CONV_POLICY 0
 #endif
+
+// PIECE_INDEX -- put the MOVING PIECE TYPE into the move index.
+//
+// The readout is score(m) = dot(ctx, emb[row(m)]) with row(m) = from*64 + to, so a rook moving
+// e1-e4 and a queen moving e1-e4 share one embedding row. The model's only way to tell them apart
+// is the 128-dim global position code ctx, and ctx is also carrying everything else it knows about
+// the position. Widening the index to (piece_type-1)*4096 + from*64 + to gives each (piece, from,
+// to) its own row: 24576 rows instead of 4096, so emb grows from 524,288 to 3,145,728 numbers.
+//
+// WHY THIS IS WORTH ISOLATING. Measured on both held-out self-play sets, the policy's top-1 is a
+// capture 24.1% of the time against a 5.8% base rate -- 4.2x -- and it finds the search's own best
+// move in its top-6 87.4% of the time when that move is a capture but only 66.0% when it is quiet,
+// which is 79% of positions. Captures are exactly the moves the NNUE FullThreats features index by
+// (from, to). This change does not add any input, so it separates "the move vocabulary is too
+// coarse" from "the input does not describe the move at all".
+//
+// Only the CONV_POLICY==0 table is widened. The CONV_POLICY==1 encoding already distinguishes
+// moves by their geometric shape (73 planes per from-square), which is a different way of solving
+// part of the same problem, and combining the two is a separate experiment.
+#ifndef PIECE_INDEX
+#define PIECE_INDEX 0
+#endif
+
+// ON-DISK FORMAT VERSIONS. The index scheme has to be recorded in the file, because a net whose emb
+// rows mean something different is not a net an older engine may load: it would read the wrong row
+// for every move and score at chance with no diagnostic. So the version is the narrow version plus
+// three when the table is piece-indexed:
+//
+//   1  W1 b1 W2 b2 emb        from*64 + to                   4096 rows
+//   2  + Wl [h2,h2]           from*64 + to
+//   3  + Cl [out,h2]          from*64 + to
+//   4  W1 b1 W2 b2 emb        (pt-1)*4096 + from*64 + to    24576 rows
+//   5  + Wl [h2,h2]           piece-indexed
+//   6  + Cl [out,h2]          piece-indexed
+//
+// The offset was at first applied only inside the LEGAL_BIAS==0 branch of the export, and
+// LEGAL_BIAS DEFAULTS TO 1 -- so the default piece-indexed build exported version 2, a file
+// recording nothing at all about its index scheme, which is the exact ambiguity the new version was
+// introduced to remove.
+#define PI_FMT (PIECE_INDEX ? 3 : 0)
+
+//A build with both flags set was silently self-contradictory: CONV_POLICY won the width (4672) and
+//won the indexing (its policy_index branch ignores pt), while the export still stamped a
+//piece-indexed version. Nothing rejected it; the engine happened to refuse the file over its width,
+//which is luck rather than a check.
+#if CONV_POLICY && PIECE_INDEX
+#error "CONV_POLICY and PIECE_INDEX are different move-table schemes; pick one"
+#endif
+
 #if CONV_POLICY
 static constexpr int POLICY_PLANES = 73;
 static constexpr int POLICY_OUT    = 64 * POLICY_PLANES;   // 4672
+#elif PIECE_INDEX
+static constexpr int POLICY_OUT    = 6 * 64 * 64;          // 24576
 #else
 static constexpr int POLICY_OUT    = 64 * 64;              // 4096
 #endif
@@ -100,12 +151,23 @@ static inline int move_plane(int from_i, int to_i, int promo) {
 }
 
 // Index of a move in the policy output, oriented squares in, -1 if unrepresentable.
-static inline int policy_index(int from_i, int to_i, int promo) {
+//
+// `pt` is the type of the piece on the from-square, Pawn=1 .. King=6. It is deliberately NOT
+// oriented: a piece's type is the same value for either colour, unlike the squares, which are
+// mirrored by ^56 for Black before they get here. It is used only when PIECE_INDEX is on, and a
+// value outside 1..6 yields -1 rather than an index into the wrong row -- a corrupt record must
+// not silently train the queen's table on a pawn move.
+static inline int policy_index(int pt, int from_i, int to_i, int promo) {
 #if CONV_POLICY
+    (void)pt;
     const int pl = move_plane(from_i, to_i, promo);
     return pl < 0 ? -1 : from_i * POLICY_PLANES + pl;
-#else
+#elif PIECE_INDEX
     (void)promo;
+    if (pt < Pawn || pt > King) return -1;
+    return (pt - Pawn) * 64 * 64 + from_i * 64 + to_i;
+#else
+    (void)pt; (void)promo;
     return from_i * 64 + to_i;
 #endif
 }
@@ -720,15 +782,15 @@ public:
     int num_checkers = checkers ? bitCount(checkers) : 0;
     auto [check_mask, ep_mask] = checkers ? checkMask(board, kingSquare, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL);
 
-    auto add_legal = [&](int from_i, int to_i) {
-      const int pi = policy_index(from_i, to_i, PieceTypeNone);
+    auto add_legal = [&](int pt, int from_i, int to_i) {
+      const int pi = policy_index(pt, from_i, to_i, PieceTypeNone);
       if (pi >= 0 && n_legal < MAX_LEGAL) legal_idx[n_legal++] = pi;
     };
 
     int king_from = is_black ? (kingSquare ^ 56) : kingSquare;
     while (king_moves) {
       const Square to_sq = popLSB(king_moves);
-      add_legal(king_from, is_black ? (to_sq ^ 56) : to_sq);
+      add_legal(King, king_from, is_black ? (to_sq ^ 56) : to_sq);
     }
 
     if (num_checkers <= 1) {
@@ -742,7 +804,7 @@ public:
           all_legal_moves |= moves;
           while (moves) {
             const Square to_sq = popLSB(moves);
-            add_legal(from_i, is_black ? (to_sq ^ 56) : to_sq);
+            add_legal(pt, from_i, is_black ? (to_sq ^ 56) : to_sq);
           }
         }
       }
@@ -819,7 +881,11 @@ public:
         int from_sq = is_black ? (pos.from_sq[i] ^ 56) : pos.from_sq[i];
         int to_sq   = is_black ? (pos.to_sq[i]   ^ 56) : pos.to_sq[i];
         static const int PROMO_PT[4] = {PieceTypeNone, Knight, Bishop, Queen};
-        const int pi = policy_index(from_sq, to_sq, PROMO_PT[pos.promo[i] & 3]);
+        //From the UNFLIPPED square: pos.from_sq[i] indexes the real board, while from_sq above has
+        //already been mirrored for Black. Reading the mirrored square would name whatever piece
+        //happens to stand on the reflected square, which for Black is usually an enemy piece.
+        const int mv_pt = board.piecesOnSquares[pos.from_sq[i]] & 7;
+        const int pi = policy_index(mv_pt, from_sq, to_sq, PROMO_PT[pos.promo[i] & 3]);
         pv_idx[i] = (pi >= 0) ? static_cast<float>(pi) : -1.0f;
         //cp is WHITE-relative (see the value target above, which flips it for
         //Black). The squares were being flipped here but the scores were not, so
@@ -1392,6 +1458,7 @@ int main() {
               << " H1=" << POLICY_H1 << " H2=" << POLICY_H2
               << " POLICY_OUT=" << POLICY_OUT
               << " CONV_POLICY=" << CONV_POLICY
+              << " PIECE_INDEX=" << PIECE_INDEX
               << " LEGAL_BIAS=" << LEGAL_BIAS
               << " MAX_PVS=" << MAX_PVS << " MAX_TRAIN_PVS=" << MAX_TRAIN_PVS
               << " POLICY_TEMP=" << POLICY_TEMP << std::endl;
@@ -1421,17 +1488,17 @@ int main() {
         //because a v2 net whose Wl is ignored is not the net that was trained -- so
         //policy_net_load() refuses a version it cannot apply rather than quietly dropping it.
 #if LEGAL_BIAS == 1
-        const int32_t fmt_version = 2;                            // + Wl [h2,h2]
+        const int32_t fmt_version = 2 + PI_FMT;                   // + Wl [h2,h2]
         const torch::Tensor ts[6] = { m.W1, m.b1, m.W2, m.b2, m.emb, m.Wl };
         const char* nm[6] = { "W1", "b1", "W2", "b2", "emb", "Wl" };
 #else
-        const int32_t fmt_version = 3;                            // + Cl [out,h2]
+        const int32_t fmt_version = 3 + PI_FMT;                   // + Cl [out,h2]
         const torch::Tensor ts[6] = { m.W1, m.b1, m.W2, m.b2, m.emb, m.Cl };
         const char* nm[6] = { "W1", "b1", "W2", "b2", "emb", "Cl" };
 #endif
         const int n_ts = 6;
 #else
-        const int32_t fmt_version = 1;
+        const int32_t fmt_version = 1 + PI_FMT;
         const torch::Tensor ts[5] = { m.W1, m.b1, m.W2, m.b2, m.emb };
         const char* nm[5] = { "W1", "b1", "W2", "b2", "emb" };
         const int n_ts = 5;
@@ -1735,9 +1802,9 @@ int main() {
               //The name must carry EVERY flag that changes the architecture, or runs overwrite each
               //other: a hidden=128 conv run silently walked over a hidden=256 bilinear run's
               //checkpoints file by file, because only attention and the two dims were encoded.
-              std::snprintf(ckpt, sizeof ckpt, "%sh1%d_h2%d_c%d_e%d_f%02d.pt",
+              std::snprintf(ckpt, sizeof ckpt, "%sh1%d_h2%d_c%d_p%d_l%d_e%d_f%02d.pt",
                             checkpoint_prefix.c_str(), POLICY_H1, POLICY_H2, CONV_POLICY,
-                            epoch, file_number);
+                            PIECE_INDEX, LEGAL_BIAS, epoch, file_number);
               torch::save(model, ckpt);
               std::cout << "  saved " << ckpt << std::endl;
             }
