@@ -1675,8 +1675,15 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
   //emit() only collects. At the default 1.0 it evaluates inline exactly as before, and no
   //vector is allocated -- the no-gate path is unchanged.
   const bool gating = use_policy && probability_mass < 1.0;
+  //COLLECT BEFORE SCORING when the net carries the legality term, because that term is a function
+  //of the WHOLE legal move set: it adds Wl * (mean embedding row over the legal moves) to ctx, so
+  //it has to be applied once, with every move known, before a single move is scored. Scoring a
+  //move against a partially-accumulated mean would give it a different value from the same move
+  //scored later.
+  const bool need_legal_set = use_policy && policy_net.has_wl;
+  const bool collect_first  = gating || need_legal_set;
   std::vector<Move> legal;
-  if (gating) legal.reserve(64);
+  if (collect_first) legal.reserve(64);
 
   auto evaluate = [&](Move& m) {
     uint64_t child_hash = 0;
@@ -1713,7 +1720,7 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
                             static_cast<int>(-res * 100), terminal, child_hash});
     }
   };
-  auto emit = [&](Move& m) { if (gating) legal.push_back(m); else evaluate(m); };
+  auto emit = [&](Move& m) { if (collect_first) legal.push_back(m); else evaluate(m); };
 
   move.src = kingSquare;
   move.promoType = PieceTypeNone;
@@ -1743,6 +1750,17 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
       }
     }
   }
+  //The legality term, applied to ctx once the full move list is known and BEFORE the gate, which
+  //ranks by policy score and so must see the corrected scores.
+  if (need_legal_set && !legal.empty()) {
+    std::vector<size_t> rows;
+    rows.reserve(legal.size());
+    for (const Move& m : legal)
+      rows.push_back(policy_row(policy_net, chess_board.piecesOnSquares[m.src] & 7,
+                                m.src, m.dst, flip));
+    policy_apply_legal_bias(policy_net, pctx, rows.data(), (int)rows.size());
+  }
+
   //The gate. Runs between enumeration and evaluation, so a dropped move costs nothing.
   //
   //Only on the policy path: with the policy off, or in check, the prior IS the evaluation and
@@ -1782,7 +1800,7 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
       legal.swap(kept);
     }
   }
-  if (gating)
+  if (collect_first)
     for (Move& m : legal) evaluate(m);
 
   if (chess_board.num_moves == 0) {
