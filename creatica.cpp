@@ -99,6 +99,8 @@ extern std::string last_move;
 extern std::unordered_map<unsigned long long, int> position_history;
 extern int64_t repetition_guard;
 extern bool    edge_visits;
+extern bool    gc_best_first;
+extern bool    use_evidence;
 extern Board board;
 extern ZobristHash zh;
 extern Zobrist z;
@@ -480,6 +482,13 @@ public:
         // instead of the child's lifetime visit count. Off by default: it costs about half the
         // simulation rate. See the note on edge_visits.
         o.check("EdgeVisits", &edge_visits, false);
+        // Collector traversal order. Best-first spends the retention budget on the most-visited
+        // lines; breadth-first (the old behaviour) spends it on the shallowest, which cuts the
+        // principal variation first. See the note on gc_best_first.
+        o.check("GcBestFirst", &gc_best_first, true);
+        // Rank moves and compute Q from visits that actually learned something, rather than from
+        // every visit. See MCTSNode::evidence for what goes wrong without it.
+        o.check("UseEvidence", &use_evidence, true);
         // Diagnostic, not a tunable. Walks the whole tree after every collection and reports
         // any broken invariant on stderr and in the log. Costs a full map walk per move, so it
         // is for runs that are asking whether tree reuse is sound, not for playing.

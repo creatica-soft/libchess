@@ -126,6 +126,12 @@ const bool        bot_ponder   = env_bool("CREATICA_PONDER", PONDER);
 //default because it costs about half the simulation rate. Exposed per bot so a head-to-head can run
 //both sides from ONE binary -- two builds risk differing in something other than the flag.
 const bool        bot_edge_visits = env_bool("CREATICA_EDGE_VISITS", false);
+//ANY engine option, without needing a change here for each new one. Comma-separated Name=Value:
+//  CREATICA_OPTIONS="UseEvidence=false,RepetitionGuard=2"
+//A value of true/false/on/off/yes/no is sent as a check, anything numeric as a spin. This exists
+//because three options were added to the engine in one day and each needed its own variable here,
+//which is exactly the kind of friction that stops a head-to-head being run at all.
+const std::string bot_options   = env_str("CREATICA_OPTIONS", "");
 //Time control of challenges this bot SENDS. Only the challenging side's values are used --
 //the accepting side plays whatever it is offered -- so setting these on the --no-challenge
 //instance has no effect.
@@ -480,6 +486,33 @@ void setEngineOptions() {
 		if (!setEngineCheck(creatica, o.name, o.value) && !complained)
 			fprintf(stderr, "  (%s = %s therefore has no effect)\n", o.name, o.value ? "true" : "false");
 	complained = true;
+	//Applied last, so an explicit CREATICA_OPTIONS entry overrides anything set above.
+	if (!bot_options.empty()) {
+		size_t start = 0;
+		while (start <= bot_options.size()) {
+			const size_t comma = bot_options.find(',', start);
+			std::string item = bot_options.substr(start, comma == std::string::npos
+			                                             ? std::string::npos : comma - start);
+			start = (comma == std::string::npos) ? bot_options.size() + 1 : comma + 1;
+			const size_t eq = item.find('=');
+			if (eq == std::string::npos) continue;
+			std::string name = item.substr(0, eq), val = item.substr(eq + 1);
+			auto trim = [](std::string& t) {
+				while (!t.empty() && std::isspace((unsigned char)t.front())) t.erase(t.begin());
+				while (!t.empty() && std::isspace((unsigned char)t.back()))  t.pop_back();
+			};
+			trim(name); trim(val);
+			if (name.empty() || val.empty()) continue;
+			std::string low; for (char c : val) low += (char)std::tolower((unsigned char)c);
+			bool ok;
+			if (low=="true"||low=="false"||low=="on"||low=="off"||low=="yes"||low=="no")
+				ok = setEngineCheck(creatica, name.c_str(), low=="true"||low=="on"||low=="yes");
+			else
+				ok = setEngineSpin(creatica, name.c_str(), strtoll(val.c_str(), nullptr, 10));
+			fprintf(stderr, "  CREATICA_OPTIONS: %s = %s%s\n", name.c_str(), val.c_str(),
+			        ok ? "" : "  (engine does not advertise it -- ignored)");
+		}
+	}
 	setOptions(creatica);
 }
 
@@ -530,8 +563,11 @@ static size_t WriteCallback2(void * contents, size_t size, size_t nmemb, void * 
 }
 
 // Combined function for HTTP requests (GET or POST) with retries
-bool HttpRequest(const std::string& method, const std::string& url, const std::string& postfields = "", std::string * response_out = nullptr, const std::string& accept = "", bool auth_required = true) {
-    const int max_retries = 5;
+//max_retries_override: -1 keeps the default. A caller that is running its own retry loop wants a
+//SINGLE fast attempt, not this function's five retries with linear backoff -- otherwise one outer
+//attempt costs about 45 seconds and the outer loop is useless.
+bool HttpRequest(const std::string& method, const std::string& url, const std::string& postfields = "", std::string * response_out = nullptr, const std::string& accept = "", bool auth_required = true, int max_retries_override = -1) {
+    const int max_retries = max_retries_override >= 0 ? max_retries_override : 5;
     int retry_count = 0;
     bool success = false;
 
@@ -599,7 +635,11 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
         } else if (res != CURLE_OK || http_code == 429 || http_code >= 500) {
             // Retryable error
             retry_count++;
-            std::cerr << "HttpRequest() error: retryable error: " << curl_easy_strerror(res) << ": " << errbuf << " HTTP: " << http_code << "Retry count " << retry_count << ". Max retries " << max_retries << std::endl;
+            //attempt N of max_retries+1: the loop condition is <=, so five "retries" is six tries.
+            //The old wording read "Retry count 6. Max retries 5", which looks like an off-by-one.
+            std::cerr << "HttpRequest() error: retryable error: " << curl_easy_strerror(res) << ": "
+                      << errbuf << " HTTP: " << http_code << " -- attempt " << retry_count
+                      << " of " << (max_retries + 1) << std::endl;
             if (retry_count <= max_retries) {
                 std::this_thread::sleep_for(std::chrono::seconds(retry_count));  // Linear delay (1s, 2s, 3s...)
             }
@@ -948,7 +988,7 @@ static bool firstLegalMove(Board& board, char * out) {
   return false;
 }
 
-void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, const std::string& initial_fen, const std::string& moves, const long long wtime, const long long btime, const long long winc, const long long binc) {
+void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, const bool is_white, const std::string& initial_fen, const std::string& moves, const long long wtime, const long long btime, const long long winc, const long long binc) {
     int gss = gameStateStatus.load();
     std::cout << "ComputeAndPostMove() debug: game state - status: " << gameSS[gss] << ", moves: " << moves << std::endl;
     if (gss != started && gss != created) {
@@ -1089,9 +1129,54 @@ try_again:  if (go(creatica, evaluations)) {
 
             std::string move_url = "https://lichess.org/api/bot/game/" + game_id + "/move/" + new_move;
             std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "..." << std::endl;
-            if (!HttpRequest("POST", move_url))
-              std::cerr << "ComputeAndPostMove() error: failed to post request to " << move_url << std::endl;
-            std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "... done" << std::endl;
+
+            //KEEP TRYING UNTIL IT LANDS, OR UNTIL THE CLOCK IS GONE.
+            //
+            //A failed POST used to be logged and dropped. Nothing recorded that a move was still
+            //owed, so the bot sat waiting for a gameState that could not arrive -- it was still our
+            //turn, so the opponent had nothing to send. Recovery depended on the game stream's
+            //60 second no-data watchdog firing and lichess re-sending gameFull, roughly a minute and
+            //a half after the outage began. A rated 120+2 game was lost on time exactly this way,
+            //after six connect failures to port 443.
+            //
+            //Nothing about the position changes while we are trying: it is our turn, so the
+            //opponent cannot move and the move stays legal. The only reasons to stop are that it
+            //landed, that the game ended, or that we are about to flag anyway.
+            //
+            //Each attempt asks HttpRequest for no internal retries. Its default five-with-backoff
+            //costs about 45 seconds per call, which would make this loop check the clock roughly
+            //twice before running out of it.
+            const long long our_ms   = is_white ? wtime : btime;
+            const long long deadline = our_ms > 6000 ? our_ms - 4000 : 2000;  //keep some back
+            const auto      started  = std::chrono::steady_clock::now();
+            bool delivered = false;
+            for (int attempt = 1; ; ++attempt) {
+                delivered = HttpRequest("POST", move_url, "", nullptr, "", true, /*max_retries=*/0);
+                if (delivered) break;
+                if (!game_in_progress.load() || gameStateStatus.load() >= aborted) {
+                    std::cerr << "ComputeAndPostMove(): giving up on " << new_move
+                              << " -- the game is over" << std::endl;
+                    break;
+                }
+                const long long spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - started).count();
+                if (spent >= deadline) {
+                    std::cerr << "ComputeAndPostMove() error: could not deliver " << new_move
+                              << " in " << spent / 1000 << " s; out of clock to keep trying"
+                              << std::endl;
+                    break;
+                }
+                std::cerr << "ComputeAndPostMove(): " << new_move << " not delivered (attempt "
+                          << attempt << ", " << spent / 1000 << " s of " << deadline / 1000
+                          << " s used); retrying" << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            if (delivered)
+                std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move
+                          << "... done" << std::endl;
+            else
+                std::cerr << "ComputeAndPostMove() error: move " << new_move
+                          << " was NEVER delivered to lichess" << std::endl;
         } else { // Not our turn
             if (numberOfPieces > 7 && bot_ponder && ponder_move_sent) {
               creatica.infinite = true;
@@ -1174,7 +1259,7 @@ void HandleGame(const std::string& game_id) {
                 bool wdraw = state["state"].value("wdraw", false);
                 bool bdraw = state["state"].value("bdraw", false);
                 bool draw_offer = is_white ? bdraw : wdraw;
-                ComputeAndPostMove(game_id, draw_offer, our_turn, initial_fen, moves, wtime, btime, winc, binc);
+                ComputeAndPostMove(game_id, draw_offer, our_turn, is_white, initial_fen, moves, wtime, btime, winc, binc);
               } else if (state.contains("type") && state["type"] == "gameState") {
                 gameStateStatus.store(0);
                 for (int i = 0; i < game_states; i++) {
@@ -1211,7 +1296,7 @@ void HandleGame(const std::string& game_id) {
                 bool wdraw = state.value("wdraw", false);
                 bool bdraw = state.value("bdraw", false);
                 bool draw_offer = is_white ? bdraw : wdraw;
-                ComputeAndPostMove(game_id, draw_offer, our_turn, initial_fen, moves, wtime, btime, winc, binc);
+                ComputeAndPostMove(game_id, draw_offer, our_turn, is_white, initial_fen, moves, wtime, btime, winc, binc);
             } else if (state.contains("type") && state["type"] == "opponentGone") {
                 //lichess omits claimWinInSeconds entirely when gone is false, and a bare
                 //operator[] on a const json& asserts and abort()s - which killed the bot
@@ -1506,6 +1591,11 @@ int main(int argc, char ** argv) {
         "  CREATICA_HASH     %-10sengine Hash in MB. Two bots on one 8 GB machine at 1024\n"
         "                              each will swap; 512 is the safer pairing.\n"
         "  CREATICA_PONDER   %-10sthink on the opponent's clock. Measured +137 Elo.\n"
+        "  CREATICA_OPTIONS (unset)    comma-separated Name=Value engine options, e.g.\n"
+        "                              \"UseEvidence=false,RepetitionGuard=2\". true/false is sent\n"
+        "                              as a check, a number as a spin. Applied after everything\n"
+        "                              else, so it overrides. This is how you set one side of a\n"
+        "                              head-to-head without a rebuild.\n"
         "  CREATICA_SKIP_BOTS (unset)  comma-separated, case-insensitive name PREFIXES never to\n"
         "                              challenge, e.g. Leela,Boris. Usually unnecessary: a bot that\n"
         "                              declines is backed off automatically, ten minutes doubling\n"
