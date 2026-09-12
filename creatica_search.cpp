@@ -271,7 +271,9 @@ std::atomic<uint64_t> total_children{0};
 std::atomic<size_t>   reap_pending{0};
 std::atomic<uint64_t> reap_pending_edges{0};
 std::atomic<uint64_t> tbhits{0};
-std::atomic<int> generation{0};
+//STARTS AT 1, because 0 now means "this arena slot is free". gc() hands out fetch_add(1)+1, so
+//the first real generation is 2 and nothing live ever carries 0.
+std::atomic<int> generation{1};
 std::atomic<int> hash_full{0};
 //Node count, maintained atomically so it can be read DURING a search.
 //
@@ -344,14 +346,68 @@ std::vector<ThreadParams> pool_params;
 void gc_join();         //all three defined with the collector below
 void reap_drain();      //waits for the deferred frees; defined with the reaper below
 void cleanup_locked();
+void reap_drain();
+
+//Wipe a slot back to a just-constructed state before it is reused. A recycled slot keeps whatever
+//the previous occupant left in it, and two of those fields are lethal: num_children > 0 with a
+//`children` pointer to an array that has just been deleted would send the very next descent into
+//freed memory. make_child() sets only hash/cp/terminal/generation/N/W/evidence, so the rest has to
+//be cleared here. Done on the reaper's thread, off the search's clock.
+static void arena_reset_slot(MCTSNode * n) {
+  n->children.store(nullptr, std::memory_order_relaxed);
+  n->num_children.store(0, std::memory_order_relaxed);
+  n->N.store(0, std::memory_order_relaxed);
+  n->W.store(0.0, std::memory_order_relaxed);
+  n->evidence.store(0, std::memory_order_relaxed);
+  n->descents.store(0, std::memory_order_relaxed);
+  n->expanding.store(0, std::memory_order_relaxed);
+  n->terminal.store(0, std::memory_order_relaxed);
+  n->cp.store(NO_MATE_SCORE, std::memory_order_relaxed);
+  n->hash.store(0, std::memory_order_relaxed);
+  //LAST, and it is what marks the slot free: the sweep reads the stamp to decide whether a slot is
+  //in use at all, so it must not see 0 while the rest of the node is still stale.
+  std::atomic_thread_fence(std::memory_order_release);
+  search.arena.stamp(n, 0);
+}
+
+//Size the arena to the Hash option. Changing Hash throws the tree away, which is the same thing
+//the engine has always done, but it must happen with the reaper idle: the reaper returns INDICES
+//into the slot array, and resizing frees that array underneath it.
+void arena_size_check() {
+  const size_t   bytes = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
+  const uint32_t want  = (uint32_t)std::min<size_t>(bytes / sizeof(MCTSNode), 0xFFFFFFFEu);
+  if (search.arena.cap == want) return;
+  reap_drain();
+  search.tree.clear();
+  search.root = nullptr;
+  total_nodes.store(0, std::memory_order_relaxed);
+  total_children.store(0, std::memory_order_relaxed);
+  search.arena.size_to(bytes);
+  log_file("info string node arena: %u slots of %zu bytes (%d MB Hash)\n",
+           search.arena.cap, sizeof(MCTSNode), chessEngine.optionSpin[Hash].value);
+}
 
 //The body, with no join. Callable from the background collector itself, which must not try
 //to join the thread it is running on.
 void cleanup_locked() {
-  for (auto& [h, node] : search.tree) {
-      Edge * children = node->children.load(std::memory_order_relaxed);
-      delete[] children;
-      delete node;
+  //Drain first: the reaper is about to be told every slot is free, and it must not be holding
+  //indices from the previous generation when that happens.
+  reap_drain();
+  //By INDEX over the arena, not by walking the map. Same sequential-access reason as the sweep,
+  //and it also catches a node that was created and then lost its map entry.
+  const uint32_t n = search.arena.high_water();
+  for (uint32_t i = 0; i < n; ++i) {
+    if (search.arena.gen[i].load(std::memory_order_relaxed) == 0) continue;   //already free
+    MCTSNode * node = &search.arena.slots[i];
+    delete[] node->children.load(std::memory_order_relaxed);
+    arena_reset_slot(node);
+  }
+  //Everything is free again, so hand the slots back by resetting the bump pointer rather than by
+  //pushing millions of indices onto the free list.
+  search.arena.bump.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lk(search.arena.free_mtx);
+    search.arena.free_list.clear();
   }
   search.tree.clear();
   search.root = nullptr;
@@ -611,8 +667,12 @@ static void reaper_func() {
     for (MCTSNode * n : batch) {
       const int nc = n->num_children.load(std::memory_order_relaxed);
       if (nc > 0) edges += (uint64_t)nc;
+      //The Edge array is still a real allocation and still has to be given back. The NODE is not:
+      //it is a slot in the arena, so it is wiped and its index returned to the free list.
       delete[] n->children.load(std::memory_order_relaxed);
-      delete n;
+      const uint32_t idx = search.arena.index_of(n);
+      arena_reset_slot(n);
+      search.arena.release(idx);
     }
     //Under the mutex, because reap_drain() waits on exactly this condition while holding it.
     {
@@ -707,7 +767,7 @@ void gc(MCTSNode * from) {
   auto push_node = [&](MCTSNode * n) {
       q.push({ best_first ? n->N.load(std::memory_order_relaxed) : fifo_key--, n });
   };
-  gc_root->generation.store(current_gen, std::memory_order_relaxed);
+  search.arena.stamp(gc_root, (uint32_t)current_gen);
   push_node(gc_root);
 
   /*const size_t gc_capacity  = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
@@ -765,7 +825,7 @@ void gc(MCTSNode * from) {
               //them although a surviving parent still points at them. exchange() makes the mark
               //independent of what was there before, so a partial mark is harmless and the
               //collector can be interrupted.
-              if (child->generation.exchange(current_gen, std::memory_order_relaxed) != current_gen) {
+              if (search.arena.stamp_exchange(child, (uint32_t)current_gen) != (uint32_t)current_gen) {
                   ++gc_marked;
                   ++kept_nodes;
                   push_node(child);
@@ -796,19 +856,35 @@ void gc(MCTSNode * from) {
   //frees to another thread is safe, and for the measurements that made it necessary. This still
   //has to run to completion before the search starts, because a dead node left in the map can be
   //handed back by make_child(); but it is now a map walk with no allocator work in it.
+  //BY INDEX OVER THE ARENA, not by iterating the map. This is the whole point of the arena and it
+  //is worth being precise about why. Iterating the map yields nodes in HASH order; when every node
+  //was its own allocation that order was arbitrary across several gigabytes of heap, so each
+  //generation check was a cache miss and often a page fault -- measured at 1.09 microseconds per
+  //entry, 83,828 ms for one sweep. Walking slot 0..bump is a sequential stride over one array, so
+  //the hardware prefetcher sees it coming.
   std::vector<MCTSNode *> dead;
-  for (auto it = search.tree.begin(); it != search.tree.end();) {
-    MCTSNode * node = it->second;
-    if (node->generation.load(std::memory_order_relaxed) < current_gen) {
-      const int num_children = node->num_children.load(std::memory_order_relaxed);
-      if (num_children > 0) {
-        total_children.fetch_sub(num_children, std::memory_order_relaxed); //update total_children count
-        gc_edges_freed += (size_t)num_children;
-      }
-      it = search.tree.erase(it);
-      dead.push_back(node);
-      ++gc_freed;
-    } else ++it;
+  const uint32_t n_slots = search.arena.high_water();
+  dead.reserve(gc_before > gc_marked ? gc_before - gc_marked : 0);
+  for (uint32_t i = 0; i < n_slots; ++i) {
+    //The only read in the common case, and it is four bytes out of a contiguous array rather than
+    //a 64-byte line out of the node. Everything below runs for DEAD slots only.
+    const uint32_t g = search.arena.gen[i].load(std::memory_order_relaxed);
+    if (g == 0) continue;                       //free slot, nothing here
+    if (g >= (uint32_t)current_gen) continue;   //marked: reachable from the root, keep it
+    MCTSNode * node = &search.arena.slots[i];
+    const int num_children = node->num_children.load(std::memory_order_relaxed);
+    if (num_children > 0) {
+      total_children.fetch_sub(num_children, std::memory_order_relaxed);
+      gc_edges_freed += (size_t)num_children;
+    }
+    //The map entry has to go before the slot is reused, because make_child() finds nodes by HASH
+    //and would otherwise hand this slot back as the OLD position. This is the one random access
+    //left in the sweep, and it is a probe into the 16-bytes-per-entry index rather than a
+    //dereference of a 64-byte node somewhere in the heap.
+    auto it = search.tree.find(node->hash.load(std::memory_order_relaxed));
+    if (it != search.tree.end() && it->second == node) search.tree.erase(it);
+    dead.push_back(node);
+    ++gc_freed;
   }
   //Right-size the table now that the survivors are known. Without this the sweep's cost is set
   //by the capacity the tree reached at its PEAK rather than by what it currently holds, and every
@@ -844,12 +920,24 @@ void gc(MCTSNode * from) {
 
 //no locking, call it before starting other threads (search, etc)
 void set_root(NNUEContext& ctx) {
+  //Cheap when Hash has not moved -- it compares one integer and returns. This is the only place
+  //the arena is created, so it has to run before the first lookup.
+  arena_size_check();
   auto it = search.tree.find(zh.hash);
   MCTSNode * root = (it != search.tree.end()) ? it->second : nullptr;
   if (!root) {
-    root = new MCTSNode();
+    root = search.arena.alloc();
+    //The arena is sized so the hash_full gate stops expansion long before it runs dry -- the gate
+    //charges 88 bytes a node and a slot is 64 -- so this is a should-not-happen. If it ever does,
+    //wiping the tree is better than proceeding without a root, which is not survivable.
+    if (!root) {
+      log_file("info string node arena exhausted at the root; resetting the tree\n");
+      cleanup_locked();
+      root = search.arena.alloc();
+      if (!root) { search.root = nullptr; return; }
+    }
     root->hash.store(zh.hash, std::memory_order_relaxed);
-    root->generation.store(generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    search.arena.stamp(root, (uint32_t)generation.load(std::memory_order_relaxed));
     search.tree.emplace(zh.hash, root);
   }
   //Expand whether the root is new or REUSED. The expansion used to sit inside the !root branch,
@@ -884,11 +972,15 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
   MCTSNode * child = (it != search.tree.end()) ? it->second : nullptr;
   search_lock.unlock();
   if (!child) { //if the child_hash is not found, create a child
-    child = new MCTSNode();
+    child = search.arena.alloc();
+    //Out of slots. Returning nullptr is safe because expand_node() builds the whole Edge array
+    //before publishing it with a CAS, so it can abandon the expansion without ever publishing a
+    //PARTIAL child list -- which would silently delete legal moves from the search.
+    if (!child) return nullptr;
     child->cp.store(cp, std::memory_order_relaxed);
     child->terminal.store(terminal, std::memory_order_relaxed);
     child->hash.store(hash, std::memory_order_relaxed);
-    child->generation.store(generation.load(std::memory_order_relaxed));
+    search.arena.stamp(child, (uint32_t)generation.load(std::memory_order_relaxed));
     //we should probably update N and W as well. We're updating cp, the node is evaluated, meaning it's been visited
     //Terminal children are seeded regardless of seed_children: a mate or tablebase result
     //is exact rather than an evaluation, and leaving a forced mate unseeded would measure
@@ -913,8 +1005,10 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
       winner   = it->second;
     }
     if (!inserted) {
-      // Another thread inserted first; use the existing node and clean up ours.
-      delete child;
+      // Another thread inserted first; use the existing node and give our slot straight back.
+      const uint32_t idx = search.arena.index_of(child);
+      arena_reset_slot(child);
+      search.arena.release(idx);
       child = winner;
     } else {
       total_nodes.fetch_add(1, std::memory_order_relaxed);
@@ -948,6 +1042,16 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
       MCTSNode * child = make_child(child_hash,
                                     path_repetition ? NO_MATE_SCORE : child_cp,
                                     path_repetition ? 0 : terminal);
+      //ALL OR NOTHING. A partial child list would remove legal moves from the search for the rest
+      //of the game, which is the one thing this engine must never do -- it plays as well as it
+      //does precisely because every legal move is expanded. Nothing has been published yet, so
+      //abandoning here just leaves the parent a leaf, exactly as a full tree does today. The
+      //children already created stay in the map, unreachable from the root, and the next
+      //collection takes them.
+      if (!child) {
+        delete[] children;
+        return;
+      }
       children[i].P.store(prior, std::memory_order_relaxed);
       children[i].move.store(move_idx, std::memory_order_relaxed);
       children[i].child.store(child, std::memory_order_relaxed);        
