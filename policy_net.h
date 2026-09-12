@@ -5,7 +5,12 @@
 // links only against libchess.
 //
 //   ctx     = relu( relu(x/127 @ W1 + b1) @ W2 + b2 )      once per position
-//   score(m) = ctx . emb[from*64 + to]                     once per legal move
+//   score(m) = ctx . emb[row(m)]                           once per legal move
+//
+// row(m) is from*64 + to for a format-1 net, and (piece_type-1)*4096 + from*64 + to for a
+// format-4 one. The piece type belongs in the index because without it a rook moving e1-e4 and a
+// queen moving e1-e4 share a single embedding row, and the model can only tell them apart through
+// the 128-dim global position code -- see the note on format 4 in policy_net_load().
 //
 // x is the NNUE feature transformer's post-activation output for the position, which the
 // search already maintains incrementally -- so the expensive part of the input is free.
@@ -24,6 +29,9 @@ struct PolicyNet {
   int in = 0, h1 = 0, h2 = 0, out = 0, conv = 0;
   std::vector<float> W1, b1, W2, b2, emb;
   bool loaded = false;
+  //Set from the format version, not guessed from `out`: a wrong guess here silently reads the
+  //wrong embedding row for every move, which scores at chance without any diagnostic.
+  bool piece_indexed = false;
 };
 
 // Returns false and leaves net.loaded == false if the file is missing or malformed, so the
@@ -46,16 +54,40 @@ inline bool policy_net_load(PolicyNet& net, const char* path, char* err, size_t 
   //would then play with a net that is NOT the one that was trained: every weight was fitted with
   //that term contributing, and dropping it silently changes every score. Fall back to the NNUE
   //prior with a message rather than play a net we are only partly running.
-  if (hdr[1] != 1) {
-    snprintf(err, errlen, "%s: policy format version %d needs the legality-bias term, which this "
-                          "engine does not implement; rebuild with it or export a v1 net",
+  //FORMAT 4 is format 1's tensor layout (W1, b1, W2, b2, emb) with the move table indexed by
+  //(piece_type-1)*4096 + from*64 + to instead of from*64 + to, so emb has 24576 rows rather than
+  //4096. It is a separate version number rather than something inferred from hdr[5] on purpose:
+  //an engine that predates it must REFUSE such a net, and it does, because it tests for
+  //hdr[1] != 1. Inferring from the output dimension would have let an old binary load it and
+  //index the wrong row for every move.
+  //Versions 1 and 4 carry the five tensors this engine applies. 2/3 and 5/6 append the
+  //legality-bias term (Wl or Cl), which it does not implement; 4/5/6 are the piece-indexed
+  //counterparts of 1/2/3.
+  if (hdr[1] != 1 && hdr[1] != 4) {
+    snprintf(err, errlen, "%s: policy format version %d is not supported by this engine. "
+                          "1 = from*64+to move table, 4 = the same tensors with a piece-indexed "
+                          "table; 2, 3, 5 and 6 append the legality-bias term, which this engine "
+                          "does not implement",
              path, hdr[1]);
     std::fclose(f); return false;
   }
+  net.piece_indexed = (hdr[1] == 4);
   net.in = hdr[2]; net.h1 = hdr[3]; net.h2 = hdr[4]; net.out = hdr[5]; net.conv = hdr[6];
+  //BEFORE the width check below, because a CONV_POLICY export has 4672 rows and would otherwise be
+  //refused for its width -- a true statement that points at the wrong cause.
   if (net.conv != 0) {
     snprintf(err, errlen, "%s: CONV_POLICY=1 export is not supported by this engine", path);
     std::fclose(f); return false;
+  }
+  //The output dimension is implied by the format, so disagreement means the file is not what its
+  //header claims and every row lookup below would be off. Refuse rather than read out of bounds.
+  {
+    const int want = net.piece_indexed ? 6 * 64 * 64 : 64 * 64;
+    if (net.out != want) {
+      snprintf(err, errlen, "%s: format %d implies %d move rows but the header says %d",
+               path, hdr[1], want, net.out);
+      std::fclose(f); return false;
+    }
   }
   auto rd = [&](std::vector<float>& v, size_t n) {
     v.resize(n);
@@ -112,9 +144,25 @@ inline void policy_context(const PolicyNet& net, const uint8_t* x, float* ctx) {
 // ever learned one colour's geometry. Passing raw squares for Black looks up an unrelated
 // embedding row and scores at chance -- which is why this is a required argument and not a
 // convenience the caller can leave out.
-inline float policy_score(const PolicyNet& net, const float* ctx, int from, int to, bool flip) {
+//
+// `pt` is the type of the piece standing on `from`, Pawn=1 .. King=6, and it is read from the
+// board BEFORE the move is made -- after it, the from-square is empty. It is NOT oriented: a
+// piece's type is the same enum value for either colour, so ^56 does not apply to it. It is
+// ignored entirely by a format-1 net.
+inline float policy_score(const PolicyNet& net, const float* ctx, int pt, int from, int to, bool flip) {
   if (flip) { from ^= 56; to ^= 56; }
-  const float* e = &net.emb[(size_t)(from * 64 + to) * net.h2];
+  size_t row = (size_t)(from * 64 + to);
+  if (net.piece_indexed) {
+    //CLAMP RATHER THAN TRUST. Every caller reads the mailbox of a generated move's source square,
+    //so pt is 1..6 by construction -- but the `& 7` idiom they use also produces 0 from PieceWhite
+    //and PieceBlack and 7 from PieceNone, and pt=0 would make (pt-1)*4096 a near-maximal unsigned
+    //offset while pt=7 lands exactly one row past the end. Both are silent out-of-bounds reads of a
+    //multi-megabyte table. The trainer already refuses these values in policy_index(); this is the
+    //same guard on the inference side.
+    if (pt < 1) pt = 1; else if (pt > 6) pt = 6;
+    row += (size_t)(pt - 1) * 64 * 64;
+  }
+  const float* e = &net.emb[row * net.h2];
   float s = 0.0f;
   for (int k = 0; k < net.h2; ++k) s += ctx[k] * e[k];
   return s;
