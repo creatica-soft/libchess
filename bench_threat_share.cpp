@@ -73,9 +73,9 @@ static void enumerate(std::vector<Cand>& out) {
         const bool cap = (them >> m.dst) & 1ULL;
         const bool ep  = !cap && pt == Pawn && epFile != -1
                        && (m.dst & 7) == epFile && (m.src & 7) != (m.dst & 7);
-        out.push_back({ policy_score(pnet, pctx, board.piecesOnSquares[m.src] & 7,
-                                     m.src, m.dst, us == ColorBlack),
-                        m.src, m.dst, m.promoType, cap, ep });
+        //Score LATER: with the legality term the score depends on the whole legal set, so nothing
+        //can be scored until enumeration finishes.
+        out.push_back({ 0.0f, m.src, m.dst, m.promoType, cap, ep });
     };
     for (uint64_t m = kmoves; m; m &= m - 1) { move.dst = lsBit(m); emit(move, King); }
     if (bitCount(checkers) > 1) return;
@@ -99,6 +99,18 @@ static void enumerate(std::vector<Cand>& out) {
             occ &= occ - 1;
         }
     }
+    //The legality term, once, with every move known -- then score.
+    if (pnet.has_wl && !out.empty()) {
+        std::vector<size_t> rows;
+        rows.reserve(out.size());
+        for (const auto& c : out)
+            rows.push_back(policy_row(pnet, board.piecesOnSquares[c.src] & 7,
+                                      c.src, c.dst, us == ColorBlack));
+        policy_apply_legal_bias(pnet, pctx, rows.data(), (int)rows.size());
+    }
+    for (auto& c : out)
+        c.score = policy_score(pnet, pctx, board.piecesOnSquares[c.src] & 7,
+                               c.src, c.dst, us == ColorBlack);
 }
 
 static int sq(const char * s) {

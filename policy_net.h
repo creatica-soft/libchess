@@ -28,6 +28,9 @@
 struct PolicyNet {
   int in = 0, h1 = 0, h2 = 0, out = 0, conv = 0;
   std::vector<float> W1, b1, W2, b2, emb;
+  //THE LEGALITY TERM, [h2,h2]. Present in format 2 and 5. See policy_apply_legal_bias().
+  std::vector<float> Wl;
+  bool has_wl = false;
   bool loaded = false;
   //Set from the format version, not guessed from `out`: a wrong guess here silently reads the
   //wrong embedding row for every move, which scores at chance without any diagnostic.
@@ -63,15 +66,18 @@ inline bool policy_net_load(PolicyNet& net, const char* path, char* err, size_t 
   //Versions 1 and 4 carry the five tensors this engine applies. 2/3 and 5/6 append the
   //legality-bias term (Wl or Cl), which it does not implement; 4/5/6 are the piece-indexed
   //counterparts of 1/2/3.
-  if (hdr[1] != 1 && hdr[1] != 4) {
+  //1 and 4 carry the five base tensors; 2 and 5 append Wl, the legality term. 3 and 6 append Cl
+  //instead -- a full [out,h2] table rather than an [h2,h2] map -- which this engine does not
+  //implement. 4, 5 and 6 are the piece-indexed counterparts of 1, 2 and 3.
+  if (hdr[1] < 1 || hdr[1] > 6 || hdr[1] == 3 || hdr[1] == 6) {
     snprintf(err, errlen, "%s: policy format version %d is not supported by this engine. "
-                          "1 = from*64+to move table, 4 = the same tensors with a piece-indexed "
-                          "table; 2, 3, 5 and 6 append the legality-bias term, which this engine "
-                          "does not implement",
+                          "1/4 = base tensors, 2/5 = with the legality term; 3 and 6 use the "
+                          "untied Cl table, which is not implemented",
              path, hdr[1]);
     std::fclose(f); return false;
   }
-  net.piece_indexed = (hdr[1] == 4);
+  net.piece_indexed = (hdr[1] >= 4);
+  net.has_wl        = (hdr[1] == 2 || hdr[1] == 5);
   net.in = hdr[2]; net.h1 = hdr[3]; net.h2 = hdr[4]; net.out = hdr[5]; net.conv = hdr[6];
   //BEFORE the width check below, because a CONV_POLICY export has 4672 rows and would otherwise be
   //refused for its width -- a true statement that points at the wrong cause.
@@ -93,9 +99,11 @@ inline bool policy_net_load(PolicyNet& net, const char* path, char* err, size_t 
     v.resize(n);
     return std::fread(v.data(), sizeof(float), n, f) == n;
   };
-  const bool ok = rd(net.W1, (size_t)net.in * net.h1) && rd(net.b1, net.h1)
-               && rd(net.W2, (size_t)net.h1 * net.h2) && rd(net.b2, net.h2)
-               && rd(net.emb, (size_t)net.out * net.h2);
+  bool ok = rd(net.W1, (size_t)net.in * net.h1) && rd(net.b1, net.h1)
+         && rd(net.W2, (size_t)net.h1 * net.h2) && rd(net.b2, net.h2)
+         && rd(net.emb, (size_t)net.out * net.h2);
+  //Wl comes last in the file, so it reads straight on from emb.
+  if (ok && net.has_wl) ok = rd(net.Wl, (size_t)net.h2 * net.h2);
   std::fclose(f);
   if (!ok) { snprintf(err, errlen, "%s: truncated tensor data", path); return false; }
   //The engine scores into fixed-size stack buffers. Refuse anything that would not fit
@@ -149,6 +157,54 @@ inline void policy_context(const PolicyNet& net, const uint8_t* x, float* ctx) {
 // board BEFORE the move is made -- after it, the from-square is empty. It is NOT oriented: a
 // piece's type is the same enum value for either colour, so ^56 does not apply to it. It is
 // ignored entirely by a format-1 net.
+// The embedding row a move indexes. Shared by scoring and by the legality term, so the two can
+// never disagree about where a move lives in the table.
+inline size_t policy_row(const PolicyNet& net, int pt, int from, int to, bool flip) {
+  if (flip) { from ^= 56; to ^= 56; }
+  size_t row = (size_t)(from * 64 + to);
+  if (net.piece_indexed) {
+    if (pt < 1) pt = 1; else if (pt > 6) pt = 6;
+    row += (size_t)(pt - 1) * 64 * 64;
+  }
+  return row;
+}
+
+// THE LEGALITY TERM. Adds Wl * (mean embedding row over the legal moves) to ctx, which is what
+// the trainer's LEGAL_BIAS=1 computes:
+//
+//     score(i) = dot(ctx + Wl * mean_{j legal} emb[j], emb[i])
+//
+// It is NOT a constant offset, which is the mistake that made me want to delete it. Expanding the
+// second term, move i picks up dot(Wl * mean_j emb[j], emb[i]) -- a learned interaction between
+// each move and the SET of moves that happen to be available, so it reorders them. Measured on a
+// matched pair: +0.97 Top-4 and +1.19 Top-6 for 16,384 numbers, 2% of the model.
+//
+// Must be applied ONCE, after policy_context() and before any move is scored, with the complete
+// legal move list. A partial list changes the mean and therefore every score.
+//
+// Cost: one row add per legal move (about 30 x h2) plus one h2 x h2 matrix-vector product. Against
+// the trunk's ~74K operations that is small, and nothing is added per move at scoring time.
+inline void policy_apply_legal_bias(const PolicyNet& net, float* ctx,
+                                    const size_t* rows, int n) {
+  if (!net.has_wl || n <= 0) return;
+  const int H2 = net.h2;
+  float* m = (float*)alloca(sizeof(float) * H2);
+  std::memset(m, 0, sizeof(float) * H2);
+  for (int j = 0; j < n; ++j) {
+    const float* e = &net.emb[rows[j] * H2];
+    for (int k = 0; k < H2; ++k) m[k] += e[k];
+  }
+  const float inv = 1.0f / (float)n;
+  for (int k = 0; k < H2; ++k) m[k] *= inv;
+  // ctx += m @ Wl, with Wl stored row-major [h2][h2] exactly as the trainer exported it.
+  for (int h = 0; h < H2; ++h) {
+    const float mh = m[h];
+    if (mh == 0.0f) continue;
+    const float* w = &net.Wl[(size_t)h * H2];
+    for (int k = 0; k < H2; ++k) ctx[k] += mh * w[k];
+  }
+}
+
 inline float policy_score(const PolicyNet& net, const float* ctx, int pt, int from, int to, bool flip) {
   if (flip) { from ^= 56; to ^= 56; }
   size_t row = (size_t)(from * 64 + to);
