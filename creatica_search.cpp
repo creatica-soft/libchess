@@ -218,23 +218,6 @@ TbProbe tb_probe;
 //two builds risk differing in something other than the flag.
 bool          edge_visits = false;
 
-//GC TRAVERSAL ORDER.
-//
-//The collector walks the tree and keeps whatever it reaches before its byte budget runs out. With
-//a FIFO that walk is BREADTH-FIRST, so retention is decided by DEPTH rather than by value: the
-//shallow layers are reached first and survive, and the deepest line -- which is the most heavily
-//searched one, the principal variation -- is reached last and is therefore cut first.
-//
-//Observed consequence, from a real game: a 48 second ponder built 20,343,257 nodes and filled the
-//hash to 1000 per-mille. The line the opponent then played had its subtree truncated, so re-rooting
-//into it left 176 nodes. The children were still in the map and were re-adopted WITH their lifetime
-//statistics, so select_best_moves() ranked a move claiming 16,025,716 visits inside a 307-node
-//tree, and the engine played it. It was a queen blunder from a +5 position.
-//
-//Best-first spends the same budget on the most-visited lines instead, so the cut lands on the
-//fringe the search never cared about. One container serves both: with best_first off the key is a
-//decreasing sequence number, which makes the max-heap behave exactly as the old FIFO did.
-bool          gc_best_first = true;
 
 //Rank and value by evidence rather than by attention. See MCTSNode::evidence. Default ON: it
 //restores the invariant the algorithm assumes rather than adding a special case around its
@@ -792,15 +775,24 @@ void gc(MCTSNode * from) {
   const auto gc_t0 = std::chrono::steady_clock::now();
   size_t gc_marked = 0, gc_freed = 0, gc_edges_freed = 0;
   const size_t gc_before = search.arena.live();
-  //key: visit count when best-first, a decreasing counter when not (which reproduces FIFO order).
-  struct QItem { uint64_t key; MCTSNode * node; };
-  struct QCmp  { bool operator()(const QItem& a, const QItem& b) const { return a.key < b.key; } };
-  std::priority_queue<QItem, std::vector<QItem>, QCmp> q;
-  uint64_t fifo_key = ~0ULL;                       //counts DOWN, so earliest push wins the max-heap
-  const bool best_first = gc_best_first;
-  auto push_node = [&](MCTSNode * n) {
-      q.push({ best_first ? n->N.load(std::memory_order_relaxed) : fifo_key--, n });
-  };
+  //A PLAIN FIFO over a vector with a read cursor. This was a binary heap, ordered by visit count
+  //under GcBestFirst and by a decreasing counter otherwise -- so BOTH settings paid O(log n) with
+  //a sift on every push and every pop, tens of millions of times a game.
+  //
+  //Nothing reads the order. It existed for the retention budget, which chose WHICH live subtrees
+  //to truncate when the tree exceeded a share of Hash, and that eviction is commented out:
+  //reachability does not care what order it is discovered in.
+  //
+  //Breadth-first rather than a stack, and that is deliberate. Depth-first is the other obvious
+  //O(1) choice, but nodes now live in one flat arena in creation order, so a level's nodes sit
+  //near each other in memory and a level-by-level walk keeps that locality. A stack abandons it.
+  //
+  //A vector with a head index rather than std::queue: the frontier is read once and never
+  //reclaimed as we go, so one contiguous allocation is all it needs.
+  std::vector<MCTSNode *> q;
+  q.reserve(1u << 16);
+  size_t q_head = 0;
+  auto push_node = [&](MCTSNode * n) { q.push_back(n); };
   search.arena.stamp(gc_root, (uint32_t)current_gen);
   push_node(gc_root);
 
@@ -812,15 +804,14 @@ void gc(MCTSNode * from) {
   bool   is_root    = true;*/
   size_t kept_nodes = 1, kept_edges = 0, truncated = 0;
 
-  while (!q.empty()) {
+  while (q_head < q.size()) {
       //Abandoning during the MARK means nothing may be swept: the marks are incomplete, so a
       //sweep would delete live nodes. Leaving the tree entirely alone is always safe, and the
       //next collection re-marks from scratch (exchange() below makes leftover stamps harmless).
       //Truncations already performed are safe to leave in place -- they free only Edge arrays,
       //and the subtrees they orphan stay intact in the map until the next collection reaches them.
       if (gc_abort.load(std::memory_order_relaxed)) return;
-      MCTSNode * node = q.top().node;
-      q.pop();
+      MCTSNode * node = q[q_head++];
       int num_children = node->num_children.load(std::memory_order_relaxed);
       Edge * children = node->children.load(std::memory_order_relaxed);
 
