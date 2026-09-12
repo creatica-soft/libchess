@@ -172,6 +172,123 @@ struct alignas(64) MCTSNode {
     std::atomic<uint64_t> evidence{0};
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
 };
+struct NodeArena {
+    MCTSNode * slots = nullptr;
+    //THE MARK STAMPS LIVE HERE, NOT IN THE NODE, and that is the difference between a sweep that
+    //reads 22 MB and one that reads 358 MB. The stamp used to be an `int generation` field inside
+    //MCTSNode, so deciding whether a slot was reachable meant touching its 64-byte cache line.
+    //Sequential is not the same as cheap: measured at 183 ns per slot even after the nodes were
+    //made contiguous, because a 5.6M-slot arena is a third of a gigabyte and this machine is under
+    //memory pressure. Four bytes a slot instead of sixty-four is sixteen times less to move.
+    //
+    //0 means the slot is free. A live slot carries the generation of the collection that last
+    //marked it, and gc() hands out values starting at 2, so the two can never be confused.
+    std::atomic<uint32_t> * gen = nullptr;
+    //IDENTITY, WHICH IS NOT THE SAME THING AS REACHABILITY, and conflating them was a real bug:
+    //the mark rewrites gen[] on EVERY collection, so a map entry validated against gen went stale
+    //the first time the collector ran and every lookup in the tree failed at once. tag[] changes
+    //only when a slot changes hands -- a fresh value on allocation, 0 when the sweep frees it --
+    //so it answers "is this still the node I filed?" while gen[] answers "did the mark reach it?".
+    std::atomic<uint32_t> * tag = nullptr;
+    //Monotonic, so a recycled slot never reuses a value an old map entry might still hold. It
+    //wraps after four billion allocations; an entry would have to survive the whole wrap AND land
+    //on the same slot, and every compact() rebuilds the table, so this is not reachable in play.
+    std::atomic<uint32_t> next_tag{1};
+    uint32_t   cap   = 0;      //how many slots exist; 0 means "not sized yet"
+    //Slots never handed out yet. Bump first, free list afterwards: a fresh arena hands out
+    //sequential indices, which keeps a young tree contiguous in memory.
+    std::atomic<uint32_t> bump{0};
+    //Indices returned by the reaper, LIFO. A plain vector under its own mutex: it is touched once
+    //per allocation and once per reclaim, both off the per-simulation hot path, so the contention
+    //that would justify a lock-free stack is not there.
+    std::vector<uint32_t> free_list;
+    std::mutex            free_mtx;
+    std::atomic<size_t>   released{0};
+
+    void size_to(size_t bytes_for_nodes) {
+        const uint32_t want = (uint32_t)std::min<size_t>(bytes_for_nodes / sizeof(MCTSNode),
+                                                         0xFFFFFFFEu);
+        if (want == cap) return;
+        delete[] slots;
+        delete[] gen;
+        delete[] tag;
+        slots = new MCTSNode[want];
+        gen   = new std::atomic<uint32_t>[want];
+        tag   = new std::atomic<uint32_t>[want];
+        for (uint32_t i = 0; i < want; ++i) {
+            gen[i].store(0, std::memory_order_relaxed);
+            tag[i].store(0, std::memory_order_relaxed);
+        }
+        cap   = want;
+        bump.store(0, std::memory_order_relaxed);
+        released.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(free_mtx);
+        free_list.clear();
+    }
+    //Returns nullptr when the arena is exhausted. The caller must treat that exactly as it treats
+    //a full tree today -- expansion does not happen, the node stays a leaf.
+    MCTSNode * alloc() {
+        //fetch_add, not a compare-exchange loop. Every node creation goes through here -- of the
+        //order of a million a second across four threads -- and a CAS loop makes every thread
+        //that loses the race go round again, so the cost grows with the thread count instead of
+        //staying flat. fetch_add is wait-free. It can run PAST cap, which is harmless: the
+        //overshoot is never dereferenced, and everything that reads bump clamps it.
+        const uint32_t i = bump.fetch_add(1, std::memory_order_relaxed);
+        if (i < cap) { stamp_fresh(i); return &slots[i]; }
+        std::lock_guard<std::mutex> lk(free_mtx);
+        if (free_list.empty()) return nullptr;
+        const uint32_t idx = free_list.back();
+        free_list.pop_back();
+        //UN-COUNT IT. live() is handed-out minus given-back, so a slot coming back OUT of the free
+        //list has to be taken off that tally or it stays counted as free for the rest of the game.
+        //Without this the node count drifts steadily below the truth -- measured as a collection
+        //reporting 575,239 live when 811,576 slots were actually in use -- which feeds
+        //tree_occupancy() and therefore the expansion gate.
+        released.fetch_sub(1, std::memory_order_relaxed);
+        stamp_fresh(idx);
+        return &slots[idx];
+    }
+    void release(uint32_t idx) {
+        std::lock_guard<std::mutex> lk(free_mtx);
+        free_list.push_back(idx);
+        released.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint32_t index_of(const MCTSNode * n) const { return (uint32_t)(n - slots); }
+    //What the map files: the slot's identity, not its mark.
+    uint32_t stamp_of(const MCTSNode * n) const {
+        return tag[index_of(n)].load(std::memory_order_relaxed);
+    }
+    //A value no live map entry can be holding, given for a slot just handed out. 0 is skipped
+    //because 0 is what "this slot is free" means.
+    void stamp_fresh(uint32_t i) {
+        uint32_t t = next_tag.fetch_add(1, std::memory_order_relaxed);
+        if (t == 0) t = next_tag.fetch_add(1, std::memory_order_relaxed);
+        tag[i].store(t, std::memory_order_relaxed);
+    }
+    void stamp(const MCTSNode * n, uint32_t g) {
+        gen[index_of(n)].store(g, std::memory_order_relaxed);
+    }
+    //Stamp and report what was there before, which is how the mark tells "I am the first to reach
+    //this node" from "someone already has".
+    uint32_t stamp_exchange(const MCTSNode * n, uint32_t g) {
+        return gen[index_of(n)].exchange(g, std::memory_order_relaxed);
+    }
+    //How many slots are live: handed out, minus those given back.
+    //Slots ever handed out, clamped because bump overshoots when the arena is exhausted.
+    uint32_t high_water() const {
+        const uint32_t b = bump.load(std::memory_order_relaxed);
+        return b < cap ? b : cap;
+    }
+    //THE NODE COUNT. It used to come from the map's entry count, which stopped being the same
+    //thing when the sweep stopped erasing: stale entries linger until the next rebuild. Handed
+    //out minus given back is exact and needs no lock.
+    size_t live() const {
+        const size_t hw = high_water(), rel = released.load(std::memory_order_relaxed);
+        return hw > rel ? hw - rel : 0;
+    }
+    ~NodeArena() { delete[] slots; delete[] gen; delete[] tag; }
+};
+
 // An OPEN-ADDRESSING hash table keyed by Zobrist hash, holding the transposition DAG.
 //
 // It replaces std::unordered_map, and the reason is measured rather than stylistic. An
@@ -195,109 +312,90 @@ struct alignas(64) MCTSNode {
 // unlocking, never dereference an iterator afterwards.
 class NodeMap {
   public:
-    // Named first/second so that "for (auto& [h, n] : tree)" and "it->second" both read exactly
-    // as they did with unordered_map, keeping every call site unchanged.
-    struct Slot { uint64_t first = 0; MCTSNode * second = nullptr; };
-
-    // second == nullptr means the slot was never used and terminates a probe; TOMB means it held
-    // an entry that was erased, so a probe must continue THROUGH it.
-    // 1 is never a real MCTSNode address: the type's alignment is at least 8.
-    static MCTSNode * tomb() noexcept { return reinterpret_cast<MCTSNode *>(uintptr_t(1)); }
-
-    class iterator {
-      public:
-        iterator() = default;
-        iterator(Slot * p, Slot * e) : p_(p), e_(e) { skip(); }
-        Slot &     operator*()  const { return *p_; }
-        Slot *     operator->() const { return p_; }
-        iterator & operator++()       { ++p_; skip(); return *this; }
-        bool operator==(const iterator& o) const { return p_ == o.p_; }
-        bool operator!=(const iterator& o) const { return p_ != o.p_; }
-        Slot * raw() const { return p_; }
-      private:
-        // begin() and operator++ must land on a LIVE slot; empties and tombstones are skipped.
-        void skip() { while (p_ != e_ && (p_->second == nullptr || p_->second == tomb())) ++p_; }
-        Slot * p_ = nullptr;
-        Slot * e_ = nullptr;
-    };
+    // HASH -> NODE AS AN INDEX AND A STAMP, NOT A POINTER.
+    //
+    // The point is what the collector's sweep has to touch. Holding a pointer meant a dead node's
+    // entry could only be removed by looking the node up by hash and erasing -- one cold read of
+    // the node plus a probe into this table, per corpse. Once the scan itself became free that was
+    // the entire remaining sweep: 1,229 ns per dead node, 6.4 seconds on a 5.2M-corpse collection.
+    //
+    // With an index and a stamp the sweep invalidates an entry WITHOUT TOUCHING ANYTHING: it zeroes
+    // gen[i] in the array it is already scanning, and every entry pointing at slot i is stale from
+    // that instant. The cold work -- reading the node, releasing its edges, wiping and returning
+    // the slot -- moves to the reaper, off the move's clock.
+    //
+    // AN ENTRY IS VALID WHEN BOTH HOLD:
+    //   gen[idx] == stamp     the slot has not been freed or re-stamped since we recorded it
+    //   slots[idx].hash == key   the slot has not been recycled for a different position
+    // The stamp alone is not enough: a slot can be freed and handed to a new node within the same
+    // generation, which would leave gen[idx] equal to the stamp we stored while the occupant is a
+    // different position entirely. The hash check closes that, and it costs nothing where it
+    // matters, because lookup() is about to hand that node to a caller who will read it anyway.
+    // The stamp alone IS enough to spot a stale slot cheaply, which is all the insert path needs.
+    struct Slot { uint64_t key = 0; uint32_t idx = 0; uint32_t stamp = 0; };
 
     NodeMap() = default;
     ~NodeMap() { delete[] slots_; }
     NodeMap(const NodeMap&)            = delete;
     NodeMap& operator=(const NodeMap&) = delete;
 
-    size_t size() const noexcept { return size_; }
-    bool  empty() const noexcept { return size_ == 0; }
+    void bind(NodeArena * a) { arena_ = a; }
 
-    iterator begin() { return iterator(slots_, slots_ + cap_); }
-    iterator end()   { return iterator(slots_ + cap_, slots_ + cap_); }
+    // Entries INSERTED since the last rebuild. Stale ones are not counted down -- nothing walks
+    // this table to find them any more -- so this is an upper bound and must not be used as the
+    // node count. NodeArena::live() is the authority on that.
+    size_t entries() const noexcept { return size_; }
 
-    void clear() {
-        delete[] slots_;
-        slots_ = nullptr;
-        cap_ = size_ = used_ = 0;
-    }
+    void clear() { delete[] slots_; slots_ = nullptr; cap_ = size_ = used_ = 0; }
 
-    iterator find(uint64_t key) {
-        if (!cap_) return end();
+    // nullptr when the key is absent, or its node has been freed, or its slot has been recycled.
+    MCTSNode * lookup(uint64_t key) const {
+        if (!cap_) return nullptr;
         size_t i = key & (cap_ - 1);
         for (;;) {
-            Slot & s = slots_[i];
-            if (s.second == nullptr) return end();              // empty: key is absent
-            if (s.second != tomb() && s.first == key) return iterator(&s, slots_ + cap_);
-            i = (i + 1) & (cap_ - 1);                           // tombstone or collision: keep going
+            const Slot & s = slots_[i];
+            if (s.stamp == 0) return nullptr;          // never written: the key is not here
+            if (s.key == key) { MCTSNode * n = resolve(s, key); if (n) return n; }
+            i = (i + 1) & (cap_ - 1);                  // collision, or a stale entry for this key
         }
     }
 
-    std::pair<iterator, bool> emplace(uint64_t key, MCTSNode * v) {
-        // Grow on PROBE occupancy (live + tombstones), not on size alone: a table full of
-        // tombstones probes just as badly as a full one.
+    // Returns (the node now filed under key, whether it was ours). Never fails: it grows first.
+    std::pair<MCTSNode *, bool> insert(uint64_t key, MCTSNode * n) {
         if (!cap_ || (used_ + 1) * 10 >= cap_ * 7) grow();
-        size_t  i    = key & (cap_ - 1);
-        Slot *  reuse = nullptr;
+        size_t i = key & (cap_ - 1);
+        Slot * reuse = nullptr;
         for (;;) {
             Slot & s = slots_[i];
-            if (s.second == nullptr) {
+            if (s.stamp == 0) {
                 Slot * dst = reuse ? reuse : &s;
-                if (!reuse) ++used_;          // a tombstone was already counted in used_
-                dst->first  = key;
-                dst->second = v;
+                if (!reuse) ++used_;                   // a reused stale slot was already counted
+                dst->key   = key;
+                dst->idx   = arena_->index_of(n);
+                dst->stamp = arena_->stamp_of(n);      // so n must be stamped BEFORE it is filed
                 ++size_;
-                return { iterator(dst, slots_ + cap_), true };
+                return { n, true };
             }
-            if (s.second == tomb()) { if (!reuse) reuse = &s; }
-            else if (s.first == key) return { iterator(&s, slots_ + cap_), false };
+            if (s.key == key) { MCTSNode * w = resolve(s, key); if (w) return { w, false }; }
+            // Cheap staleness only -- the gen check, no node read. Missing a recycled-but-
+            // same-generation slot costs one unreused entry, which the next rebuild reclaims.
+            if (!reuse && arena_->tag[s.idx].load(std::memory_order_relaxed) != s.stamp) reuse = &s;
             i = (i + 1) & (cap_ - 1);
         }
     }
 
-    iterator erase(iterator it) {
-        Slot * p = it.raw();
-        p->second = tomb();     // used_ is unchanged: the slot still blocks probes
-        --size_;
-        return iterator(p + 1, slots_ + cap_);
-    }
-
-    // Right-size the table after a collection, which also sweeps out the tombstones.
-    //
-    // This is not an optimisation, it is the thing that makes an open-addressed table viable
-    // here at all. Iteration is O(CAPACITY), not O(size): the sweep scans every slot, live or
-    // not. std::unordered_map iterates in O(size) because libc++ threads its elements onto a
-    // linked list, so it never pays for the empty space. Measured without this: a collection
-    // that freed nothing walked 1.6M live entries in 551 ms because the table still had ~16M
-    // slots left over from before the last die-off, while unordered_map walked 4.0M in 390 ms.
-    // Per slot the flat table is about three times quicker; it was simply scanning ten times as
-    // many of them.
-    //
-    // Rebuilding is cheap precisely because this table has no per-entry allocation: it is one
-    // array allocation plus a linear reinsert of the survivors.
+    // Rebuild, dropping stale entries. Called after a collection, which is exactly when a large
+    // share of the table has just been invalidated by the sweep zeroing their stamps.
     void compact() {
         if (!cap_) return;
+        size_t live = 0;
+        for (size_t i = 0; i < cap_; ++i)
+            if (slots_[i].stamp &&
+                arena_->tag[slots_[i].idx].load(std::memory_order_relaxed) == slots_[i].stamp)
+                ++live;
         size_t want = 16;
-        while (want * 7 < size_ * 10) want <<= 1;
-        // Rehash when the table is mostly empty, OR when tombstones have taken over the probe
-        // space even though the live count has not moved much.
-        if (want < cap_ || used_ > size_ + (cap_ >> 2)) rehash(want < cap_ ? want : cap_);
+        while (want * 7 < live * 10) want <<= 1;
+        if (want < cap_ || used_ > live + (cap_ >> 2)) rehash(want < cap_ ? want : cap_);
     }
 
     void reserve(size_t n) {
@@ -307,9 +405,13 @@ class NodeMap {
     }
 
   private:
+    MCTSNode * resolve(const Slot & s, uint64_t key) const {
+        if (arena_->tag[s.idx].load(std::memory_order_relaxed) != s.stamp) return nullptr;
+        MCTSNode * n = &arena_->slots[s.idx];
+        return n->hash.load(std::memory_order_relaxed) == key ? n : nullptr;
+    }
+
     void grow() {
-        // Sizing off size_ rather than used_ is what makes a rehash also SWEEP the tombstones:
-        // a table that is mostly tombstones is rebuilt at the same capacity instead of doubling.
         size_t ncap = cap_ ? cap_ : 1024;
         while ((size_ + 1) * 10 >= ncap * 7) ncap <<= 1;
         rehash(ncap);
@@ -317,31 +419,27 @@ class NodeMap {
 
     void rehash(size_t ncap) {
         Slot * old = slots_;
-        size_t oc  = cap_;
-        slots_ = new Slot[ncap];      // Slot's default member initialisers make every slot empty
+        const size_t oc = cap_;
+        slots_ = new Slot[ncap];
         cap_   = ncap;
-        size_ = used_ = 0;
+        size_  = used_ = 0;
         for (size_t i = 0; i < oc; ++i) {
-            MCTSNode * v = old[i].second;
-            if (v && v != tomb()) insert_fresh(old[i].first, v);
+            const Slot & s = old[i];
+            if (!s.stamp) continue;
+            if (arena_->tag[s.idx].load(std::memory_order_relaxed) != s.stamp) continue;  // stale
+            size_t j = s.key & (cap_ - 1);
+            while (slots_[j].stamp) j = (j + 1) & (cap_ - 1);
+            slots_[j] = s;
+            ++size_; ++used_;
         }
         delete[] old;
     }
 
-    // No tombstones exist in a table being rehashed, so the first empty slot is the destination.
-    void insert_fresh(uint64_t key, MCTSNode * v) {
-        size_t i = key & (cap_ - 1);
-        while (slots_[i].second != nullptr) i = (i + 1) & (cap_ - 1);
-        slots_[i].first  = key;
-        slots_[i].second = v;
-        ++size_;
-        ++used_;
-    }
-
-    Slot * slots_ = nullptr;
-    size_t cap_   = 0;   // always a power of two, so the modulo is a mask
-    size_t size_  = 0;   // live entries
-    size_t used_  = 0;   // live entries + tombstones, i.e. slots that block a probe
+    NodeArena * arena_ = nullptr;
+    Slot *  slots_ = nullptr;
+    size_t  cap_   = 0;   // always a power of two, so the modulo is a mask
+    size_t  size_  = 0;   // entries inserted since the last rebuild
+    size_t  used_  = 0;   // probe-occupied slots since the last rebuild
 };
 
 //ONE FLAT ARRAY OF NODES, ALLOCATED ONCE.
@@ -367,88 +465,12 @@ class NodeMap {
 //that overwrites the least valuable entry, say) would let one thread overwrite a node another
 //thread is standing on, and the second thread's result would land in an unrelated position's
 //statistics, silently. The pointers stay raw because nothing live is ever reused.
-struct NodeArena {
-    MCTSNode * slots = nullptr;
-    //THE MARK STAMPS LIVE HERE, NOT IN THE NODE, and that is the difference between a sweep that
-    //reads 22 MB and one that reads 358 MB. The stamp used to be an `int generation` field inside
-    //MCTSNode, so deciding whether a slot was reachable meant touching its 64-byte cache line.
-    //Sequential is not the same as cheap: measured at 183 ns per slot even after the nodes were
-    //made contiguous, because a 5.6M-slot arena is a third of a gigabyte and this machine is under
-    //memory pressure. Four bytes a slot instead of sixty-four is sixteen times less to move.
-    //
-    //0 means the slot is free. A live slot carries the generation of the collection that last
-    //marked it, and gc() hands out values starting at 2, so the two can never be confused.
-    std::atomic<uint32_t> * gen = nullptr;
-    uint32_t   cap   = 0;      //how many slots exist; 0 means "not sized yet"
-    //Slots never handed out yet. Bump first, free list afterwards: a fresh arena hands out
-    //sequential indices, which keeps a young tree contiguous in memory.
-    std::atomic<uint32_t> bump{0};
-    //Indices returned by the reaper, LIFO. A plain vector under its own mutex: it is touched once
-    //per allocation and once per reclaim, both off the per-simulation hot path, so the contention
-    //that would justify a lock-free stack is not there.
-    std::vector<uint32_t> free_list;
-    std::mutex            free_mtx;
-
-    void size_to(size_t bytes_for_nodes) {
-        const uint32_t want = (uint32_t)std::min<size_t>(bytes_for_nodes / sizeof(MCTSNode),
-                                                         0xFFFFFFFEu);
-        if (want == cap) return;
-        delete[] slots;
-        delete[] gen;
-        slots = new MCTSNode[want];
-        gen   = new std::atomic<uint32_t>[want];
-        for (uint32_t i = 0; i < want; ++i) gen[i].store(0, std::memory_order_relaxed);
-        cap   = want;
-        bump.store(0, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lk(free_mtx);
-        free_list.clear();
-    }
-    //Returns nullptr when the arena is exhausted. The caller must treat that exactly as it treats
-    //a full tree today -- expansion does not happen, the node stays a leaf.
-    MCTSNode * alloc() {
-        //fetch_add, not a compare-exchange loop. Every node creation goes through here -- of the
-        //order of a million a second across four threads -- and a CAS loop makes every thread
-        //that loses the race go round again, so the cost grows with the thread count instead of
-        //staying flat. fetch_add is wait-free. It can run PAST cap, which is harmless: the
-        //overshoot is never dereferenced, and everything that reads bump clamps it.
-        const uint32_t i = bump.fetch_add(1, std::memory_order_relaxed);
-        if (i < cap) return &slots[i];
-        std::lock_guard<std::mutex> lk(free_mtx);
-        if (free_list.empty()) return nullptr;
-        const uint32_t idx = free_list.back();
-        free_list.pop_back();
-        return &slots[idx];
-    }
-    void release(uint32_t idx) {
-        std::lock_guard<std::mutex> lk(free_mtx);
-        free_list.push_back(idx);
-    }
-    uint32_t index_of(const MCTSNode * n) const { return (uint32_t)(n - slots); }
-    uint32_t stamp_of(const MCTSNode * n) const {
-        return gen[index_of(n)].load(std::memory_order_relaxed);
-    }
-    void stamp(const MCTSNode * n, uint32_t g) {
-        gen[index_of(n)].store(g, std::memory_order_relaxed);
-    }
-    //Stamp and report what was there before, which is how the mark tells "I am the first to reach
-    //this node" from "someone already has".
-    uint32_t stamp_exchange(const MCTSNode * n, uint32_t g) {
-        return gen[index_of(n)].exchange(g, std::memory_order_relaxed);
-    }
-    //How many slots are live: handed out, minus those given back.
-    //Slots ever handed out, clamped because bump overshoots when the arena is exhausted.
-    uint32_t high_water() const {
-        const uint32_t b = bump.load(std::memory_order_relaxed);
-        return b < cap ? b : cap;
-    }
-    size_t in_use() const { return (size_t)high_water() - free_list.size(); }
-    ~NodeArena() { delete[] slots; delete[] gen; }
-};
 
 struct MCTSSearch {
+    MCTSSearch() { tree.bind(&arena); }
     MCTSNode * root = nullptr;
-    NodeMap    tree;   //Zobrist hash -> node, all of them inside `arena`
-    NodeArena  arena;
+    NodeArena  arena;  //declared first: the map validates against its stamps
+    NodeMap    tree;   //Zobrist hash -> a slot in `arena`, as an index plus a stamp
 };
 struct Edge {
     std::atomic<int> move {0};             // The move that leads to the child position

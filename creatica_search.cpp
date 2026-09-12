@@ -278,7 +278,7 @@ std::atomic<int> hash_full{0};
 //Node count, maintained atomically so it can be read DURING a search.
 //
 //tree_occupancy() and the workers' expansion guard both need to know how full the tree is, but
-//search.tree.size() cannot be read while make_child() is inserting under map_mutex. Kept in
+//search.arena.live() cannot be read while make_child() is inserting under map_mutex. Kept in
 //step here instead: incremented on a successful insert, resynced from the map by gc() and
 //cleanup(), which only ever run with no search in flight.
 std::atomic<size_t> total_nodes{0};
@@ -364,10 +364,13 @@ static void arena_reset_slot(MCTSNode * n) {
   n->terminal.store(0, std::memory_order_relaxed);
   n->cp.store(NO_MATE_SCORE, std::memory_order_relaxed);
   n->hash.store(0, std::memory_order_relaxed);
-  //LAST, and it is what marks the slot free: the sweep reads the stamp to decide whether a slot is
-  //in use at all, so it must not see 0 while the rest of the node is still stale.
+  //LAST, and in this order: the tag retires the slot's identity so no map entry can resolve to
+  //it, then the generation marks the slot itself free. Neither may be seen while the rest of the
+  //node is still the previous occupant's.
   std::atomic_thread_fence(std::memory_order_release);
-  search.arena.stamp(n, 0);
+  const uint32_t idx = search.arena.index_of(n);
+  search.arena.tag[idx].store(0, std::memory_order_relaxed);
+  search.arena.gen[idx].store(0, std::memory_order_relaxed);
 }
 
 //Size the arena to the Hash option. Changing Hash throws the tree away, which is the same thing
@@ -405,6 +408,9 @@ void cleanup_locked() {
   //Everything is free again, so hand the slots back by resetting the bump pointer rather than by
   //pushing millions of indices onto the free list.
   search.arena.bump.store(0, std::memory_order_relaxed);
+  //AND the released counter, which pairs with bump: live() is handed-out minus given-back, so
+  //resetting one without the other makes the node count collapse to zero.
+  search.arena.released.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lk(search.arena.free_mtx);
     search.arena.free_list.clear();
@@ -492,6 +498,11 @@ int tree_occupancy() {
 
 int validate_tree(const char * where, bool collected) {
   if (!validate_tree_enabled) return 0;
+  //WAIT FOR THE REAPER FIRST. Since the sweep stopped reading corpses, the live slot count, the
+  //free list and total_children only settle once the reaper has worked through its batch;
+  //checking before that reports the backlog as corruption. Free to do here, because this whole
+  //function runs only under ValidateTree, which is off in play.
+  reap_drain();
   int errors = 0;
   int reported = 0;
   const int MAX_REPORT = 20;
@@ -505,10 +516,18 @@ int validate_tree(const char * where, bool collected) {
     }
   };
 
-  //Every node the map holds, by address. Membership tests below use this and never dereference.
+  //Every LIVE node, by address, taken from the arena rather than the map: the map no longer
+  //enumerates -- it only answers lookups -- and a slot with a non-zero stamp is exactly a node
+  //that has been handed out and not yet reclaimed. Membership tests below use this set and never
+  //dereference.
   std::unordered_set<const MCTSNode *> live;
-  live.reserve(search.tree.size() * 2);
-  for (const auto& [key, node] : search.tree) live.insert(node);
+  live.reserve(search.arena.live() * 2);
+  {
+    const uint32_t hw = search.arena.high_water();
+    for (uint32_t i = 0; i < hw; ++i)
+      if (search.arena.gen[i].load(std::memory_order_relaxed) != 0)
+        live.insert(&search.arena.slots[i]);
+  }
 
   //1. The root must exist and be the node the map holds under its own hash.
   if (!search.root) {
@@ -517,17 +536,22 @@ int validate_tree(const char * where, bool collected) {
     complain("search.root is not in the tree map", 0, 0);
   } else {
     const uint64_t rh = search.root->hash.load(std::memory_order_relaxed);
-    auto it = search.tree.find(rh);
-    if (it == search.tree.end() || it->second != search.root)
+    if (search.tree.lookup(rh) != search.root)
       complain("search.root is filed under a different key than its own hash", rh, 0);
   }
 
   //2. Per node: the key matches the stored hash, the children array agrees with the count, no
   //   node carries a repetition verdict, and every Edge points at a node still in the map.
   uint64_t counted_children = 0;
-  for (const auto& [key, node] : search.tree) {
-    const uint64_t nh = node->hash.load(std::memory_order_relaxed);
-    if (nh != key) complain("node filed under a key that is not its hash", key, nh);
+  const uint32_t hw_nodes = search.arena.high_water();
+  for (uint32_t si = 0; si < hw_nodes; ++si) {
+    if (search.arena.gen[si].load(std::memory_order_relaxed) == 0) continue;
+    MCTSNode * node = &search.arena.slots[si];
+    const uint64_t key = node->hash.load(std::memory_order_relaxed);
+    //The map must agree that this node is the one filed under its own hash. This replaces the old
+    //"key matches the stored hash" check, which was free when the loop walked the map's keys.
+    if (search.tree.lookup(key) != node)
+      complain("live node is not the one the map holds under its own hash", key, 0);
 
     //Repetition is a property of the path, not the position, so it must never be cached on a
     //shared node. If this fires, something is writing terminal 3 to a node again.
@@ -568,7 +592,7 @@ int validate_tree(const char * where, bool collected) {
   //check above is the one that matters, and it applies at all times.
   if (collected && search.root && live.count(search.root)) {
     std::unordered_set<const MCTSNode *> seen;
-    seen.reserve(search.tree.size() * 2);
+    seen.reserve(search.arena.live() * 2);
     std::queue<const MCTSNode *> q;
     seen.insert(search.root);
     q.push(search.root);
@@ -584,14 +608,14 @@ int validate_tree(const char * where, bool collected) {
         if (c && live.count(c) && seen.insert(c).second) q.push(c);
       }
     }
-    if (seen.size() != search.tree.size())
+    if (seen.size() != search.arena.live())
       complain("nodes in the map are unreachable from the root",
-               (uint64_t)search.tree.size(), (uint64_t)seen.size());
+               (uint64_t)search.arena.live(), (uint64_t)seen.size());
   }
 
   if (errors) {
-    log_file("validate_tree(%s): %d violation(s), %zu nodes\n", where, errors, search.tree.size());
-    print("info string validate_tree(%s): %d violation(s), %zu nodes\n", where, errors, search.tree.size());
+    log_file("validate_tree(%s): %d violation(s), %zu nodes\n", where, errors, search.arena.live());
+    print("info string validate_tree(%s): %d violation(s), %zu nodes\n", where, errors, search.arena.live());
   }
   return errors;
 }
@@ -649,13 +673,13 @@ void gc(MCTSNode * from = nullptr);
 //unaccounted, so reap_pending keeps their memory in the occupancy figure until it is really gone.
 std::mutex                           reap_mtx;
 std::condition_variable              reap_cv;
-std::vector<std::vector<MCTSNode *>> reap_queue;
+std::vector<std::vector<uint32_t>>   reap_queue;   //slot indices, not pointers
 std::thread                          reap_thread;
 std::atomic<bool>                    reap_quit{false};
 
 static void reaper_func() {
   for (;;) {
-    std::vector<MCTSNode *> batch;
+    std::vector<uint32_t> batch;
     {
       std::unique_lock<std::mutex> lk(reap_mtx);
       reap_cv.wait(lk, [] { return reap_quit.load(std::memory_order_relaxed) || !reap_queue.empty(); });
@@ -663,17 +687,27 @@ static void reaper_func() {
       batch = std::move(reap_queue.front());
       reap_queue.erase(reap_queue.begin());
     }
+    //EVERY COLD ACCESS LIVES HERE. Reading a corpse is a cache miss and often a page fault --
+    //these are by definition the nodes the search has not touched -- so the sweep hands over bare
+    //indices and this thread pays for them while the search runs.
     uint64_t edges = 0;
-    for (MCTSNode * n : batch) {
+    for (uint32_t idx : batch) {
+      MCTSNode * n = &search.arena.slots[idx];
       const int nc = n->num_children.load(std::memory_order_relaxed);
       if (nc > 0) edges += (uint64_t)nc;
       //The Edge array is still a real allocation and still has to be given back. The NODE is not:
       //it is a slot in the arena, so it is wiped and its index returned to the free list.
       delete[] n->children.load(std::memory_order_relaxed);
-      const uint32_t idx = search.arena.index_of(n);
       arena_reset_slot(n);
       search.arena.release(idx);
     }
+    //Charged here rather than in the sweep, for the same reason: it needs num_children, which
+    //means reading the node. tree_occupancy() already excludes what the reaper still holds.
+    if (edges) total_children.fetch_sub(edges, std::memory_order_relaxed);
+    //Added here, not at enqueue: the sweep cannot count these without reading the corpses, which
+    //is the whole thing it stopped doing. Adding before the subtraction below keeps the counter
+    //balanced -- it used to be subtracted against an enqueue of zero, which underflowed.
+    reap_pending_edges.fetch_add(edges, std::memory_order_relaxed);
     //Under the mutex, because reap_drain() waits on exactly this condition while holding it.
     {
       std::lock_guard<std::mutex> lk(reap_mtx);
@@ -684,7 +718,7 @@ static void reaper_func() {
   }
 }
 
-void reap_enqueue(std::vector<MCTSNode *>&& dead, uint64_t edges) {
+void reap_enqueue(std::vector<uint32_t>&& dead, uint64_t edges) {
   if (dead.empty()) return;
   {
     std::lock_guard<std::mutex> lk(reap_mtx);
@@ -728,11 +762,11 @@ void gc_join() {
 //time at a 1000 ms movetime.
 void gc_start(MCTSNode * from, bool wipe) {
   gc_join();                                   //never two collectors at once
-  const size_t before = search.tree.size();
+  const size_t before = search.arena.live();
   const auto   t0     = std::chrono::steady_clock::now();
   gc_thread = std::thread([from, before, t0, wipe] {
     if (wipe) cleanup_locked(); else gc(from);
-    const size_t after = search.tree.size();
+    const size_t after = search.arena.live();
     last_gc_freed.store(before ? (double)(before - after) / (double)before : 1.0,
                         std::memory_order_relaxed);
     last_gc_ms.store(std::chrono::duration<double, std::milli>(
@@ -741,7 +775,7 @@ void gc_start(MCTSNode * from, bool wipe) {
     //Logged from inside the thread: the caller returns immediately and cannot observe the
     //outcome. log_file() is mutex-guarded, so this is safe from here.
     log_file("info string post-move %s: %zu -> %zu nodes, %d permille, %.1f ms%s\n",
-             wipe ? "cleanup" : "gc", before, search.tree.size(), tree_occupancy(),
+             wipe ? "cleanup" : "gc", before, search.arena.live(), tree_occupancy(),
              std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t0).count(),
              gc_abort.load(std::memory_order_relaxed) ? " (interrupted)" : "");
@@ -757,7 +791,7 @@ void gc(MCTSNode * from) {
   // Use queue to avoid recursion and potential stack overflow in deep trees.
   const auto gc_t0 = std::chrono::steady_clock::now();
   size_t gc_marked = 0, gc_freed = 0, gc_edges_freed = 0;
-  const size_t gc_before = search.tree.size();
+  const size_t gc_before = search.arena.live();
   //key: visit count when best-first, a decreasing counter when not (which reproduces FIFO order).
   struct QItem { uint64_t key; MCTSNode * node; };
   struct QCmp  { bool operator()(const QItem& a, const QItem& b) const { return a.key < b.key; } };
@@ -862,7 +896,7 @@ void gc(MCTSNode * from) {
   //generation check was a cache miss and often a page fault -- measured at 1.09 microseconds per
   //entry, 83,828 ms for one sweep. Walking slot 0..bump is a sequential stride over one array, so
   //the hardware prefetcher sees it coming.
-  std::vector<MCTSNode *> dead;
+  std::vector<uint32_t> dead;
   const uint32_t n_slots = search.arena.high_water();
   dead.reserve(gc_before > gc_marked ? gc_before - gc_marked : 0);
   for (uint32_t i = 0; i < n_slots; ++i) {
@@ -871,19 +905,16 @@ void gc(MCTSNode * from) {
     const uint32_t g = search.arena.gen[i].load(std::memory_order_relaxed);
     if (g == 0) continue;                       //free slot, nothing here
     if (g >= (uint32_t)current_gen) continue;   //marked: reachable from the root, keep it
-    MCTSNode * node = &search.arena.slots[i];
-    const int num_children = node->num_children.load(std::memory_order_relaxed);
-    if (num_children > 0) {
-      total_children.fetch_sub(num_children, std::memory_order_relaxed);
-      gc_edges_freed += (size_t)num_children;
-    }
-    //The map entry has to go before the slot is reused, because make_child() finds nodes by HASH
-    //and would otherwise hand this slot back as the OLD position. This is the one random access
-    //left in the sweep, and it is a probe into the 16-bytes-per-entry index rather than a
-    //dereference of a 64-byte node somewhere in the heap.
-    auto it = search.tree.find(node->hash.load(std::memory_order_relaxed));
-    if (it != search.tree.end() && it->second == node) search.tree.erase(it);
-    dead.push_back(node);
+    //ZERO THE STAMP AND MOVE ON. That single store invalidates every map entry pointing at this
+    //slot, so there is nothing to erase and no reason to read the node -- its hash, its child
+    //count and its edges are all the reaper's business now, off this clock. This is the whole
+    //difference between a sweep that reads 4 bytes a slot and one that chases a 64-byte line plus
+    //a table probe for every corpse.
+    //Both, and the tag is the one that matters to the map: zeroing it is what makes every entry
+    //pointing at this slot stale, instantly and without touching the node or the table.
+    search.arena.tag[i].store(0, std::memory_order_relaxed);
+    search.arena.gen[i].store(0, std::memory_order_relaxed);
+    dead.push_back(i);
     ++gc_freed;
   }
   //Right-size the table now that the survivors are known. Without this the sweep's cost is set
@@ -891,7 +922,9 @@ void gc(MCTSNode * from) {
   //later collection rescans that empty space. See NodeMap::compact().
   search.tree.compact();
   const auto gc_t2 = std::chrono::steady_clock::now();
-  reap_enqueue(std::move(dead), (uint64_t)gc_edges_freed);
+  //Zero edges: the sweep never reads a corpse, so it cannot count their Edge arrays. The reaper
+  //counts them as it frees them, charges total_children, and balances the pending figure itself.
+  reap_enqueue(std::move(dead), 0);
   //Record the yield HERE, not only in gc_start(). last_gc_freed existed already but was written
   //solely by the background collector and read solely by the background decision, so the inline
   //path -- the only one that runs with Ponder on -- had no futile-collection guard at all.
@@ -905,13 +938,16 @@ void gc(MCTSNode * from) {
   //no longer appear here at all -- they are the reaper's, and they happen during the search.
   log_file("info string gc breakdown: %zu nodes -> %zu, marked %zu, freed %zu nodes + %zu edges, "
            "reaper backlog %zu, mark %.1f ms, sweep %.1f ms\n",
-           gc_before, search.tree.size(), gc_marked, gc_freed, gc_edges_freed,
+           //gc_before - gc_freed, NOT live(): the sweep only retires stamps, and the slots are not
+           //given back until the reaper works through the batch, so live() still counts every
+           //corpse at this point and the line read "N nodes -> N" after freeing five million.
+           gc_before, gc_before - gc_freed, gc_marked, gc_freed, gc_edges_freed,
            reap_pending.load(std::memory_order_relaxed),
            std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
            std::chrono::duration<double, std::milli>(gc_t2 - gc_t1).count());
-  total_nodes.store(search.tree.size(), std::memory_order_relaxed);
+  total_nodes.store(search.arena.live(), std::memory_order_relaxed);
   //update hash_full
-  size_t total_memory = search.tree.size() * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+  size_t total_memory = search.arena.live() * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
   size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
   int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
   if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
@@ -923,8 +959,7 @@ void set_root(NNUEContext& ctx) {
   //Cheap when Hash has not moved -- it compares one integer and returns. This is the only place
   //the arena is created, so it has to run before the first lookup.
   arena_size_check();
-  auto it = search.tree.find(zh.hash);
-  MCTSNode * root = (it != search.tree.end()) ? it->second : nullptr;
+  MCTSNode * root = search.tree.lookup(zh.hash);
   if (!root) {
     root = search.arena.alloc();
     //The arena is sized so the hash_full gate stops expansion long before it runs dry -- the gate
@@ -938,7 +973,7 @@ void set_root(NNUEContext& ctx) {
     }
     root->hash.store(zh.hash, std::memory_order_relaxed);
     search.arena.stamp(root, (uint32_t)generation.load(std::memory_order_relaxed));
-    search.tree.emplace(zh.hash, root);
+    search.tree.insert(zh.hash, root);
   }
   //Expand whether the root is new or REUSED. The expansion used to sit inside the !root branch,
   //so a root inherited from the previous search was left exactly as it was found. That is fine
@@ -968,8 +1003,7 @@ void set_root(NNUEContext& ctx) {
 MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
   //first, try to find child_hash in the tree
   std::shared_lock search_lock(map_mutex);
-  auto it = search.tree.find(hash);
-  MCTSNode * child = (it != search.tree.end()) ? it->second : nullptr;
+  MCTSNode * child = search.tree.lookup(hash);
   search_lock.unlock();
   if (!child) { //if the child_hash is not found, create a child
     child = search.arena.alloc();
@@ -1000,9 +1034,9 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
     bool inserted = false;
     {
       std::unique_lock insert_lock(map_mutex);
-      auto [it, ins] = search.tree.emplace(hash, child);
+      auto [w, ins] = search.tree.insert(hash, child);
       inserted = ins;
-      winner   = it->second;
+      winner   = w;
     }
     if (!inserted) {
       // Another thread inserted first; use the existing node and give our slot straight back.
@@ -2072,7 +2106,7 @@ void uci_output_thread() {
     }
     depth.store(d, std::memory_order_relaxed);
     std::shared_lock lock(map_mutex);
-    size_t unique_nodes = search.tree.size();
+    size_t unique_nodes = search.arena.live();
     lock.unlock();
     size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
     size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
@@ -2186,7 +2220,7 @@ void runMCTS(NNUEContext& ctx) {
                std::chrono::steady_clock::now() - collect_start).count(),
              set_root_ms, collected ? "yes" : "SKIPPED",
              pondering ? "ponder search" : "real search",
-             search.tree.size());
+             search.arena.live());
     search_simulations.store(0, std::memory_order_relaxed);
     //Charge the collection to this move's budget instead of adding to it. iter_start is taken
     //AFTER all of the above, so the search used to run its full allocation on top of however
@@ -2282,14 +2316,14 @@ void runMCTS(NNUEContext& ctx) {
                (unsigned long long)sims, secs * 1000.0,
                secs > 0 ? sims / secs : 0.0,
                last_gc_ms.load(std::memory_order_relaxed),
-               search.tree.size(), tree_occupancy(),
+               search.arena.live(), tree_occupancy(),
                position_history.size(), max_rep, flipped,
                (unsigned long long)hollow, sims ? 100.0 * hollow / sims : 0.0);
     }
     if (chessEngine.optionCheck[FinalInfoLines].value) {    
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
       nodes = search_simulations.load(std::memory_order_relaxed);
-      unique_nodes = search.tree.size();
+      unique_nodes = search.arena.live();
       // Calculate hashfull (in per-mille) using unique_nodes
       size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
       size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
