@@ -135,13 +135,12 @@ struct ThreadParams {
     int seldepth;
 };
 struct Edge;
-struct MCTSNode {
+struct alignas(64) MCTSNode {
     std::atomic<uint64_t> hash{0};
     std::atomic<uint64_t> N{0};  // Atomic for lock-free updates
     std::atomic<double> W{0};
     std::atomic<int> cp {NO_MATE_SCORE}; //position evaluation in centipawns 
     std::atomic<int> num_children{0};
-    std::atomic<int> generation{0};
     std::atomic<int> terminal{0}; //0 (not terminal), 1 (mate), 2 (stalemate), 3 (repetition), -1 (check)
     std::atomic<uint8_t> expanding{0};  // expansion gate (test-and-set try-lock): exchange(1, acquire) == 0 acquires it, store(0, release) releases it
     //How many times the search has DESCENDED THROUGH this node, i.e. the sum of its edges' n.
@@ -345,9 +344,111 @@ class NodeMap {
     size_t used_  = 0;   // live entries + tombstones, i.e. slots that block a probe
 };
 
+//ONE FLAT ARRAY OF NODES, ALLOCATED ONCE.
+//
+//Nodes used to come from `new MCTSNode()`, millions of times a move, which scattered them across
+//the heap in allocation order. The collector's sweep iterates the hash map, so it walked those
+//nodes in HASH order -- effectively at random across several gigabytes -- and had to dereference
+//every one of them to read its generation stamp. The nodes it wants are by definition the ones the
+//search has not touched, so they are the coldest pages in the process. Measured at Hash 4096 on an
+//8 GB machine: 83,828 ms for one sweep, 1.09 microseconds per entry over 26.8M entries, charged to
+//the clock of the move about to be played. The search that followed got 4 ms and 37 simulations.
+//
+//With the nodes in one array the sweep iterates by INDEX instead, which is a sequential stride, and
+//the frees disappear entirely -- a slot is returned to a free list rather than handed to the
+//allocator.
+//
+//WHAT THIS DELIBERATELY DOES NOT CHANGE: which nodes die. Only nodes unreachable from the root are
+//reclaimed, exactly as before. That property is load-bearing and must not be traded away for
+//speed: search threads hold raw MCTSNode* for a whole simulation -- down the tree, through a
+//~30-evaluation expansion, and back up writing results into every node on the path -- and that is
+//safe precisely because a node on a live thread's path is reachable, so the mark reaches it and
+//the sweep never frees it. A scheme that recycled live slots (a transposition-table-style arena
+//that overwrites the least valuable entry, say) would let one thread overwrite a node another
+//thread is standing on, and the second thread's result would land in an unrelated position's
+//statistics, silently. The pointers stay raw because nothing live is ever reused.
+struct NodeArena {
+    MCTSNode * slots = nullptr;
+    //THE MARK STAMPS LIVE HERE, NOT IN THE NODE, and that is the difference between a sweep that
+    //reads 22 MB and one that reads 358 MB. The stamp used to be an `int generation` field inside
+    //MCTSNode, so deciding whether a slot was reachable meant touching its 64-byte cache line.
+    //Sequential is not the same as cheap: measured at 183 ns per slot even after the nodes were
+    //made contiguous, because a 5.6M-slot arena is a third of a gigabyte and this machine is under
+    //memory pressure. Four bytes a slot instead of sixty-four is sixteen times less to move.
+    //
+    //0 means the slot is free. A live slot carries the generation of the collection that last
+    //marked it, and gc() hands out values starting at 2, so the two can never be confused.
+    std::atomic<uint32_t> * gen = nullptr;
+    uint32_t   cap   = 0;      //how many slots exist; 0 means "not sized yet"
+    //Slots never handed out yet. Bump first, free list afterwards: a fresh arena hands out
+    //sequential indices, which keeps a young tree contiguous in memory.
+    std::atomic<uint32_t> bump{0};
+    //Indices returned by the reaper, LIFO. A plain vector under its own mutex: it is touched once
+    //per allocation and once per reclaim, both off the per-simulation hot path, so the contention
+    //that would justify a lock-free stack is not there.
+    std::vector<uint32_t> free_list;
+    std::mutex            free_mtx;
+
+    void size_to(size_t bytes_for_nodes) {
+        const uint32_t want = (uint32_t)std::min<size_t>(bytes_for_nodes / sizeof(MCTSNode),
+                                                         0xFFFFFFFEu);
+        if (want == cap) return;
+        delete[] slots;
+        delete[] gen;
+        slots = new MCTSNode[want];
+        gen   = new std::atomic<uint32_t>[want];
+        for (uint32_t i = 0; i < want; ++i) gen[i].store(0, std::memory_order_relaxed);
+        cap   = want;
+        bump.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(free_mtx);
+        free_list.clear();
+    }
+    //Returns nullptr when the arena is exhausted. The caller must treat that exactly as it treats
+    //a full tree today -- expansion does not happen, the node stays a leaf.
+    MCTSNode * alloc() {
+        //fetch_add, not a compare-exchange loop. Every node creation goes through here -- of the
+        //order of a million a second across four threads -- and a CAS loop makes every thread
+        //that loses the race go round again, so the cost grows with the thread count instead of
+        //staying flat. fetch_add is wait-free. It can run PAST cap, which is harmless: the
+        //overshoot is never dereferenced, and everything that reads bump clamps it.
+        const uint32_t i = bump.fetch_add(1, std::memory_order_relaxed);
+        if (i < cap) return &slots[i];
+        std::lock_guard<std::mutex> lk(free_mtx);
+        if (free_list.empty()) return nullptr;
+        const uint32_t idx = free_list.back();
+        free_list.pop_back();
+        return &slots[idx];
+    }
+    void release(uint32_t idx) {
+        std::lock_guard<std::mutex> lk(free_mtx);
+        free_list.push_back(idx);
+    }
+    uint32_t index_of(const MCTSNode * n) const { return (uint32_t)(n - slots); }
+    uint32_t stamp_of(const MCTSNode * n) const {
+        return gen[index_of(n)].load(std::memory_order_relaxed);
+    }
+    void stamp(const MCTSNode * n, uint32_t g) {
+        gen[index_of(n)].store(g, std::memory_order_relaxed);
+    }
+    //Stamp and report what was there before, which is how the mark tells "I am the first to reach
+    //this node" from "someone already has".
+    uint32_t stamp_exchange(const MCTSNode * n, uint32_t g) {
+        return gen[index_of(n)].exchange(g, std::memory_order_relaxed);
+    }
+    //How many slots are live: handed out, minus those given back.
+    //Slots ever handed out, clamped because bump overshoots when the arena is exhausted.
+    uint32_t high_water() const {
+        const uint32_t b = bump.load(std::memory_order_relaxed);
+        return b < cap ? b : cap;
+    }
+    size_t in_use() const { return (size_t)high_water() - free_list.size(); }
+    ~NodeArena() { delete[] slots; delete[] gen; }
+};
+
 struct MCTSSearch {
     MCTSNode * root = nullptr;
-    NodeMap tree; //Zobrist hash -> node
+    NodeMap    tree;   //Zobrist hash -> node, all of them inside `arena`
+    NodeArena  arena;
 };
 struct Edge {
     std::atomic<int> move {0};             // The move that leads to the child position
