@@ -504,11 +504,28 @@ void setEngineOptions() {
 			trim(name); trim(val);
 			if (name.empty() || val.empty()) continue;
 			std::string low; for (char c : val) low += (char)std::tolower((unsigned char)c);
-			bool ok;
-			if (low=="true"||low=="false"||low=="on"||low=="off"||low=="yes"||low=="no")
+			//TRY EVERY KIND, and let the engine's own advertised option list decide which one the
+			//name is. Dispatching on what the VALUE looks like was wrong: PolicyWeights is a
+			//string option, so "PolicyWeights=nnue_policy_pi.bin" went to setEngineSpin(), failed
+			//to find a spin of that name, and was dropped with a warning that read like the
+			//engine did not have the option at all. A whole match would then have run the old
+			//policy net on both sides while appearing to test a new one.
+			//
+			//Order matters only for a value that could be read as more than one type. A bare
+			//number is tried as a spin first, since every numeric option here is one; true/false
+			//as a check first. Anything the engine advertises as a string still gets set, because
+			//the string attempt is last and unconditional.
+			bool ok = false;
+			const bool looks_bool = (low=="true"||low=="false"||low=="on"||low=="off"||
+			                         low=="yes"||low=="no");
+			const bool looks_num  = !val.empty() &&
+			                        val.find_first_not_of("+-0123456789") == std::string::npos;
+			if (looks_bool)
 				ok = setEngineCheck(creatica, name.c_str(), low=="true"||low=="on"||low=="yes");
-			else
+			if (!ok && looks_num)
 				ok = setEngineSpin(creatica, name.c_str(), strtoll(val.c_str(), nullptr, 10));
+			if (!ok)
+				ok = setEngineStringOption(creatica, name.c_str(), val.c_str());
 			fprintf(stderr, "  CREATICA_OPTIONS: %s = %s%s\n", name.c_str(), val.c_str(),
 			        ok ? "" : "  (engine does not advertise it -- ignored)");
 		}
