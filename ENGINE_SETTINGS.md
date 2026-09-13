@@ -41,7 +41,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `SyzygyPath` | string | `<empty>` | — | Tablebase directory. The advertised default is empty but `creatica` falls back to the compiled-in `SYZYGY_PATH` at startup, so the local tables are used whether or not a GUI sets it. See below — empty does **not** mean "no tablebases". |
 | `ProbabilityMass` | spin | 1000 | 900–1000 | **Per-mille, not percent.** Keep only the moves whose policy priors sum to this share and drop the tail, gated before the child evaluations. `1000` keeps every move and is an exact no-op. `creatica` only — see below before changing it. |
 | `ReuseTree` | check | **true** | — | Keep the search tree between moves instead of rebuilding it, so the subtree under the move played is inherited already searched. `Ponder` implies this; this does not imply `Ponder`. Default changed to on after measurement — see below. `creatica` only. |
-| `GcThreshold` | spin | 700 | 0–1000 | Per-mille of `Hash` at which the tree is collected. Collection is O(tree) and reclaims only memory — an unreachable node is never traversed — so collecting every move paid a growing cost for nothing. `creatica` only. |
+| `GcThreshold` | spin | 700 | 0–1000 | Per-mille of `Hash` at which the tree is collected. It reclaims only memory — an unreachable node is never traversed — so collecting every move used to pay a large cost for nothing. Since the arena that cost is roughly 100 ms at `Hash` 1024, and the value is now set by the *expansion ceiling* rather than by collection cost: occupancy climbs a p99 of 299 per-mille during one search, so 700 is about the highest value that keeps the tree off the 1000 ceiling. Raise it and roughly one search in ten overshoots; lowering it is now affordable. See *The node arena*. `creatica` only. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
 | `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
@@ -259,7 +259,7 @@ them with `setoption`, at any time, and see them listed in response to `uci`.
 
 | option | type | default | range | meaning |
 |---|---|---|---|---|
-| `PolicyWeights` | string | `nnue_policy.bin` | — | The exported policy net. Changing it reloads the net; if the load fails the previous net is kept and an `info string` says why, so the engine never runs on a half-loaded net. A reload is refused while a search is running, because the worker threads read the net without a lock. |
+| `PolicyWeights` | string | `nnue_policy.bin` | — | The exported policy net. Changing it reloads the net; if the load fails the previous net is kept and an `info string` says why, so the engine never runs on a half-loaded net. A reload is refused while a search is running, because the worker threads read the net without a lock. The `info string` names the row count, which is how you check which net is actually in use: **4096 = the narrow table, 24576 = piece-indexed.** See *Policy file formats*. |
 | `PolicyMode` | spin | 1 | 0–2 | 0 = off, 1 = prior, 2 = full. See below. |
 | `PolicyBlend` | spin | 45 | 0–100 | Share of the prior taken from the policy head, in hundredths; the rest comes from the 1-ply child evaluations. 0 reproduces the incumbent prior exactly, 100 is policy-only. Ignored when `PolicyMode` is 2. |
 | `PolicyTemp` | spin | 75 | 0–300 | Temperature the policy logits are read at, in hundredths. Chosen so the resulting prior has the concentration the exploration constants were tuned for. |
@@ -283,6 +283,47 @@ PolicyTemp 0.75, BlendScale 1.15, FpuReduction 0.2, SeedChildren true, NodeMinim
 
 There is also a `settings` command, outside the UCI protocol, that prints the same values
 in a readable column with both the engine-side number and the UCI integer.
+
+### Policy file formats
+
+The exported `.bin` records its own layout in a version field, and the engine refuses anything it
+cannot apply rather than silently running a net it is only partly executing. Two things vary
+independently: whether the move table is indexed by the moving piece, and whether the legality term
+`Wl` is present.
+
+| version | tensors | move index | rows |
+|---|---|---|---|
+| 1 | W1 b1 W2 b2 emb | `from*64 + to` | 4096 |
+| 2 | + `Wl` [h2,h2] | `from*64 + to` | 4096 |
+| 3 | + `Cl` [out,h2] | `from*64 + to` | 4096 |
+| 4 | W1 b1 W2 b2 emb | `(piece-1)*4096 + from*64 + to` | 24576 |
+| 5 | + `Wl` [h2,h2] | piece-indexed | 24576 |
+| 6 | + `Cl` [out,h2] | piece-indexed | 24576 |
+
+The engine implements 1, 2, 4 and 5. Versions 3 and 6 use the untied `Cl` table and are refused.
+
+**The piece index** exists because `emb[from*64 + to]` gave a rook moving e1–e4 and a queen moving
+e1–e4 the same row, leaving the model to tell them apart through the 128-dim global position code.
+Measured on matched 28-shard runs: **Top-1 33.45 → 34.65, Top-6 76.07 → 78.02**. It helps *quiet*
+moves roughly six times more than captures (best-move-in-top-6: captures 89.75 → 90.16, quiet
+65.45 → 67.88), which is the blind spot it was aimed at — the NNUE `FullThreats` input indexes a
+move by `(from, to)` only when the destination is occupied, so among legal moves it names captures
+and nothing else. Inference cost is unchanged: `policy_score()` does `h2` multiply-adds per move
+whatever the row count.
+
+**The legality term** is `score(i) = dot(ctx + Wl * mean over legal moves of emb[j], emb[i])`. It is
+*not* a constant offset: expanding it, move *i* picks up `dot(Wl * mean_j emb[j], emb[i])`, a
+learned interaction between each move and the set of moves available, so it reorders them. Worth
++0.97 Top-4 and +1.19 Top-6 on a matched pair, for 16,384 numbers — 2% of the model. Because it
+depends on the *whole* legal set, the engine collects the moves before scoring any of them, and any
+offline tool that scores move-by-move during enumeration will silently omit it. That bug made
+`bench_blend` report policy-only Top-1 of 29.89% for a net the trainer measures at 34.65%, and would
+have moved a deployed parameter the wrong way.
+
+**A consistency check worth keeping.** Every offline harness should have one number that must match
+an independent measurement. Here it is policy-only Top-1 against the trainer's own validation: it
+agreed for the old net and was five points out for the new one, which is what exposed the missing
+term.
 
 ### Policy modes
 
@@ -515,7 +556,8 @@ collection that dropped 8.1M nodes spending **15.8 seconds** in the unlink walk 
 marking — roughly 2 microseconds per erase. `std::unordered_map` allocates a hash node per entry,
 so every `erase()` is an allocator free of a small block scattered across a gigabyte of live tree.
 `search.tree` is now `NodeMap`, an open-addressed table: one contiguous slot array, index from the
-low bits of the Zobrist key, linear probing, erase as a tombstone write, no per-entry allocation.
+low bits of the Zobrist key, linear probing, no per-entry allocation. (It has since stopped
+storing pointers and stopped having an `erase()` at all — see *The node arena* below.)
 
 **The first attempt at it was slower, for a reason worth remembering.** Open addressing iterates in
 O(*capacity*); `std::unordered_map` iterates in O(*size*), because libc++ threads every element
@@ -523,8 +565,9 @@ onto a linked list and never pays for empty space. After a large die-off the fla
 ~16M slots for 1.6M live entries, and every later sweep rescanned all of them — a collection that
 freed *nothing* walked 1.6M live entries in 551 ms, where `unordered_map` walked 4.0M in 390 ms.
 Per slot the flat table was about three times quicker; it was simply scanning ten times as many.
-`NodeMap::compact()` rehashes down to fit the survivors after each sweep, which also sweeps out the
-tombstones, and is cheap precisely because there is no per-entry allocation.
+`NodeMap::compact()` rehashes down to fit the survivors after each sweep and is cheap precisely
+because there is no per-entry allocation. (Tombstones are gone with `erase()`; what `compact()`
+drops now are entries whose slot has been retired.)
 
 | `bench_map`, identical keys and erasures | `unordered_map` | `NodeMap` |
 |---|---|---|
@@ -773,6 +816,93 @@ to avoid: there is no work being deferred, because there is nothing there to rec
 **Sizing.** The tree reached 9.8M nodes on a 1 GB `Hash` in a single 3+2 game with pondering,
 i.e. the ceiling. Roughly 10M nodes per GB. Size `Hash` for the whole game, not for one move.
 
+### The node arena: why strength ran *inversely* to `Hash`, and what fixed it
+
+By September 2026 the collector had become the engine's largest single cost, and the symptom was
+the clearest possible: **playing strength ran opposite to the memory it was given.** Games at
+`Hash` 1024, 2048 and 4096 were best at the smallest setting and, in Arkadi's words, "lose rapidly"
+at the largest. More memory bought a slower collector, not a deeper tree.
+
+Measured across one day of rated games — 8 games, 519 own-clock searches:
+
+| | |
+|---|---|
+| search | 722.1 s |
+| collection | **317.7 s — 30.6% of all own-clock thinking time** |
+| collections over 1 s | 110 |
+| worst single collection | 83,828 ms |
+
+After that 84-second sweep the search that followed got **4 ms and 37 simulations**, and the move
+was chosen from visit counts inherited from the previous move's tree. Two games were lost to this:
+one on time, one to a blundered queen from a winning position.
+
+**The cost was never the frees.** Those already happened on a background thread. It was the
+**walk**. Nodes came from `new MCTSNode()`, millions a move, so they were scattered across the heap
+in allocation order; the sweep iterates the hash map, so it visited them in *hash* order —
+effectively at random across gigabytes — and had to dereference every one to read its generation
+stamp. The nodes it wants are by definition the ones the search has not touched, so they are the
+coldest pages in the process. Measured at **1.09 µs per entry** over 26.8M entries.
+
+Three changes, each about how much memory the sweep has to move:
+
+- **One flat arena of nodes**, sized from `Hash`, with a free list. Iterating by index is a
+  sequential stride instead of a random walk, and a reclaimed node is a returned index rather than
+  a call into the allocator.
+- **The mark stamp left the node** for its own `uint32` array. Sequential is not the same as cheap:
+  reading `generation` out of the node still touches a 64-byte line per slot, 358 MB for a
+  5.6M-slot arena. Four bytes a slot is sixteen times less, and measures at **2.9 ns per slot**.
+- **The map holds `(index, stamp)` rather than a pointer.** The sweep retires a node by zeroing its
+  stamp — one store into the array it is already scanning — and every map entry pointing at that
+  slot is stale from that instant. Nothing to erase, no reason to read the corpse. All the cold
+  work moved to the reaper.
+
+| Hash 2048, 4 threads, same workload | sweep | per corpse | sims/s |
+|---|---|---|---|
+| before | 15,926.8 ms | 2,562 ns | 56,117 |
+| arena + stamps | 6,407.1 ms | 1,229 ns | 76,045 |
+| + indexed map | **313.2 ms** | **54 ns** | **109,130** |
+
+**The search got faster too, and that was not the goal.** The first cut was 27% *slower* before two
+fixes: `alloc()` used a compare-exchange loop, so with node creation running at about a million a
+second every thread that lost went round again; and `MCTSNode` is exactly 64 bytes but
+`new MCTSNode[n]` only guarantees `alignof` (8), so every node straddled two cache lines.
+`fetch_add` and `alignas(64)` turned it into 1.9x faster.
+
+**The mark then became the whole remaining cost, and a binary heap was most of it.** The mark walked
+the tree through a `std::priority_queue` ordered by visit count — so both settings of the old
+`GcBestFirst` paid O(log n) with a sift on every push and pop, tens of millions of times a game.
+Nothing read that order: it existed for the retention budget that chose which live subtrees to
+truncate, and that eviction is commented out. Replacing it with a plain FIFO over a vector measured
+**74 → 14 ns per marked node**, a 5x reduction, on three runs each varying by 1.4%.
+
+Breadth-first, not a stack, and deliberately: depth-first is the other obvious O(1) choice and
+measured 672 ns per node. Nodes now live in one arena in creation order, so a level's nodes sit near
+each other in memory and a level-by-level walk keeps that locality; a stack abandons it.
+
+**What deliberately did not change is *which* nodes die.** Only nodes unreachable from the root are
+reclaimed. That property is load-bearing rather than incidental: search threads hold raw
+`MCTSNode *` for a whole simulation — down the tree, through a ~30-evaluation expansion, and back up
+writing results into every node on the path — and that is safe *precisely because* a node on a live
+thread's path is reachable, so the mark reaches it and the sweep never frees it. A
+transposition-table-style arena that overwrote the least valuable entry would let one thread
+overwrite a node another is standing on, and the second thread's result would land in an unrelated
+position's statistics, silently. Nothing live is ever recycled, so the pointers stay raw.
+
+**A measurement discipline this cost a day to learn.** Under load — a training job running, load
+average 9.78, 20% free memory — the same binary measured anywhere between 304 and 672 ns per marked
+node, and that spread was read as a real difference between two variants. It was memory pressure.
+On an idle machine the same measurement repeats to within 1.4%. **Timings taken while something
+else has the machine are not evidence**, and the collector figures in live bot-vs-bot games are
+inflated by an order of magnitude if both engines are sized to fill the machine.
+
+**What this means for `GcThreshold`.** Its job has changed. It existed to ration an expensive
+operation; the operation is now roughly 100 ms at `Hash` 1024. What is left is keeping occupancy
+below the 1000 per-mille ceiling where expansion stops, and 700 is tuned almost exactly to that:
+measured over 1,301 searches, occupancy climbs by a median of 53 per-mille during one search, p90
+133 and p99 **299** — and 1000 − 299 = 701. Raising it is therefore wrong; roughly one search in ten
+would overshoot. Lowering it is now affordable for the first time, and lower is what keeps the tree
+away from the ceiling.
+
 
 ## Running comparisons
 
@@ -920,7 +1050,29 @@ Things that have actually cost time here:
   about a gigabyte each. 512 is the safer pairing.
 - **Only the challenging side's clock settings are used.** Setting `CREATICA_CLOCK` on the
   `--no-challenge` instance does nothing.
+- **`CREATICA_SPEEDS` decides what the ACCEPTING side will take**, and it is easy to trip over,
+  because lichess derives the speed from `initial + 40 * increment` rather than from the clock you
+  asked for. `60+1` estimates at 100 s and is **bullet**, so a 1+1 match is declined with
+  `reason=timeControl` even though `CREATICA_CLOCK`/`CREATICA_INC` are set correctly — the two
+  settings control different sides and nothing connects them. `60+3` is 180 s and is blitz, the
+  fastest control the default accepts.
+
+      CREATICA_SPEEDS="bullet,blitz,rapid,classical"   # to allow 1+1
+
+  The default excludes bullet deliberately: a lichess round trip from this machine measures about
+  **350 ms typical and 580 ms at worst** on a reused connection, so at a one-second increment a
+  third of every move is gone to the network before the engine thinks. Widen it for local
+  experiments, not for rated play.
+- **`CREATICA_OPTIONS` passes any UCI option through**, as `Name=Value` pairs. It tries check, spin
+  and string in turn and lets the engine's own advertised option list decide which the name is —
+  it used to dispatch on what the *value* looked like, so `PolicyWeights=some.bin` went to the spin
+  path, was dropped, and a match ran the old net on both sides while appearing to test a new one.
 - **`--accept-only=` on both sides** keeps a passing bot out of a self-play experiment.
+- **Measuring a policy, not an engine?** Prefer the local GUI (`python3 chess_gui.py`, then
+  <http://127.0.0.1:8080>) over lichess. Same binary both sides differing only by
+  `PolicyWeights`, fixed movetime so time management drops out, paired openings so each position is
+  played once with each engine on each colour, and no 350 ms round trip per move. Paste FENs into
+  its opening box; `book.tsv` column 1 is the source, filtered by its `cp` column for balance.
 
 ## Collecting a self-play dataset
 
