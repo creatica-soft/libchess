@@ -1283,12 +1283,32 @@ int main() {
     //Without a clean baseline, "the fine-tune gained 1.5 points" cannot be distinguished from
     //measurement noise. The training file is not read at all in this mode.
     const bool eval_only = (num_epochs == 0);
-    //The loader, not the GPU, is the bottleneck: MPS sits around 75% while CPU exceeds
-    //100%, because every sample costs board reconstruction, full legal-move generation,
-    //NNUE feature extraction (6.6 us) and a tensor allocation -- all on one thread with
-    //workers(1). This machine has 4 performance cores, so leave one for the main thread
-    //driving the GPU and give the rest to sample production. Each worker builds its own
-    //NNUEContext lazily via thread_ctx(), since the accumulator stack is not thread-safe.
+    //THE LOADER IS NO LONGER THE BOTTLENECK. This used to read "the loader, not the GPU, is the
+    //bottleneck: MPS sits around 75% while CPU exceeds 100%", and that was true when it was
+    //written -- every sample cost board reconstruction, full legal-move generation, NNUE feature
+    //extraction and a tensor allocation, on one thread. FEATURE_CACHE removed the largest of those
+    //and flipped the picture. Measured with PROFILE_GET on one shard:
+    //
+    //                     no cache        with cache
+    //    board build      10.39 us          0.63 us
+    //    move gen          0.77 us          0.62 us
+    //    nnue_features    25.43 us          1.50 us
+    //    targets           2.34 us          1.81 us
+    //    total            38.93 us          4.56 us
+    //                  25,686 pos/s     219,455 pos/s
+    //
+    //Training actually runs at about 45,000 positions/s for the narrow net and 10,000 for the
+    //piece-indexed one, against a loader that can supply 219,000 -- so the data path is idle 80 to
+    //95% of the time and the MODEL STEP sets the rate. Do not optimise this pipeline further, and
+    //in particular do not cache the legal move set: it is 0.62 us, 13% of a stage with five times
+    //the headroom the model can consume. The cost that matters is the [B, POLICY_OUT] tensors in
+    //the forward, the masked_fill and the log_softmax, which is why PIECE_INDEX -- six times the
+    //output width -- costs 4.6x the training time.
+    //
+    //NUM_WORKERS still matters when FEATURE_CACHE is NOT set, which is the case while a cache is
+    //being built. This machine has 4 performance cores, so leave one for the main thread driving
+    //the GPU and give the rest to sample production. Each worker builds its own NNUEContext lazily
+    //via thread_ctx(), since the accumulator stack is not thread-safe.
 #ifndef NUM_WORKERS
 #define NUM_WORKERS 1
 #endif
