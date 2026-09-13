@@ -137,6 +137,38 @@ const std::string bot_options   = env_str("CREATICA_OPTIONS", "");
 //instance has no effect.
 const int         bot_clock     = env_int("CREATICA_CLOCK", CLOCK_LIMIT);
 const int         bot_increment = env_int("CREATICA_INC",   CLOCK_INCREMENT);
+//WHICH SPEEDS THIS BOT WILL ACCEPT, comma-separated, using lichess's own names: ultraBullet,
+//bullet, blitz, rapid, classical.
+//
+//This is a filter on INCOMING challenges and it is easy to trip over, because lichess decides the
+//speed from `initial + 40 * increment`, not from the clock you asked for. 60+1 estimates at 100
+//seconds, which is BULLET -- so a 1+1 match between two of these bots was declined with
+//reason=timeControl even though CREATICA_CLOCK/CREATICA_INC were set correctly. Those two set what
+//is CHALLENGED; this sets what is ACCEPTED, and both have to agree.
+//
+//  60 + 40x1 = 100 s  bullet          120 + 40x2 = 200 s  blitz
+//  60 + 40x3 = 180 s  blitz           bullet is anything under 180 s
+//
+//The default excludes bullet deliberately. Measured from this machine, a lichess round trip is
+//about 350 ms typical and 580 ms at worst, so at a one-second increment a third of every move is
+//already gone to the network before the engine thinks; at bullet increments most of it is. The
+//engine's conservative time management cannot save a move that never had time to begin with.
+//Widen this for local experiments where losing a game to latency costs nothing, not for rated play.
+const std::string bot_speeds  = env_str("CREATICA_SPEEDS", "blitz,rapid,classical");
+static bool speedAllowed(const std::string& speed) {
+    if (speed.empty()) return false;
+    size_t start = 0;
+    while (start <= bot_speeds.size()) {
+        const size_t comma = bot_speeds.find(',', start);
+        std::string item = bot_speeds.substr(start, comma == std::string::npos
+                                                    ? std::string::npos : comma - start);
+        start = (comma == std::string::npos) ? bot_speeds.size() + 1 : comma + 1;
+        while (!item.empty() && std::isspace((unsigned char)item.front())) item.erase(item.begin());
+        while (!item.empty() && std::isspace((unsigned char)item.back()))  item.pop_back();
+        if (item == speed) return true;
+    }
+    return false;
+}
 //Variant this bot plays. "standard" or "chess960"; set it on BOTH bots for a 960 match,
 //because it decides what is CHALLENGED and what is ACCEPTED. Chess960 was declined outright
 //until the library was actually tested against Stockfish -- see perft_suite_960*.txt, which
@@ -1398,7 +1430,7 @@ void ProcessEvent(const json& event) {
             //are handled by the same path.
             const bool variant_ok = (variant == "standard" || variant == "fromPosition" || variant == bot_variant);
             if ((!game_in_progress.load() && !challengeStillOutstanding() && variant_ok) &&
-                (speed == "blitz" || speed == "rapid" || speed == "classical") && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
+                speedAllowed(speed) && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -1410,7 +1442,7 @@ void ProcessEvent(const json& event) {
                 std::string reason = "reason=";
                 if (game_in_progress.load() || challengeStillOutstanding()) reason += "later";
                 else if (!variant_ok) reason += "variant";
-                else if (speed != "blitz" && speed != "rapid" && speed != "classical") reason += "timeControl";
+                else if (!speedAllowed(speed)) reason += "timeControl";
                 else reason += "generic";
                 if (HttpRequest("POST", decline_url, reason)) {
                     std::cout << "ProcessEvent() debug: challenge declined successfully with " << reason << std::endl;
@@ -1634,6 +1666,13 @@ int main(int argc, char ** argv) {
         "                              into a variant it is not configured for.\n"
         "  CREATICA_CLOCK    %-10sinitial clock, seconds\n"
         "  CREATICA_INC      %-10sincrement, seconds\n"
+        "  CREATICA_SPEEDS   (blitz,rapid,classical)\n"
+        "                              speeds this bot ACCEPTS, comma-separated, from:\n"
+        "                              ultraBullet, bullet, blitz, rapid, classical.\n"
+        "                              lichess derives the speed from initial + 40*increment, NOT\n"
+        "                              from the clock you asked for, so 60+1 is 100 s and counts as\n"
+        "                              BULLET -- a 1+1 match is declined with reason=timeControl\n"
+        "                              unless bullet is listed here. 60+3 is 180 s and is blitz.\n"
         "  CREATICA_BOOK     (unset)   opening book, tab-separated:\n"
         "                                fen, eco, name, plies, cp\n"
         "                              Each position is played twice with the colours swapped, so\n"
