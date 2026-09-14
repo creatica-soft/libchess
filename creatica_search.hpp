@@ -1,3 +1,4 @@
+#include <cstdlib>   //calloc/malloc for the child table
 #include "nnue/nnue/nnue_accumulator.h"
 
 #ifdef _MSC_VER
@@ -172,6 +173,10 @@ struct alignas(64) MCTSNode {
     std::atomic<uint64_t> evidence{0};
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
 };
+//THE CHILD TABLE stores std::atomic<uint64_t> in calloc'd memory, which is only sound while the atomic
+//has the plain integer's size and alignment.
+static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t) && alignof(std::atomic<uint64_t>) == alignof(uint64_t),
+              "the child table relies on std::atomic<uint64_t> being laid out as uint64_t");
 struct NodeArena {
     MCTSNode * slots = nullptr;
     //THE MARK STAMPS LIVE HERE, NOT IN THE NODE, and that is the difference between a sweep that
@@ -205,6 +210,58 @@ struct NodeArena {
     std::mutex            free_mtx;
     std::atomic<size_t>   released{0};
 
+    //THE CHILD TABLE. What the collector's mark needs, kept where the mark can read it without touching
+    //a node or an edge.
+    //
+    //The mark only needs, for each reachable node, how many children it has and which slots they are.
+    //It used to get that from the node's 64-byte line and from every child's 24-byte Edge, which for an
+    //11.6M-node, 39M-edge tree is about 1.7 GB of pages. Measured: with those pages in RAM the mark
+    //costs about 10.5 ns per node-plus-edge; when the machine has compressed them it cost 67.5 ns, with
+    //463,243 decompressions in one run. A page is decompressed if ANY byte of it is read, so a smaller
+    //read only helps if it lives in pages of its own -- which is why this is two separate arrays
+    //rather than a field added to the node or the edge.
+    //
+    //  kids[slot]  (pool offset << 32) | child count, 0 when the slot has no children. Per slot, like
+    //              gen[] and tag[]. Written when an expansion is PUBLISHED, before num_children, so a
+    //              reader that sees a child count also sees where the children are.
+    //  pool[off+i] the arena slot of child i, for i < count. Written BEFORE the expansion is published,
+    //              never changed afterwards, and returned to pool_free when the node dies.
+    //
+    //Blocks are recycled by exact size: a chess position has at most 218 legal moves and the sizes in
+    //a game cluster tightly, so exact-size free lists reuse well without a general allocator.
+    static constexpr uint32_t POOL_MAX_BLOCK = 256;
+    std::atomic<uint64_t> * kids = nullptr;
+    uint32_t *            pool = nullptr;
+    uint64_t              pool_cap = 0;
+    std::atomic<uint64_t> pool_bump{0};
+    std::vector<uint64_t> pool_free[POOL_MAX_BLOCK + 1];
+    std::mutex            pool_mtx;
+    //Offset of a block of n entries, or UINT64_MAX when the pool is exhausted, which the caller treats
+    //exactly like an exhausted arena: the expansion is abandoned and the node stays a leaf.
+    uint64_t pool_alloc(uint32_t n) {
+        if (n == 0 || n > POOL_MAX_BLOCK) return UINT64_MAX;
+        {
+            std::lock_guard<std::mutex> lk(pool_mtx);
+            auto& fl = pool_free[n];
+            if (!fl.empty()) { const uint64_t off = fl.back(); fl.pop_back(); return off; }
+        }
+        const uint64_t off = pool_bump.fetch_add(n, std::memory_order_relaxed);
+        return off + n <= pool_cap ? off : UINT64_MAX;
+    }
+    void pool_release(uint64_t off, uint32_t n) {
+        if (n == 0 || n > POOL_MAX_BLOCK) return;
+        std::lock_guard<std::mutex> lk(pool_mtx);
+        pool_free[n].push_back(off);
+    }
+    void pool_reset() {
+        pool_bump.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(pool_mtx);
+        for (auto& fl : pool_free) fl.clear();
+    }
+    static uint64_t kids_pack(uint64_t off, uint32_t n) { return (off << 32) | (uint64_t)n; }
+    static uint64_t kids_off(uint64_t k) { return k >> 32; }
+    static uint32_t kids_count(uint64_t k) { return (uint32_t)(k & 0xFFFFFFFFu); }
+
     void size_to(size_t bytes_for_nodes) {
         const uint32_t want = (uint32_t)std::min<size_t>(bytes_for_nodes / sizeof(MCTSNode),
                                                          0xFFFFFFFEu);
@@ -212,9 +269,19 @@ struct NodeArena {
         delete[] slots;
         delete[] gen;
         delete[] tag;
+        std::free(kids);
+        std::free(pool);
         slots = new MCTSNode[want];
         gen   = new std::atomic<uint32_t>[want];
         tag   = new std::atomic<uint32_t>[want];
+        //calloc and malloc, not new[]: a value-initialised new[] writes every element, which would make
+        //hundreds of megabytes resident up front. These pages are touched only as the tree grows.
+        //std::atomic<uint64_t> has uint64_t's size and layout, and zero bytes are a zero value.
+        kids  = static_cast<std::atomic<uint64_t> *>(std::calloc(want, sizeof(std::atomic<uint64_t>)));
+        //An Edge is never smaller than 16 bytes, so Hash / 16 bounds the edges that can ever exist.
+        pool_cap = std::min<uint64_t>(bytes_for_nodes / 16, 0xFFFFFFFFull);
+        pool     = static_cast<uint32_t *>(std::malloc(pool_cap * sizeof(uint32_t)));
+        pool_reset();
         for (uint32_t i = 0; i < want; ++i) {
             gen[i].store(0, std::memory_order_relaxed);
             tag[i].store(0, std::memory_order_relaxed);
@@ -286,7 +353,7 @@ struct NodeArena {
         const size_t hw = high_water(), rel = released.load(std::memory_order_relaxed);
         return hw > rel ? hw - rel : 0;
     }
-    ~NodeArena() { delete[] slots; delete[] gen; delete[] tag; }
+    ~NodeArena() { delete[] slots; delete[] gen; delete[] tag; std::free(kids); std::free(pool); }
 };
 
 // An OPEN-ADDRESSING hash table keyed by Zobrist hash, holding the transposition DAG.
