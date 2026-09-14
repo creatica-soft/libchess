@@ -172,6 +172,12 @@ struct alignas(64) MCTSNode {
     //does not move rather than being cemented in place by repetition.
     std::atomic<uint64_t> evidence{0};
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
+    //Where this node's children sit in the child table's pool: child i is slot pool[pool_off + i]. A
+    //copy of what kids[] holds for the collector, kept here because the SEARCH already has this cache
+    //line loaded when it walks a node's children, so reading it costs nothing extra. Written when the
+    //expansion is published, before num_children. Occupies four of the eight bytes of padding that
+    //already sat at the end of the node, so sizeof(MCTSNode) stays 64.
+    std::atomic<uint32_t> pool_off{0};
 };
 //THE CHILD TABLE stores std::atomic<uint64_t> in calloc'd memory, which is only sound while the atomic
 //has the plain integer's size and alignment.
@@ -257,6 +263,11 @@ struct NodeArena {
         pool_bump.store(0, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(pool_mtx);
         for (auto& fl : pool_free) fl.clear();
+    }
+    //Child i of a published node. `parent` must be expanded (num_children > i): that is what guarantees
+    //pool_off and the block behind it are in place. Every read of a child goes through here.
+    MCTSNode * child_at(const MCTSNode * parent, int i) const {
+        return &slots[pool[(uint64_t)parent->pool_off.load(std::memory_order_relaxed) + (uint64_t)i]];
     }
     static uint64_t kids_pack(uint64_t off, uint32_t n) { return (off << 32) | (uint64_t)n; }
     static uint64_t kids_off(uint64_t k) { return k >> 32; }
@@ -355,6 +366,7 @@ struct NodeArena {
     }
     ~NodeArena() { delete[] slots; delete[] gen; delete[] tag; std::free(kids); std::free(pool); }
 };
+
 
 // An OPEN-ADDRESSING hash table keyed by Zobrist hash, holding the transposition DAG.
 //
@@ -546,11 +558,22 @@ struct Edge {
     //under ReuseTree, where a child keeps every visit it ever earned -- including the visits it
     //earned while it was itself the search root or the ponder root. Ranking and exploration both
     //want the per-edge count; only the value estimate Q wants the per-position one. Occupies the
-    //four bytes of padding that already sat between `move` and `P`, so sizeof(Edge) stays 24.
+    //four bytes of padding that already sat between `move` and `P`.
     std::atomic<uint32_t> n {0};
     std::atomic<double> P {0.0};            // Prior probability - model move_probs for a given move in the node
-    std::atomic<struct MCTSNode *> child {nullptr}; // Pointer to the child node
+    //NO CHILD POINTER. It was an 8-byte pointer here; the child's slot now lives in the child table's
+    //pool, and search.arena.child_at(parent, i) returns it. Keeping both would have been 12 bytes an edge
+    //of duplicated state that could disagree, and would have grown the tree's footprint -- the very
+    //thing the table exists to shrink. sizeof(Edge) is 16.
 };
+//WHAT ONE NODE AND ONE EDGE COST AGAINST Hash. Every occupancy figure is built from these, so the child
+//table's entries are counted where they are spent: 8 bytes of kids[] per node, 4 bytes of pool per edge.
+//The 24 per node is the map entry and the two stamp arrays, as before. With the child pointer gone from
+//Edge the per-edge cost fell from 24 to 20, so the table leaves the tree's capacity roughly unchanged:
+//about 3% fewer nodes for a tree-like middlegame, about 3% more for a transposition-dense endgame.
+inline constexpr size_t NODE_BYTES = sizeof(MCTSNode) + 24 + sizeof(uint64_t);
+inline constexpr size_t EDGE_BYTES = sizeof(Edge) + sizeof(uint32_t);
+
 
 //ASYNC ONLINE TABLEBASE PROBE.
 //
