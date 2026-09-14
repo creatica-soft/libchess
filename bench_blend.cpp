@@ -347,6 +347,12 @@ int main(int argc, char ** argv) {
     static const double MS[] = {0.90, 0.95, 0.98, 0.99, 0.999};
     static const int NM = sizeof(MS)/sizeof(MS[0]);
     long long w_mass_keep[NW][NM] = {};
+    //CONCENTRATION AT SEVERAL BlendScale VALUES, at the engine's PolicyBlend 0.45, in one pass. The scale
+    //multiplies every blended logit, so it cannot change the ranking -- only how much of the prior the top
+    //move gets -- and calibrating a new net's BlendScale used to take one full run per candidate value.
+    static const double BS[] = {0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30};
+    static const int NB = sizeof(BS)/sizeof(BS[0]);
+    double bs_mass[NB] = {0};
     double    w_mass_moves[NW][NM] = {};
     long long top1 = 0;
     double mass_on_pv1 = 0.0, mass_on_top1 = 0.0;
@@ -427,6 +433,17 @@ int main(int argc, char ** argv) {
         //The engine never uses the policy when the side to move is in check -- use_policy is
         //policy_enabled && !checkers -- so there the prior is the child evaluations alone.
         if (board.isCheck) ++in_check;
+        {
+            const double w = board.isCheck ? 0.0 : 0.45;
+            double base_mx = -1e18;
+            for (const auto& m : moves) base_mx = std::max(base_mx, w * (m.pol / 0.75) + (1.0 - w) * (m.score / 0.58));
+            for (int bi = 0; bi < NB; ++bi) {
+                double tot = 0.0;
+                for (const auto& m : moves)
+                    tot += std::exp(BS[bi] * (w * (m.pol / 0.75) + (1.0 - w) * (m.score / 0.58) - base_mx));
+                if (tot > 0.0) bs_mass[bi] += 1.0 / tot;
+            }
+        }
         for (int wi = 0; wi < NW; ++wi) {
             const double w = board.isCheck ? 0.0 : WS[wi];
             //Overall sharpness of the blended logits. A mixture of two disagreeing signals
@@ -536,6 +553,9 @@ int main(int argc, char ** argv) {
                     WS[wi] == 0.0 ? "   <- child evaluations only"
                     : (WS[wi] > 0.44 && WS[wi] < 0.46) ? "   <- engine default PolicyBlend"
                     : WS[wi] == 1.0 ? "   <- policy only (except in check)" : "");
+    std::printf("\n  top-move mass at PolicyBlend 0.45 by BlendScale (ranking is the same at every scale):\n  ");
+    for (int bi = 0; bi < NB; ++bi) std::printf(" %.2f:%.4f", BS[bi], bs_mass[bi] / used);
+    std::printf("\n");
     std::printf("\n  probability-mass gate:\n");
     std::printf("  %-8s %-14s %s\n", "mass", "PV1 kept", "mean moves kept");
     for (int wi = 0; wi < NW; ++wi) {
