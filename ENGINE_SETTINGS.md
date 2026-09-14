@@ -379,6 +379,29 @@ an expansion does nothing but score moves, the convolution adds about 9 µs to a
 otherwise costs about 46 µs at `Hash 2048`; in the default `PolicyMode 1`, where every child is also
 evaluated with NNUE, single-threaded node rate fell 2.6–3.2% against the piece-indexed net.
 
+**In play it tied.** 100 games at 500 ms a move, `Hash 512`, 2 threads, `pisp` against `pi` at default
+settings: 49–51 (17 wins, 64 draws, 19 losses), about −7 Elo with a 95% range of roughly −48 to +34.
+
+**Half of its gain survives the blend.** `bench_blend` on 200,000 positions of the test file, with the
+engine's in-check rule and a consistency gate that reproduces the trainer's validation (Top-1 38.75
+against 38.84 for `pisp`, 34.59 against 34.65 for `pi`):
+
+| `pisp` − `pi` | Top-1 | Top-4 | Top-6 |
+|---|---|---|---|
+| policy alone | +4.36 | +6.11 | +5.83 |
+| blended at `PolicyBlend 45` | +2.12 | +3.51 | +3.03 |
+
+The other half overlaps with what the 1-ply child evaluations already see — plausibly the attack planes
+telling the policy what an evaluation after the move notices anyway. The best blend weight barely moves
+(Top-6 peaks at 0.50 for `pisp`, 0.40–0.45 for `pi`). What does move is concentration: at the same
+settings the blended prior puts 0.445 on its top move for `pisp` against 0.416 for `pi`, and
+**`BlendScale 105` restores 0.416** without changing the ranking. The match above did not use it.
+
+`bench_blend` needed three fixes to measure this: spatial-net support; policy scoring only at the root,
+because the recursion into a checking move's replies applied their legality term to the root's context;
+and the engine's rules that in check the prior is the child evaluations alone and that promotions count
+once in the legality term.
+
 ### Policy modes
 
 - **`0` off** — the incumbent. Every legal move's child is evaluated with NNUE; the priors,
