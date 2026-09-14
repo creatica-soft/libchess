@@ -255,6 +255,9 @@ std::atomic<uint64_t> total_children{0};
 //because tree_occupancy() counts them: that memory is still held by the process.
 std::atomic<size_t>   reap_pending{0};
 std::atomic<uint64_t> reap_pending_edges{0};
+//Nodes the sweep has retired that the reaper has not yet given back. arena.live() keeps counting them
+//until their slots are released, so every occupancy figure subtracts this; see live_tree_nodes().
+std::atomic<size_t>   retired_nodes{0};
 std::atomic<uint64_t> tbhits{0};
 //STARTS AT 1, because 0 now means "this arena slot is free". gc() hands out fetch_add(1)+1, so
 //the first real generation is 2 and nothing live ever carries 0.
@@ -414,6 +417,7 @@ void cleanup_locked() {
   search.root = nullptr;
   total_children.store(0, std::memory_order_relaxed);
   total_nodes.store(0, std::memory_order_relaxed);
+  retired_nodes.store(0, std::memory_order_relaxed);   //the drain above released every retired slot
   gc_completed_invalidate();
 }
 
@@ -484,6 +488,21 @@ std::string   game_tag;          //set per game by the driver, so records can be
 //
 //The reaper's backlog is still worth seeing, so it is logged in the gc breakdown line instead of
 //being folded into a number that decides whether to keep searching.
+//
+//THAT EXCLUSION HAD QUIETLY STOPPED WORKING. Once the sweep stopped reading corpses, nothing subtracted
+//them until the reaper reached them: total_nodes was resynced from arena.live(), which still counts every
+//retired slot, and total_children fell only as the reaper freed each Edge array, at the end of its batch.
+//In game QHWLWAbv a collection retired 11.75M nodes and the next search reported 618,205 nodes at 928
+//per-mille and ran 94% hollow. The sweep now charges both at once: it counts the dead nodes, reads their
+//child counts from kids[] -- a separate array, so still no corpse is touched -- and subtracts the edges
+//from total_children before the search starts. retired_nodes carries the nodes until the reaper releases
+//them, and live_tree_nodes() takes it off arena.live().
+size_t live_tree_nodes() {
+  const size_t live    = search.arena.live();
+  const size_t retired = retired_nodes.load(std::memory_order_relaxed);
+  return live > retired ? live - retired : 0;
+}
+
 int tree_occupancy() {
   const size_t total_memory =
       total_nodes.load(std::memory_order_relaxed) * NODE_BYTES
@@ -847,24 +866,22 @@ static void reaper_func() {
     uint64_t edges = 0;
     for (uint32_t idx : batch) {
       MCTSNode * n = &search.arena.slots[idx];
-      const int nc = n->num_children.load(std::memory_order_relaxed);
-      if (nc > 0) edges += (uint64_t)nc;
       //The Edge array is still a real allocation and still has to be given back. The NODE is not:
       //it is a slot in the arena, so it is wiped and its index returned to the free list.
       delete[] n->children.load(std::memory_order_relaxed);
-      //And the child table's block, which is a pool entry rather than an allocation of its own.
-      if (const uint64_t k = search.arena.kids[idx].exchange(0, std::memory_order_relaxed))
+      //And the child table's block, which is a pool entry rather than an allocation of its own. Its
+      //count is the same number the sweep charged for this node, which keeps reap_pending_edges exact.
+      if (const uint64_t k = search.arena.kids[idx].exchange(0, std::memory_order_relaxed)) {
+        edges += NodeArena::kids_count(k);
         search.arena.pool_release(NodeArena::kids_off(k), NodeArena::kids_count(k));
+      }
       arena_reset_slot(n);
       search.arena.release(idx);
+      //Per node, right after the release, so live_tree_nodes() never counts this slot twice or not at all.
+      retired_nodes.fetch_sub(1, std::memory_order_relaxed);
     }
-    //Charged here rather than in the sweep, for the same reason: it needs num_children, which
-    //means reading the node. tree_occupancy() already excludes what the reaper still holds.
-    if (edges) total_children.fetch_sub(edges, std::memory_order_relaxed);
-    //Added here, not at enqueue: the sweep cannot count these without reading the corpses, which
-    //is the whole thing it stopped doing. Adding before the subtraction below keeps the counter
-    //balanced -- it used to be subtracted against an enqueue of zero, which underflowed.
-    reap_pending_edges.fetch_add(edges, std::memory_order_relaxed);
+    //total_children is NOT charged here any more: the sweep took these edges off before the search
+    //started, reading their counts from kids[]. See tree_occupancy().
     //Under the mutex, because reap_drain() waits on exactly this condition while holding it.
     {
       std::lock_guard<std::mutex> lk(reap_mtx);
@@ -1205,15 +1222,20 @@ void gc(MCTSNode * from) {
     search.arena.gen[i].store(0, std::memory_order_relaxed);
     dead.push_back(i);
     ++gc_freed;
+    gc_edges_freed += NodeArena::kids_count(search.arena.kids[i].load(std::memory_order_relaxed));
   }
   //Right-size the table now that the survivors are known. Without this the sweep's cost is set
   //by the capacity the tree reached at its PEAK rather than by what it currently holds, and every
   //later collection rescans that empty space. See NodeMap::compact().
   search.tree.compact();
   const auto gc_t2 = std::chrono::steady_clock::now();
-  //Zero edges: the sweep never reads a corpse, so it cannot count their Edge arrays. The reaper
-  //counts them as it frees them, charges total_children, and balances the pending figure itself.
-  reap_enqueue(std::move(dead), 0);
+  //CHARGED NOW. The dead nodes and their edges come off the occupancy figures before the next search
+  //starts, instead of whenever the reaper reaches them; see tree_occupancy(). The edge counts come from
+  //kids[], so the sweep still never reads a corpse. retired_nodes goes up before the batch is queued, so
+  //the reaper can never release a slot that has not been counted.
+  retired_nodes.fetch_add(gc_freed, std::memory_order_relaxed);
+  total_children.fetch_sub(gc_edges_freed, std::memory_order_relaxed);
+  reap_enqueue(std::move(dead), gc_edges_freed);
   //Record the yield HERE, not only in gc_start(). last_gc_freed existed already but was written
   //solely by the background collector and read solely by the background decision, so the inline
   //path -- the only one that runs with Ponder on -- had no futile-collection guard at all.
@@ -1255,9 +1277,9 @@ void gc(MCTSNode * from) {
              loc_blocks ? 100.0 * (double)loc_far_blocks / (double)loc_blocks : 0.0,
              search.arena.high_water(), search.arena.cap,
              [] { std::lock_guard<std::mutex> lk(search.arena.free_mtx); return search.arena.free_list.size(); }());
-  total_nodes.store(search.arena.live(), std::memory_order_relaxed);
+  total_nodes.store(live_tree_nodes(), std::memory_order_relaxed);
   //update hash_full
-  size_t total_memory = search.arena.live() * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
+  size_t total_memory = live_tree_nodes() * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
   size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
   int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
   if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
@@ -2521,7 +2543,7 @@ void uci_output_thread() {
     }
     depth.store(d, std::memory_order_relaxed);
     std::shared_lock lock(map_mutex);
-    size_t unique_nodes = search.arena.live();
+    size_t unique_nodes = live_tree_nodes();
     lock.unlock();
     size_t total_memory = unique_nodes * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
     size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
@@ -2666,7 +2688,7 @@ void runMCTS(NNUEContext& ctx) {
                                                            : "SKIPPED-EXACT, last collection's root reachable from this one, no expansion abandoned since")
                                       : "SKIPPED"),
              pondering ? "ponder search" : "real search",
-             search.arena.live());
+             live_tree_nodes());
     search_simulations.store(0, std::memory_order_relaxed);
     //Charge the collection to this move's budget instead of adding to it. iter_start is taken
     //AFTER all of the above, so the search used to run its full allocation on top of however
@@ -2762,14 +2784,14 @@ void runMCTS(NNUEContext& ctx) {
                (unsigned long long)sims, secs * 1000.0,
                secs > 0 ? sims / secs : 0.0,
                last_gc_ms.load(std::memory_order_relaxed),
-               search.arena.live(), tree_occupancy(),
+               live_tree_nodes(), tree_occupancy(),
                position_history.size(), max_rep, flipped,
                (unsigned long long)hollow, sims ? 100.0 * hollow / sims : 0.0);
     }
     if (chessEngine.optionCheck[FinalInfoLines].value) {    
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
       nodes = search_simulations.load(std::memory_order_relaxed);
-      unique_nodes = search.arena.live();
+      unique_nodes = live_tree_nodes();
       // Calculate hashfull (in per-mille) using unique_nodes
       size_t total_memory = unique_nodes * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
       size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes

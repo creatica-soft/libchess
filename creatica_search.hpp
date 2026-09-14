@@ -619,6 +619,8 @@ extern std::atomic<size_t> total_nodes;
 extern bool reuse_tree;
 extern bool post_move_collect;
 extern int64_t gc_threshold;
+//Nodes in the tree, excluding those retired by a collection and still waiting for the reaper.
+size_t live_tree_nodes();
 //Visit-distribution dump: the AlphaZero-style policy training target, collected as a free
 //byproduct of searches that happen anyway. Empty path disables it.
 extern std::string visit_dump_path;
