@@ -184,6 +184,12 @@ bool          post_move_collect = true;
 //search nothing while it sits there. At 5.1M nodes occupancy was still only ~180 of 1000, so
 //almost every one of those collections was work for nothing.
 int64_t       gc_threshold = 700;
+//TREE RESET: discard the tree, instead of collecting it, when a search is about to start on a nearly
+//full tree whose root inherited almost nothing. TreeResetBelow is the root's evidence -- informed
+//simulations it inherited -- below which to reset, 0 = off. TreeResetOccupancy is the per-mille of Hash
+//at or above which the rule applies. See the reset in runMCTS() for why and for the measurements.
+int64_t       tree_reset_below = 0;
+int64_t       tree_reset_occupancy = 950;
 
 //Simulations performed by THIS search. The info lines used to report search.root->N for
 //"nodes", which the comment at the ponder-output site still calls "total simulations" -- and it
@@ -817,7 +823,7 @@ static const bool verify_futile = [] {
   return e && *e && *e != '0';
 }();
 
-void gc(MCTSNode * from = nullptr);
+void gc(MCTSNode * from = nullptr, bool retire_all = false);
 
 //--- deferred reclamation: the reaper ---------------------------------------------------------
 //
@@ -1064,7 +1070,10 @@ static void run_mark_bench() {
 static void run_mark_bench() {}
 #endif
 
-void gc(MCTSNode * from) {
+//retire_all: keep nothing, not even the root -- the tree reset. The caller must drop search.root and call
+//set_root() again. It goes through the ordinary sweep and reaper, so it is exactly as safe as a
+//collection whose mark happened to reach nothing, and it costs the same sequential sweep.
+void gc(MCTSNode * from, bool retire_all) {
   MCTSNode * const gc_root = from ? from : search.root;
   assert(gc_root);
   //The exact futility test's snapshot, taken BEFORE marking and published only if this collection
@@ -1109,7 +1118,7 @@ void gc(MCTSNode * from) {
   const std::atomic<uint64_t> * const kids = search.arena.kids;
   const uint32_t * const              pool = search.arena.pool;
   std::atomic<uint32_t> * const       gen  = search.arena.gen;
-  {
+  if (!retire_all) {
     const uint32_t root_idx = search.arena.index_of(gc_root);
     gen[root_idx].store((uint32_t)current_gen, std::memory_order_relaxed);
     q.push_back(root_idx);
@@ -1119,7 +1128,7 @@ void gc(MCTSNode * from) {
   //table. It cut a live node's children by clearing `children` and deleting the Edge array; reinstating
   //it now would also have to clear kids[] and return the pool block, and it would break THE EXACT
   //FUTILITY TEST, which relies on edges never being removed from a live node.
-  size_t kept_nodes = 1, kept_edges = 0, truncated = 0;
+  size_t kept_nodes = retire_all ? 0 : 1, kept_edges = 0, truncated = 0;
 
   while (q_head < q.size()) {
       //Abandoning during the MARK means nothing may be swept: the marks are incomplete, so a
@@ -1244,7 +1253,8 @@ void gc(MCTSNode * from) {
   last_gc_freed_count.store(gc_freed, std::memory_order_relaxed);
   //Completed: the mark reached everything reachable from gc_root and the sweep retired the rest, so
   //the tree is now exactly the set reachable from gc_root. See THE EXACT FUTILITY TEST.
-  {
+  //Not after a reset: its snapshot names a root that has just been retired.
+  if (!retire_all) {
     std::lock_guard<std::mutex> lk(gc_completed_mtx);
     gc_completed = gc_snapshot;
   }
@@ -2591,6 +2601,7 @@ void runMCTS(NNUEContext& ctx) {
     const bool reusing_tree = reuse_tree || chessEngine.optionCheck[Ponder].value;
     bool collected = !reusing_tree;   //cleanup() always "collects": it empties the tree entirely
     bool futile_skip = false;         //skipped because it provably frees nothing
+    bool tree_reset  = false;         //discarded instead of collected; see TREE RESET below
     int  futile_why  = 0;             //gc_would_free_nothing()'s answer
     double set_root_ms = 0.0;
     if (reusing_tree) {
@@ -2629,7 +2640,44 @@ void runMCTS(NNUEContext& ctx) {
       //EXCEPT when the collection is certain to free nothing -- see THE EXACT FUTILITY TEST. The
       //tree after skipping is identical to the tree after collecting, so this cannot reintroduce
       //the full-tree problem described above.
-      const bool wanted = tree_occupancy() >= gc_threshold;
+      //TREE RESET (TreeResetBelow > 0, off by default).
+      //
+      //The collector keeps everything reachable from the root, and during a run of reversible moves that
+      //is the whole tree: every earlier root can be reached again by moving pieces back, almost always
+      //without repeating an exact game position (measured at 99-100% of a full tree in game QHWLWAbv).
+      //So the tree fills, nothing can be freed, and every simulation of the next search is hollow.
+      //
+      //That is usually survivable, because the root still carries what earlier searches learned about
+      //it. It is not survivable when the opponent plays a move the last search barely looked at: the
+      //new root inherits a handful of informed simulations and the full tree lets it gain none. In
+      //QHWLWAbv move 32 the root inherited 16, every root move finished the search with one visit, and
+      //the engine played the highest-prior move and lost its queen. Across 22 games, 189 searches began
+      //on a tree at 950 per-mille or more; the move chosen had fewer than 1,000 informed simulations
+      //behind it in 7 of them, and the median across those 189 was over 100,000.
+      //
+      //So: when the tree is at TreeResetOccupancy or more AND the root inherited fewer than
+      //TreeResetBelow informed simulations, keeping the tree buys almost nothing and costs the whole
+      //search. Retire every node, root included, and start this search on an empty tree. A new root
+      //that set_root() just created counts as having inherited 1.
+      if (tree_reset_below > 0 && search.root) {
+        const int      occ       = tree_occupancy();
+        const uint64_t inherited = search.root->evidence.load(std::memory_order_relaxed);
+        if (occ >= tree_reset_occupancy && inherited < (uint64_t)tree_reset_below) {
+          const size_t before = live_tree_nodes();
+          gc(search.root, /*retire_all=*/true);
+          search.root = nullptr;
+          const auto t = std::chrono::steady_clock::now();
+          set_root(ctx);
+          set_root_ms += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t).count();
+          tree_reset = true;
+          log_file("info string tree reset: root inherited %llu informed simulations (TreeResetBelow %lld) "
+                   "with the tree at %d permille (TreeResetOccupancy %lld); retired %zu nodes, now %d permille\n",
+                   (unsigned long long)inherited, (long long)tree_reset_below, occ,
+                   (long long)tree_reset_occupancy, before, tree_occupancy());
+        }
+      }
+      const bool wanted = !tree_reset && tree_occupancy() >= gc_threshold;
       futile_why  = wanted ? gc_would_free_nothing() : 0;
       futile_skip = futile_why != 0;
       //Under CREATICA_VERIFY_FUTILE, say which condition failed whenever a collection is NOT judged
@@ -2642,8 +2690,8 @@ void runMCTS(NNUEContext& ctx) {
                  gc_completed.root_tag, search.arena.stamp_of(search.root),
                  gc_completed.next_tag, search.arena.next_tag.load(std::memory_order_relaxed));
       }
-      collected = wanted && (!futile_skip || verify_futile);
-      if (collected) {
+      collected = tree_reset || (wanted && (!futile_skip || verify_futile));
+      if (collected && !tree_reset) {
         gc();
         if (futile_skip)
           log_file("info string FUTILE-CHECK: the exact test said nothing could be freed; "
@@ -2683,6 +2731,7 @@ void runMCTS(NNUEContext& ctx) {
              std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - collect_start).count(),
              set_root_ms,
+             tree_reset ? "RESET" :
              collected ? (futile_skip ? "yes (VERIFY_FUTILE)" : "yes")
                        : (futile_skip ? (futile_why == 1 ? "SKIPPED-EXACT, same root, no expansion abandoned since the last collection"
                                                            : "SKIPPED-EXACT, last collection's root reachable from this one, no expansion abandoned since")

@@ -619,6 +619,8 @@ extern std::atomic<size_t> total_nodes;
 extern bool reuse_tree;
 extern bool post_move_collect;
 extern int64_t gc_threshold;
+extern int64_t tree_reset_below;
+extern int64_t tree_reset_occupancy;
 //Nodes in the tree, excluding those retired by a collection and still waiting for the reaper.
 size_t live_tree_nodes();
 //Visit-distribution dump: the AlphaZero-style policy training target, collected as a free

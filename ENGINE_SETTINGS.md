@@ -42,6 +42,8 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `ProbabilityMass` | spin | 1000 | 900–1000 | **Per-mille, not percent.** Keep only the moves whose policy priors sum to this share and drop the tail, gated before the child evaluations. `1000` keeps every move and is an exact no-op. `creatica` only — see below before changing it. |
 | `ReuseTree` | check | **true** | — | Keep the search tree between moves instead of rebuilding it, so the subtree under the move played is inherited already searched. `Ponder` implies this; this does not imply `Ponder`. Default changed to on after measurement — see below. `creatica` only. |
 | `GcThreshold` | spin | 700 | 0–1000 | Per-mille of `Hash` at which the tree is collected. It reclaims only memory — an unreachable node is never traversed — so collecting every move used to pay a large cost for nothing. Since the arena that cost is roughly 100 ms at `Hash` 1024, and the value is now set by the *expansion ceiling* rather than by collection cost: occupancy climbs a p99 of 299 per-mille during one search, so 700 is about the highest value that keeps the tree off the 1000 ceiling. Raise it and roughly one search in ten overshoots; lowering it is now affordable. See *The node arena*. `creatica` only. |
+| `TreeResetBelow` | spin | 0 | 0–1000000000 | **Off at 0.** Before a search, if the tree is at `TreeResetOccupancy` or more and the root inherited fewer than this many informed simulations (its evidence), discard the whole tree instead of collecting it. Aimed at the one case a full tree turns into a blunder: a root the last search barely looked at, on a tree nothing can be freed from. 1000 is the value tested in replays; it has not been measured in games. See *A full tree that cannot be collected*. |
+| `TreeResetOccupancy` | spin | 950 | 0–1000 | Per-mille of `Hash` at or above which `TreeResetBelow` applies. Below 950 no search in 22 games froze, so resetting there would only throw knowledge away. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
 | `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
@@ -1117,6 +1119,65 @@ measured over 1,301 searches, occupancy climbs by a median of 53 per-mille durin
 133 and p99 **299** — and 1000 − 299 = 701. Raising it is therefore wrong; roughly one search in ten
 would overshoot. Lowering it is now affordable for the first time, and lower is what keeps the tree
 away from the ceiling.
+
+### A full tree that cannot be collected, and the tree reset
+
+**The failure.** In game `QHWLWAbv` (14 September) the engine lost its queen with 32.Qxh6. The tree
+had filled at move 26, and moves 26–31 contained no capture and no pawn move. From the current
+position every earlier root could be reached again by moving pieces back, so every node stayed
+reachable and the collector freed nothing. With the tree full, every simulation was hollow: it could
+expand nothing and taught nothing. Then Black played 31...Ke8, which the ponder search had ranked
+18th of 29 and given 16 informed simulations. Those 16 were all the new root inherited, the full tree
+let the next search add none in 12.2 million simulations, every root move finished at one visit, and
+the engine played the move with the highest prior. (The node-size bug described under *The node
+arena* made the tree fill much sooner that day; this section is about what happens once it is full.)
+
+**Freeing what the search cannot reach does not help.** The search stops at any position that has
+already occurred in the game, while the mark walks straight through such positions, so it looked as
+if the collector was keeping dead subtrees. A probe that repeated the mark but stopped at game
+positions found **99–100% of a full tree reachable without passing through any of them**, at
+`Hash` 2048 and at 1024, in replays of that game. The full tree is genuinely reachable along paths
+the search can take, so only discarding reachable nodes can relieve it. The probe was removed.
+
+**What decides a freeze, measured over 22 games** from the visit dump and the engine log:
+
+- Searches that started with the tree **under 950 per-mille: 0 of 1,539 froze.**
+- Searches that started at **950 or more: about half ended at least 90% hollow**, whether the
+  opponent had played the predicted move or a surprise.
+- What the root inherited decides how much the freeze costs. Across the 189 searches that started
+  at 950 or more, the move chosen had a median of over 100,000 informed simulations behind it; only
+  7 had fewer than 1,000, and 3 fewer than 100.
+
+**A second defect made every large collection block the search after it.** Once the sweep stopped
+reading corpses, nothing took retired nodes off the occupancy figures until the reaper reached them:
+`total_nodes` was resynced from `arena.live()`, which still counts retired slots, and
+`total_children` fell only as the reaper freed each edge array. In `QHWLWAbv` a collection retired
+11.75 million nodes and the next search reported 618,205 nodes at 928 per-mille and ran 94% hollow.
+The sweep now counts the retired nodes and reads their child counts from `kids[]` (a separate array,
+so it still never touches a corpse), takes both off before the search starts, and a `retired_nodes`
+counter carries the nodes until the reaper releases them. In the replay, the search after the capture
+now runs at 35 per-mille with no hollow simulations.
+
+**The tree reset.** With `TreeResetBelow` set, the collection before a search checks two things: the
+tree is at `TreeResetOccupancy` (950) or more, and the root's evidence — the informed simulations it
+inherited — is below `TreeResetBelow`. If both hold, it retires every node, the root included,
+through the ordinary sweep and reaper, and `set_root()` builds a fresh root. It is a collection whose
+mark reached nothing, so it is exactly as safe as any other collection; the futility snapshot is not
+published, so the next collection cannot be skipped against a root that no longer exists. The log
+line reads `collect RESET`, preceded by a `tree reset:` line with the numbers.
+
+Replaying `QHWLWAbv` with its clocks and pondering at `Hash` 1024, where even the fixed build fills:
+with `TreeResetBelow 1000` the reset fired twice, on roots that had inherited 605 and 932 informed
+simulations with the tree at 1002–1003 per-mille. Each retired about 9 million nodes in 228–273 ms,
+charged to the search that followed, and each of those searches started at 0 per-mille with no hollow
+simulations. It did **not** touch the long freeze in between, where the roots inherited more than
+1,000: that is the common case above, and a reset there would throw away a lot to rescue little.
+
+Validated by forcing a reset before every search (`TreeResetOccupancy 0`, `TreeResetBelow` at its
+maximum) with `ValidateTree` on and `CREATICA_VERIFY_KIDS=1`: 38 searches, 38 resets, no invariant
+violations, and none of 54 million published child entries reached the wrong position.
+
+**Not yet measured:** whether it changes results in games. It is off by default.
 
 
 ## Running comparisons
