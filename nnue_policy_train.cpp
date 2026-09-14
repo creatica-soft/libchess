@@ -200,6 +200,26 @@ const float eval_scale = 600.0f; // conversion scale from cp to cnn target and b
 #ifndef SPATIAL_ATTACK
 #define SPATIAL_ATTACK 0
 #endif
+
+// SPATIAL_FROM_PLANE_FIX -- where plane 12's "a legal move starts here" marks go under PIECE_INDEX.
+//
+// get() writes them at pl[12*64 + (legal_idx >> 6)]. That is the from-square only for a 4096-row
+// table. Under PIECE_INDEX legal_idx is (pt-1)*4096 + from*64 + to, so >> 6 is (pt-1)*64 + from and
+// the mark lands in plane 12 + (pt-1): pawn sources in plane 12 as intended, but knight sources in
+// plane 13 (legal destinations), bishop in 14, rook in 15, queen in 16 and king in 17 -- the first
+// four own-piece attack planes. Nothing goes out of bounds and it is deterministic, so a model
+// trained with it simply learned from those merged planes; the first full-corpus piece-indexed
+// spatial model (83.65% Top-6) was trained this way.
+//
+// 0 keeps that behaviour, so existing checkpoints can still be validated and fine-tuned on the inputs
+// they were trained on. 1 masks to the true from-square. The export records which layout the
+// weights expect (plane_layout in the spatial block), and the engine reproduces exactly that one --
+// feeding a model the corrected planes it never saw would be as wrong as the bug.
+#ifndef SPATIAL_FROM_PLANE_FIX
+#define SPATIAL_FROM_PLANE_FIX 0
+#endif
+//1 = legal-source marks offset by piece type (the behaviour described above), 0 = true from-square.
+#define SPATIAL_PLANE_LAYOUT ((PIECE_INDEX && !SPATIAL_FROM_PLANE_FIX) ? 1 : 0)
 #if SPATIAL_ATTACK != 0 && SPATIAL_ATTACK != 2 && SPATIAL_ATTACK != 12
 #error "SPATIAL_ATTACK must be 0, 2 or 12"
 #endif
@@ -937,6 +957,11 @@ private:
   std::vector<unsigned char> feats_;
   int feat_dims_ = 0;
 public:
+  //The board behind sample `index`, exactly as get() decodes it. EXPORT_CHECK uses it to hand the
+  //engine the same position whose logits it is about to compare.
+  void board_at(size_t index, Board& board) const {
+    board_from_record((*samples_ref)[base_ + index], board);
+  }
   //Read once per call rather than per phase; getenv on the hot path would itself distort
   //what we are trying to measure.
   static bool profiling() {
@@ -1184,7 +1209,13 @@ public:
       //Planes 12 and 13: where a legal move starts, and where one lands. legal_idx already holds
       //policy indices over oriented squares, so this needs no second move generation.
       for (int i = 0; i < n_legal; ++i) {
+        //See SPATIAL_FROM_PLANE_FIX: without the mask, a piece-indexed index puts this mark in
+        //plane 12 + (pt-1). The & 63 is written out so the two layouts differ by exactly that.
+#if SPATIAL_FROM_PLANE_FIX
+        pl[12 * 64 + ((legal_idx[i] >> 6) & 63)] = 1;
+#else
         pl[12 * 64 + (legal_idx[i] >> 6)] = 1;
+#endif
         pl[13 * 64 + (legal_idx[i] & 63)] = 1;
       }
 #if SPATIAL_ATTACK
@@ -2015,18 +2046,107 @@ int main() {
         const char* nm[5] = { "W1", "b1", "W2", "b2", "emb" };
         const int n_ts = 5;
 #endif
+#if SPATIAL
+        //FORMATS 7 AND 8: version 2 or 5 followed by a SPATIAL BLOCK. Without this the export wrote
+        //version 5 for a spatial model and silently left out every spatial weight, so the engine
+        //would have loaded a different model from the one trained, with no diagnostic. Only what the
+        //engine implements is exported: the convolutional term (SPATIAL=2), the Wl legality term, and
+        //no planes (14) or the 12 by-piece attack planes (26).
+#if SPATIAL != 2 || LEGAL_BIAS != 1 || (SPATIAL_ATTACK != 0 && SPATIAL_ATTACK != 12)
+        std::cerr << "EXPORT_WEIGHTS: the engine implements SPATIAL=2 with LEGAL_BIAS=1 and "
+                     "SPATIAL_ATTACK 0 or 12 only; refusing to write a net it would misread" << std::endl;
+        return 4;
+#endif
+        const int32_t fmt_spatial = PIECE_INDEX ? 8 : 7;
+#endif
         FILE* f = std::fopen(xp, "wb");
         if (!f) { std::cerr << "EXPORT_WEIGHTS: cannot write " << xp << std::endl; return 4; }
-        const int32_t hdr[7] = { 0x4C4F5043 /*"CPOL"*/, fmt_version, NNUE_DIMS, POLICY_H1,
-                                 POLICY_H2, POLICY_OUT, CONV_POLICY };
+        const int32_t hdr[7] = { 0x4C4F5043 /*"CPOL"*/,
+#if SPATIAL
+                                 fmt_spatial,
+#else
+                                 fmt_version,
+#endif
+                                 NNUE_DIMS, POLICY_H1, POLICY_H2, POLICY_OUT, CONV_POLICY };
         std::fwrite(hdr, sizeof(int32_t), 7, f);
         for (int i = 0; i < n_ts; ++i) {
             auto t = ts[i].detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
             std::fwrite(t.data_ptr<float>(), sizeof(float), t.numel(), f);
             std::cout << "  " << nm[i] << " " << t.sizes() << " -> " << t.numel() << " floats" << std::endl;
         }
+#if SPATIAL
+        //The spatial block: a header that makes the block self-describing, then the tensors in the
+        //order policy_net_load() reads them. Wc2/bc2 are present only with two layers.
+        //  magic "SPAT", planes, channels, dim, layers, scale, plane_layout, attack planes
+        //scale 1 = planes enter the convolution as 0/1 (SPATIAL_SCALE), 0 = as 0/127ths.
+        {
+            const int32_t sh[8] = { 0x54415053 /*"SPAT"*/, SPATIAL_PLANES, SPATIAL_CH, SPATIAL_DIM,
+                                    SPATIAL_LAYERS, SPATIAL_SCALE, SPATIAL_PLANE_LAYOUT, SPATIAL_ATTACK };
+            std::fwrite(sh, sizeof(int32_t), 8, f);
+            std::vector<std::pair<const char*, torch::Tensor>> st = { {"Wc1", m.Wc1}, {"bc1", m.bc1} };
+#if SPATIAL_LAYERS >= 2
+            st.push_back({"Wc2", m.Wc2}); st.push_back({"bc2", m.bc2});
+#endif
+            st.push_back({"Wu", m.Wu}); st.push_back({"Wv", m.Wv});
+            for (auto& [name, tt] : st) {
+                auto t = tt.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+                std::fwrite(t.data_ptr<float>(), sizeof(float), t.numel(), f);
+                std::cout << "  " << name << " " << t.sizes() << " -> " << t.numel() << " floats" << std::endl;
+            }
+            std::cout << "  spatial block: planes " << SPATIAL_PLANES << ", channels " << SPATIAL_CH
+                      << ", dim " << SPATIAL_DIM << ", layers " << SPATIAL_LAYERS
+                      << ", scale " << SPATIAL_SCALE << ", plane layout " << SPATIAL_PLANE_LAYOUT
+                      << (SPATIAL_PLANE_LAYOUT ? " (legal-source marks offset by piece type)" : " (true from-square)")
+                      << std::endl;
+        }
+#endif
         std::fclose(f);
-        std::cout << "Exported to " << xp << std::endl;
+        std::cout << "Exported to " << xp << " (format "
+#if SPATIAL
+                  << fmt_spatial
+#else
+                  << fmt_version
+#endif
+                  << ")" << std::endl;
+
+        //EXPORT_CHECK=<out.tsv> also dumps the TRAINER's logit for every legal move of the first
+        //EXPORT_CHECK_N test positions (default 2000), computed by the same forward the validation
+        //uses. check_policy_export compares the engine's score for each move against it -- the only
+        //test that catches a wrong plane, a flipped square or a misread tensor, all of which would
+        //otherwise just cost a point of Top-k and look like noise.
+        //  line per position:  FEN \t n \t idx:logit idx:logit ...     (idx = policy index)
+        if (const char* cp = std::getenv("EXPORT_CHECK")) {
+            const size_t N = std::getenv("EXPORT_CHECK_N") ? (size_t)std::atoll(std::getenv("EXPORT_CHECK_N")) : 2000;
+            ChessDataset ds(test_data_path, N);
+            FILE* cf = std::fopen(cp, "w");
+            if (!cf) { std::cerr << "EXPORT_CHECK: cannot write " << cp << std::endl; return 4; }
+            model->eval();
+            torch::NoGradGuard ng;
+            const size_t n = std::min(N, (size_t)ds.size().value());
+            char fen[128];
+            size_t written = 0;
+            for (size_t i = 0; i < n; ++i) {
+                auto ex = ds.get(i);
+                auto x  = ex.data.unsqueeze(0).to(torch::kFloat32).div_(127.0f);
+                auto t  = ex.target.unsqueeze(0);
+                const int64_t W = legal_width_cpu(t);
+                auto legal = t.narrow(1, 3 + 2 * MAX_PVS, W);
+                auto lg = model->forward_legal(x, legal).contiguous();
+                Board b; ds.board_at(i, b);
+                board2fen(b, fen);
+                const float* L = legal.data_ptr<float>();
+                const float* V = lg.data_ptr<float>();
+                int cnt = 0;
+                for (int64_t j = 0; j < W; ++j) if (L[j] >= 0) ++cnt;
+                std::fprintf(cf, "%s\t%d\t", fen, cnt);
+                for (int64_t j = 0; j < W; ++j)
+                    if (L[j] >= 0) std::fprintf(cf, "%d:%.6f ", (int)L[j], V[j]);
+                std::fprintf(cf, "\n");
+                ++written;
+            }
+            std::fclose(cf);
+            std::cout << "EXPORT_CHECK: " << written << " positions -> " << cp << std::endl;
+        }
         return 0;
     }
     
