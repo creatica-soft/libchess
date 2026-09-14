@@ -61,6 +61,7 @@ extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 extern int64_t   tree_reset_below;
 extern int64_t   tree_reset_occupancy;
+extern int64_t   tree_reset_hollow;
 void gc_join();
 void reap_shutdown();
 extern std::string visit_dump_path;
@@ -501,6 +502,8 @@ public:
         // root inherited fewer than TreeResetBelow informed simulations. 0 = off. See runMCTS().
         o.spin("TreeResetBelow",     &tree_reset_below,     0,   0, 1000000000);
         o.spin("TreeResetOccupancy", &tree_reset_occupancy, 950, 0, 1000);
+        // Also discard it when the previous search was at least this many per-mille hollow: a frozen tree.
+        o.spin("TreeResetHollow",    &tree_reset_hollow,    0,   0, 1000);
         // Where to append the root visit distribution after each search, and a tag written on
         // every line so records can be joined back to a game and its result. Empty = off.
         o.string("VisitDumpFile", &visit_dump_path, "");
