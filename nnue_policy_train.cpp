@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <iomanip>
 #include <random>
+#include <set>
+#include <unistd.h>   // fsync for the run state
 #include <chrono>
 #include "nnue/bitboard.h"
 #include "nnue/nnue/nnue_accumulator.h"
@@ -211,12 +213,19 @@ const float eval_scale = 600.0f; // conversion scale from cp to cnn target and b
 // trained with it simply learned from those merged planes; the first full-corpus piece-indexed
 // spatial model (83.65% Top-6) was trained this way.
 //
-// 0 keeps that behaviour, so existing checkpoints can still be validated and fine-tuned on the inputs
-// they were trained on. 1 masks to the true from-square. The export records which layout the
-// weights expect (plane_layout in the spatial block), and the engine reproduces exactly that one --
-// feeding a model the corrected planes it never saw would be as wrong as the bug.
+// 1, the default since the second full-corpus piece-indexed run, masks to the true from-square. 0 keeps
+// the offset behaviour, and is what every checkpoint trained before that run needs in order to be
+// validated, fine-tuned or exported on the inputs it was trained on. The export records which layout
+// the weights expect (plane_layout in the spatial block), and the engine reproduces exactly that one
+// -- feeding a model the corrected planes it never saw would be as wrong as the bug.
+//
+// Getting this wrong is SILENT everywhere downstream. An old checkpoint exported by a build with the
+// fix on gives a net the engine reproduces exactly -- the export check passes -- that is simply less
+// accurate than it should be. So a checkpoint now carries the layout it was trained with, as the
+// plane_layout buffer, and the weight loader refuses one that disagrees with the build. A checkpoint
+// without the buffer predates it, and under PIECE_INDEX that means layout 1.
 #ifndef SPATIAL_FROM_PLANE_FIX
-#define SPATIAL_FROM_PLANE_FIX 0
+#define SPATIAL_FROM_PLANE_FIX 1
 #endif
 //1 = legal-source marks offset by piece type (the behaviour described above), 0 = true from-square.
 #define SPATIAL_PLANE_LAYOUT ((PIECE_INDEX && !SPATIAL_FROM_PLANE_FIX) ? 1 : 0)
@@ -380,6 +389,7 @@ struct NNUEPolicyImpl : torch::nn::Module {
     torch::Tensor W1, b1, W2, b2, emb;
 #if SPATIAL
     torch::Tensor Wu, Wv;
+    torch::Tensor plane_layout;
 #if SPATIAL == 2
     torch::Tensor Wc1, bc1, Wc2, bc2;
 #endif
@@ -424,6 +434,9 @@ struct NNUEPolicyImpl : torch::nn::Module {
         Wu = register_parameter("Wu", u({SPATIAL_PLANES, SPATIAL_DIM}, SPATIAL_PLANES));
         Wv = register_parameter("Wv", torch::zeros({SPATIAL_PLANES, SPATIAL_DIM}));
 #endif
+        //The input layout this model is trained on; see SPATIAL_FROM_PLANE_FIX. A buffer rather than
+        //a parameter: it is saved in every checkpoint but the optimizer never sees it.
+        plane_layout = register_buffer("plane_layout", torch::full({1}, (float)SPATIAL_PLANE_LAYOUT));
 #endif
 #if LEGAL_BIAS
         //ZERO, deliberately. With the term's weights at 0 it contributes exactly nothing and the
@@ -1743,6 +1756,75 @@ static int build_feature_cache(const std::string& dir,
   return 0;
 }
 
+//RUN STATE -- what an unattended run needs in order to continue after it dies.
+//
+//The weights plus a .step file were never enough to resume a multi-epoch run. The shard order came
+//from std::random_device, so a restarted epoch drew a different order and could not tell which
+//shards it had already trained on. Adam's moment estimates were not saved, so a restart began with
+//empty moments. And nothing recorded which epoch the run was in. The feature cache lives on an
+//external drive that has unmounted twice during long jobs, so an overnight run has to survive a
+//crash between shards.
+//
+//After every shard the trainer writes <CKPT_PREFIX>run_state.txt, after the checkpoint and optimizer
+//files it names are complete, and atomically: a temporary file is renamed over the old one. RESUME=1
+//reads it back. The seed reproduces the shard order, the shards already trained in the current
+//epoch are skipped, and the weights, Adam's moments and the step counter continue from the last
+//completed shard, so at most one shard's work is lost. A fresh run refuses to start over an existing
+//state file, so a reused CKPT_PREFIX cannot silently overwrite a run in progress.
+struct RunState {
+    uint64_t seed = 0;
+    int epochs = 0;
+    int64_t batch_size = 0;
+    int64_t total_steps = 0;
+    int64_t global_step = 0;
+    int epoch = 1;                    //the epoch in progress
+    std::vector<std::string> done;    //shards of that epoch already trained, in training order
+    std::string checkpoint;           //model weights after the last completed shard
+    std::string optimizer;            //Adam state after the last completed shard
+    std::vector<std::string> shards;  //every shard in the run, unshuffled
+    bool finished = false;
+};
+
+static bool read_run_state(const std::string& path, RunState& st) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        if      (k == "seed")        st.seed        = std::stoull(v);
+        else if (k == "epochs")      st.epochs      = std::stoi(v);
+        else if (k == "batch_size")  st.batch_size  = std::stoll(v);
+        else if (k == "total_steps") st.total_steps = std::stoll(v);
+        else if (k == "global_step") st.global_step = std::stoll(v);
+        else if (k == "epoch")       st.epoch       = std::stoi(v);
+        else if (k == "checkpoint")  st.checkpoint  = v;
+        else if (k == "optimizer")   st.optimizer   = v;
+        else if (k == "finished")    st.finished    = (v == "1");
+        else if (k == "done")        st.done.push_back(v);
+        else if (k == "shard")       st.shards.push_back(v);
+    }
+    return true;
+}
+
+static void write_run_state(const std::string& path, const RunState& st) {
+    const std::string tmp = path + ".tmp";
+    FILE * f = std::fopen(tmp.c_str(), "w");
+    if (!f) throw std::runtime_error("cannot write " + tmp);
+    std::fprintf(f, "seed=%llu\nepochs=%d\nbatch_size=%lld\ntotal_steps=%lld\nglobal_step=%lld\n"
+                    "epoch=%d\ncheckpoint=%s\noptimizer=%s\nfinished=%d\n",
+                 (unsigned long long)st.seed, st.epochs, (long long)st.batch_size,
+                 (long long)st.total_steps, (long long)st.global_step, st.epoch,
+                 st.checkpoint.c_str(), st.optimizer.c_str(), st.finished ? 1 : 0);
+    for (const auto& d : st.done)   std::fprintf(f, "done=%s\n", d.c_str());
+    for (const auto& d : st.shards) std::fprintf(f, "shard=%s\n", d.c_str());
+    std::fflush(f);
+    fsync(fileno(f));
+    std::fclose(f);
+    std::filesystem::rename(tmp, path);
+}
+
 int main() {
     Stockfish::Bitboards::init();
     init_nnue();   //embedded nets; thread contexts are created lazily per worker
@@ -1877,8 +1959,11 @@ int main() {
     //current one. The architecture is also encoded in every checkpoint name, and the size
     //guard on load refuses a checkpoint trained for other dimensions, so the two cannot be
     //mixed up silently.
-    const std::string weights_file = std::getenv("WEIGHTS") ? std::getenv("WEIGHTS")
-                                                            : "nnue_policy.pt";
+    //Not const: RESUME=1 replaces it with the checkpoint the run state names.
+    std::string weights_file = std::getenv("WEIGHTS") ? std::getenv("WEIGHTS")
+                                                      : "nnue_policy.pt";
+    //Keyed to WEIGHTS as given, before any resume replaces it; see the step counter below.
+    const std::string step_file = weights_file + ".step";
     const std::string checkpoint_prefix = std::getenv("CKPT_PREFIX")
                                         ? std::getenv("CKPT_PREFIX")
                                         : "nnue_policy_checkpoint_";
@@ -1922,6 +2007,51 @@ int main() {
         file_list.swap(cached);
     }
 
+    //TRAIN_SHARDS=n trains on the first n shards only, in get_data_files() order and after the
+    //cache filter. MAX_BATCHES_PER_SHARD=n stops each shard after n batches. Both are for testing a
+    //change -- resume above all -- in minutes rather than hours, and both are counted by the exact
+    //step count below, so a shortened run still anneals to LR_MIN.
+    if (const char * ts = std::getenv("TRAIN_SHARDS")) {
+        size_t k = (size_t)std::atoll(ts);
+        if (k > 0 && k < file_list.size()) file_list.resize(k);
+    }
+    const int64_t max_batches_per_shard = env_i("MAX_BATCHES_PER_SHARD", 0);
+
+    //EXACT STEP COUNT, so the cosine reaches LR_MIN on the last batch of the run.
+    //
+    //TOTAL_STEPS used to be a guess of 300,000,000 positions per epoch divided by the batch size.
+    //Where the guess is too high the run ends with the rate still above the floor, and the low-rate
+    //tail -- where much of the final quality comes from -- is never trained. Where it is too low the
+    //schedule bottoms out early and the rest of the run trains at LR_MIN. With a feature cache the
+    //true count costs one header read per shard, and the batches follow from it exactly as the
+    //training loop forms them: the shard is cut into chunks of min(CHUNK_SIZE, n) positions, and
+    //each chunk is batched with its final partial batch kept.
+    int64_t exact_steps = -1;
+    int64_t corpus_positions = 0;
+    if (!cache_dir.empty() && !eval_only) {
+        exact_steps = 0;
+        for (const auto& f : file_list) {
+            const std::string cp = feat_cache_path(cache_dir, f);
+            FeatCacheHeader h{};
+            FILE * hf = std::fopen(cp.c_str(), "rb");
+            const bool ok = hf && std::fread(&h, sizeof h, 1, hf) == 1
+                         && std::memcmp(h.magic, "NFEA", 4) == 0 && h.count > 0;
+            if (hf) std::fclose(hf);
+            if (!ok) {
+                std::cerr << "FATAL: cannot read the header of " << cp << std::endl;
+                return 6;
+            }
+            const int64_t n  = h.count;
+            const int64_t cn = std::min<int64_t>((int64_t)chunk_size, n);
+            int64_t steps = 0;
+            for (int64_t b = 0; b < n; b += cn) steps += (std::min(cn, n - b) + batch_size - 1) / batch_size;
+            if (max_batches_per_shard > 0) steps = std::min(steps, max_batches_per_shard);
+            exact_steps += steps;
+            corpus_positions += n;
+        }
+        exact_steps *= num_epochs;
+    }
+
     // 2. Setup Device (Use CUDA or MPS if available, else CPU)
     torch::Device device(torch::kCPU);
     if (torch::cuda::is_available()) {
@@ -1934,6 +2064,43 @@ int main() {
         std::cout << "Neither CUDA nor MPS not available. Training on CPU." << std::endl;
     }
     
+    //See RunState. RESUME=1 continues the run recorded beside CKPT_PREFIX, and takes its weights
+    //from the checkpoint that state names rather than from WEIGHTS.
+    const std::string state_path = checkpoint_prefix + "run_state.txt";
+    const bool resume = !eval_only && env_i("RESUME", 0) != 0;
+    RunState run;
+    if (resume) {
+        if (!read_run_state(state_path, run)) {
+            std::cerr << "FATAL: RESUME=1 but there is no run state at " << state_path << std::endl;
+            return 7;
+        }
+        if (run.finished) {
+            std::cout << "The run recorded in " << state_path << " has finished; nothing to resume."
+                      << std::endl;
+            return 0;
+        }
+        std::string why;
+        if (run.epochs != num_epochs)                      why = "EPOCHS differs";
+        else if (run.batch_size != batch_size)             why = "BATCH_SIZE differs";
+        else if (run.shards != file_list)                  why = "the set of shards differs (is the feature cache drive mounted?)";
+        else if (!std::filesystem::exists(run.checkpoint)) why = "its checkpoint " + run.checkpoint + " is missing";
+        else if (!std::filesystem::exists(run.optimizer))  why = "its optimizer state " + run.optimizer + " is missing";
+        if (!why.empty()) {
+            std::cerr << "FATAL: cannot resume " << state_path << ": " << why << std::endl;
+            return 7;
+        }
+        weights_file = run.checkpoint;
+        std::cout << "Resuming run: epoch " << run.epoch << " of " << run.epochs << ", "
+                  << run.done.size() << " of " << file_list.size() << " shards already done in it, step "
+                  << run.global_step << " of " << run.total_steps << ", seed " << run.seed << std::endl;
+    }
+    //The seed fixes every epoch's shard order (see the epoch loop) and a fresh model's initial
+    //weights. SEED=n chooses it; otherwise a fresh run draws one, and the run state records it.
+    const uint64_t run_seed = resume ? run.seed
+                            : std::getenv("SEED") ? (uint64_t)std::strtoull(std::getenv("SEED"), nullptr, 10)
+                            : (((uint64_t)std::random_device{}() << 32) ^ (uint64_t)std::random_device{}());
+    torch::manual_seed(run_seed);
+
     // 3. Initialize Model
     NNUEPolicy model;
     //Timing does not need trained weights, and the size guard below would reject any
@@ -1995,6 +2162,23 @@ int main() {
                 }
               }
               std::cout << "Loaded " << got << " tensors from " << weights_file << std::endl;
+#if SPATIAL
+              torch::Tensor lt;
+              const bool has_layout = ar.try_read("plane_layout", lt, /*is_buffer=*/true);
+              const int saved_layout = has_layout ? (int)std::lround(lt.item<float>())
+                                                  : (PIECE_INDEX ? 1 : 0);
+              if (saved_layout != SPATIAL_PLANE_LAYOUT) {
+                std::cerr << "FATAL: " << weights_file << " was trained on spatial plane layout "
+                          << saved_layout << (has_layout ? "" : " (it predates the plane_layout buffer)")
+                          << ",\n       but this build uses layout " << SPATIAL_PLANE_LAYOUT
+                          << ". Rebuild with -DSPATIAL_FROM_PLANE_FIX=" << (saved_layout ? 0 : 1)
+                          << " to use it.\n";
+                return 3;
+              }
+              std::cout << "Spatial plane layout " << saved_layout
+                        << (has_layout ? "" : " (inferred: checkpoint predates the plane_layout buffer)")
+                        << std::endl;
+#endif
             }
         } catch (const c10::Error& e) {
             std::cerr << "Error loading weights: " << e.what() << std::endl;
@@ -2219,13 +2403,42 @@ int main() {
     if (!g_wl.empty()) groups.emplace_back(g_wl);
     torch::optim::Adam optimizer(groups, torch::optim::AdamOptions(LR_MAX));
 
+    if (!eval_only && !resume && std::filesystem::exists(state_path)) {
+        std::cerr << "FATAL: " << state_path << " exists, so CKPT_PREFIX=" << checkpoint_prefix
+                  << " belongs to another run.\n       RESUME=1 continues that run; delete the file "
+                     "to start a new one under this prefix." << std::endl;
+        return 8;
+    }
+    if (resume) {
+        //Loaded onto the CPU and then moved to the parameters' device explicitly, rather than
+        //relying on the device recorded in the archive. Adam's state is matched to parameters by
+        //position within each group, which holds because the groups are built in the same order
+        //in every run of the same build.
+        torch::load(optimizer, run.optimizer, torch::Device(torch::kCPU));
+        size_t moved = 0;
+        for (auto& kv : optimizer.state()) {
+            auto& st = static_cast<torch::optim::AdamParamState&>(*kv.second);
+            st.exp_avg(st.exp_avg().to(device));
+            st.exp_avg_sq(st.exp_avg_sq().to(device));
+            if (st.max_exp_avg_sq().defined()) st.max_exp_avg_sq(st.max_exp_avg_sq().to(device));
+            ++moved;
+        }
+        std::cout << "Loaded optimizer state for " << moved << " parameters from " << run.optimizer
+                  << std::endl;
+    }
+
     // 6. Training Loop
     std::cout << "Starting training..." << std::endl;       
     
     // Estimate total batches: ~60M positions per epoch / 1024 batch size * 10 epochs
     // You can hardcode this or calculate it dynamically if you know the exact file sizes.
+    //Superseded by exact_steps whenever a feature cache is in use. The guess survives only as the
+    //fallback for a run without one, where counting would mean decoding every shard first. A
+    //resumed run keeps the total it started with.
     const int64_t total_estimated_positions = 300000000ULL * num_epochs; 
-    const int64_t TOTAL_STEPS = env_i("TOTAL_STEPS", total_estimated_positions / batch_size); 
+    const int64_t TOTAL_STEPS = resume ? run.total_steps
+                              : env_i("TOTAL_STEPS", exact_steps > 0 ? exact_steps
+                                                                     : total_estimated_positions / batch_size);
     int64_t global_step = 0;
     //Resume the SCHEDULE, not just the weights. torch::load restores the parameters but
     //nothing about where the run had got to, so a restarted run re-entered the cosine at
@@ -2236,8 +2449,15 @@ int main() {
     //
     //The step counter lives beside the weights, keyed to the checkpoint file, so a resume
     //picks up the schedule exactly where it stopped. Delete the .step file to start over.
-    const std::string step_file = weights_file + ".step";
-    if (!std::getenv("BENCH_FORWARD") && std::filesystem::exists(step_file)) {
+    //(step_file is defined beside WEIGHTS, at the top of main.) Under RESUME=1 the run state
+    //carries the step instead, recorded together with the checkpoint and optimizer it belongs to.
+    if (resume) {
+        global_step = run.global_step;
+    //Only beside weights that exist. A fresh run (WEIGHTS naming no file) that died after writing
+    //its first .step but before its first run state would otherwise restart the schedule midway
+    //with untrained weights.
+    } else if (!std::getenv("BENCH_FORWARD") && std::filesystem::exists(step_file)
+               && std::filesystem::exists(weights_file)) {
         FILE * sf = std::fopen(step_file.c_str(), "r");
         if (sf) {
             long long v = 0;
@@ -2249,6 +2469,14 @@ int main() {
     //TOTAL_STEPS is what makes the cosine reach its floor at the end of the run. Raising the
     //epoch count without raising this bottoms the schedule out partway and trains the
     //remainder at LR_MIN.
+    if (exact_steps > 0)
+        std::cout << "Exact step count: " << corpus_positions << " positions in " << file_list.size()
+                  << " shards, " << exact_steps << " batches over " << num_epochs << " epoch(s)"
+                  << (std::getenv("TOTAL_STEPS") && !resume ? " -- OVERRIDDEN by TOTAL_STEPS" : "")
+                  << std::endl;
+    else if (!eval_only)
+        std::cout << "WARNING: no feature cache, so TOTAL_STEPS is an ESTIMATE and the schedule will "
+                     "not end exactly at LR_MIN" << std::endl;
     std::cout << "Schedule: TOTAL_STEPS=" << TOTAL_STEPS
               << " batch_size=" << batch_size
               << " num_epochs=" << num_epochs
@@ -2257,11 +2485,22 @@ int main() {
               << std::endl;
     // -----------------------------------
     
-    for (int epoch = 1; epoch <= std::max(1, num_epochs); ++epoch) {        
-        // Optional: Shuffle file order to mix data slightly better
-        std::random_device rd;
-        std::mt19937 g(rd());
+    //The run's shards in get_data_files() order. Every epoch shuffles a fresh copy of this list.
+    const std::vector<std::string> run_shards = file_list;
+    std::vector<std::string> done_this_epoch;
+    std::string prev_optimizer = resume ? run.optimizer : std::string();
+    const int first_epoch = resume ? run.epoch : 1;
+    for (int epoch = first_epoch; epoch <= std::max(1, num_epochs); ++epoch) {        
+        //SEEDED by the run and the epoch; this used to be std::random_device. A resumed run has to
+        //redraw the order the epoch was actually being trained in, or it cannot know which shards
+        //remain. Shuffling a fresh copy of the original list, instead of reshuffling last epoch's
+        //order in place, makes each epoch's order independent of whether the previous epoch ran in
+        //this process.
+        file_list = run_shards;
+        std::mt19937_64 g(run_seed + (uint64_t)epoch);
         std::shuffle(file_list.begin(), file_list.end(), g);
+        done_this_epoch = (resume && epoch == run.epoch) ? run.done : std::vector<std::string>();
+        const std::set<std::string> skip(done_this_epoch.begin(), done_this_epoch.end());
   
         double epoch_total_loss = 0.0;
         double epoch_value_loss = 0.0;
@@ -2273,7 +2512,17 @@ int main() {
                 
         constexpr float policy_weight = 1.0f;
         for (const auto& filepath : file_list) {
-            std::cout << "  Processing file " << ++file_number << ": " << filepath << std::endl;
+            ++file_number;
+            if (skip.count(filepath)) {
+                std::cout << "  Skipping file " << file_number << ": " << filepath
+                          << " (trained before the restart)" << std::endl;
+                continue;
+            }
+            std::cout << "  Processing file " << file_number << ": " << filepath << std::endl;
+            //RandomSampler draws from torch's global generator. Seeding it per shard gives a shard
+            //retrained after a restart the same batch order it had the first time.
+            torch::manual_seed(run_seed ^ ((uint64_t)epoch << 40) ^ ((uint64_t)file_number << 20));
+            int64_t shard_batches = 0;
             //eval_only never reads the training file: an empty shard leaves shard_n at 0, so the
             //chunk loop below does not execute and no gradient is ever computed.
             auto shard_samples = eval_only
@@ -2287,6 +2536,7 @@ int main() {
             const size_t chunk_n = cache_dir.empty() ? shard_n
                                                      : std::min<size_t>(chunk_size, shard_n);
             for (size_t chunk_base = 0; chunk_base < shard_n; chunk_base += chunk_n) {
+                if (max_batches_per_shard > 0 && shard_batches >= max_batches_per_shard) break;
                 const size_t this_n = std::min(chunk_n, shard_n - chunk_base);
                 auto dataset = ChessDataset(shard_samples, chunk_base, this_n, cpath)
                                    .map(torch::data::transforms::Stack<>());
@@ -2304,6 +2554,7 @@ int main() {
                 // so it cannot be used for a rate. Count this file's batches separately.
                 size_t file_batches = 0;
                 for (auto& batch : *data_loader) {
+                    if (max_batches_per_shard > 0 && shard_batches >= max_batches_per_shard) break;
                     auto data    = batch.data.to(device).to(torch::kFloat32).div_(127.0f);
                     auto targets = batch.target.to(device);          // [batch, 4097]
         
@@ -2508,6 +2759,7 @@ int main() {
                     epoch_total_loss += loss.item<double>();
                                                                                 epoch_total_batches++;
                     file_batches++;
+                    shard_batches++;
                 
                     if (epoch_total_batches % 100 == 0) {
                         double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
@@ -2545,8 +2797,36 @@ int main() {
               std::snprintf(ckpt, sizeof ckpt, "%sh1%d_h2%d_c%d_p%d_l%d_e%d_f%02d.pt",
                             checkpoint_prefix.c_str(), POLICY_H1, POLICY_H2, CONV_POLICY,
                             PIECE_INDEX, LEGAL_BIAS, epoch, file_number);
-              torch::save(model, ckpt);
+              //Written under a temporary name and renamed, so a crash mid-write cannot leave a
+              //truncated file under a name the run state might point at.
+              const std::string ckpt_tmp = std::string(ckpt) + ".tmp";
+              torch::save(model, ckpt_tmp);
+              std::filesystem::rename(ckpt_tmp, ckpt);
               std::cout << "  saved " << ckpt << std::endl;
+
+              //Adam's moments, one file per shard like the weights, so the run state can never pair
+              //a checkpoint with an optimizer state from a different shard. Only the latest is kept,
+              //since each is twice the size of the model.
+              char opt[256];
+              std::snprintf(opt, sizeof opt, "%soptimizer_e%d_f%02d.pt",
+                            checkpoint_prefix.c_str(), epoch, file_number);
+              const std::string opt_tmp = std::string(opt) + ".tmp";
+              torch::save(optimizer, opt_tmp);
+              std::filesystem::rename(opt_tmp, opt);
+
+              //Last, once both files it names are complete on disk.
+              done_this_epoch.push_back(filepath);
+              RunState st;
+              st.seed = run_seed;           st.epochs = num_epochs;     st.batch_size = batch_size;
+              st.total_steps = TOTAL_STEPS; st.global_step = global_step; st.epoch = epoch;
+              st.done = done_this_epoch;    st.checkpoint = ckpt;       st.optimizer = opt;
+              st.shards = run_shards;
+              write_run_state(state_path, st);
+              if (!prev_optimizer.empty() && prev_optimizer != opt) {
+                  std::error_code ec;
+                  std::filesystem::remove(prev_optimizer, ec);
+              }
+              prev_optimizer = opt;
             }
 
         
@@ -2769,6 +3049,20 @@ int main() {
         }        
         
       }     
+    }
+    //Marked finished so a supervising script stops restarting it, and so RESUME=1 on a completed
+    //run does nothing instead of training a third epoch.
+    if (!eval_only) {
+        RunState st;
+        if (read_run_state(state_path, st)) {
+            st.finished = true;
+            write_run_state(state_path, st);
+        }
+        std::cout << "Run finished at step " << global_step << "; the schedule was sized for "
+                  << TOTAL_STEPS
+                  << (global_step == TOTAL_STEPS ? ", so the rate ended at LR_MIN"
+                                                 : " -- MISMATCH, the rate did not end at LR_MIN")
+                  << std::endl;
     }
     return 0;
 }
