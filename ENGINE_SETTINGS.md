@@ -427,6 +427,34 @@ because the recursion into a checking move's replies applied their legality term
 and the engine's rules that in check the prior is the child evaluations alone and that promotions count
 once in the legality term.
 
+**The retrained spatial net, `nnue_policy_pisp2.bin`** (format 8, plane layout 0). Same architecture as
+`pisp`, trained from scratch with the three trainer fixes of 14 September: plane 12 marks the true
+from-square, the cosine schedule is sized from the exact position count, and the run state makes it
+resumable. Two epochs over all 28 cached shards — 277,074,119 positions a pass, 68,726 steps — in 7 h 08 min
+under `train_unattended.sh`, with no restarts and the rate ending exactly at `LR_MIN`. Validation on the
+first 20,000 test positions: Top-1 39.05 / Top-4 74.40 / Top-6 83.54 after the first epoch, **39.46 / 74.95 /
+84.04** after the second. The engine reproduces the trainer to 1.1e-5 over 56,373 moves, with no top-move
+disagreements.
+
+`bench_blend` on 200,000 test positions, all three nets in one session with the same tool:
+
+| | policy alone: Top-1 | Top-4 | Top-6 | blended at 0.45: Top-1 | Top-4 | Top-6 |
+|---|---|---|---|---|---|---|
+| `pi` | 34.60 | 68.36 | 77.74 | 36.48 | 73.04 | 82.65 |
+| `pisp` | 39.16 | 74.53 | 83.57 | 38.60 | 76.55 | 85.68 |
+| `pisp2` | **39.52** | **74.94** | **83.79** | 38.71 | 76.54 | 85.71 |
+
+As a policy alone `pisp2` is about 0.4 points ahead of `pisp` at Top-1 and Top-4; blended, which is how
+the engine uses it, it is 0.1 ahead at Top-1 and level otherwise. The retraining's gain lies mostly in
+what the child evaluations already see, so a large difference in strength is not expected. (This run
+reads 39.16 for `pisp`'s consistency gate where the paragraph above recorded 38.75; the cause was not
+investigated, and the table compares like with like.)
+
+**`BlendScale 102` for `pisp2`.** `bench_blend` now reports the top move's share of the blended prior for
+several BlendScale values in one pass, since the scale changes concentration but never the ranking. It
+reproduces the earlier calibration — `pi` at 1.15 puts 0.4163 on its top move, `pisp` at 1.05 puts
+0.4155 — and `pisp2` is slightly sharper, with 0.4098 at 1.00 and 0.4254 at 1.05, so 1.02 matches.
+
 ### Policy modes
 
 - **`0` off** — the incumbent. Every legal move's child is evaluated with NNUE; the priors,
