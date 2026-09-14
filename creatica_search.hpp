@@ -148,10 +148,15 @@ struct alignas(64) MCTSNode {
     //It is the numerator of the exploration term, and it has to be edge-consistent with the
     //denominator or the two are on different scales: N below counts every arrival at this
     //POSITION from any parent and across the whole game, which under tree reuse can be millions
-    //while a fresh edge is still at zero. Lives in the seven bytes of padding that already sat
-    //between `expanding` and `children`, so sizeof(MCTSNode) stays 56 and the gc accounting in
-    //tree_occupancy() is unchanged.
+    //while a fresh edge is still at zero. Sits in padding after `expanding`, so it did not grow the
+    //node; the size is pinned by the static_assert after the struct.
     std::atomic<uint32_t> descents{0};
+    //Where this node's children sit in the child table's pool: child i is slot pool[pool_off + i]. A
+    //copy of what kids[] holds for the collector, kept here because the SEARCH already has this cache
+    //line loaded when it walks a node's children, so reading it costs nothing extra. Written when the
+    //expansion is published, before num_children. It must sit HERE, in the four bytes between
+    //`descents` and `evidence` -- the only padding left in the node. See the static_assert below.
+    std::atomic<uint32_t> pool_off{0};
     //EVIDENCE: visits that actually produced information, as distinct from N, which counts every
     //time the search came here.
     //
@@ -172,13 +177,14 @@ struct alignas(64) MCTSNode {
     //does not move rather than being cemented in place by repetition.
     std::atomic<uint64_t> evidence{0};
     std::atomic<Edge *> children {nullptr}; //array of moves and priors leading to next nodes
-    //Where this node's children sit in the child table's pool: child i is slot pool[pool_off + i]. A
-    //copy of what kids[] holds for the collector, kept here because the SEARCH already has this cache
-    //line loaded when it walks a node's children, so reading it costs nothing extra. Written when the
-    //expansion is published, before num_children. Occupies four of the eight bytes of padding that
-    //already sat at the end of the node, so sizeof(MCTSNode) stays 64.
-    std::atomic<uint32_t> pool_off{0};
 };
+//64 BYTES, checked. pool_off was first declared after `children`, in what the comment beside it called
+//"padding that already sat at the end of the node". There was none: `children` ends at exactly byte
+//64, so the fields came to 68 and alignas(64) rounded the node up to 128. That doubled every arena
+//slot and raised the occupancy charge per node from 88 to 160 bytes, so Hash 2048 held about 11.7
+//million nodes instead of about 18.7 million -- and nothing noticed until a lichess game froze on a
+//full tree and lost its queen. The only real gap is the four bytes between `descents` and `evidence`.
+static_assert(sizeof(MCTSNode) == 64, "MCTSNode must stay one cache line; see pool_off");
 //THE CHILD TABLE stores std::atomic<uint64_t> in calloc'd memory, which is only sound while the atomic
 //has the plain integer's size and alignment.
 static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t) && alignof(std::atomic<uint64_t>) == alignof(uint64_t),
