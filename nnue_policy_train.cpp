@@ -1746,6 +1746,23 @@ static int build_feature_cache(const std::string& dir,
 int main() {
     Stockfish::Bitboards::init();
     init_nnue();   //embedded nets; thread contexts are created lazily per worker
+    //FILL THE CASTLING PATH TABLE. castlingMoves() refuses castling through pieces or through check
+    //using CastlingPath, a process-wide table that only fen2board() fills (via initCastlingPath()).
+    //This trainer never parses a FEN -- board_from_record() builds every board -- so the table stayed
+    //all zeros, a zero path blocks nothing, and every record with a castling right and its rook
+    //generated castling through pieces and through check. Measured on 2,000 held-out positions: 263
+    //carried at least one illegal castle in the legal list, which fed the softmax, the legality term
+    //and the spatial planes. The engine parses FENs, so it never had them, and scored those
+    //positions from a different list than the one the net was trained on.
+    //
+    //Standard-chess paths are the same for every board, so filling the table once from the start
+    //position is correct for every record. (The table is filled from whichever board fen2board saw
+    //last, and a board without rights clears it -- which is why it must be the full-rights start
+    //position.)
+    {
+        Board start;
+        fen2board(start, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    }
 #ifdef SEED
     torch::manual_seed(SEED);
     std::cout << "Seed: " << SEED << std::endl;
