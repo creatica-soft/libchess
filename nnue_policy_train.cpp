@@ -96,6 +96,132 @@ const float eval_scale = 600.0f; // conversion scale from cp to cnn target and b
 #define PIECE_INDEX 0
 #endif
 
+// SPATIAL -- give the move's SCORE access to what is standing on its two squares.
+//
+// The readout is score(m) = dot(ctx, emb[from*64+to]). ctx is one GLOBAL 128-dim code for the
+// position and emb is STATIC -- the same 4096 vectors for every position in the corpus. So a move's
+// score depends on the position only through that bottleneck, and nothing in the model can look at
+// what is on `from` or on `to`. The only inputs anywhere in the pipeline indexed by (from, to) are
+// the NNUE FullThreats features, and those are emitted only when the destination is OCCUPIED --
+// which is why the policy's top-1 is a capture 4.2x as often as the base rate, and why it finds the
+// best move in its top-6 87% of the time when that move is a capture against 66% when it is quiet.
+// Quiet moves are 79% of positions.
+//
+// This adds a second term computed from a SPATIALLY RESOLVED input:
+//
+//     score(m) += dot(u[from], v[to])
+//
+// where u and v are per-square feature vectors read off 14 planes of the raw board -- 12 piece
+// planes (own 0-5, enemy 6-11) plus one marking every legal move's origin and one marking every
+// legal destination. Nothing here is hand-crafted: the planes are raw facts and every relationship
+// is learned.
+//
+// DELIBERATELY 1x1 FIRST. A 3x3 convolution would let u[from] see the square's neighbourhood and is
+// the obvious next step, but it costs about 850K multiply-adds a position against 28K for this, and
+// the model step -- not the loader -- now sets the training rate (see PROFILE_GET below). So the
+// cheapest thing that could work goes first: if a per-square term with no spatial mixing at all
+// moves held-out Top-6 on quiet moves, the idea is sound and the convolution is worth its cost.
+//
+// Wv starts at ZERO so the model begins at exactly the incumbent's behaviour and can only move away
+// by learning something -- the same reasoning as LEGAL_BIAS below. Wu must NOT also start at zero:
+// the gradient of dot(u,v) with respect to Wu is proportional to v, so two zeroed matrices would
+// never leave the origin.
+// SPATIAL: 0 off, 1 = per-square linear (1x1), 2 = two 3x3 convolutions then the same readout.
+//
+// Mode 1 measured as a null: the term did learn -- 0.216% of |logits|, so the gradient arrives --
+// but held-out Top-1/4/6 moved by less than single-run noise. The informative part was the control
+// sitting next to it in the same run: LEGAL_BIAS is ALSO zero-initialised, on the same schedule
+// with the same optimiser, and it grew to 78% of |ctx| while this grew to 0.2%. The optimiser can
+// clearly grow a zero-init term fast when it is useful, so mode 1's flatness is a weak gradient
+// signal rather than too little training.
+//
+// The suspected reason: 14 planes read per square give the MARGINALS of the move set -- which
+// squares a move starts from, which squares moves land on -- and never the pairing. At 1x1,
+// u[from] knows "a knight is here and it can move somewhere" and v[to] knows "something can land
+// here", but nothing says from->to is one of the actual moves.
+//
+// Mode 2 gives each square its neighbourhood, which is a real increase in expressiveness and the
+// obvious next step, at roughly 913K multiply-adds a position against 28K. It does NOT fix the
+// pairing gap, so if it also comes back flat that is evidence about the whole u[from].v[to] shape
+// rather than about how much context the squares can see.
+#ifndef SPATIAL
+#define SPATIAL 0
+#endif
+#ifndef SPATIAL_DIM
+#define SPATIAL_DIM 16
+#endif
+#ifndef SPATIAL_CH
+#define SPATIAL_CH 32
+#endif
+
+// SPATIAL_ATTACK -- square contention, the thing FullThreats structurally cannot express.
+//
+// A FullThreats feature is (attacker, from, to, attacked) and every attack bitboard is masked with
+// `& occupied` before an index is emitted. So an attack on an EMPTY square produces nothing: if a
+// knight moves to e5 and e5 is covered by a pawn, no input anywhere says e5 is covered. For a
+// capture the destination is occupied, so the threat features do describe it -- which is exactly
+// the shape of the measured gap (best move in top-6: captures 89.75%, quiet 65.45%). The single
+// most important fact about a quiet move is whether its destination is safe, and it is missing.
+//
+//   0   no attack planes
+//   2   own attackers, enemy attackers -- a count per square, "square contention"
+//  12   the same split by ATTACKING PIECE TYPE, 6 per side, so the model can learn that a pawn
+//       covering a square is a different matter from a rook covering it
+//
+// Raw board fact, in the same category as the piece planes: no exchange evaluation, no ordering
+// rule, every interpretation learned.
+// SPATIAL_SCALE -- undo the input's global /127 for the plane portion only.
+//
+// The training loop does data.div_(127.0f) over the WHOLE input, which is right for the NNUE
+// features (they are uint8 activations in [0,127]) and wrong for the planes: a binary plane
+// reaches the convolution as 0.0079 rather than 1.0, and an attacker count of 3 as 0.0236. The
+// network can compensate through the first layer's weights, and evidently did -- but it is
+// spending weight magnitude on undoing an accident of the encoding, and the initialisation scale
+// was chosen for inputs near unity.
+//
+// 1 multiplies the plane slice by 127 so planes arrive as 0/1 and counts as 1, 2, 3. The data
+// format on disk is unchanged, so this costs one elementwise multiply and nothing else.
+#ifndef SPATIAL_SCALE
+#define SPATIAL_SCALE 0
+#endif
+
+// SPATIAL_LAYERS -- how many 3x3 convolutions the spatial term uses. The second layer is the
+// expensive one: its cost grows with the SQUARE of the channel count (SPATIAL_CH x SPATIAL_CH x 9
+// per square) while the first grows only linearly (SPATIAL_PLANES x SPATIAL_CH x 9). At 32 channels
+// the two layers are 479k and 590k multiply-accumulates per position, and the engine measures the
+// pair at 51.6 microseconds per expanded node against the 45.9 microseconds an expansion otherwise
+// costs -- so dropping the second layer is the single largest saving available, if the accuracy
+// survives it. 1 is one convolution, 2 is the pair.
+#ifndef SPATIAL_LAYERS
+#define SPATIAL_LAYERS 2
+#endif
+
+#ifndef SPATIAL_ATTACK
+#define SPATIAL_ATTACK 0
+#endif
+#if SPATIAL_ATTACK != 0 && SPATIAL_ATTACK != 2 && SPATIAL_ATTACK != 12
+#error "SPATIAL_ATTACK must be 0, 2 or 12"
+#endif
+static constexpr int SPATIAL_PLANES = 14 + SPATIAL_ATTACK;
+static constexpr int SPATIAL_IN     = SPATIAL_PLANES * 64;   // 896
+#if SPATIAL && CONV_POLICY
+#error "SPATIAL adds a [B,64,64] term that lines up with the from*64+to table only; build it with CONV_POLICY=0"
+#endif
+//SPATIAL WITH PIECE_INDEX. The spatial term is dot(u[from], v[to]) -- a function of the two SQUARES
+//and of nothing else. It says how good it is to go from here to there given what surrounds both
+//squares, and that judgement does not depend on which piece makes the trip. So under piece indexing
+//it is not an incompatible shape, just a term that has to be added to all six of the per-piece
+//blocks rather than to one 4096-wide table: the logits are laid out (pt-1)*4096 + from*64 + to, so
+//repeating the [B,4096] term six times along dim 1 lands the same value in every piece's block,
+//which is exactly the intended meaning.
+#if SPATIAL && PIECE_INDEX
+#define SPATIAL_TILE 6
+#else
+#define SPATIAL_TILE 1
+#endif
+//What the dataset actually emits per sample: NNUE features, then the planes when SPATIAL is on.
+static constexpr int SAMPLE_IN = NNUE_DIMS + (SPATIAL ? SPATIAL_IN : 0);
+
 // ON-DISK FORMAT VERSIONS. The index scheme has to be recorded in the file, because a net whose emb
 // rows mean something different is not a net an older engine may load: it would read the wrong row
 // for every move and score at chance with no diagnostic. So the version is the narrow version plus
@@ -231,6 +357,12 @@ static inline int policy_index(int pt, int from_i, int to_i, int promo) {
 //transformer uses. Training keeps it dense; the GPU does not care.
 struct NNUEPolicyImpl : torch::nn::Module {
     torch::Tensor W1, b1, W2, b2, emb;
+#if SPATIAL
+    torch::Tensor Wu, Wv;
+#if SPATIAL == 2
+    torch::Tensor Wc1, bc1, Wc2, bc2;
+#endif
+#endif
 #if LEGAL_BIAS == 1
     torch::Tensor Wl;
 #elif LEGAL_BIAS == 2
@@ -247,6 +379,31 @@ struct NNUEPolicyImpl : torch::nn::Module {
         W2  = register_parameter("W2",  u({h1, h2}, h1));
         b2  = register_parameter("b2",  torch::zeros({h2}));
         emb = register_parameter("emb", u({nmoves, h2}, h2));
+#if SPATIAL
+        //Wu random, Wv ZERO. The term contributes exactly nothing at step 0, so the model starts at
+        //the incumbent's behaviour and any movement in held-out Top-6 is something it learned. Both
+        //at zero would be a dead parameter: d(u.v)/dWu is proportional to v. The v side is also
+        //deliberately NOT passed through a relu -- see spatial(), where zero-init plus relu killed
+        //the gradient entirely on the first attempt.
+#if SPATIAL == 2
+        //Two 3x3 layers over the 8x8 board, then the same per-square readout. Only the v head is
+        //zeroed: with it at zero the whole term is zero, so the convolutions get no gradient until
+        //v moves off the origin. That is a warm-up rather than a dead parameter -- the gradient to
+        //the v head itself is proportional to u and the features, neither of which is zero -- and
+        //LEGAL_BIAS demonstrates a zero-init term can grow within a single shard when it is useful.
+        Wc1 = register_parameter("Wc1", u({SPATIAL_CH, SPATIAL_PLANES, 3, 3}, SPATIAL_PLANES * 9));
+        bc1 = register_parameter("bc1", torch::zeros({SPATIAL_CH}));
+#if SPATIAL_LAYERS >= 2
+        Wc2 = register_parameter("Wc2", u({SPATIAL_CH, SPATIAL_CH, 3, 3}, SPATIAL_CH * 9));
+        bc2 = register_parameter("bc2", torch::zeros({SPATIAL_CH}));
+#endif
+        Wu  = register_parameter("Wu", u({SPATIAL_CH, SPATIAL_DIM}, SPATIAL_CH));
+        Wv  = register_parameter("Wv", torch::zeros({SPATIAL_CH, SPATIAL_DIM}));
+#else
+        Wu = register_parameter("Wu", u({SPATIAL_PLANES, SPATIAL_DIM}, SPATIAL_PLANES));
+        Wv = register_parameter("Wv", torch::zeros({SPATIAL_PLANES, SPATIAL_DIM}));
+#endif
+#endif
 #if LEGAL_BIAS
         //ZERO, deliberately. With the term's weights at 0 it contributes exactly nothing and the
         //output is identical to a net trained without it, so a fine-tune STARTS at the incumbent's
@@ -260,22 +417,85 @@ struct NNUEPolicyImpl : torch::nn::Module {
 #endif
 #endif
     }
-    // x [B, NNUE_DIMS] -> [B, POLICY_H2]
+    // x [B, SAMPLE_IN] -> [B, POLICY_H2]. Only the NNUE features feed the trunk; the planes that
+    // follow them are the spatial term's input and are sliced off separately.
     torch::Tensor trunk(torch::Tensor x) {
-        auto h = torch::relu(torch::matmul(x, W1) + b1);
+        auto f = (x.size(1) > NNUE_DIMS) ? x.slice(1, 0, NNUE_DIMS) : x;
+        auto h = torch::relu(torch::matmul(f, W1) + b1);
         return torch::relu(torch::matmul(h, W2) + b2);
     }
+#if SPATIAL
+    // The per-square term. x [B, SAMPLE_IN] -> [B, 4096] laid out as from*64 + to, which is exactly
+    // the readout's own indexing, so it adds straight onto the logits.
+    //
+    //   planes [B, 14, 64] -> per square a 14-vector -> u,v [B, 64, d] -> u @ v^T [B, 64, 64]
+    //
+    // That last product is every (from, to) pair at once: B*64*64*d multiply-adds, about an eighth
+    // of the existing ctx @ emb^T readout at d=16.
+    torch::Tensor spatial(torch::Tensor x) {
+        const int64_t B = x.size(0);
+#if SPATIAL == 2
+        auto img = x.slice(1, NNUE_DIMS, NNUE_DIMS + SPATIAL_IN)
+#if SPATIAL_SCALE
+                    .mul(127.0f)
+#endif
+                    .view({B, SPATIAL_PLANES, 8, 8});
+        auto h1c = torch::relu(torch::conv2d(img, Wc1, bc1, 1, 1));   // [B, CH, 8, 8]
+#if SPATIAL_LAYERS >= 2
+        h1c = torch::relu(torch::conv2d(h1c, Wc2, bc2, 1, 1));        // [B, CH, 8, 8]
+#endif
+        auto planes = h1c.view({B, SPATIAL_CH, 64}).transpose(1, 2);  // [B, 64, CH]
+#else
+        auto planes = x.slice(1, NNUE_DIMS, NNUE_DIMS + SPATIAL_IN)
+#if SPATIAL_SCALE
+                       .mul(127.0f)
+#endif
+                       .view({B, SPATIAL_PLANES, 64})
+                       .transpose(1, 2);                       // [B, 64, planes]
+#endif
+        auto uu = torch::relu(torch::matmul(planes, Wu));       // [B, 64, d]
+        //NO RELU ON v, and that is not a style choice. Wv starts at zero so the term contributes
+        //nothing at step 0; with a relu the pre-activation is then EXACTLY zero, where the
+        //subgradient is also zero, so no gradient ever reaches Wv and the unit is dead from birth.
+        //The first run of this measured "Spatial term: 0% of |logits|" -- the term never left its
+        //initialisation, and the held-out numbers said nothing about the idea. Linear v keeps both
+        //properties that matter: the term is still exactly zero at init, and d(term)/dWv is
+        //proportional to uu and the planes, neither of which is zero.
+        auto vv = torch::matmul(planes, Wv);                    // [B, 64, d]
+        return torch::matmul(uu, vv.transpose(1, 2)).reshape({B, 64 * 64});
+    }
+#endif
     // x [B, NNUE_DIMS] -> [B, POLICY_OUT]. No legality: BENCH_FORWARD times the trunk alone,
     // and a caller without a mask gets exactly the pre-LEGAL_BIAS behaviour.
     torch::Tensor forward(torch::Tensor x) {
-        return torch::matmul(trunk(x), emb.transpose(0, 1));
+        auto logits = torch::matmul(trunk(x), emb.transpose(0, 1));
+#if SPATIAL
+        //Included here too: this path is what BENCH_FORWARD times, and timing the model without a
+        //term the real path pays for would report a cost the engine never sees.
+        if (x.size(1) >= NNUE_DIMS + SPATIAL_IN) {
+#if SPATIAL_TILE > 1
+            //BROADCAST, NEVER repeat(). Under piece indexing logits is [B, 24576]; at batch 8192
+            //that is already 805 MB of float32, and repeat() materialises a SECOND tensor of the
+            //same size purely to hold six identical copies of a 4096-wide term. On an 8 GB unified
+            //memory machine that alone took training from 45,000 positions a second to 889.
+            //Viewing logits as [B, 6, 4096] and unsqueezing the term to [B, 1, 4096] adds the same
+            //values with no intermediate at all.
+            logits = (logits.view({logits.size(0), SPATIAL_TILE, 64 * 64})
+                      + spatial(x).unsqueeze(1)).view({logits.size(0), -1});
+#else
+            logits = logits + spatial(x);
+#endif
+        }
+#endif
+        return logits;
     }
     // mask [B, POLICY_OUT], 1.0 on each legal move. See the LEGAL_BIAS note above.
     // If `share` is non-null it receives the mean |legality term| / mean |ctx| for this batch --
     // the one number that says whether the term is doing anything at all. A variant that scores
     // like the baseline because Wl never left zero is not evidence about legality; it is evidence
     // that nothing was tested. Report it rather than infer it.
-    torch::Tensor forward(torch::Tensor x, const torch::Tensor& mask, double* share = nullptr) {
+    torch::Tensor forward(torch::Tensor x, const torch::Tensor& mask, double* share = nullptr,
+                          double* share2 = nullptr) {
         auto ctx = trunk(x);
 #if LEGAL_BIAS
         auto n = mask.sum(1, /*keepdim=*/true).clamp_min(1.0f);   // [B,1] legal move count
@@ -292,7 +512,32 @@ struct NNUEPolicyImpl : torch::nn::Module {
 #else
         if (share) *share = 0.0;
 #endif
-        return torch::matmul(ctx, emb.transpose(0, 1));
+        auto logits = torch::matmul(ctx, emb.transpose(0, 1));
+#if SPATIAL
+        //Reported for the same reason the legality term is: a term that never left its zero
+        //initialisation is indistinguishable, from the held-out numbers alone, from one that
+        //learned nothing useful -- and that ambiguity is exactly what hid LEGAL_BIAS having never
+        //actually been exercised in the shipped net. If this reads 0%, the gradient is not
+        //arriving and the result says nothing about the idea.
+        auto sp = spatial(x);
+        if (share2) {
+            //Measured on the UNtiled term: tiling repeats the same values six times, so the mean of
+            //their absolute value is identical and the copy would be for nothing.
+            const double a = logits.abs().mean().item<double>();
+            *share2 = a > 0.0 ? sp.abs().mean().item<double>() / a : 0.0;
+        }
+        //Added to all six per-piece blocks by broadcasting; see SPATIAL_TILE and the note in
+        //forward() about why this must not be a repeat().
+#if SPATIAL_TILE > 1
+        logits = (logits.view({logits.size(0), SPATIAL_TILE, 64 * 64})
+                  + sp.unsqueeze(1)).view({logits.size(0), -1});
+#else
+        logits = logits + sp;
+#endif
+#else
+        if (share2) *share2 = 0.0;
+#endif
+        return logits;
     }
 };
 TORCH_MODULE(NNUEPolicy);
@@ -834,10 +1079,81 @@ public:
     }
     //Kept as uint8: 1 KB per sample instead of 4, and a quarter of the host-to-device
     //traffic. Scaled to [0,1] on the GPU, where the divide is free.
-    torch::Tensor input = torch::empty({NNUE_DIMS}, torch::kUInt8);
+    torch::Tensor input = torch::empty({SAMPLE_IN}, torch::kUInt8);
     {
       unsigned char * d = input.data_ptr<unsigned char>();
       for (int i = 0; i < NNUE_DIMS; ++i) d[i] = (i < got) ? raw[i] : 0;
+#if SPATIAL
+      //THE PLANES, appended so the Example type and the batching are untouched; the model slices
+      //them back out. Squares are ORIENTED exactly as the move index is (mirrored by ^56 for
+      //Black) and pieces are OWN/ENEMY rather than white/black, so the model sees one geometry
+      //instead of two -- the same convention policy_index() already uses.
+      unsigned char * pl = d + NNUE_DIMS;
+      std::memset(pl, 0, SPATIAL_IN);
+      for (int sq = 0; sq < 64; ++sq) {
+        const int pc = board.piecesOnSquares[sq];
+        const int ty = pc & 7;
+        if (ty < Pawn || ty > King) continue;             // empty, or the none/any sentinels
+        const bool own   = ((pc >> 3) & 1) == (int)board.sideToMove;
+        const int  plane = (own ? 0 : 6) + (ty - Pawn);
+        pl[plane * 64 + (is_black ? (sq ^ 56) : sq)] = 1;
+      }
+      //Planes 12 and 13: where a legal move starts, and where one lands. legal_idx already holds
+      //policy indices over oriented squares, so this needs no second move generation.
+      for (int i = 0; i < n_legal; ++i) {
+        pl[12 * 64 + (legal_idx[i] >> 6)] = 1;
+        pl[13 * 64 + (legal_idx[i] & 63)] = 1;
+      }
+#if SPATIAL_ATTACK
+      //SQUARE CONTENTION. Every square each side attacks, INCLUDING empty ones -- which is the
+      //whole point, since that is the case the NNUE threat features drop. Pawn attacks come from a
+      //shift of the pawn bitboard; everything else from attacks_bb<> over the current occupancy,
+      //the same call board.cpp uses to generate moves. About 32 lookups per position.
+      {
+        const uint64_t occ = board.side[ColorWhite] | board.side[ColorBlack];
+        for (int c = 0; c < 2; ++c) {
+          const bool own = ((Color)c == board.sideToMove);
+          for (PieceType pt = Pawn; pt <= King; pt = (PieceType)(pt + 1)) {
+            uint64_t bb = board.side[c] & board.pieceTypes[pt - 1];
+            uint64_t att = 0;
+            if (pt == Pawn) {
+              att = (c == ColorWhite) ? (((bb & ~files_bb[7]) << 9) | ((bb & ~files_bb[0]) << 7))
+                                      : (((bb & ~files_bb[0]) >> 9) | ((bb & ~files_bb[7]) >> 7));
+            } else {
+              while (bb) {
+                const int sq = lsBit(bb); bb &= bb - 1;
+                switch (pt) {
+                  case Knight: att |= Stockfish::attacks_bb<Stockfish::KNIGHT>((Stockfish::Square)sq); break;
+                  case Bishop: att |= Stockfish::attacks_bb<Stockfish::BISHOP>((Stockfish::Square)sq, occ); break;
+                  case Rook:   att |= Stockfish::attacks_bb<Stockfish::ROOK>((Stockfish::Square)sq, occ); break;
+                  case Queen:  att |= Stockfish::attacks_bb<Stockfish::BISHOP>((Stockfish::Square)sq, occ)
+                                    | Stockfish::attacks_bb<Stockfish::ROOK>((Stockfish::Square)sq, occ); break;
+                  default:     att |= Stockfish::attacks_bb<Stockfish::KING>((Stockfish::Square)sq); break;
+                }
+              }
+            }
+#if SPATIAL_ATTACK == 12
+            const int plane = 14 + (own ? 0 : 6) + (pt - Pawn);
+            while (att) {
+              const int sq = lsBit(att); att &= att - 1;
+              pl[plane * 64 + (is_black ? (sq ^ 56) : sq)] = 1;
+            }
+#else
+            //Two planes: a COUNT of attackers per square, saturating at 255. Counting rather than
+            //flagging is what makes it contention -- one defender and three is the difference
+            //between a square being safe and not.
+            const int plane = 14 + (own ? 0 : 1);
+            while (att) {
+              const int sq = lsBit(att); att &= att - 1;
+              unsigned char * cell = &pl[plane * 64 + (is_black ? (sq ^ 56) : sq)];
+              if (*cell < 255) ++(*cell);
+            }
+#endif
+          }
+        }
+      }
+#endif
+#endif
     }
 
     if (prof) {
@@ -1866,6 +2182,7 @@ int main() {
             //not, so this is both deterministic and the mean it always claimed to be.
             double test_pol_sum = 0.0, test_pol_n = 0.0;
             double lb_share_sum = 0.0; size_t lb_share_n = 0;
+            double sp_share_sum = 0.0; size_t sp_share_n = 0;
             double mean_cp_error_total = 0.0, sign_accuracy_total = 0.0;
             double pol_top1 = 0.0, pol_top4 = 0.0, pol_top6 = 0.0, pol_total = 0.0;
             // Same metrics split by how many PV moves the position carries. 57% of records
@@ -1907,9 +2224,10 @@ int main() {
                     // Cast BEFORE masking: -1e9 is not representable in half.
                     auto mask   = legality_mask_dims(data.size(0), POLICY_OUT, data.options(),
                                                      tg.legal_idx);
-                    double lb_share = 0.0;
-                    auto policy_logits = model->forward(data, mask, &lb_share).to(torch::kFloat32);
+                    double lb_share = 0.0, sp_share = 0.0;
+                    auto policy_logits = model->forward(data, mask, &lb_share, &sp_share).to(torch::kFloat32);
                     lb_share_sum += lb_share; ++lb_share_n;
+                    sp_share_sum += sp_share; ++sp_share_n;
 
                     // --- Policy metrics, over legal moves only ---
                     auto masked = policy_logits.masked_fill(mask < 0.5f, -1e9f);
@@ -1968,6 +2286,11 @@ int main() {
                       << "% of |ctx|  (0% = the term is still at zero, so nothing was tested)\n";
 #endif
             
+#if SPATIAL
+            std::cout << "    Spatial term:    "
+                      << (sp_share_n ? 100.0 * sp_share_sum / sp_share_n : 0.0)
+                      << "% of |logits|  (0% = Wv never left zero, so nothing was tested)\n";
+#endif
             std::cout << "    Avg CP Error:    " << avg(mean_cp_error_total) << " centipawns\n";
             std::cout << "    Sign Accuracy:   " << avg(sign_accuracy_total) << "%\n";
             //WHICH TARGET, AND WHICH BASELINE. The 26.9/65.5/77.4 figures were measured by
