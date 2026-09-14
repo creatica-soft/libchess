@@ -1228,16 +1228,35 @@ In a controlled benchmark — fill the tree for 30 s, play a pawn move each that
 unreachable, search 2 s — the old build spent 266–398 ms collecting and searched 415–527 million
 simulations; the new build spent under 1 ms and searched 503–579 million.
 
-**What it still costs.** The map walk holds the whole map's lock for each short step, and every
-search thread needs that lock to create a node, so the search runs slower for as long as the walk
-lasts: typically 120–400 ms per collection that freed something. It is skipped when nothing was
-freed. Moving the walk and the reaper onto macOS's efficiency cores (`QOS_CLASS_UTILITY`) was tried and
-reverted: in one of three runs the walk took 1.9 s on a slow core while holding the lock, and the
-search behind it fell to 74,000 simulations a second.
+**The map is locked by range, not as a whole.** With one lock for the whole map, every step of the
+background walk stopped every search thread that wanted to create a node: the search after a collection
+fell to about 200,000 simulations a second, against 340,000 otherwise, for as long as the walk lasted.
+Moving the walk and the reaper onto macOS's efficiency cores (`QOS_CLASS_UTILITY`) made it worse, not
+better: in one of three runs the walk took 1.9 s on a slow core while holding the lock, and the search
+behind it fell to 74,000 a second.
+
+So `NodeMap` now locks itself, with 1,024 locks each covering one contiguous stretch of slots. A lookup
+or insert locks the stretch its probe starts in, and the next only if the probe runs into it; the walk
+locks one stretch at a time; growth and clearing lock all of them. Locks are always taken in increasing
+order, so probes no longer wrap from the end of the table to the start — a run that would wrap spills
+into a 1,024-slot tail instead, and one that reaches the end forces a rebuild. A rebuild is now sized
+from the entries that are still valid, so a table full of stale entries is compacted rather than
+doubled.
+
+| 2 s search right after a large collection (controlled test above) | simulations |
+|---|---|
+| sweep on the clock | 415–527 million |
+| background sweep, one map lock | 503–579 million |
+| background sweep, range locks | 542–631 million |
+
+In a replay of `QHWLWAbv` the searches that followed a collection ran at 249,000 simulations a second
+against 273,000 for the rest, a 9% difference where the single lock had cost 42%.
 
 Validated with `ValidateTree`, `CREATICA_VERIFY_KIDS` and `CREATICA_VERIFY_FUTILE` over a full replay at
 `Hash` 1024 and with a reset forced before every search: no invariant violations, no exact-futility
-failures, and no child-table errors. `CREATICA_MAP_CLEAN=0` skips the map walk, for measurement.
+failures, and no child-table errors — for the single-lock version and again for the range-locked one,
+which ran 52 searches with every check on and 39 with a reset forced before each. `CREATICA_MAP_CLEAN=0`
+skips the map walk, for measurement.
 
 
 ## Running comparisons

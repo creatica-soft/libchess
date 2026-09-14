@@ -398,10 +398,25 @@ struct NodeArena {
 // The index is simply the low bits of the key, which is what NoOpHash already did for
 // unordered_map -- Zobrist hashes are well distributed, so no mixing is needed.
 //
-// LOCKING IS UNCHANGED and remains the caller's job: shared_lock on map_mutex to look up, unique
-// _lock to insert. One rule is stricter than before, though. A rehash REALLOCATES the slot array,
-// so an iterator or a Slot& is only valid while the lock is held -- copy the MCTSNode* out before
-// unlocking, never dereference an iterator afterwards.
+// LOCKING IS INTERNAL AND BY RANGE. Callers take no lock.
+//
+// It used to be one shared_mutex held by the caller: shared to look up, exclusive to insert. That was
+// fine while nothing but the search touched the table, but the background sweep has to rewrite it while
+// the search runs, and under a single lock every step of that rewrite stopped every search thread that
+// wanted to create a node -- measured as the search after a collection falling from roughly 340,000 to
+// 200,000 simulations a second for as long as the walk lasted.
+//
+// So the table is guarded by LOCKS locks, each covering one contiguous stretch of slots. A lookup or
+// insert locks the stretch its probe starts in, and the next one only if the probe runs on into it;
+// the background clean locks one stretch at a time; a rebuild (growth, clear) locks all of them. Every
+// thread acquires locks in increasing index order, so no set of them can deadlock -- which is why
+// probes do not wrap from the end of the table to the start. A run that would wrap spills into a TAIL
+// of extra slots instead, and a run that reaches the very end forces a rebuild.
+//
+// The table's pointer and size change only under all the locks, and a rebuild bumps `epoch_` before
+// releasing them. A reader takes its first lock and then checks the epoch it started with: if a rebuild
+// happened in between, it starts again. Holding any lock guarantees no rebuild can run, so a Slot& is
+// valid for as long as the operation holds its locks, and not after.
 class NodeMap {
   public:
     // HASH -> NODE AS AN INDEX AND A STAMP, NOT A POINTER.
@@ -416,8 +431,9 @@ class NodeMap {
     // that instant. The cold work -- reading the node, releasing its edges, wiping and returning
     // the slot -- moves to the reaper, off the move's clock.
     //
-    // AN ENTRY IS VALID WHEN BOTH HOLD:
-    //   gen[idx] == stamp     the slot has not been freed or re-stamped since we recorded it
+    // AN ENTRY IS VALID WHEN ALL HOLD:
+    //   tag[idx] == stamp        the slot has not been freed or handed to a new node since we recorded it
+    //   gen[idx] >= visible_gen  the node was reached by the latest mark, or created since (see NodeArena)
     //   slots[idx].hash == key   the slot has not been recycled for a different position
     // The stamp alone is not enough: a slot can be freed and handed to a new node within the same
     // generation, which would leave gen[idx] equal to the stamp we stored while the occupant is a
@@ -426,137 +442,184 @@ class NodeMap {
     // The stamp alone IS enough to spot a stale slot cheaply, which is all the insert path needs.
     struct Slot { uint64_t key = 0; uint32_t idx = 0; uint32_t stamp = 0; };
 
+    // Range locks, and the tail that replaces wrap-around. See LOCKING above.
+    static constexpr size_t LOCKS = 1024;
+    static constexpr size_t TAIL  = 1024;
+
     NodeMap() = default;
-    ~NodeMap() { delete[] slots_; }
+    ~NodeMap() { delete[] slots_.load(std::memory_order_relaxed); }
     NodeMap(const NodeMap&)            = delete;
     NodeMap& operator=(const NodeMap&) = delete;
 
     void bind(NodeArena * a) { arena_ = a; }
 
-    // Entries INSERTED since the last rebuild. Stale ones are not counted down -- nothing walks
-    // this table to find them any more -- so this is an upper bound and must not be used as the
-    // node count. NodeArena::live() is the authority on that.
-    size_t entries() const noexcept { return size_; }
+    // Entries INSERTED since the last rebuild. Stale ones are not counted down, so this is an upper bound
+    // and must not be used as the node count.
+    size_t entries() const noexcept { return size_.load(std::memory_order_relaxed); }
 
-    void clear() { delete[] slots_; slots_ = nullptr; cap_ = size_ = used_ = 0; ++epoch_; }
+    void clear() {
+        lock_all();
+        delete[] slots_.load(std::memory_order_relaxed);
+        slots_.store(nullptr, std::memory_order_relaxed);
+        cap_.store(0, std::memory_order_relaxed);
+        shift_.store(0, std::memory_order_relaxed);
+        size_.store(0, std::memory_order_relaxed);
+        used_.store(0, std::memory_order_relaxed);
+        epoch_.fetch_add(1, std::memory_order_relaxed);
+        unlock_all();
+    }
 
-    // Bumped whenever the table is rebuilt or emptied, so a background clean in progress can tell that
-    // the slots it was walking no longer exist.
-    uint64_t epoch() const noexcept { return epoch_; }
+    // Bumped by every rebuild and clear, under all the locks.
+    uint64_t epoch() const noexcept { return epoch_.load(std::memory_order_relaxed); }
 
-    // nullptr when the key is absent, or its node has been freed, or its slot has been recycled.
+    // nullptr when the key is absent, or its node has been freed, is invisible, or its slot was recycled.
     MCTSNode * lookup(uint64_t key) const {
-        if (!cap_) return nullptr;
-        size_t i = key & (cap_ - 1);
         for (;;) {
-            const Slot & s = slots_[i];
-            if (s.stamp == 0) return nullptr;          // never written: the key is not here
-            if (s.key == key) { MCTSNode * n = resolve(s, key); if (n) return n; }
-            i = (i + 1) & (cap_ - 1);                  // collision, or a stale entry for this key
+            const uint64_t e   = epoch_.load(std::memory_order_acquire);
+            const size_t   cap = cap_.load(std::memory_order_acquire);
+            if (!cap) return nullptr;
+            const unsigned sh  = shift_.load(std::memory_order_acquire);
+            size_t j = key & (cap - 1);
+            const size_t lo = j >> sh;
+            size_t hi = lo;
+            locks_[lo].lock_shared();
+            if (epoch_.load(std::memory_order_acquire) != e) { unlock_shared(lo, hi); continue; }
+            const Slot * t = slots_.load(std::memory_order_acquire);
+            const size_t end = cap + TAIL;
+            MCTSNode * found = nullptr;
+            for (; j < end; ++j) {
+                if ((j >> sh) > hi) { ++hi; locks_[hi].lock_shared(); }
+                const Slot & s = t[j];
+                if (s.stamp == 0) break;                   // never written: the key is not here
+                if (s.key == key) { MCTSNode * n = resolve(s, key); if (n) { found = n; break; } }
+            }
+            unlock_shared(lo, hi);
+            return found;
         }
     }
 
-    // Returns (the node now filed under key, whether it was ours). Never fails: it grows first.
+    // Returns (the node now filed under key, whether it was ours). Never fails: it rebuilds first if needed.
     std::pair<MCTSNode *, bool> insert(uint64_t key, MCTSNode * n) {
-        if (!cap_ || (used_ + 1) * 10 >= cap_ * 7) grow();
-        size_t i = key & (cap_ - 1);
-        Slot * reuse = nullptr;
         for (;;) {
-            Slot & s = slots_[i];
-            if (s.stamp == 0) {
-                Slot * dst = reuse ? reuse : &s;
-                if (!reuse) ++used_;                   // a reused stale slot was already counted
+            if (needs_growth()) grow(false);
+            const uint64_t e   = epoch_.load(std::memory_order_acquire);
+            const size_t   cap = cap_.load(std::memory_order_acquire);
+            if (!cap) continue;
+            const unsigned sh  = shift_.load(std::memory_order_acquire);
+            size_t j = key & (cap - 1);
+            const size_t lo = j >> sh;
+            size_t hi = lo;
+            locks_[lo].lock();
+            if (epoch_.load(std::memory_order_acquire) != e) { unlock(lo, hi); continue; }
+            Slot * t = slots_.load(std::memory_order_acquire);
+            const size_t end = cap + TAIL;
+            Slot * reuse = nullptr;
+            for (; j < end; ++j) {
+                if ((j >> sh) > hi) { ++hi; locks_[hi].lock(); }
+                Slot & s = t[j];
+                if (s.stamp == 0) break;
+                if (s.key == key) {
+                    if (MCTSNode * w = resolve(s, key)) { unlock(lo, hi); return { w, false }; }
+                }
+                // Cheap staleness only -- tag and visibility, no node read.
+                if (!reuse && !valid(s)) reuse = &s;
+            }
+            // The key is not in its run. File it in the first stale slot the probe passed, or the empty slot
+            // that ended the run. A run that reached the end of the tail with no stale slot needs a rebuild.
+            Slot * dst = reuse ? reuse : (j < end ? &t[j] : nullptr);
+            if (dst) {
+                if (!reuse) used_.fetch_add(1, std::memory_order_relaxed);
                 dst->key   = key;
                 dst->idx   = arena_->index_of(n);
-                dst->stamp = arena_->stamp_of(n);      // so n must be stamped BEFORE it is filed
-                ++size_;
+                dst->stamp = arena_->stamp_of(n);          // so n must be stamped BEFORE it is filed
+                size_.fetch_add(1, std::memory_order_relaxed);
+                unlock(lo, hi);
                 return { n, true };
             }
-            if (s.key == key) { MCTSNode * w = resolve(s, key); if (w) return { w, false }; }
-            // Cheap staleness only -- tag and visibility, no node read. Missing a recycled-but-
-            // same-generation slot costs one unreused entry, which the next rebuild reclaims.
-            if (!reuse && !valid(s)) reuse = &s;
-            i = (i + 1) & (cap_ - 1);
+            unlock(lo, hi);
+            grow(true);
         }
     }
 
-    // THE MAP'S SHARE OF THE SWEEP, in bounded steps, for the background sweeper. The caller holds
-    // map_mutex exclusively for one call and releases it between calls, so searching threads interleave.
-    //
-    // This used to be compact(), a scan of the whole table plus a rehash, run before the search: measured
-    // at 112-719 ms a collection at Hash 2048, by far the larger part of the sweep. It now happens in place
-    // while the search runs.
+    // THE MAP'S SHARE OF THE SWEEP, one lock range at a time, for the background sweeper.
     //
     // Linear probing cannot simply empty a stale slot: a later entry may have probed past it, and emptying
-    // it would cut that entry off from its home. So the work is done a CLUSTER at a time -- a maximal run
-    // of occupied slots with an empty slot on each side. Every entry in such a run has its home inside it,
-    // so the run can be emptied and its valid entries reinserted from their homes, and they are guaranteed
-    // to fit back inside the same run (for any home h, at most end-h entries of the run have homes >= h).
+    // it would cut that entry off from its home. So the work is done a RUN at a time -- a maximal stretch of
+    // occupied slots with an empty slot (or the start of the table) before it. Every entry in such a run
+    // has its home inside it, so the run can be emptied and its valid entries reinserted from their homes,
+    // and they fit back inside the same run (for any home h, at most end-h entries of the run have homes
+    // >= h). This call owns the runs that START in range `li`: it takes range li-1 shared, to see whether
+    // the first slot continues a run from there, range li exclusively, and further ranges exclusively as a
+    // run extends into them -- always in increasing order.
     //
-    // WHICH ENTRIES ARE STALE comes from `retired`, one bit per arena slot, set by the sweep for every slot it
-    // just retired. Testing a bit in a 4 MB array replaces reading tag[] and gen[] -- 268 MB between them,
-    // at random -- for every entry, which made each locked step cost about 14 ns per table slot and stalled
-    // the search for the whole walk. It is exact only because the sweep holds its retired slots back from the
-    // reaper until the walk is over: a retired slot cannot be handed to a new node and refiled meanwhile, so
-    // every entry pointing at one is stale. Stale entries left from earlier sweeps are not dropped here; they
-    // cost nothing but a probe, and insert() reuses them.
+    // WHICH ENTRIES ARE STALE comes from `retired`, one bit per arena slot, set by the sweep for every slot
+    // it just retired: a 4 MB bitmap instead of reading tag[] and gen[] for every entry. It is exact only
+    // because the sweep holds its retired slots back from the reaper until the walk is over, so no retired
+    // slot can be refiled meanwhile. Stale entries left from earlier sweeps are not dropped here; they cost
+    // a probe, and insert() reuses them.
     //
-    // `cursor` sits on an empty slot and is where the walk resumes; `scanned` counts slots covered since the
-    // start. Returns true when the walk has gone once round the table, or when `epoch` shows a rebuild in
-    // between -- a rebuild already dropped every stale entry.
-    bool clean_step(size_t & cursor, size_t & scanned, uint64_t epoch, size_t budget, size_t & dropped,
-                    std::vector<Slot> & keep, const uint64_t * retired) {
-        if (epoch != epoch_ || !cap_) return true;
-        const size_t mask = cap_ - 1;
-        // An insert between two steps may have filled the empty slot we were standing on. The run after it
-        // is then no longer bounded on the left, so move on to the next empty slot without cleaning.
-        while (slots_[cursor].stamp != 0) {
-            cursor = (cursor + 1) & mask;
-            if (++scanned >= cap_) return true;
-        }
-        size_t work = 0;
-        while (work < budget) {
-            if (scanned >= cap_) return true;
-            const size_t a = (cursor + 1) & mask;
-            if (slots_[a].stamp == 0) { cursor = a; ++scanned; ++work; continue; }
+    // Returns false when `epoch` shows a rebuild or clear since the walk began: a rebuild already dropped
+    // every stale entry, so the walk is over.
+    bool clean_range(size_t li, uint64_t epoch, size_t & dropped, std::vector<Slot> & keep,
+                     const uint64_t * retired) {
+        const size_t cap = cap_.load(std::memory_order_acquire);
+        if (!cap || epoch_.load(std::memory_order_acquire) != epoch) return false;
+        const unsigned sh  = shift_.load(std::memory_order_acquire);
+        const size_t   end = cap + TAIL;
+        const size_t first = li << sh;
+        if (first >= end) return true;
+        if (li > 0) locks_[li - 1].lock_shared();
+        locks_[li].lock();
+        size_t hi = li;
+        auto release = [&] {
+            for (size_t r = li; r <= hi; ++r) locks_[r].unlock();
+            if (li > 0) locks_[li - 1].unlock_shared();
+        };
+        if (epoch_.load(std::memory_order_acquire) != epoch) { release(); return false; }
+        Slot * t = slots_.load(std::memory_order_acquire);
+        const size_t range_end = std::min(end, (li + 1) << sh);
+        size_t j = first;
+        if (li > 0 && t[first - 1].stamp != 0)            // a run from the previous range: not ours
+            while (j < range_end && t[j].stamp != 0) ++j;
+        while (j < range_end) {
+            if (t[j].stamp == 0) { ++j; continue; }
+            const size_t a = j;
             size_t len = 0;
             keep.clear();
-            for (size_t k = a; slots_[k].stamp != 0; k = (k + 1) & mask) {
-                const uint32_t x = slots_[k].idx;
-                if (!((retired[x >> 6] >> (x & 63)) & 1)) keep.push_back(slots_[k]);
+            for (size_t k = a; k < end && t[k].stamp != 0; ++k) {
+                if ((k >> sh) > hi) { ++hi; locks_[hi].lock(); }
+                const uint32_t x = t[k].idx;
+                if (!((retired[x >> 6] >> (x & 63)) & 1)) keep.push_back(t[k]);
                 ++len;
             }
             if (keep.size() < len) {
-                for (size_t k = 0; k < len; ++k) slots_[(a + k) & mask] = Slot{};
-                used_ -= len;
                 const size_t gone = len - keep.size();
-                size_  = size_ > gone ? size_ - gone : 0;
-                dropped += gone;
+                for (size_t k = 0; k < len; ++k) t[a + k] = Slot{};
                 for (const Slot & s : keep) {
-                    size_t j = s.key & mask;
-                    while (slots_[j].stamp) j = (j + 1) & mask;
-                    slots_[j] = s;
-                    ++used_;
+                    size_t q = s.key & (cap - 1);
+                    while (t[q].stamp) ++q;
+                    t[q] = s;
                 }
+                used_.fetch_sub(gone, std::memory_order_relaxed);
+                size_.fetch_sub(gone, std::memory_order_relaxed);   // size_ >= used_ >= gone, always
+                dropped += gone;
             }
-            cursor   = (a + len) & mask;          // the empty slot that ended the run
-            scanned += len + 1;
-            work    += len + 1;
+            j = a + len;
         }
-        return false;
-    }
-
-    // An empty slot to start cleaning from. There is always one: the table never passes 70% occupancy.
-    size_t first_empty() const {
-        for (size_t i = 0; i < cap_; ++i) if (slots_[i].stamp == 0) return i;
-        return 0;
+        release();
+        return true;
     }
 
     void reserve(size_t n) {
-        size_t want = 16;
+        lock_all();
+        size_t want = 1024;
         while (want * 7 < n * 10) want <<= 1;
-        if (want > cap_) rehash(want);
+        if (want > cap_.load(std::memory_order_relaxed)) rehash_locked(want);
+        unlock_all();
     }
+
+    // Diagnostics: how often the table has been rebuilt, and the time spent doing it under all the locks.
+    inline static std::atomic<uint64_t> rehashes{0}, rehash_us{0};
 
   private:
     // Still filed for the node we recorded, and that node was reached by the latest mark or created since.
@@ -571,45 +634,79 @@ class NodeMap {
         return n->hash.load(std::memory_order_relaxed) == key ? n : nullptr;
     }
 
-    void grow() {
-        size_t ncap = cap_ ? cap_ : 1024;
-        while ((size_ + 1) * 10 >= ncap * 7) ncap <<= 1;
-        rehash(ncap);
+    bool needs_growth() const {
+        const size_t cap = cap_.load(std::memory_order_relaxed);
+        return !cap || (used_.load(std::memory_order_relaxed) + 1) * 10 >= cap * 7;
     }
 
-    void rehash(size_t ncap) {
+    void lock_all() const   { for (size_t r = 0; r < LOCKS; ++r) locks_[r].lock(); }
+    void unlock_all() const { for (size_t r = LOCKS; r-- > 0; ) locks_[r].unlock(); }
+    void unlock(size_t lo, size_t hi) const        { for (size_t r = lo; r <= hi; ++r) locks_[r].unlock(); }
+    void unlock_shared(size_t lo, size_t hi) const { for (size_t r = lo; r <= hi; ++r) locks_[r].unlock_shared(); }
+
+    // Under all the locks. Sized from the entries that are still VALID, not from size_: after a large
+    // collection most entries are stale, and a table that only needs rebuilding must not be doubled. Never
+    // shrinks, and leaves the table at most 60% full. `force` is for a run that reached the end of the
+    // tail, which a rebuild at the same size may not cure.
+    void grow(bool force) {
+        lock_all();
+        const size_t cap = cap_.load(std::memory_order_relaxed);
+        if (force || needs_growth()) {
+            size_t live = 0;
+            if (const Slot * t = slots_.load(std::memory_order_relaxed))
+                for (size_t i = 0; i < cap + TAIL; ++i) if (t[i].stamp && valid(t[i])) ++live;
+            size_t ncap = cap ? cap : 1024;
+            while (live * 10 >= ncap * 6) ncap <<= 1;          // at most 60% full, below the 70% trigger
+            if (force && ncap == cap) ncap <<= 1;
+            rehash_locked(ncap);
+        }
+        unlock_all();
+    }
+
+    // Under all the locks: rebuild at ncap slots plus the tail, keeping only valid entries.
+    void rehash_locked(size_t ncap) {
         const auto rt0 = std::chrono::steady_clock::now();
-        Slot * old = slots_;
-        const size_t oc = cap_;
-        slots_ = new Slot[ncap];
-        cap_   = ncap;
-        size_  = used_ = 0;
-        for (size_t i = 0; i < oc; ++i) {
-            const Slot & s = old[i];
-            if (!s.stamp) continue;
-            if (!valid(s)) continue;  // stale
-            size_t j = s.key & (cap_ - 1);
-            while (slots_[j].stamp) j = (j + 1) & (cap_ - 1);
-            slots_[j] = s;
-            ++size_; ++used_;
+        const Slot * old = slots_.load(std::memory_order_relaxed);
+        const size_t oc  = cap_.load(std::memory_order_relaxed);
+        for (;;) {
+            Slot * t = new Slot[ncap + TAIL];
+            size_t n = 0;
+            bool fits = true;
+            if (old)
+                for (size_t i = 0; i < oc + TAIL && fits; ++i) {
+                    const Slot & s = old[i];
+                    if (!s.stamp || !valid(s)) continue;        // empty or stale
+                    size_t q = s.key & (ncap - 1);
+                    while (q < ncap + TAIL && t[q].stamp) ++q;
+                    if (q == ncap + TAIL) { fits = false; break; }
+                    t[q] = s;
+                    ++n;
+                }
+            if (!fits) { delete[] t; ncap <<= 1; continue; }  // a run reached the end: larger, and again
+            unsigned sh = 0;
+            while (((ncap + TAIL) >> sh) >= LOCKS) ++sh;       // ranges of 2^sh slots, fewer than LOCKS of them
+            slots_.store(t, std::memory_order_relaxed);
+            cap_.store(ncap, std::memory_order_relaxed);
+            shift_.store(sh, std::memory_order_relaxed);
+            size_.store(n, std::memory_order_relaxed);
+            used_.store(n, std::memory_order_relaxed);
+            break;
         }
         delete[] old;
-        ++epoch_;
+        epoch_.fetch_add(1, std::memory_order_relaxed);
         rehashes.fetch_add(1, std::memory_order_relaxed);
         rehash_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                               std::chrono::steady_clock::now() - rt0).count(), std::memory_order_relaxed);
     }
-  public:
-    // Diagnostics: how often the table has been rebuilt, and the time spent doing it (under the exclusive lock).
-    inline static std::atomic<uint64_t> rehashes{0}, rehash_us{0};
-  private:
 
-    NodeArena * arena_ = nullptr;
-    uint64_t    epoch_ = 0;
-    Slot *  slots_ = nullptr;
-    size_t  cap_   = 0;   // always a power of two, so the modulo is a mask
-    size_t  size_  = 0;   // entries inserted since the last rebuild
-    size_t  used_  = 0;   // probe-occupied slots since the last rebuild
+    NodeArena *                  arena_ = nullptr;
+    std::atomic<Slot *>          slots_{nullptr};
+    std::atomic<size_t>          cap_{0};     // home slots, a power of two; the table holds cap_ + TAIL
+    std::atomic<unsigned>        shift_{0};   // a lock range is 2^shift_ slots
+    std::atomic<size_t>          size_{0};    // entries inserted since the last rebuild
+    std::atomic<size_t>          used_{0};    // occupied slots
+    std::atomic<uint64_t>        epoch_{0};
+    mutable std::shared_mutex    locks_[LOCKS];
 };
 
 //ONE FLAT ARRAY OF NODES, ALLOCATED ONCE.

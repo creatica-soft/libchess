@@ -68,7 +68,6 @@ extern std::string game_tag;
 extern bool      validate_tree_enabled;
 
 extern std::mutex mtx, log_mtx, print_mtx, pool_mutex, search_done_mtx, probe_mutex;
-extern std::shared_mutex map_mutex;
 extern std::condition_variable cv, pool_cv, pool_done_cv, cv_search_done;
 extern std::atomic<bool> searchFlag;
 extern std::atomic<bool> stopFlag;
