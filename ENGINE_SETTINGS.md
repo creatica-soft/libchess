@@ -996,6 +996,18 @@ in the node's spare bytes so the search pays no extra memory access for it. `NOD
 roughly 3% fewer nodes for a tree-like middlegame and 3% more for a transposition-dense endgame.
 Blocks are recycled by exact size through the reaper, and a new game resets the pool.
 
+**That capacity claim was false in the first builds, and it cost a lichess game.** `pool_off` was
+declared after `children`, where there is no padding, so `MCTSNode` grew from 64 to 128 bytes and
+`NODE_BYTES` from 96 to 160. At `Hash 2048` a full tree held about 11.7 million nodes instead of about
+18.7 million. In game `QHWLWAbv` (14 September, `pisp`, 4 threads) the tree filled at move 26, during
+a run of moves with no capture or pawn move, so every node stayed reachable and the collector freed
+nothing. From move 28 nearly every simulation was hollow. At move 32 every root move had exactly one
+visit, and the engine played the highest-prior move, 32.Qxh6, which lost the queen to ...Qxh6. The
+games that day hit a full tree 6 to 37 times each, against 0 to 7 for the build before the child
+table. `pool_off` now sits in the four spare bytes after `descents`, and a `static_assert` pins the
+node at 64 bytes. Replaying that game with its clocks and pondering on the fixed build reached move 32
+at 986 permille with no hollow simulations; in the same replay the unfixed build froze again for several moves.
+
 Measured on a 9.5M-node, 19.3M-edge endgame tree with 6 GB of memory pressure applied before every
 run: the old pointer traversal cost 18.9–20.7 ns per node+edge with about 49,000 decompressions per
 run; the child table cost 12.6–12.8 ns with about 18,600 — about 38% cheaper and 62% fewer
