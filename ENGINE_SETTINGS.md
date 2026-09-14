@@ -388,8 +388,20 @@ an expansion does nothing but score moves, the convolution adds about 9 µs to a
 otherwise costs about 46 µs at `Hash 2048`; in the default `PolicyMode 1`, where every child is also
 evaluated with NNUE, single-threaded node rate fell 2.6–3.2% against the piece-indexed net.
 
-**In play it tied.** 100 games at 500 ms a move, `Hash 512`, 2 threads, `pisp` against `pi` at default
-settings: 49–51 (17 wins, 64 draws, 19 losses), about −7 Elo with a 95% range of roughly −48 to +34.
+**In play.** Three matches have been played between `pisp` and `pi`, all at 500 ms a move, `Hash 512`
+and 2 threads. Only the third is a clean comparison.
+
+- The first, 100 games, ran the older `creatica` binary on both sides. That binary cannot read
+  version 8, so it refused `pisp` and kept its default net. It did not test `pisp` at all.
+- The second, 100 games at default settings: `pisp` scored 49 (17 wins, 64 draws, 19 losses), about
+  −7 Elo with a 95% range of −48 to +34. But its `pisp` side ran `creatica_sp` and its `pi` side ran
+  the older `creatica`, so it changed the engine binary and the net at the same time.
+- The third, 200 games, with `creatica_sp` on both sides and `pisp` at `BlendScale 105` (see below):
+  `pisp` scored 108 (37 wins, 142 draws, 21 losses), about +28 Elo with a 95% range of +2 to +54.
+
+No clean match has been played with `pisp` at any other `BlendScale`. So these results do not show
+whether 105 is better than the default 115 for `pisp`. They show only that `pisp` at 105 beat `pi` at
+the default, on the same binary.
 
 **Half of its gain survives the blend.** `bench_blend` on 200,000 positions of the test file, with the
 engine's in-check rule and a consistency gate that reproduces the trainer's validation (Top-1 38.75
@@ -404,7 +416,8 @@ The other half overlaps with what the 1-ply child evaluations already see — pl
 telling the policy what an evaluation after the move notices anyway. The best blend weight barely moves
 (Top-6 peaks at 0.50 for `pisp`, 0.40–0.45 for `pi`). What does move is concentration: at the same
 settings the blended prior puts 0.445 on its top move for `pisp` against 0.416 for `pi`, and
-**`BlendScale 105` restores 0.416** without changing the ranking. The match above did not use it.
+**`BlendScale 105` restores 0.416** without changing the ranking. The third match above used it; the
+second did not.
 
 `bench_blend` needed three fixes to measure this: spatial-net support; policy scoring only at the root,
 because the recursion into a checking move's replies applied their legality term to the root's context;
