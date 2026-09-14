@@ -59,6 +59,8 @@ extern double    probability_mass;
 extern bool      reuse_tree;
 extern bool      post_move_collect;
 extern int64_t   gc_threshold;
+extern int64_t   tree_reset_below;
+extern int64_t   tree_reset_occupancy;
 void gc_join();
 void reap_shutdown();
 extern std::string visit_dump_path;
@@ -496,6 +498,10 @@ public:
         // Per-mille of Hash at which the tree is collected. Collection is O(tree) and only
         // reclaims memory, so running it every move paid a growing cost for nothing.
         o.spin("GcThreshold", &gc_threshold, 700, 0, 1000);
+        // Discard the tree before a search when it is at TreeResetOccupancy per-mille or more and the
+        // root inherited fewer than TreeResetBelow informed simulations. 0 = off. See runMCTS().
+        o.spin("TreeResetBelow",     &tree_reset_below,     0,   0, 1000000000);
+        o.spin("TreeResetOccupancy", &tree_reset_occupancy, 950, 0, 1000);
         // Where to append the root visit distribution after each search, and a tag written on
         // every line so records can be joined back to a game and its result. Empty = off.
         o.string("VisitDumpFile", &visit_dump_path, "");
