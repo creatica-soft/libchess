@@ -972,10 +972,20 @@ private:
         }
         policy_net = std::move(fresh);
         policy_loaded_ = path;
-        print("info string policy head %s loaded: %d -> %d -> %d -> %d\n",
-              path, policy_net.in, policy_net.h1, policy_net.h2, policy_net.out);
-        log_file("info string policy head %s loaded: %d -> %d -> %d -> %d\n",
-                 path, policy_net.in, policy_net.h1, policy_net.h2, policy_net.out);
+        //Say whether the spatial term is active, and which plane layout it expects. A spatial net
+        //that silently ran as a plain one would be invisible in the log otherwise.
+        char sp[160] = "";
+        if (policy_net.spatial.loaded)
+            snprintf(sp, sizeof sp, ", spatial term: %d planes, %d channels, dim %d, %d conv layer%s, layout %d",
+                     policy_net.spatial.planes, policy_net.spatial.ch, policy_net.spatial.dim,
+                     policy_net.spatial.layers, policy_net.spatial.layers == 1 ? "" : "s",
+                     policy_net.spatial.layout);
+        print("info string policy head %s loaded: %d -> %d -> %d -> %d%s%s\n",
+              path, policy_net.in, policy_net.h1, policy_net.h2, policy_net.out,
+              policy_net.has_wl ? ", legality term" : "", sp);
+        log_file("info string policy head %s loaded: %d -> %d -> %d -> %d%s%s\n",
+                 path, policy_net.in, policy_net.h1, policy_net.h2, policy_net.out,
+                 policy_net.has_wl ? ", legality term" : "", sp);
         return true;
     }
 
