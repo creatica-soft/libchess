@@ -390,8 +390,11 @@ void cleanup_locked() {
     if (search.arena.gen[i].load(std::memory_order_relaxed) == 0) continue;   //already free
     MCTSNode * node = &search.arena.slots[i];
     delete[] node->children.load(std::memory_order_relaxed);
+    search.arena.kids[i].store(0, std::memory_order_relaxed);
     arena_reset_slot(node);
   }
+  //Every block is free again, so reset the pool the same way the arena is reset below.
+  search.arena.pool_reset();
   //Everything is free again, so hand the slots back by resetting the bump pointer rather than by
   //pushing millions of indices onto the free list.
   search.arena.bump.store(0, std::memory_order_relaxed);
@@ -747,6 +750,10 @@ static const bool gc_locality_probe = [] {
   const char * e = std::getenv("CREATICA_GC_LOCALITY");
   return e && *e && *e != '0';
 }();
+static const bool verify_kids = [] {
+  const char * e = std::getenv("CREATICA_VERIFY_KIDS");
+  return e && *e && *e != '0';
+}();
 static const bool verify_futile = [] {
   const char * e = std::getenv("CREATICA_VERIFY_FUTILE");
   return e && *e && *e != '0';
@@ -806,6 +813,9 @@ static void reaper_func() {
       //The Edge array is still a real allocation and still has to be given back. The NODE is not:
       //it is a slot in the arena, so it is wiped and its index returned to the free list.
       delete[] n->children.load(std::memory_order_relaxed);
+      //And the child table's block, which is a pool entry rather than an allocation of its own.
+      if (const uint64_t k = search.arena.kids[idx].exchange(0, std::memory_order_relaxed))
+        search.arena.pool_release(NodeArena::kids_off(k), NodeArena::kids_count(k));
       arena_reset_slot(n);
       search.arena.release(idx);
     }
@@ -903,70 +913,68 @@ void gc_start(MCTSNode * from, bool wipe) {
 //
 //Runs the MARK ALONE -- no sweep, nothing freed -- several times over the tree as it stands, flushing
 //the CPU caches before each run, and rotates through three versions of the walk:
-//  0  exactly the mark gc() does today
-//  1  + software prefetch: q[h+24]'s node, q[h+12]'s child array, and the mark stamps of q[h+6]'s
-//     children, so each is on its way into cache by the time the walk reaches it
-//  2  1 + read the stamp before writing it, so an edge to an already-marked node does not dirty it
+//  0  through each node and its Edge array, as the mark did before the child table
+//  1  through the child table, as gc() does now
+//(Software prefetch variants were measured here first and removed: 10-15% slower with pages resident.)
 //It exists to test why the mark cost 17 ns a node early in a game and 125-148 ns late at the same
 //tree size: whether the cost follows edges per node, and whether it is memory latency, which
 //prefetching would cut. Harmless to the tree: it stamps reachable nodes with a fresh generation,
 //exactly as a mark does, so the next real collection simply re-stamps them.
 static const int mark_bench_rounds = [] {
   const char * e = std::getenv("CREATICA_MARK_BENCH"); return e ? std::atoi(e) : 0; }();
+//CREATICA_MARK_BENCH_PRESSURE_MB=<n>: before every round, allocate and touch n MB, then free it. On a
+//machine without n MB to spare that pushes the tree's idle pages into the compressor, so every round
+//starts from the same compressed state -- which is what a collection late in a long game faces.
+static const size_t mark_bench_pressure_mb = [] {
+  const char * e = std::getenv("CREATICA_MARK_BENCH_PRESSURE_MB"); return e ? (size_t)std::atoll(e) : (size_t)0; }();
 static const int mark_bench_every = [] {
   const char * e = std::getenv("CREATICA_MARK_BENCH_EVERY"); return e && std::atoi(e) > 0 ? std::atoi(e) : 4; }();
 struct MarkBenchStats { size_t nodes = 0, edges = 0, edges_to_marked = 0; double ms = 0.0; };
+//variant 0: through the node and its Edge array, as the mark did before the child table.
+//variant 1: through the child table, as gc() now does.
 static MarkBenchStats mark_only(MCTSNode * root, int variant) {
   MarkBenchStats st;
   const uint32_t g = (uint32_t)(generation.fetch_add(1, std::memory_order_relaxed) + 1);
-  std::vector<MCTSNode *> q;
-  q.reserve(1u << 20);
   const auto t0 = std::chrono::steady_clock::now();
-  search.arena.stamp(root, g);
-  q.push_back(root);
-  const bool pf = variant >= 1, read_first = variant >= 2;
-  const size_t D1 = 24, D2 = 12, D3 = 6;
-  for (size_t h = 0; h < q.size(); ++h) {
-    if (pf) {
-      const size_t n = q.size();
-      if (h + D1 < n) __builtin_prefetch(q[h + D1], 0, 1);
-      if (h + D2 < n) {
-        const Edge * e2 = q[h + D2]->children.load(std::memory_order_relaxed);
-        if (e2) __builtin_prefetch(e2, 0, 1);
-      }
-      if (h + D3 < n) {
-        const MCTSNode * n3 = q[h + D3];
-        const int    nc3 = n3->num_children.load(std::memory_order_relaxed);
-        const Edge * e3  = n3->children.load(std::memory_order_relaxed);
-        if (e3)
-          for (int j = 0; j < nc3; ++j) {
-            const MCTSNode * c = e3[j].child.load(std::memory_order_relaxed);
-            if (c) __builtin_prefetch(&search.arena.gen[search.arena.index_of(c)], 1, 1);
-          }
+  if (variant == 0) {
+    std::vector<MCTSNode *> q;
+    q.reserve(1u << 20);
+    search.arena.stamp(root, g);
+    q.push_back(root);
+    for (size_t h = 0; h < q.size(); ++h) {
+      MCTSNode * node = q[h];
+      const int    nc = node->num_children.load(std::memory_order_relaxed);
+      const Edge * ch = node->children.load(std::memory_order_relaxed);
+      if (!ch) continue;
+      st.edges += (size_t)nc;
+      for (int i = 0; i < nc; ++i) {
+        MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+        if (!c) continue;
+        if (search.arena.stamp_exchange(c, g) != g) q.push_back(c); else ++st.edges_to_marked;
       }
     }
-    MCTSNode * node = q[h];
-    const int    nc = node->num_children.load(std::memory_order_relaxed);
-    const Edge * ch = node->children.load(std::memory_order_relaxed);
-    if (!ch) continue;
-    st.edges += (size_t)nc;
-    for (int i = 0; i < nc; ++i) {
-      MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
-      if (!c) continue;
-      if (read_first && search.arena.gen[search.arena.index_of(c)].load(std::memory_order_relaxed) == g) {
-        ++st.edges_to_marked;
-        continue;
+    st.nodes = q.size();
+  } else {
+    std::vector<uint32_t> q;
+    q.reserve(1u << 20);
+    const uint32_t r = search.arena.index_of(root);
+    search.arena.gen[r].store(g, std::memory_order_relaxed);
+    q.push_back(r);
+    for (size_t h = 0; h < q.size(); ++h) {
+      const uint64_t k = search.arena.kids[q[h]].load(std::memory_order_relaxed);
+      const uint32_t n = NodeArena::kids_count(k);
+      const uint64_t off = NodeArena::kids_off(k);
+      st.edges += n;
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t c = search.arena.pool[off + i];
+        if (search.arena.gen[c].exchange(g, std::memory_order_relaxed) != g) q.push_back(c); else ++st.edges_to_marked;
       }
-      if (search.arena.stamp_exchange(c, g) != g) q.push_back(c);
-      else ++st.edges_to_marked;
     }
+    st.nodes = q.size();
   }
-  st.nodes = q.size();
   st.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   return st;
 }
-//System-wide VM counters, so a slow mark can be attributed to page-ins or decompressions rather than
-//to CPU caching. host_statistics64 needs no privileges.
 #include <mach/mach.h>
 struct VmCounters { uint64_t pageins = 0, decompressions = 0, swapins = 0; };
 static VmCounters vm_counters() {
@@ -986,31 +994,42 @@ static void run_mark_bench() {
   //and far more pages than the TLB holds, so every run starts from the same cold state instead of
   //the second run inheriting what the first loaded -- which is what swamped the last experiment.
   static std::vector<uint8_t> flush(128u << 20);
-  double ms[3] = {0, 0, 0}; int cnt[3] = {0, 0, 0};
-  MarkBenchStats last;
+  double ms[2] = {0, 0}; int cnt[2] = {0, 0};
+  MarkBenchStats last, seen[2];
   for (int r = 0; r < mark_bench_rounds; ++r) {
+    if (mark_bench_pressure_mb) {
+      const size_t bytes = mark_bench_pressure_mb << 20;
+      if (char * hog = static_cast<char *>(std::malloc(bytes))) {
+        for (size_t i = 0; i < bytes; i += 4096) hog[i] = (char)(i >> 12);
+        std::free(hog);
+      }
+    }
     std::memset(flush.data(), (r * 37 + 11) & 0xff, flush.size());
     volatile uint64_t sink = 0;
     for (size_t i = 0; i < flush.size(); i += 4096) sink += flush[i];
-    const int v = r % 3;
+    const int v = r % 2;
     const VmCounters c0 = vm_counters();
     last = mark_only(search.root, v);
     const VmCounters c1 = vm_counters();
     ms[v] += last.ms; ++cnt[v];
+    seen[v] = last;
     log_file("info string MARK BENCH round %d (%s): %.0f ms, %.1f ns per node+edge, during it %llu decompressions, "
-             "%llu page-ins, %llu swap-ins\n", r, v == 0 ? "baseline" : v == 1 ? "prefetch" : "prefetch+read-first",
+             "%llu page-ins, %llu swap-ins\n", r, v == 0 ? "pointers" : "child table",
              last.ms, (last.nodes + last.edges) ? last.ms * 1e6 / (double)(last.nodes + last.edges) : 0.0,
              (unsigned long long)(c1.decompressions - c0.decompressions),
              (unsigned long long)(c1.pageins - c0.pageins), (unsigned long long)(c1.swapins - c0.swapins));
   }
+  //Both traversals must reach exactly the same nodes over exactly the same edges.
+  if (cnt[0] && cnt[1] && (seen[0].nodes != seen[1].nodes || seen[0].edges != seen[1].edges))
+    log_file("info string MARK BENCH MISMATCH: pointers reached %zu nodes over %zu edges, the child table %zu over %zu  <-- WRONG\n",
+             seen[0].nodes, seen[0].edges, seen[1].nodes, seen[1].edges);
   const double elems = (double)(last.nodes + last.edges);
   auto nse = [&](int v) { return cnt[v] && elems > 0 ? ms[v] / cnt[v] * 1e6 / elems : 0.0; };
   log_file("info string MARK BENCH: %zu nodes, %zu edges (%.2f per node), %.1f%% of edges lead to an already-marked node; "
-           "ns per node+edge, cold: baseline %.1f, prefetch %.1f, prefetch+read-first %.1f; ms: %.0f / %.0f / %.0f\n",
+           "ns per node+edge, cold: pointers %.1f, child table %.1f; ms: %.0f / %.0f\n",
            last.nodes, last.edges, last.nodes ? (double)last.edges / (double)last.nodes : 0.0,
            last.edges ? 100.0 * (double)last.edges_to_marked / (double)last.edges : 0.0,
-           nse(0), nse(1), nse(2),
-           cnt[0] ? ms[0] / cnt[0] : 0.0, cnt[1] ? ms[1] / cnt[1] : 0.0, cnt[2] ? ms[2] / cnt[2] : 0.0);
+           nse(0), nse(1), cnt[0] ? ms[0] / cnt[0] : 0.0, cnt[1] ? ms[1] / cnt[1] : 0.0);
 }
 #else
 static void run_mark_bench() {}
@@ -1045,91 +1064,81 @@ void gc(MCTSNode * from) {
   //
   //A vector with a head index rather than std::queue: the frontier is read once and never
   //reclaimed as we go, so one contiguous allocation is all it needs.
-  std::vector<MCTSNode *> q;
+  //THE MARK READS ONLY THE CHILD TABLE: kids[] for each node's child count and pool position, pool[]
+  //for the child slots, gen[] for the stamps. It never reads an MCTSNode or an Edge. See THE CHILD TABLE
+  //in NodeArena for the measurements behind this: the pages the mark has to bring into memory are what
+  //made it slow late in a game, and those three arrays are a fraction of the size of the nodes and
+  //edges they summarise. The queue holds 4-byte slot numbers rather than 8-byte pointers for the same
+  //reason.
+  std::vector<uint32_t> q;
   q.reserve(1u << 16);
   size_t q_head = 0;
-  int64_t loc_prev_idx = -1, loc_prev_edges = 0;
-  size_t  loc_nodes = 0, loc_far_nodes = 0, loc_edge_arrays = 0, loc_far_edges = 0;
-  auto push_node = [&](MCTSNode * n) { q.push_back(n); };
-  search.arena.stamp(gc_root, (uint32_t)current_gen);
-  push_node(gc_root);
+  int64_t loc_prev_idx = -1, loc_prev_off = -1;
+  size_t  kids_checked_nodes = 0, kids_checked_edges = 0, kids_bad_count = 0, kids_bad_child = 0;
+  size_t  loc_nodes = 0, loc_far_nodes = 0, loc_blocks = 0, loc_far_blocks = 0;
+  const std::atomic<uint64_t> * const kids = search.arena.kids;
+  const uint32_t * const              pool = search.arena.pool;
+  std::atomic<uint32_t> * const       gen  = search.arena.gen;
+  {
+    const uint32_t root_idx = search.arena.index_of(gc_root);
+    gen[root_idx].store((uint32_t)current_gen, std::memory_order_relaxed);
+    q.push_back(root_idx);
+  }
 
-  /*const size_t gc_capacity  = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
-  const size_t soft_bytes   = gc_capacity ? (gc_capacity * (size_t)GC_EVICT_SOFT) / 1000 : 0;
-  const size_t hard_bytes   = gc_capacity ? (gc_capacity * (size_t)GC_EVICT_HARD) / 1000 : 0;
-  const uint64_t root_visits = gc_root->N.load(std::memory_order_relaxed);
-  const uint64_t keep_visits = std::max<uint64_t>(1, root_visits / 1000);
-  bool   is_root    = true;*/
+  //The eviction block that once sat in this loop, and is still commented out, predates the child
+  //table. It cut a live node's children by clearing `children` and deleting the Edge array; reinstating
+  //it now would also have to clear kids[] and return the pool block, and it would break THE EXACT
+  //FUTILITY TEST, which relies on edges never being removed from a live node.
   size_t kept_nodes = 1, kept_edges = 0, truncated = 0;
 
   while (q_head < q.size()) {
       //Abandoning during the MARK means nothing may be swept: the marks are incomplete, so a
       //sweep would delete live nodes. Leaving the tree entirely alone is always safe, and the
       //next collection re-marks from scratch (exchange() below makes leftover stamps harmless).
-      //Truncations already performed are safe to leave in place -- they free only Edge arrays,
-      //and the subtrees they orphan stay intact in the map until the next collection reaches them.
       if (gc_abort.load(std::memory_order_relaxed)) return;
-      MCTSNode * node = q[q_head++];
-      int num_children = node->num_children.load(std::memory_order_relaxed);
-      Edge * children = node->children.load(std::memory_order_relaxed);
-      //LOCALITY PROBE (CREATICA_GC_LOCALITY=1). How often does the mark jump more than 2 MB between
-      //consecutive nodes, and between consecutive child arrays? 2 MB is a large page and far beyond
-      //any cache, so a jump that size is a cache miss and usually a TLB miss. It exists to test one
-      //explanation for the mark costing 17 ns a node at the start of a game and 150 ns by the end at
-      //the same tree size: the live tree spreading across the arena as freed slots are reused.
+      const uint32_t idx          = q[q_head++];
+      const uint64_t k            = kids[idx].load(std::memory_order_relaxed);
+      const uint32_t num_children = NodeArena::kids_count(k);
+      const uint64_t off          = NodeArena::kids_off(k);
+
+      //LOCALITY PROBE (CREATICA_GC_LOCALITY=1): how often consecutive nodes are more than 2 MB apart
+      //in the arena, and consecutive child blocks more than 2 MB apart in the pool.
       if (gc_locality_probe) {
-        const int64_t idx = (int64_t)search.arena.index_of(node);
-        if (loc_prev_idx >= 0 && std::llabs(idx - loc_prev_idx) > (int64_t)((2u << 20) / sizeof(MCTSNode))) ++loc_far_nodes;
-        loc_prev_idx = idx;
-        if (children) {
-          const int64_t addr = (int64_t)(intptr_t)children;
-          if (loc_prev_edges && std::llabs(addr - loc_prev_edges) > (int64_t)(2u << 20)) ++loc_far_edges;
-          loc_prev_edges = addr;
-          ++loc_edge_arrays;
+        if (loc_prev_idx >= 0 && std::llabs((int64_t)idx - loc_prev_idx) > (int64_t)((2u << 20) / sizeof(MCTSNode))) ++loc_far_nodes;
+        loc_prev_idx = (int64_t)idx;
+        if (num_children) {
+          if (loc_prev_off >= 0 && std::llabs((int64_t)off - loc_prev_off) > (int64_t)((2u << 20) / sizeof(uint32_t))) ++loc_far_blocks;
+          loc_prev_off = (int64_t)off;
+          ++loc_blocks;
         }
         ++loc_nodes;
       }
-
-      //The root always keeps its children: without them there is no move to choose.
-      /*if (!is_root && num_children > 0 && soft_bytes) {
-          const size_t kept_bytes = kept_nodes * (sizeof(MCTSNode) + 24)
-                                  + kept_edges * sizeof(Edge);
-          const bool over = kept_bytes >= hard_bytes
-                         || (kept_bytes >= soft_bytes
-                             && node->N.load(std::memory_order_relaxed) < keep_visits);
-          if (over) {
-              //Freed here rather than handed to the reaper: the reaper deletes whole nodes, and
-              //this node must survive. Only the cut boundary is touched, so this is a small
-              //number of frees next to the sweep's own.
-              node->children.store(nullptr, std::memory_order_release);
-              node->num_children.store(0, std::memory_order_release);
-              total_children.fetch_sub(num_children, std::memory_order_relaxed);
-              delete[] children;
-              ++truncated;
-              continue;
+      //CREATICA_VERIFY_KIDS=1: the child table must say exactly what the node and its edges say. Reads
+      //the node and its Edge array, so it brings back all the cost the table removes -- a check, not a mode.
+      if (verify_kids) {
+        const MCTSNode * node = &search.arena.slots[idx];
+        const int    nc = node->num_children.load(std::memory_order_relaxed);
+        const Edge * ch = node->children.load(std::memory_order_relaxed);
+        ++kids_checked_nodes;
+        if (num_children != (uint32_t)(nc > 0 ? nc : 0)) ++kids_bad_count;
+        else if (ch)
+          for (int i = 0; i < nc; ++i) {
+            const MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+            ++kids_checked_edges;
+            if (!c || pool[off + (uint64_t)i] != search.arena.index_of(c)) ++kids_bad_child;
           }
       }
-      is_root = false;*/
 
-      if (num_children > 0) kept_edges += (size_t)num_children;
-      for (int i = 0; i < num_children; ++i) {
-          MCTSNode * child = children[i].child.load(std::memory_order_relaxed);
-          if (child) {
-              //Stamp with this generation; push only if we are the first to reach it.
-              //
-              //This was a compare_exchange expecting EXACTLY current_gen - 1, which assumed every
-              //reachable node was marked by the immediately preceding collection. That held only
-              //while every collection ran to completion. It breaks the moment a collection is
-              //abandoned part way -- some nodes then carry the new stamp and some the old, the
-              //CAS fails for the mismatched ones, they are never pushed, and the sweep deletes
-              //them although a surviving parent still points at them. exchange() makes the mark
-              //independent of what was there before, so a partial mark is harmless and the
-              //collector can be interrupted.
-              if (search.arena.stamp_exchange(child, (uint32_t)current_gen) != (uint32_t)current_gen) {
-                  ++gc_marked;
-                  ++kept_nodes;
-                  push_node(child);
-              }
+      kept_edges += num_children;
+      for (uint32_t i = 0; i < num_children; ++i) {
+          const uint32_t c = pool[off + i];
+          //Stamp with this generation; push only if we are the first to reach it. exchange(), not a
+          //compare-exchange expecting the previous generation: a partial mark left by an abandoned
+          //collection must be harmless, and exchange() makes the mark independent of what was there.
+          if (gen[c].exchange((uint32_t)current_gen, std::memory_order_relaxed) != (uint32_t)current_gen) {
+              ++gc_marked;
+              ++kept_nodes;
+              q.push_back(c);
           }
       }
   }
@@ -1218,12 +1227,16 @@ void gc(MCTSNode * from) {
            reap_pending.load(std::memory_order_relaxed),
            std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
            std::chrono::duration<double, std::milli>(gc_t2 - gc_t1).count());
+  if (verify_kids)
+    log_file("info string KIDS-CHECK: %zu nodes, %zu edges checked; child count mismatches %zu, child slot mismatches %zu%s\n",
+             kids_checked_nodes, kids_checked_edges, kids_bad_count, kids_bad_child,
+             (kids_bad_count || kids_bad_child) ? "  <-- THE CHILD TABLE IS WRONG" : "");
   if (gc_locality_probe && loc_nodes)
     log_file("info string gc locality: %zu nodes marked, %.1f ns/node, far node jumps %.1f%%, "
-             "far child-array jumps %.1f%%, arena high water %u of %u slots, free list %zu\n",
+             "far child-block jumps %.1f%%, arena high water %u of %u slots, free list %zu\n",
              loc_nodes, std::chrono::duration<double, std::nano>(gc_t1 - gc_t0).count() / (double)loc_nodes,
              100.0 * (double)loc_far_nodes / (double)loc_nodes,
-             loc_edge_arrays ? 100.0 * (double)loc_far_edges / (double)loc_edge_arrays : 0.0,
+             loc_blocks ? 100.0 * (double)loc_far_blocks / (double)loc_blocks : 0.0,
              search.arena.high_water(), search.arena.cap,
              [] { std::lock_guard<std::mutex> lk(search.arena.free_mtx); return search.arena.free_list.size(); }());
   total_nodes.store(search.arena.live(), std::memory_order_relaxed);
@@ -1344,6 +1357,10 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
   if (parent->num_children.load(std::memory_order_relaxed) > 0) return; //already expanded by other threads, perhaps
   int num_moves = top_moves.size();
   assert(num_moves > 0);
+  //The child table's block, taken before any child is created so every exit below can give it back.
+  //An exhausted pool is treated exactly like an exhausted arena: no expansion, the node stays a leaf.
+  const uint64_t pool_off = search.arena.pool_alloc((uint32_t)num_moves);
+  if (pool_off == UINT64_MAX) return;
   Edge * children = new Edge[num_moves];
   for (int i = 0; i < num_moves; ++i) {
       auto [prior, move_idx, child_cp, terminal, child_hash] = top_moves[i];
@@ -1365,11 +1382,13 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
       //collection takes them.
       if (!child) {
         delete[] children;
+        search.arena.pool_release(pool_off, (uint32_t)num_moves);
         return;
       }
       children[i].P.store(prior, std::memory_order_relaxed);
       children[i].move.store(move_idx, std::memory_order_relaxed);
       children[i].child.store(child, std::memory_order_relaxed);        
+      search.arena.pool[pool_off + (uint64_t)i] = search.arena.index_of(child);
   }
   total_children.fetch_add(num_moves, std::memory_order_relaxed); //update total_children counter
   //Publish with a CAS, not a bare store. process_check() -> eval_and_expand() reaches
@@ -1382,8 +1401,12 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
         std::memory_order_release, std::memory_order_relaxed)) {
     total_children.fetch_sub(num_moves, std::memory_order_relaxed);
     delete[] children;
+    search.arena.pool_release(pool_off, (uint32_t)num_moves);
     return;
   }
+  //Child table before the count: a reader that sees num_children > 0 must find the block in place.
+  search.arena.kids[search.arena.index_of(parent)].store(NodeArena::kids_pack(pool_off, (uint32_t)num_moves),
+                                                         std::memory_order_release);
   parent->num_children.store(num_moves, std::memory_order_release);
 }
 
