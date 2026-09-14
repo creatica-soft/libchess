@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o bench_prior_acc bench_prior_acc.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o bench_blend bench_blend.cpp
 //
 // THE YARDSTICK: how good is the incumbent prior, really?
 //
@@ -44,6 +44,7 @@
 #include <vector>
 #include <algorithm>
 #include "nnue/nnue/nnue_accumulator.h"
+#include "nnue/bitboard.h"   //policy_net.h builds attack planes with Stockfish::attacks_bb
 #include "libchess.h"
 #include "policy_net.h"
 
@@ -213,7 +214,11 @@ struct Scored { double score; int src, dst, promo;     double pol = 0.0;   // po
 // scored on the same footing they are during a real search.
 static double eval_child(int depth);
 
-static void enumerate(std::vector<Scored>& out, bool score_them, int depth) {
+//with_policy: score the moves with the policy head too. ONLY for the position being measured. eval_child()
+//recurses into this for a checking move's replies, and those replies' policy scores are never read --
+//but computing them applied THEIR legality term to the global pctx, which is the root's context, so
+//every root position with a checking move had its policy scores computed from a corrupted context.
+static void enumerate(std::vector<Scored>& out, bool score_them, int depth, bool with_policy) {
     auto [kmoves, pinned, pinning, checkers, ksq] = kingMoves(board);
     Move move = {}; move.src = ksq; move.promoType = PieceTypeNone;
     auto emit = [&](Move& m) {
@@ -248,7 +253,7 @@ static void enumerate(std::vector<Scored>& out, bool score_them, int depth) {
             occ &= occ - 1;
         }
     }
-    if (!score_them) return;
+    if (!score_them || !with_policy) return;
     //THE LEGALITY TERM. It adds Wl * (mean embedding row over the legal moves) to ctx, so it has
     //to be applied once, with every move known, before anything is scored. Omitting it does not
     //degrade the scores gently -- in the piece-indexed net the term reaches 98% of the magnitude
@@ -260,11 +265,32 @@ static void enumerate(std::vector<Scored>& out, bool score_them, int depth) {
         for (const auto& c : out)
             rows.push_back(policy_row(pnet, board.piecesOnSquares[c.src] & 7,
                                       c.src, c.dst, board.sideToMove == ColorBlack));
+        //Deduplicated, as eval_and_expand() does: this list holds four entries for every promotion,
+        //the trainer's holds one, and a mean counted four times is a different function.
+        std::sort(rows.begin(), rows.end());
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
         policy_apply_legal_bias(pnet, pctx, rows.data(), (int)rows.size());
+    }
+    //THE SPATIAL TERM, built exactly as eval_and_expand() builds it: planes from the board and the full
+    //legal list (oriented squares, moving piece type), one forward, then every move scored against it.
+    static PolicySpatialScratch scr;
+    const PolicySpatialScratch * sp = nullptr;
+    if (pnet.spatial.loaded && !out.empty()) {
+        const bool flip = (board.sideToMove == ColorBlack);
+        std::vector<int> f, t, pt;
+        for (const auto& c : out) {
+            f.push_back(flip ? (c.src ^ 56) : c.src);
+            t.push_back(flip ? (c.dst ^ 56) : c.dst);
+            pt.push_back(board.piecesOnSquares[c.src] & 7);
+        }
+        unsigned char planes[26 * 64];
+        policy_build_planes(board, pnet.spatial, f.data(), t.data(), pt.data(), (int)out.size(), planes);
+        policy_spatial_forward(pnet.spatial, planes, scr);
+        sp = &scr;
     }
     for (auto& c : out)
         c.pol = policy_score(pnet, pctx, board.piecesOnSquares[c.src] & 7,
-                             c.src, c.dst, board.sideToMove == ColorBlack);
+                             c.src, c.dst, board.sideToMove == ColorBlack, sp);
 }
 
 // Eval of the position now on the board, from ITS side to move.
@@ -272,7 +298,7 @@ static double eval_child(int depth) {
     if (!board.isCheck) return evaluate_nnue(board, ctx);
     if (depth <= 0) return 0.0;                    // give up recursing; neutral
     std::vector<Scored> replies;
-    enumerate(replies, true, depth - 1);
+    enumerate(replies, true, depth - 1, false);
     if (replies.empty()) return -327.68;           // mated: huge loss for side to move
     double best = -1e18;
     for (const auto& r : replies) best = std::max(best, r.score);
@@ -309,7 +335,12 @@ int main(int argc, char ** argv) {
     //big net's features needs the big accumulator, which is not maintained on those
     //nodes -- so this is the fraction that would pay an extra update.
     long long smallnet_hits = 0;
-    static const double WS[] = {0.0, 0.25, 0.4, 0.45, 0.5, 0.6, 0.75, 1.0};
+    static const double WS[] = {0.0, 0.25, 0.4, 0.45, 0.5, 0.6, 0.75, 0.9, 1.0};
+    //THE CONSISTENCY GATE: policy alone, over every position including those in check, which is what the
+    //trainer's validation measures. It must reproduce the trainer's Top-1 before any blended number is
+    //believed -- this tool once reported 29.89% for a net the trainer measured at 34.65%.
+    long long gate_top1 = 0, gate_top4 = 0, gate_top6 = 0;
+    long long in_check = 0;
     static const int NW = sizeof(WS)/sizeof(WS[0]);
     long long w_top1[NW] = {0}, w_top4[NW] = {0}, w_top6[NW] = {0};
     double    w_mass[NW] = {0};
@@ -350,7 +381,7 @@ int main(int argc, char ** argv) {
         policy_context(pnet, pfeat.data(), pctx);
         moves.clear();
         if (TRACE) { std::fprintf(stderr, "[rec %lld] enumerating\n", rec); std::fflush(stderr); }
-        enumerate(moves, true, 1);
+        enumerate(moves, true, 1, true);
         if (moves.empty()) { ++skipped_nomove; continue; }
 
         // get_prob(): softmax over scores at `temperature`
@@ -383,8 +414,21 @@ int main(int argc, char ** argv) {
         }
         if (!pv_present) { ++skipped_nomove; continue; }
 
+        {
+            int grank = 0; double gkey = -1e18;
+            for (const auto& m : moves)
+                if (m.src == pv_src2 && m.dst == pv_dst2 &&
+                    (m.promo == pv_pr2 || (p.promo[0] == 0 && m.promo == PieceTypeNone))) gkey = m.pol;
+            for (const auto& m : moves) if (m.pol > gkey) ++grank;
+            if (grank == 0) ++gate_top1;
+            if (grank <  4) ++gate_top4;
+            if (grank <  6) ++gate_top6;
+        }
+        //The engine never uses the policy when the side to move is in check -- use_policy is
+        //policy_enabled && !checkers -- so there the prior is the child evaluations alone.
+        if (board.isCheck) ++in_check;
         for (int wi = 0; wi < NW; ++wi) {
-            const double w = WS[wi];
+            const double w = board.isCheck ? 0.0 : WS[wi];
             //Overall sharpness of the blended logits. A mixture of two disagreeing signals
             //is flatter than either alone, so this restores the concentration the search's
             //exploration constants were fitted to.
@@ -475,13 +519,23 @@ int main(int argc, char ** argv) {
     std::printf("small-net routed   %.2f%%   (|simple_eval| > 962)\n",
                 100.0 * smallnet_hits / used);
     std::printf("\n--- incumbent prior quality (softmax over 1-ply NNUE child evals) ---\n");
+    std::printf("\npolicy net         %s  (spatial term %s, legality term %s)\n",
+                std::getenv("POLICY_WEIGHTS") ? std::getenv("POLICY_WEIGHTS") : "nnue_policy.bin",
+                pnet.spatial.loaded ? "yes" : "no", pnet.has_wl ? "yes" : "no");
+    std::printf("CONSISTENCY GATE   policy alone, all positions: Top-1 %.2f%%  Top-4 %.2f%%  Top-6 %.2f%%\n"
+                "                   (must match the trainer's validation on the same file)\n",
+                100.0 * gate_top1 / used, 100.0 * gate_top4 / used, 100.0 * gate_top6 / used);
+    std::printf("in check           %lld of %lld positions (%.1f%%): prior is the child evaluations alone, as in the engine\n",
+                in_check, used, 100.0 * in_check / used);
     std::printf("\n  blend of 1-ply child eval and policy head, %lld positions\n", used);
     std::printf("  %-6s %-8s %-8s %-8s %s\n", "w", "Top-1", "Top-4", "Top-6", "top-move mass");
     for (int wi = 0; wi < NW; ++wi)
         std::printf("  %-6.2f %6.2f%%  %6.2f%%  %6.2f%%   mass %.4f%s\n", WS[wi],
                     100.0 * w_top1[wi] / used, 100.0 * w_top4[wi] / used,
                     100.0 * w_top6[wi] / used, w_mass[wi] / used,
-                    WS[wi] == 0.0 ? "   <- incumbent" : WS[wi] == 1.0 ? "   <- policy only" : "");
+                    WS[wi] == 0.0 ? "   <- child evaluations only"
+                    : (WS[wi] > 0.44 && WS[wi] < 0.46) ? "   <- engine default PolicyBlend"
+                    : WS[wi] == 1.0 ? "   <- policy only (except in check)" : "");
     std::printf("\n  probability-mass gate:\n");
     std::printf("  %-8s %-14s %s\n", "mass", "PV1 kept", "mean moves kept");
     for (int wi = 0; wi < NW; ++wi) {
