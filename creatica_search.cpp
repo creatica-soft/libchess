@@ -342,6 +342,7 @@ void reap_drain();
 static void arena_reset_slot(MCTSNode * n) {
   n->children.store(nullptr, std::memory_order_relaxed);
   n->num_children.store(0, std::memory_order_relaxed);
+  n->pool_off.store(0, std::memory_order_relaxed);
   n->N.store(0, std::memory_order_relaxed);
   n->W.store(0.0, std::memory_order_relaxed);
   n->evidence.store(0, std::memory_order_relaxed);
@@ -481,8 +482,8 @@ std::string   game_tag;          //set per game by the driver, so records can be
 //being folded into a number that decides whether to keep searching.
 int tree_occupancy() {
   const size_t total_memory =
-      total_nodes.load(std::memory_order_relaxed) * (sizeof(MCTSNode) + 24)
-    + (size_t)total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+      total_nodes.load(std::memory_order_relaxed) * NODE_BYTES
+    + (size_t)total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
   const size_t max_capacity = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
   return max_capacity ? (int)((total_memory * 1000) / max_capacity) : 0;
 }
@@ -554,10 +555,21 @@ int validate_tree(const char * where, bool collected) {
     if (nc < 0) complain("negative num_children", key, (uint64_t)nc);
     if ((nc > 0) != (ch != nullptr))
       complain("num_children and children array disagree", key, (uint64_t)nc);
+    //The child table has two copies of where the children are -- kids[] for the collector, pool_off in
+    //the node for the search -- and both must agree with the node's own count.
+    {
+      const uint64_t k = search.arena.kids[search.arena.index_of(node)].load(std::memory_order_relaxed);
+      if (NodeArena::kids_count(k) != (uint32_t)(nc > 0 ? nc : 0))
+        complain("kids[] child count disagrees with num_children", key, (uint64_t)NodeArena::kids_count(k));
+      else if (nc > 0 && NodeArena::kids_off(k) != (uint64_t)node->pool_off.load(std::memory_order_relaxed))
+        complain("kids[] pool offset disagrees with the node's pool_off", key, NodeArena::kids_off(k));
+      else if (nc > 0 && NodeArena::kids_off(k) + (uint64_t)nc > search.arena.pool_cap)
+        complain("child block runs past the end of the pool", key, NodeArena::kids_off(k));
+    }
     if (nc > 0 && ch) {
       counted_children += (uint64_t)nc;
       for (int i = 0; i < nc; ++i) {
-        const MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+        const MCTSNode * c = search.arena.child_at(node, i);
         if (!c) { complain("null child pointer in an Edge", key, (uint64_t)i); continue; }
         //Membership only -- c may be freed memory, so it is never dereferenced here.
         if (!live.count(c))
@@ -594,7 +606,7 @@ int validate_tree(const char * where, bool collected) {
       const Edge * ch = n->children.load(std::memory_order_relaxed);
       if (nc <= 0 || !ch) continue;
       for (int i = 0; i < nc; ++i) {
-        const MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+        const MCTSNode * c = search.arena.child_at(n, i);
         //Only follow pointers already proven live, so a dangling Edge cannot crash the walk.
         if (c && live.count(c) && seen.insert(c).second) q.push(c);
       }
@@ -696,7 +708,7 @@ static bool reachable_within(const MCTSNode * from, const MCTSNode * target, int
       const Edge * ch = n->children.load(std::memory_order_relaxed);
       if (!ch) continue;
       for (int i = 0; i < nc; ++i) {
-        const MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+        const MCTSNode * c = search.arena.child_at(n, i);
         if (!c) continue;
         if (c == target) return true;
         if (++visits > max_visits) return false;
@@ -750,6 +762,7 @@ static const bool gc_locality_probe = [] {
   const char * e = std::getenv("CREATICA_GC_LOCALITY");
   return e && *e && *e != '0';
 }();
+static std::atomic<uint64_t> kids_wrong_position{0}, kids_published_edges{0};
 static const bool verify_kids = [] {
   const char * e = std::getenv("CREATICA_VERIFY_KIDS");
   return e && *e && *e != '0';
@@ -913,9 +926,8 @@ void gc_start(MCTSNode * from, bool wipe) {
 //
 //Runs the MARK ALONE -- no sweep, nothing freed -- several times over the tree as it stands, flushing
 //the CPU caches before each run, and rotates through three versions of the walk:
-//  0  through each node and its Edge array, as the mark did before the child table
-//  1  through the child table, as gc() does now
-//(Software prefetch variants were measured here first and removed: 10-15% slower with pages resident.)
+//It walks the child table exactly as gc() does. (Software prefetch variants and the old pointer traversal
+//were both measured here and removed; the numbers are in mark_only() and in ENGINE_SETTINGS.md.)
 //It exists to test why the mark cost 17 ns a node early in a game and 125-148 ns late at the same
 //tree size: whether the cost follows edges per node, and whether it is memory latency, which
 //prefetching would cut. Harmless to the tree: it stamps reachable nodes with a fresh generation,
@@ -930,48 +942,29 @@ static const size_t mark_bench_pressure_mb = [] {
 static const int mark_bench_every = [] {
   const char * e = std::getenv("CREATICA_MARK_BENCH_EVERY"); return e && std::atoi(e) > 0 ? std::atoi(e) : 4; }();
 struct MarkBenchStats { size_t nodes = 0, edges = 0, edges_to_marked = 0; double ms = 0.0; };
-//variant 0: through the node and its Edge array, as the mark did before the child table.
-//variant 1: through the child table, as gc() now does.
-static MarkBenchStats mark_only(MCTSNode * root, int variant) {
+//The mark alone, through the child table, exactly as gc() does it. (The pointer traversal it was compared
+//against no longer exists: under 6 GB of pressure it cost 18.9-20.7 ns per node+edge with ~49,000
+//decompressions per run, the child table 12.6-12.8 ns with ~18,600.)
+static MarkBenchStats mark_only(MCTSNode * root) {
   MarkBenchStats st;
   const uint32_t g = (uint32_t)(generation.fetch_add(1, std::memory_order_relaxed) + 1);
   const auto t0 = std::chrono::steady_clock::now();
-  if (variant == 0) {
-    std::vector<MCTSNode *> q;
-    q.reserve(1u << 20);
-    search.arena.stamp(root, g);
-    q.push_back(root);
-    for (size_t h = 0; h < q.size(); ++h) {
-      MCTSNode * node = q[h];
-      const int    nc = node->num_children.load(std::memory_order_relaxed);
-      const Edge * ch = node->children.load(std::memory_order_relaxed);
-      if (!ch) continue;
-      st.edges += (size_t)nc;
-      for (int i = 0; i < nc; ++i) {
-        MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
-        if (!c) continue;
-        if (search.arena.stamp_exchange(c, g) != g) q.push_back(c); else ++st.edges_to_marked;
-      }
+  std::vector<uint32_t> q;
+  q.reserve(1u << 20);
+  const uint32_t r = search.arena.index_of(root);
+  search.arena.gen[r].store(g, std::memory_order_relaxed);
+  q.push_back(r);
+  for (size_t h = 0; h < q.size(); ++h) {
+    const uint64_t k = search.arena.kids[q[h]].load(std::memory_order_relaxed);
+    const uint32_t n = NodeArena::kids_count(k);
+    const uint64_t off = NodeArena::kids_off(k);
+    st.edges += n;
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t c = search.arena.pool[off + i];
+      if (search.arena.gen[c].exchange(g, std::memory_order_relaxed) != g) q.push_back(c); else ++st.edges_to_marked;
     }
-    st.nodes = q.size();
-  } else {
-    std::vector<uint32_t> q;
-    q.reserve(1u << 20);
-    const uint32_t r = search.arena.index_of(root);
-    search.arena.gen[r].store(g, std::memory_order_relaxed);
-    q.push_back(r);
-    for (size_t h = 0; h < q.size(); ++h) {
-      const uint64_t k = search.arena.kids[q[h]].load(std::memory_order_relaxed);
-      const uint32_t n = NodeArena::kids_count(k);
-      const uint64_t off = NodeArena::kids_off(k);
-      st.edges += n;
-      for (uint32_t i = 0; i < n; ++i) {
-        const uint32_t c = search.arena.pool[off + i];
-        if (search.arena.gen[c].exchange(g, std::memory_order_relaxed) != g) q.push_back(c); else ++st.edges_to_marked;
-      }
-    }
-    st.nodes = q.size();
   }
+  st.nodes = q.size();
   st.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   return st;
 }
@@ -994,8 +987,8 @@ static void run_mark_bench() {
   //and far more pages than the TLB holds, so every run starts from the same cold state instead of
   //the second run inheriting what the first loaded -- which is what swamped the last experiment.
   static std::vector<uint8_t> flush(128u << 20);
-  double ms[2] = {0, 0}; int cnt[2] = {0, 0};
-  MarkBenchStats last, seen[2];
+  double total_ms = 0.0; int runs = 0;
+  MarkBenchStats last;
   for (int r = 0; r < mark_bench_rounds; ++r) {
     if (mark_bench_pressure_mb) {
       const size_t bytes = mark_bench_pressure_mb << 20;
@@ -1007,29 +1000,22 @@ static void run_mark_bench() {
     std::memset(flush.data(), (r * 37 + 11) & 0xff, flush.size());
     volatile uint64_t sink = 0;
     for (size_t i = 0; i < flush.size(); i += 4096) sink += flush[i];
-    const int v = r % 2;
     const VmCounters c0 = vm_counters();
-    last = mark_only(search.root, v);
+    last = mark_only(search.root);
     const VmCounters c1 = vm_counters();
-    ms[v] += last.ms; ++cnt[v];
-    seen[v] = last;
-    log_file("info string MARK BENCH round %d (%s): %.0f ms, %.1f ns per node+edge, during it %llu decompressions, "
-             "%llu page-ins, %llu swap-ins\n", r, v == 0 ? "pointers" : "child table",
-             last.ms, (last.nodes + last.edges) ? last.ms * 1e6 / (double)(last.nodes + last.edges) : 0.0,
+    total_ms += last.ms; ++runs;
+    log_file("info string MARK BENCH round %d: %.0f ms, %.1f ns per node+edge, during it %llu decompressions, "
+             "%llu page-ins, %llu swap-ins\n", r, last.ms,
+             (last.nodes + last.edges) ? last.ms * 1e6 / (double)(last.nodes + last.edges) : 0.0,
              (unsigned long long)(c1.decompressions - c0.decompressions),
              (unsigned long long)(c1.pageins - c0.pageins), (unsigned long long)(c1.swapins - c0.swapins));
   }
-  //Both traversals must reach exactly the same nodes over exactly the same edges.
-  if (cnt[0] && cnt[1] && (seen[0].nodes != seen[1].nodes || seen[0].edges != seen[1].edges))
-    log_file("info string MARK BENCH MISMATCH: pointers reached %zu nodes over %zu edges, the child table %zu over %zu  <-- WRONG\n",
-             seen[0].nodes, seen[0].edges, seen[1].nodes, seen[1].edges);
   const double elems = (double)(last.nodes + last.edges);
-  auto nse = [&](int v) { return cnt[v] && elems > 0 ? ms[v] / cnt[v] * 1e6 / elems : 0.0; };
   log_file("info string MARK BENCH: %zu nodes, %zu edges (%.2f per node), %.1f%% of edges lead to an already-marked node; "
-           "ns per node+edge, cold: pointers %.1f, child table %.1f; ms: %.0f / %.0f\n",
+           "%.1f ns per node+edge, %.0f ms per mark\n",
            last.nodes, last.edges, last.nodes ? (double)last.edges / (double)last.nodes : 0.0,
            last.edges ? 100.0 * (double)last.edges_to_marked / (double)last.edges : 0.0,
-           nse(0), nse(1), cnt[0] ? ms[0] / cnt[0] : 0.0, cnt[1] ? ms[1] / cnt[1] : 0.0);
+           runs && elems > 0 ? total_ms / runs * 1e6 / elems : 0.0, runs ? total_ms / runs : 0.0);
 }
 #else
 static void run_mark_bench() {}
@@ -1113,19 +1099,20 @@ void gc(MCTSNode * from) {
         }
         ++loc_nodes;
       }
-      //CREATICA_VERIFY_KIDS=1: the child table must say exactly what the node and its edges say. Reads
-      //the node and its Edge array, so it brings back all the cost the table removes -- a check, not a mode.
+      //CREATICA_VERIFY_KIDS=1: kids[] (which this mark reads) must agree with the node's num_children and
+      //pool_off (which the search reads), and every child slot must be a live slot. Reads the node, so it
+      //brings back the cost the table removes -- a check, not a mode.
       if (verify_kids) {
         const MCTSNode * node = &search.arena.slots[idx];
-        const int    nc = node->num_children.load(std::memory_order_relaxed);
-        const Edge * ch = node->children.load(std::memory_order_relaxed);
+        const int nc = node->num_children.load(std::memory_order_relaxed);
         ++kids_checked_nodes;
         if (num_children != (uint32_t)(nc > 0 ? nc : 0)) ++kids_bad_count;
-        else if (ch)
-          for (int i = 0; i < nc; ++i) {
-            const MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+        else if (nc > 0 && off != (uint64_t)node->pool_off.load(std::memory_order_relaxed)) ++kids_bad_count;
+        else
+          for (uint32_t i = 0; i < num_children; ++i) {
             ++kids_checked_edges;
-            if (!c || pool[off + (uint64_t)i] != search.arena.index_of(c)) ++kids_bad_child;
+            const uint32_t c = pool[off + i];
+            if (c >= search.arena.cap || search.arena.tag[c].load(std::memory_order_relaxed) == 0) ++kids_bad_child;
           }
       }
 
@@ -1228,9 +1215,11 @@ void gc(MCTSNode * from) {
            std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
            std::chrono::duration<double, std::milli>(gc_t2 - gc_t1).count());
   if (verify_kids)
-    log_file("info string KIDS-CHECK: %zu nodes, %zu edges checked; child count mismatches %zu, child slot mismatches %zu%s\n",
+    log_file("info string KIDS-CHECK: %zu nodes, %zu edges checked; count or offset mismatches %zu, children in free slots %zu; "
+             "since start %llu edges published, %llu reached the wrong position%s\n",
              kids_checked_nodes, kids_checked_edges, kids_bad_count, kids_bad_child,
-             (kids_bad_count || kids_bad_child) ? "  <-- THE CHILD TABLE IS WRONG" : "");
+             (unsigned long long)kids_published_edges.load(), (unsigned long long)kids_wrong_position.load(),
+             (kids_bad_count || kids_bad_child || kids_wrong_position.load()) ? "  <-- THE CHILD TABLE IS WRONG" : "");
   if (gc_locality_probe && loc_nodes)
     log_file("info string gc locality: %zu nodes marked, %.1f ns/node, far node jumps %.1f%%, "
              "far child-block jumps %.1f%%, arena high water %u of %u slots, free list %zu\n",
@@ -1241,7 +1230,7 @@ void gc(MCTSNode * from) {
              [] { std::lock_guard<std::mutex> lk(search.arena.free_mtx); return search.arena.free_list.size(); }());
   total_nodes.store(search.arena.live(), std::memory_order_relaxed);
   //update hash_full
-  size_t total_memory = search.arena.live() * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+  size_t total_memory = search.arena.live() * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
   size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
   int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
   if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
@@ -1257,7 +1246,7 @@ void set_root(NNUEContext& ctx) {
   if (!root) {
     root = search.arena.alloc();
     //The arena is sized so the hash_full gate stops expansion long before it runs dry -- the gate
-    //charges 88 bytes a node and a slot is 64 -- so this is a should-not-happen. If it ever does,
+    //charges NODE_BYTES (96) a node and a slot is 64 -- so this is a should-not-happen. If it ever does,
     //wiping the tree is better than proceeding without a root, which is not survivable.
     if (!root) {
       log_file("info string node arena exhausted at the root; resetting the tree\n");
@@ -1387,7 +1376,6 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
       }
       children[i].P.store(prior, std::memory_order_relaxed);
       children[i].move.store(move_idx, std::memory_order_relaxed);
-      children[i].child.store(child, std::memory_order_relaxed);        
       search.arena.pool[pool_off + (uint64_t)i] = search.arena.index_of(child);
   }
   total_children.fetch_add(num_moves, std::memory_order_relaxed); //update total_children counter
@@ -1404,10 +1392,21 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
     search.arena.pool_release(pool_off, (uint32_t)num_moves);
     return;
   }
-  //Child table before the count: a reader that sees num_children > 0 must find the block in place.
+  //Child table and pool position BEFORE the count: every reader of a child goes through
+  //child_at(parent, i), which is only valid for i < num_children, so anyone who sees the count must find
+  //both already in place. kids[] is the collector's copy, pool_off the search's.
   search.arena.kids[search.arena.index_of(parent)].store(NodeArena::kids_pack(pool_off, (uint32_t)num_moves),
                                                          std::memory_order_release);
+  parent->pool_off.store((uint32_t)pool_off, std::memory_order_release);
   parent->num_children.store(num_moves, std::memory_order_release);
+  //CREATICA_VERIFY_KIDS=1: structure is not enough -- a consistent but shifted index would pass every
+  //other check and play the wrong move. Each child reached through the table must be the position its
+  //move leads to.
+  if (verify_kids)
+    for (int i = 0; i < num_moves; ++i)
+      if (search.arena.child_at(parent, i)->hash.load(std::memory_order_relaxed) != std::get<4>(top_moves[i]))
+        kids_wrong_position.fetch_add(1, std::memory_order_relaxed);
+  if (verify_kids) kids_published_edges.fetch_add((uint64_t)num_moves, std::memory_order_relaxed);
 }
 
 //no locking, call only when search threads finished
@@ -1422,7 +1421,7 @@ int most_visited_child(const MCTSNode * parent) {
     //By EDGE when enabled. Following the child with the largest lifetime N walks into whichever
     //position the game happens to have visited most, not the line this search preferred.
     uint64_t n = edge_visits ? (uint64_t)children[i].n.load(std::memory_order_relaxed)
-                             : children[i].child.load(std::memory_order_relaxed)->N.load(std::memory_order_relaxed);
+                             : search.arena.child_at(parent, i)->N.load(std::memory_order_relaxed);
     priors.push_back({children[i].P.load(std::memory_order_relaxed), i});
     if (n > N) {
       N = n;
@@ -1529,7 +1528,7 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
   std::vector<std::tuple<uint64_t, int>> visits; //N, child_idx
   Edge * children = search.root->children.load(std::memory_order_relaxed);
   for (int i = 0; i < num_children; i++) {
-    MCTSNode * child = children[i].child.load(std::memory_order_relaxed);
+    MCTSNode * child = search.arena.child_at(search.root, i);
     //BY EDGE, not by the child node. Ranking by the child's lifetime N is what put frozen nodes
     //at the top of this list every move: a position already played in the game keeps every visit
     //it banked as the ponder root, so it outranked moves the current search had actually worked
@@ -1583,7 +1582,7 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
   bool escape_exists = false;
   int n_null = 0, n_winning = 0, n_fresh = 0;
   for (int i = 0; i < num_children; ++i) {
-      MCTSNode * c = children[i].child.load(std::memory_order_relaxed);
+      MCTSNode * c = search.arena.child_at(search.root, i);
       if (!c) { ++n_null; continue; }
       const bool winning = child_q(c) > 0;
       const bool fresh   = rep_count(c->hash.load(std::memory_order_relaxed)) == 0;
@@ -1610,8 +1609,8 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
   while (repetition_guard > 0 && visits.size() > 1) {
     int idx = std::get<1>(visits[0]); //index of the most visited child
     int next_idx = std::get<1>(visits[1]); //index of the next most visited child
-    MCTSNode * child = children[idx].child.load(std::memory_order_relaxed);
-    MCTSNode * next_child = children[next_idx].child.load(std::memory_order_relaxed);
+    MCTSNode * child = search.arena.child_at(search.root, idx);
+    MCTSNode * next_child = search.arena.child_at(search.root, next_idx);
     //Q, NOT W.
     //
     //The old guard read the raw accumulated W and the comment above it claimed "if it is positive,
@@ -1660,7 +1659,7 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
   for (int i = 0; i < multiPV; i++) {
     int index = std::get<1>(visits[i]);
     idx2uci(children[index].move.load(std::memory_order_relaxed), uci_move);
-    MCTSNode * child = children[index].child.load(std::memory_order_relaxed);      
+    MCTSNode * child = search.arena.child_at(search.root, index);
     int cp = report_cp(child);                                   //the search's value, not the stale one-ply cp
     const int stale_cp = -child->cp.load(std::memory_order_relaxed); //kept for the debug line below
     double parent_N = static_cast<double>(search.root->N.load(std::memory_order_relaxed));
@@ -1689,7 +1688,7 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
       pv.append(uci_move);  
       pv2 += ' ';
       pv2.append(uci_move);   
-      child = children2[idx].child.load(std::memory_order_relaxed);
+      child = search.arena.child_at(child, idx);   //the old child is the parent; evaluated before the assignment
       int cp2 = report_cp(child);
       N = child->N.load(std::memory_order_relaxed);
       W = -child->W.load(std::memory_order_relaxed);
@@ -1732,7 +1731,7 @@ int select_best_child(MCTSNode * parent, const int depth) {
   const double   parentQ = parentE ? parentW / parentE : 0.0;
   for (int i = 0; i < num_children; i++) {
     double P = children[i].P.load(std::memory_order_relaxed);
-    MCTSNode * child = children[i].child.load(std::memory_order_relaxed);
+    MCTSNode * child = search.arena.child_at(parent, i);
     uint64_t N = child->N.load(std::memory_order_relaxed);   //attention: drives exploration
     const uint64_t Ne = ev_of(child);                        //evidence: drives Q
     //N(s,a) for this edge, which is NOT the child's visit count. See the note on Edge::n.
@@ -1761,7 +1760,7 @@ int select_best_child(MCTSNode * parent, const int depth) {
   }
   // Apply virtual loss to selected child to avoid contention among threads for the same node
   //children = parent.children.load(std::memory_order_acquire);
-  MCTSNode * child = children[selected].child.load(std::memory_order_acquire);
+  MCTSNode * child = search.arena.child_at(parent, selected);
   child->N.fetch_add(1, std::memory_order_release);
   child->W.fetch_sub(virtual_loss, std::memory_order_release);
   //Count the edge and the descent together, so the two stay consistent. Neither is ever undone:
@@ -2241,7 +2240,7 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
     int move_idx = children[idx].move.load(std::memory_order_relaxed);
     path.push_back(node);  // Add parent node to path
     //continue iterating down the tree by getting next node until no more children
-    node = children[idx].child.load(std::memory_order_acquire);
+    node = search.arena.child_at(node, idx);   //the parent is the node being left; evaluated before the assignment
     //init and take edge's move that leads to the child node
     terminal = node->terminal.load(std::memory_order_acquire);
     if (terminal == 3) break; //repetition
@@ -2460,7 +2459,7 @@ void uci_output_thread() {
       Edge * children = current_node->children.load(std::memory_order_acquire);
       for (int i = 0; i < num_children; i++) {
         //Same edge-versus-position distinction as most_visited_child() and select_best_moves().
-        MCTSNode * ch = children[i].child.load(std::memory_order_acquire);
+        MCTSNode * ch = search.arena.child_at(current_node, i);
         uint64_t n = edge_visits ? (uint64_t)children[i].n.load(std::memory_order_relaxed)
                                  : (ch ? ch->N.load(std::memory_order_relaxed) : 0);
         if (current_node == search.root) visits.push_back({n, i});
@@ -2470,14 +2469,14 @@ void uci_output_thread() {
         } 
       }
       if (next_idx < 0) break; //meaning current_node is a leaf node, i.e. no children
-      current_node = children[next_idx].child.load(std::memory_order_acquire);
+      current_node = search.arena.child_at(current_node, next_idx);   //evaluated before the assignment
       d++;
     }
     depth.store(d, std::memory_order_relaxed);
     std::shared_lock lock(map_mutex);
     size_t unique_nodes = search.arena.live();
     lock.unlock();
-    size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+    size_t total_memory = unique_nodes * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
     size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
     int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
     if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
@@ -2490,7 +2489,7 @@ void uci_output_thread() {
       const int move_idx = children[visits[i].second].move.load(std::memory_order_relaxed);
       char uci_move[6];
       idx2uci(move_idx, uci_move);
-      MCTSNode * child = children[visits[i].second].child.load(std::memory_order_acquire);
+      MCTSNode * child = search.arena.child_at(search.root, visits[i].second);
       log_file("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", d, seldepth.load(std::memory_order_relaxed), i + 1, report_cp(child), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, uci_move);
       print("info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %.0f hashfull %d tbhits %lld time %.0f pv %s\n", d, seldepth.load(std::memory_order_relaxed), i + 1, report_cp(child), nodes, nps, hashfull, tbhits.load(std::memory_order_relaxed), elapsed * 1000, uci_move);
     }
@@ -2725,7 +2724,7 @@ void runMCTS(NNUEContext& ctx) {
       nodes = search_simulations.load(std::memory_order_relaxed);
       unique_nodes = search.arena.live();
       // Calculate hashfull (in per-mille) using unique_nodes
-      size_t total_memory = unique_nodes * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
+      size_t total_memory = unique_nodes * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
       size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
       hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
       if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
@@ -2924,7 +2923,7 @@ void runMCTS(NNUEContext& ctx) {
       MCTSNode * next_root = nullptr;
       for (int i = 0; i < nc && ch; ++i) {
         if (ch[i].move.load(std::memory_order_relaxed) == want) {
-          next_root = ch[i].child.load(std::memory_order_acquire);
+          next_root = search.arena.child_at(search.root, i);
           break;
         }
       }
