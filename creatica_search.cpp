@@ -261,9 +261,6 @@ std::atomic<uint64_t> total_children{0};
 //because tree_occupancy() counts them: that memory is still held by the process.
 std::atomic<size_t>   reap_pending{0};
 std::atomic<uint64_t> reap_pending_edges{0};
-//Nodes the sweep has retired that the reaper has not yet given back. arena.live() keeps counting them
-//until their slots are released, so every occupancy figure subtracts this; see live_tree_nodes().
-std::atomic<size_t>   retired_nodes{0};
 std::atomic<uint64_t> tbhits{0};
 //STARTS AT 1, because 0 now means "this arena slot is free". gc() hands out fetch_add(1)+1, so
 //the first real generation is 2 and nothing live ever carries 0.
@@ -272,9 +269,8 @@ std::atomic<int> hash_full{0};
 //Node count, maintained atomically so it can be read DURING a search.
 //
 //tree_occupancy() and the workers' expansion guard both need to know how full the tree is, but
-//search.arena.live() cannot be read while make_child() is inserting under map_mutex. Kept in
-//step here instead: incremented on a successful insert, resynced from the map by gc() and
-//cleanup(), which only ever run with no search in flight.
+//search.arena.live() counts SLOTS, including nodes the background sweep has not retired yet. Kept in
+//step here instead: set from the mark by gc(), zeroed by cleanup(), incremented on every insert.
 std::atomic<size_t> total_nodes{0};
 std::atomic<int> depth{0};
 std::atomic<int> seldepth{0};
@@ -339,6 +335,8 @@ std::vector<ThreadParams> pool_params;
 
 void gc_join();         //all three defined with the collector below
 void reap_drain();      //waits for the deferred frees; defined with the reaper below
+void sweep_stop();      //the background sweep: stop it, or let it finish; defined with the collector below
+void sweep_finish();
 void cleanup_locked();
 static void gc_completed_invalidate();   //THE EXACT FUTILITY TEST, defined with the collector below
 //Expansions abandoned after children may already have been created -- the only way a node can be left
@@ -380,6 +378,7 @@ void arena_size_check() {
   const size_t   bytes = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
   const uint32_t want  = (uint32_t)std::min<size_t>(bytes / sizeof(MCTSNode), 0xFFFFFFFEu);
   if (search.arena.cap == want) return;
+  sweep_stop();
   reap_drain();
   search.tree.clear();
   search.root = nullptr;
@@ -394,8 +393,9 @@ void arena_size_check() {
 //The body, with no join. Callable from the background collector itself, which must not try
 //to join the thread it is running on.
 void cleanup_locked() {
-  //Drain first: the reaper is about to be told every slot is free, and it must not be holding
-  //indices from the previous generation when that happens.
+  //Stop the background sweep, then drain: the reaper is about to be told every slot is free, and it
+  //must not be holding indices from the previous generation when that happens.
+  sweep_stop();
   reap_drain();
   //By INDEX over the arena, not by walking the map. Same sequential-access reason as the sweep,
   //and it also catches a node that was created and then lost its map entry.
@@ -423,7 +423,6 @@ void cleanup_locked() {
   search.root = nullptr;
   total_children.store(0, std::memory_order_relaxed);
   total_nodes.store(0, std::memory_order_relaxed);
-  retired_nodes.store(0, std::memory_order_relaxed);   //the drain above released every retired slot
   gc_completed_invalidate();
 }
 
@@ -495,18 +494,16 @@ std::string   game_tag;          //set per game by the driver, so records can be
 //The reaper's backlog is still worth seeing, so it is logged in the gc breakdown line instead of
 //being folded into a number that decides whether to keep searching.
 //
-//THAT EXCLUSION HAD QUIETLY STOPPED WORKING. Once the sweep stopped reading corpses, nothing subtracted
-//them until the reaper reached them: total_nodes was resynced from arena.live(), which still counts every
-//retired slot, and total_children fell only as the reaper freed each Edge array, at the end of its batch.
-//In game QHWLWAbv a collection retired 11.75M nodes and the next search reported 618,205 nodes at 928
-//per-mille and ran 94% hollow. The sweep now charges both at once: it counts the dead nodes, reads their
-//child counts from kids[] -- a separate array, so still no corpse is touched -- and subtracts the edges
-//from total_children before the search starts. retired_nodes carries the nodes until the reaper releases
-//them, and live_tree_nodes() takes it off arena.live().
+//THAT EXCLUSION HAD QUIETLY STOPPED WORKING once the sweep stopped reading corpses: nothing subtracted them
+//until the reaper reached them. In game QHWLWAbv a collection retired 11.75M nodes and the next search
+//reported 618,205 nodes at 928 per-mille and ran 94% hollow.
+//
+//Now the counts come from the MARK, which is exact: the tree after a collection is precisely the nodes and
+//edges the mark reached, so gc() sets total_nodes and total_children to those and the search adds to them
+//as it expands. Neither the background sweep nor the reaper touches them. arena.live() is still the
+//authority on SLOTS in use, which includes nodes waiting to be retired or released.
 size_t live_tree_nodes() {
-  const size_t live    = search.arena.live();
-  const size_t retired = retired_nodes.load(std::memory_order_relaxed);
-  return live > retired ? live - retired : 0;
+  return total_nodes.load(std::memory_order_relaxed);
 }
 
 int tree_occupancy() {
@@ -883,11 +880,8 @@ static void reaper_func() {
       }
       arena_reset_slot(n);
       search.arena.release(idx);
-      //Per node, right after the release, so live_tree_nodes() never counts this slot twice or not at all.
-      retired_nodes.fetch_sub(1, std::memory_order_relaxed);
     }
-    //total_children is NOT charged here any more: the sweep took these edges off before the search
-    //started, reading their counts from kids[]. See tree_occupancy().
+    //total_children is NOT charged here: gc() sets it from the mark. See tree_occupancy().
     //Under the mutex, because reap_drain() waits on exactly this condition while holding it.
     {
       std::lock_guard<std::mutex> lk(reap_mtx);
@@ -916,17 +910,116 @@ void reap_enqueue(std::vector<uint32_t>&& dead, uint64_t edges) {
 //Block until every deferred free has actually happened. Needed only where the memory itself
 //must be gone -- cleanup() and shutdown -- never on the search path, which is the entire point.
 void reap_drain() {
+  //The background sweep feeds the reaper, so it has to finish first or the drain could end with slots
+  //still waiting to be retired.
+  sweep_finish();
   std::unique_lock<std::mutex> lk(reap_mtx);
   reap_cv.wait(lk, [] { return reap_pending.load(std::memory_order_relaxed) == 0; });
 }
 
 void reap_shutdown() {
+  sweep_stop();   //it enqueues, and reap_enqueue() would start the reaper again
   {
     std::lock_guard<std::mutex> lk(reap_mtx);
     reap_quit.store(true, std::memory_order_relaxed);
   }
   reap_cv.notify_all();
   if (reap_thread.joinable()) reap_thread.join();
+}
+
+//--- the background sweep -------------------------------------------------------------------------
+//
+//Everything gc() used to do after its mark, done while the search runs: retire every slot the mark did
+//not reach and hand it to the reaper, then drop the map entries that point at them. See NO SWEEP ON THE
+//CLOCK in gc() for why this is safe to do late, and to leave unfinished.
+//
+//It is never needed for correctness, only for memory: a node the mark did not reach is already invisible.
+//So it can be stopped at any point. Whatever it has not retired still carries an old generation, and the
+//next collection's sweep takes it.
+static std::thread       sweep_thread;
+static std::atomic<bool> sweep_abort{false};
+
+//One bit per arena slot, set for the slots the running sweep retired; see NodeMap::clean_step(). Owned by the
+//sweep thread, and only one sweep ever runs.
+static std::vector<uint64_t> retired_bits;
+//CREATICA_MAP_CLEAN=0 skips the map walk (experiment: is the walk what slows the search it overlaps?).
+static const bool map_clean_enabled = [] { const char * e = std::getenv("CREATICA_MAP_CLEAN"); return !(e && *e == '0'); }();
+
+static void sweep_func(uint32_t threshold, uint32_t n_slots) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const size_t words = ((size_t)search.arena.cap + 63) / 64;
+  if (retired_bits.size() != words) retired_bits.assign(words, 0);
+  std::vector<uint32_t> dead;
+  uint64_t dead_edges = 0;
+  bool aborted = false;
+  //Slots: by index over the arena, a sequential stride over gen[], exactly as the old sweep. A slot is dead
+  //when it is occupied (gen != 0) and the mark did not reach it (gen < threshold). The compare-exchange
+  //makes retirement happen once even if two sweeps ever overlapped.
+  for (uint32_t i = 0; i < n_slots; ++i) {
+    if ((i & 0xFFFF) == 0 && sweep_abort.load(std::memory_order_relaxed)) { aborted = true; break; }
+    uint32_t g = search.arena.gen[i].load(std::memory_order_relaxed);
+    if (g == 0 || g >= threshold) continue;
+    if (!search.arena.gen[i].compare_exchange_strong(g, 0, std::memory_order_relaxed)) continue;
+    search.arena.tag[i].store(0, std::memory_order_relaxed);
+    dead_edges += NodeArena::kids_count(search.arena.kids[i].load(std::memory_order_relaxed));
+    dead.push_back(i);
+    retired_bits[i >> 6] |= 1ull << (i & 63);
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  //The map: drop the entries for those slots, one cluster at a time under the exclusive lock, yielding
+  //between steps so a searching thread waiting on the lock gets it. Not needed at all when nothing died.
+  size_t dropped = 0, steps = 0;
+  const char * map_state = "nothing to drop";
+  if (!aborted && !dead.empty() && map_clean_enabled) {
+    size_t cursor = 0, scanned = 0;
+    uint64_t epoch = 0;
+    {
+      std::unique_lock lk(map_mutex);
+      epoch  = search.tree.epoch();
+      cursor = search.tree.first_empty();
+    }
+    std::vector<NodeMap::Slot> keep;
+    map_state = "stopped by the next collection";
+    while (!sweep_abort.load(std::memory_order_relaxed)) {
+      bool done;
+      {
+        std::unique_lock lk(map_mutex);
+        ++steps;
+        //32,768 table slots a step: about half a megabyte of the table.
+        done = search.tree.clean_step(cursor, scanned, epoch, 1u << 15, dropped, keep, retired_bits.data());
+      }
+      if (done) { map_state = "clean"; break; }
+      std::this_thread::yield();
+    }
+  }
+  //Only now do the slots go back. Until the walk has passed, a retired slot must not become a new node,
+  //or that node's fresh map entry would be dropped as if it were one of the stale ones.
+  for (uint32_t i : dead) retired_bits[i >> 6] &= ~(1ull << (i & 63));
+  const size_t retired = dead.size();
+  reap_enqueue(std::move(dead), dead_edges);
+  const auto t2 = std::chrono::steady_clock::now();
+  log_file("info string background sweep: retired %zu slots in %.1f ms; map: %s, %zu stale entries dropped "
+           "in %zu locked steps, %.1f ms\n",
+           retired, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+           map_state, dropped, steps, std::chrono::duration<double, std::milli>(t2 - t1).count());
+}
+
+//Stop a sweep in progress and wait for its thread. Quick: it checks for this every 65,536 slots and
+//between map steps.
+void sweep_stop() {
+  sweep_abort.store(true, std::memory_order_relaxed);
+  if (sweep_thread.joinable()) sweep_thread.join();
+  sweep_abort.store(false, std::memory_order_relaxed);
+}
+
+//Let a sweep in progress finish, for callers that need every dead slot gone (a drain, the validator).
+void sweep_finish() {
+  if (sweep_thread.joinable()) sweep_thread.join();
+}
+
+static void sweep_start(uint32_t threshold, uint32_t n_slots) {
+  sweep_stop();
+  sweep_thread = std::thread(sweep_func, threshold, n_slots);
 }
 
 void gc_join() {
@@ -942,20 +1035,21 @@ void gc_join() {
 //time at a 1000 ms movetime.
 void gc_start(MCTSNode * from, bool wipe) {
   gc_join();                                   //never two collectors at once
-  const size_t before = search.arena.live();
+  const size_t before = live_tree_nodes();
   const auto   t0     = std::chrono::steady_clock::now();
   gc_thread = std::thread([from, before, t0, wipe] {
-    if (wipe) cleanup_locked(); else gc(from);
-    const size_t after = search.arena.live();
-    last_gc_freed.store(before ? (double)(before - after) / (double)before : 1.0,
-                        std::memory_order_relaxed);
+    //gc() records its own yield from the mark. arena.live() is no measure of it any more: slots are
+    //retired by the background sweep, after this returns.
+    if (wipe) { cleanup_locked(); last_gc_freed.store(1.0, std::memory_order_relaxed); }
+    else gc(from);
+    const size_t after = live_tree_nodes();
     last_gc_ms.store(std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - t0).count(),
                      std::memory_order_relaxed);
     //Logged from inside the thread: the caller returns immediately and cannot observe the
     //outcome. log_file() is mutex-guarded, so this is safe from here.
     log_file("info string post-move %s: %zu -> %zu nodes, %d permille, %.1f ms%s\n",
-             wipe ? "cleanup" : "gc", before, search.arena.live(), tree_occupancy(),
+             wipe ? "cleanup" : "gc", before, after, tree_occupancy(),
              std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t0).count(),
              gc_abort.load(std::memory_order_relaxed) ? " (interrupted)" : "");
@@ -1087,8 +1181,12 @@ void gc(MCTSNode * from, bool retire_all) {
   // BFS traversal to mark reachable nodes with the current generation.
   // Use queue to avoid recursion and potential stack overflow in deep trees.
   const auto gc_t0 = std::chrono::steady_clock::now();
-  size_t gc_marked = 0, gc_freed = 0, gc_edges_freed = 0;
-  const size_t gc_before = search.arena.live();
+  size_t gc_marked = 0;
+  //A previous sweep still running must not overlap this mark's restamping; whatever it left is taken by
+  //this collection's own sweep.
+  sweep_stop();
+  const size_t   nodes_before = total_nodes.load(std::memory_order_relaxed);
+  const uint64_t edges_before = total_children.load(std::memory_order_relaxed);
   //A PLAIN FIFO over a vector with a read cursor. This was a binary heap, ordered by visit count
   //under GcBestFirst and by a decreasing counter otherwise -- so BOTH settings paid O(log n) with
   //a sift on every push and every pop, tens of millions of times a game.
@@ -1186,93 +1284,47 @@ void gc(MCTSNode * from, bool retire_all) {
     log_file("info string gc: truncated %zu nodes to fit %d permille of Hash "
              "(kept %zu nodes, %zu edges)\n",
              truncated, GC_EVICT_SOFT, kept_nodes, kept_edges);
-  // Now iterate through the map and erase nodes with outdated generations, i.e. nodes that are not reachable
-  // Also clean up allocated children arrays.
-  //The SWEEP runs to completion once started. It must not be interrupted, and the reason is not
-  //obvious, so it is worth writing down -- an earlier version did interrupt it and the validator
-  //caught the result immediately, 34 dangling Edges in one search.
-  //
-  //A survivor never points at garbage: if it did, that node would be reachable from the root and
-  //would have been marked. So every dangling Edge left by a partial sweep is garbage pointing at
-  //deleted garbage, which the search can never traverse -- and that looks harmless. It is not,
-  //because make_child() finds nodes by HASH, not by traversal. A garbage node still sitting in
-  //the map can be handed back as a child of a live node, and its Edges point at freed memory.
-  //Deleting a parent and its children in the same sweep is what prevents that, so the sweep is
-  //all-or-nothing. Interruption is confined to the mark phase above, where abandoning the whole
-  //collection frees nothing and leaves the tree exactly as it was.
   const auto gc_t1 = std::chrono::steady_clock::now();
-  //UNLINK ONLY -- no delete anywhere in this loop. See the reaper above for why handing the
-  //frees to another thread is safe, and for the measurements that made it necessary. This still
-  //has to run to completion before the search starts, because a dead node left in the map can be
-  //handed back by make_child(); but it is now a map walk with no allocator work in it.
-  //BY INDEX OVER THE ARENA, not by iterating the map. This is the whole point of the arena and it
-  //is worth being precise about why. Iterating the map yields nodes in HASH order; when every node
-  //was its own allocation that order was arbitrary across several gigabytes of heap, so each
-  //generation check was a cache miss and often a page fault -- measured at 1.09 microseconds per
-  //entry, 83,828 ms for one sweep. Walking slot 0..bump is a sequential stride over one array, so
-  //the hardware prefetcher sees it coming.
-  std::vector<uint32_t> dead;
-  const uint32_t n_slots = search.arena.high_water();
-  dead.reserve(gc_before > gc_marked ? gc_before - gc_marked : 0);
-  for (uint32_t i = 0; i < n_slots; ++i) {
-    //The only read in the common case, and it is four bytes out of a contiguous array rather than
-    //a 64-byte line out of the node. Everything below runs for DEAD slots only.
-    const uint32_t g = search.arena.gen[i].load(std::memory_order_relaxed);
-    if (g == 0) continue;                       //free slot, nothing here
-    if (g >= (uint32_t)current_gen) continue;   //marked: reachable from the root, keep it
-    //ZERO THE STAMP AND MOVE ON. That single store invalidates every map entry pointing at this
-    //slot, so there is nothing to erase and no reason to read the node -- its hash, its child
-    //count and its edges are all the reaper's business now, off this clock. This is the whole
-    //difference between a sweep that reads 4 bytes a slot and one that chases a 64-byte line plus
-    //a table probe for every corpse.
-    //Both, and the tag is the one that matters to the map: zeroing it is what makes every entry
-    //pointing at this slot stale, instantly and without touching the node or the table.
-    search.arena.tag[i].store(0, std::memory_order_relaxed);
-    search.arena.gen[i].store(0, std::memory_order_relaxed);
-    dead.push_back(i);
-    ++gc_freed;
-    gc_edges_freed += NodeArena::kids_count(search.arena.kids[i].load(std::memory_order_relaxed));
-  }
-  //Right-size the table now that the survivors are known. Without this the sweep's cost is set
-  //by the capacity the tree reached at its PEAK rather than by what it currently holds, and every
-  //later collection rescans that empty space. See NodeMap::compact().
-  search.tree.compact();
-  const auto gc_t2 = std::chrono::steady_clock::now();
-  //CHARGED NOW. The dead nodes and their edges come off the occupancy figures before the next search
-  //starts, instead of whenever the reaper reaches them; see tree_occupancy(). The edge counts come from
-  //kids[], so the sweep still never reads a corpse. retired_nodes goes up before the batch is queued, so
-  //the reaper can never release a slot that has not been counted.
-  retired_nodes.fetch_add(gc_freed, std::memory_order_relaxed);
-  total_children.fetch_sub(gc_edges_freed, std::memory_order_relaxed);
-  reap_enqueue(std::move(dead), gc_edges_freed);
+  //NO SWEEP ON THE CLOCK.
+  //
+  //The mark above is all of the collection the search waits for. Publishing current_gen as the arena's
+  //visible generation makes every node the mark did not reach invisible to the map at once, so make_child()
+  //can never hand one back, and no traversal can reach one either -- a survivor never points at an unmarked
+  //node, or that node would have been marked. Nothing therefore has to be retired before the search starts.
+  //
+  //The sweep used to run here to completion. Measured on a replay at Hash 2048 it cost 131-819 ms a
+  //collection -- 15-125 ms scanning slots and 112-719 ms compacting the node map -- charged to the search
+  //that followed. In lichess game 2VnUZWDh collections before real searches took 25 seconds of Black's
+  //clock, and one left the search 2 ms. Both jobs now run on a background thread while the search runs
+  //(sweep_func), and neither has to finish.
+  //
+  //The counters come from the mark, which is exact: the tree is now precisely the kept nodes and edges.
+  const size_t   freed_nodes = nodes_before > kept_nodes ? nodes_before - kept_nodes : 0;
+  const uint64_t freed_edges = edges_before > (uint64_t)kept_edges ? edges_before - (uint64_t)kept_edges : 0;
+  total_nodes.store(kept_nodes, std::memory_order_relaxed);
+  total_children.store((uint64_t)kept_edges, std::memory_order_relaxed);
+  search.arena.visible_gen.store((uint32_t)current_gen, std::memory_order_relaxed);
+  sweep_start((uint32_t)current_gen, search.arena.high_water());
   //Record the yield HERE, not only in gc_start(). last_gc_freed existed already but was written
   //solely by the background collector and read solely by the background decision, so the inline
   //path -- the only one that runs with Ponder on -- had no futile-collection guard at all.
-  last_gc_freed.store(gc_before ? (double)gc_freed / (double)gc_before : 1.0,
+  last_gc_freed.store(nodes_before ? (double)freed_nodes / (double)nodes_before : 1.0,
                       std::memory_order_relaxed);
-  last_gc_freed_count.store(gc_freed, std::memory_order_relaxed);
-  //Completed: the mark reached everything reachable from gc_root and the sweep retired the rest, so
+  last_gc_freed_count.store(freed_nodes, std::memory_order_relaxed);
+  //Completed: the mark reached everything reachable from gc_root and everything else is invisible, so
   //the tree is now exactly the set reachable from gc_root. See THE EXACT FUTILITY TEST.
   //Not after a reset: its snapshot names a root that has just been retired.
   if (!retire_all) {
     std::lock_guard<std::mutex> lk(gc_completed_mtx);
     gc_completed = gc_snapshot;
   }
-  //One line per collection that actually runs, which is now rare. Kept because the question it
-  //answers -- how much of a collection is marking, how much is walking the map, and how many
-  //nodes really died -- has to be re-asked every time collection feels slow, and it cannot be
-  //reconstructed from "gc took N ms" alone. mark is a pointer-chase over live nodes; sweep is
-  //the unlink walk, which visits every entry in the map whether or not anything dies. The frees
-  //no longer appear here at all -- they are the reaper's, and they happen during the search.
-  log_file("info string gc breakdown: %zu nodes -> %zu, marked %zu, freed %zu nodes + %zu edges, "
-           "reaper backlog %zu, mark %.1f ms, sweep %.1f ms\n",
-           //gc_before - gc_freed, NOT live(): the sweep only retires stamps, and the slots are not
-           //given back until the reaper works through the batch, so live() still counts every
-           //corpse at this point and the line read "N nodes -> N" after freeing five million.
-           gc_before, gc_before - gc_freed, gc_marked, gc_freed, gc_edges_freed,
+  //One line per collection that actually runs. The sweep reports separately when it finishes.
+  log_file("info string gc breakdown: %zu nodes -> %zu, marked %zu, freed %zu nodes + %llu edges, "
+           "reaper backlog %zu, mark %.1f ms, sweep in the background; map rehashes so far %llu (%.1f ms)\n",
+           nodes_before, kept_nodes, gc_marked, freed_nodes, (unsigned long long)freed_edges,
            reap_pending.load(std::memory_order_relaxed),
            std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
-           std::chrono::duration<double, std::milli>(gc_t2 - gc_t1).count());
+           (unsigned long long)NodeMap::rehashes.load(), NodeMap::rehash_us.load() / 1000.0);
   if (verify_kids)
     log_file("info string KIDS-CHECK: %zu nodes, %zu edges checked; count or offset mismatches %zu, children in free slots %zu; "
              "since start %llu edges published, %llu reached the wrong position%s\n",
@@ -1287,7 +1339,6 @@ void gc(MCTSNode * from, bool retire_all) {
              loc_blocks ? 100.0 * (double)loc_far_blocks / (double)loc_blocks : 0.0,
              search.arena.high_water(), search.arena.cap,
              [] { std::lock_guard<std::mutex> lk(search.arena.free_mtx); return search.arena.free_list.size(); }());
-  total_nodes.store(live_tree_nodes(), std::memory_order_relaxed);
   //update hash_full
   size_t total_memory = live_tree_nodes() * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
   size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
@@ -1301,7 +1352,12 @@ void set_root(NNUEContext& ctx) {
   //Cheap when Hash has not moved -- it compares one integer and returns. This is the only place
   //the arena is created, so it has to run before the first lookup.
   arena_size_check();
-  MCTSNode * root = search.tree.lookup(zh.hash);
+  //Under the lock even here, with no search running: the background sweep may be cleaning the map.
+  MCTSNode * root = nullptr;
+  {
+    std::shared_lock lk(map_mutex);
+    root = search.tree.lookup(zh.hash);
+  }
   if (!root) {
     root = search.arena.alloc();
     //The arena is sized so the hash_full gate stops expansion long before it runs dry -- the gate
@@ -1315,7 +1371,11 @@ void set_root(NNUEContext& ctx) {
     }
     root->hash.store(zh.hash, std::memory_order_relaxed);
     search.arena.stamp(root, (uint32_t)generation.load(std::memory_order_relaxed));
-    search.tree.insert(zh.hash, root);
+    {
+      std::unique_lock lk(map_mutex);
+      search.tree.insert(zh.hash, root);
+    }
+    total_nodes.fetch_add(1, std::memory_order_relaxed);
   }
   //Expand whether the root is new or REUSED. The expansion used to sit inside the !root branch,
   //so a root inherited from the previous search was left exactly as it was found. That is fine

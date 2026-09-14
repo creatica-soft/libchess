@@ -1179,6 +1179,66 @@ violations, and none of 54 million published child entries reached the wrong pos
 
 **Not yet measured:** whether it changes results in games. It is off by default.
 
+**Resetting a frozen tree, measured by position.** From the logs of today's games, 340 searches ran on
+a full, frozen tree (at least 90% hollow, 950 per-mille or more). Fifty of them, ten in each
+piece-count band, were searched again from an empty tree for the same time, with the bot's settings,
+and Stockfish (600 ms a position) scored the move each version chose:
+
+| pieces | fresh search, simulations/s | fresh move had more search behind it | frozen move: mean loss | fresh move: mean loss | fresh better / worse / equal |
+|---|---|---|---|---|---|
+| ≤ 10 | 460,000 | 7 of 10 | 225 cp | 204 cp | 1 / 0 / 9 |
+| 11–16 | 402,000 | 6 of 10 | 45 cp | 113 cp | 3 / 2 / 5 |
+| 17–22 | 297,000 | 2 of 10 | 135 cp | 128 cp | 2 / 1 / 7 |
+| 23–28 | 274,000 | 8 of 10 | 12 cp | 6 cp | 1 / 0 / 9 |
+| 29–32 | 259,000 | 7 of 10 | 7 cp | 9 cp | 0 / 1 / 9 |
+
+A fresh search is indeed faster with fewer pieces, about 1.8 times from a full board to ten pieces or
+fewer. In 30 of the 50 positions it put more search behind its chosen move than the frozen search had
+inherited; where it did not, the frozen root had inherited a lot (a median of 672,000 in the 17–22
+band). By Stockfish the two choices were equivalent in 39 of 50 positions; the fresh move was better in
+7 and worse in 4, and it lost a pawn or more 5 times against 7. Fifty positions cannot separate those,
+so the measurement says a reset in a frozen position costs nothing measurable, not that it gains.
+
+### The sweep off the clock
+
+A collection used to be a mark, then a sweep, both before the search on the move's own clock. At
+`Hash` 2048 after the node-size fix, the sweep measured 131–819 ms a collection: 15–125 ms scanning the
+node slots and **112–719 ms compacting the node map**. In lichess game `2VnUZWDh` collections before
+real searches took 25 seconds of Black's two-minute clock, and one left the search 2 ms and 128
+simulations for 105...Ka7.
+
+Only the mark now runs before the search. When it completes, `gc()` publishes its generation as the
+arena's *visible generation*, and the map resolves a node only if its generation is at least that
+(`NodeMap::valid()`), so every node the mark did not reach is invisible at once. Nothing can hand one
+out, and no survivor points at one, so nothing has to be retired before the search starts. A background
+thread (`sweep_func`) then retires those slots, drops their map entries cluster by cluster under short
+exclusive locks, and only then gives the slots to the reaper — a retired slot must not become a new
+node while the walk still treats every entry pointing at it as stale. None of this has to finish: a
+collection starting while it runs stops it, and its own sweep takes whatever was left. The occupancy
+counters now come from the mark, which is exact, rather than from the sweep.
+
+Measured on replays of `QHWLWAbv` at `Hash` 2048:
+
+| | collection before the search, mean | worst |
+|---|---|---|
+| sweep on the clock | 568 ms | 912 ms |
+| sweep in the background | 67–214 ms | 101–396 ms |
+
+In a controlled benchmark — fill the tree for 30 s, play a pawn move each that leaves most of it
+unreachable, search 2 s — the old build spent 266–398 ms collecting and searched 415–527 million
+simulations; the new build spent under 1 ms and searched 503–579 million.
+
+**What it still costs.** The map walk holds the whole map's lock for each short step, and every
+search thread needs that lock to create a node, so the search runs slower for as long as the walk
+lasts: typically 120–400 ms per collection that freed something. It is skipped when nothing was
+freed. Moving the walk and the reaper onto macOS's efficiency cores (`QOS_CLASS_UTILITY`) was tried and
+reverted: in one of three runs the walk took 1.9 s on a slow core while holding the lock, and the
+search behind it fell to 74,000 simulations a second.
+
+Validated with `ValidateTree`, `CREATICA_VERIFY_KIDS` and `CREATICA_VERIFY_FUTILE` over a full replay at
+`Hash` 1024 and with a reset forced before every search: no invariant violations, no exact-futility
+failures, and no child-table errors. `CREATICA_MAP_CLEAN=0` skips the map walk, for measurement.
+
 
 ## Running comparisons
 
