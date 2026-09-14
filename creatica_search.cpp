@@ -332,6 +332,10 @@ void gc_join();         //all three defined with the collector below
 void reap_drain();      //waits for the deferred frees; defined with the reaper below
 void cleanup_locked();
 static void gc_completed_invalidate();   //THE EXACT FUTILITY TEST, defined with the collector below
+//Expansions abandoned after children may already have been created -- the only way a node can be left
+//allocated but attached to nothing. THE EXACT FUTILITY TEST requires this unchanged since the last
+//collection; see the list of abandon points there.
+static std::atomic<uint64_t> expansion_abandons{0};
 void reap_drain();
 
 //Wipe a slot back to a just-constructed state before it is reused. A recycled slot keeps whatever
@@ -686,7 +690,7 @@ std::atomic<size_t> last_gc_freed_count{0};
 //a fresh go rather than ponderhit, the ponder search is stopped before it simulates anything, and
 //the real search then re-marks an 11.6-million-node tree it had just marked -- 1.5 s of the move's
 //budget, ten times in one game.
-struct GcCompleted { bool valid = false; uint32_t root_idx = 0, root_tag = 0, next_tag = 0; };
+struct GcCompleted { bool valid = false; uint32_t root_idx = 0, root_tag = 0, next_tag = 0; uint64_t abandons = 0; };
 static std::mutex  gc_completed_mtx;
 static GcCompleted gc_completed;
 static void gc_completed_invalidate() {
@@ -734,6 +738,26 @@ static bool reachable_within(const MCTSNode * from, const MCTSNode * target, int
 //the no-allocation condition, because an allocated node is not guaranteed to be attached (an
 //expansion abandoned when the arena runs dry keeps the children it already created).
 //
+//ALLOCATIONS ARE ALLOWED, and that is what makes the test useful after a ponder search that actually
+//searched. The first version required that not one node had been allocated since the collection,
+//because an allocated node is not guaranteed to be attached. What matters is not allocation but
+//ORPHANING, and a node can be left attached to nothing only when an expansion is abandoned after
+//children may exist. eval_and_expand() has three exits: checkmate and stalemate, which return before a
+//child is evaluated, and expand_node(). So the abandon points are all in expand_node(), plus
+//process_check()'s null guard, and each increments expansion_abandons:
+//  1. the child table's pool is exhausted (process_check() may already have created in-check children)
+//  2. make_child() fails part way through the child list
+//  3. the publication CAS is lost -- which should orphan nothing, since make_child() keeps one node per
+//     position and the winning array points at it, but is counted anyway
+//  4. process_check() cannot get a node at all
+//expand_node()'s early return when another thread has already published orphans nothing, by the same
+//one-node-per-position argument, and is not counted. CREATICA_VERIFY_FUTILE checks all of this: a hole
+//in it would show as a collection the test called futile freeing more than zero.
+//
+//With no abandon, every node allocated since the collection hangs under a node that was reachable from
+//the root the search was running from; edges are never removed; so the collection's root R still
+//reaches every live node, and if R is reachable from the current root, so does the current root.
+//
 //The search is capped, so a failed test costs a few milliseconds against a collection that costs
 //hundreds; four plies covers the shortest shuffle back (three) with one to spare.
 static const int    GC_FUTILE_REACH_DEPTH  = 4;
@@ -747,7 +771,9 @@ static int gc_would_free_nothing() {
   GcCompleted c;
   { std::lock_guard<std::mutex> lk(gc_completed_mtx); c = gc_completed; }
   if (!c.valid) return 0;
-  if (c.next_tag != search.arena.next_tag.load(std::memory_order_relaxed)) return 0;
+  //No expansion abandoned since the collection: every node allocated since then was attached where it
+  //was created, under a node reachable from the root the search was running from. See ALLOCATIONS below.
+  if (c.abandons != expansion_abandons.load(std::memory_order_relaxed)) return 0;
   //No allocation since, so the old root's slot cannot have changed hands -- but check its identity
   //anyway rather than rest the whole argument on that.
   if (c.root_idx >= search.arena.cap || search.arena.tag[c.root_idx].load(std::memory_order_relaxed) != c.root_tag)
@@ -1028,7 +1054,8 @@ void gc(MCTSNode * from) {
   //completes. Invalidated first, so a collection abandoned during the mark leaves no claim behind.
   gc_completed_invalidate();
   const GcCompleted gc_snapshot{ true, search.arena.index_of(gc_root), search.arena.stamp_of(gc_root),
-                                 search.arena.next_tag.load(std::memory_order_relaxed) };
+                                 search.arena.next_tag.load(std::memory_order_relaxed),
+                                 expansion_abandons.load(std::memory_order_relaxed) };
   //fetch_add() updates generation but returns original value before addition; hence, we add 1
   int current_gen = generation.fetch_add(1, std::memory_order_relaxed) + 1;
   // BFS traversal to mark reachable nodes with the current generation.
@@ -1349,7 +1376,12 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
   //The child table's block, taken before any child is created so every exit below can give it back.
   //An exhausted pool is treated exactly like an exhausted arena: no expansion, the node stays a leaf.
   const uint64_t pool_off = search.arena.pool_alloc((uint32_t)num_moves);
-  if (pool_off == UINT64_MAX) return;
+  if (pool_off == UINT64_MAX) {
+    //ABANDON POINT 1. The children were evaluated before this call, and process_check() may already
+    //have created nodes for the in-check ones; with no publication they stay attached to nothing.
+    expansion_abandons.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   Edge * children = new Edge[num_moves];
   for (int i = 0; i < num_moves; ++i) {
       auto [prior, move_idx, child_cp, terminal, child_hash] = top_moves[i];
@@ -1370,6 +1402,8 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
       //children already created stay in the map, unreachable from the root, and the next
       //collection takes them.
       if (!child) {
+        //ABANDON POINT 2. Children 0..i-1 exist in the map and are published nowhere.
+        expansion_abandons.fetch_add(1, std::memory_order_relaxed);
         delete[] children;
         search.arena.pool_release(pool_off, (uint32_t)num_moves);
         return;
@@ -1387,6 +1421,10 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
   Edge * expected = nullptr;
   if (!parent->children.compare_exchange_strong(expected, children,
         std::memory_order_release, std::memory_order_relaxed)) {
+    //ABANDON POINT 3, counted conservatively. Losing the race should orphan nothing: make_child() leaves
+    //exactly one node per position in the map, and the array that won the CAS points at it. Counted
+    //anyway, because it is rare and an uncounted orphan would make the futility test wrong.
+    expansion_abandons.fetch_add(1, std::memory_order_relaxed);
     total_children.fetch_sub(num_moves, std::memory_order_relaxed);
     delete[] children;
     search.arena.pool_release(pool_off, (uint32_t)num_moves);
@@ -1810,6 +1848,15 @@ double process_check(Board& temp_board, const ZobristHash& board_hash, NNUEConte
   //recurses forever, and what it would have overflowed.
   if (iter >= MAX_CHECK_EXTENSION) return 0.0;
   MCTSNode * node = make_child(board_hash.hash, NO_MATE_SCORE, -1);
+  //make_child() returns null when the arena is exhausted, and this used to dereference it at once -- a
+  //crash, which on lichess is a forfeit. The occupancy gate keeps the arena from running dry, so this
+  //is a should-not-happen, but a check extension without a node is better than a dead process: score it
+  //as the incumbent does a check it cannot follow, 0.0, and count it as an abandon so the futility test
+  //never trusts a tree built across it.
+  if (!node) {
+    expansion_abandons.fetch_add(1, std::memory_order_relaxed);
+    return 0.0;
+  }
   int stored_cp = node->cp.load(std::memory_order_relaxed);
   if (stored_cp == NO_MATE_SCORE) { //make_child() returned new node without a parent, let's update its cp and expand it
     /*if (iter >= 1) {
@@ -2615,8 +2662,8 @@ void runMCTS(NNUEContext& ctx) {
                std::chrono::steady_clock::now() - collect_start).count(),
              set_root_ms,
              collected ? (futile_skip ? "yes (VERIFY_FUTILE)" : "yes")
-                       : (futile_skip ? (futile_why == 1 ? "SKIPPED-EXACT, same root, nothing allocated since the last collection"
-                                                           : "SKIPPED-EXACT, last collection's root reachable from this one, nothing allocated since")
+                       : (futile_skip ? (futile_why == 1 ? "SKIPPED-EXACT, same root, no expansion abandoned since the last collection"
+                                                           : "SKIPPED-EXACT, last collection's root reachable from this one, no expansion abandoned since")
                                       : "SKIPPED"),
              pondering ? "ponder search" : "real search",
              search.arena.live());
