@@ -331,6 +331,7 @@ std::vector<ThreadParams> pool_params;
 void gc_join();         //all three defined with the collector below
 void reap_drain();      //waits for the deferred frees; defined with the reaper below
 void cleanup_locked();
+static void gc_completed_invalidate();   //THE EXACT FUTILITY TEST, defined with the collector below
 void reap_drain();
 
 //Wipe a slot back to a just-constructed state before it is reused. A recycled slot keeps whatever
@@ -371,6 +372,7 @@ void arena_size_check() {
   total_nodes.store(0, std::memory_order_relaxed);
   total_children.store(0, std::memory_order_relaxed);
   search.arena.size_to(bytes);
+  gc_completed_invalidate();
   log_file("info string node arena: %u slots of %zu bytes (%d MB Hash)\n",
            search.arena.cap, sizeof(MCTSNode), chessEngine.optionSpin[Hash].value);
 }
@@ -404,6 +406,7 @@ void cleanup_locked() {
   search.root = nullptr;
   total_children.store(0, std::memory_order_relaxed);
   total_nodes.store(0, std::memory_order_relaxed);
+  gc_completed_invalidate();
 }
 
 //The public form: stop the background collector first, since it owns the tree while it runs
@@ -628,6 +631,126 @@ std::atomic<bool> gc_abort{false};
 //is no work there to defer.
 std::atomic<double> last_gc_freed{1.0};   //start optimistic so the first collection always runs
 #define GC_MIN_YIELD 0.05                 //below this the previous collection was not worth its cost
+//How many nodes the last completed collection freed, as a count rather than a share. Read by the
+//CREATICA_VERIFY_FUTILE check, which has to say "the exact test said 0 and the collection freed N".
+std::atomic<size_t> last_gc_freed_count{0};
+
+//THE EXACT FUTILITY TEST.
+//
+//A collection frees precisely the nodes its mark cannot reach from the root. So it can free
+//something only if the set reachable from the root has changed since the last collection that ran
+//to completion -- and there are exactly three ways that set can change:
+//
+//  1. The root moves. Nodes reachable from the old root may not be reachable from the new one.
+//  2. Nodes are handed out. An expansion that fails part way leaves children it already created in
+//     the map but under no published edge; those are unreachable from birth.
+//  3. An existing edge is removed or re-pointed. NOTHING does this: expand_node() publishes a
+//     children array only onto a parent whose pointer is still null (a CAS expecting nullptr), and
+//     the other writers are arena_reset_slot(), which runs only on slots the sweep already retired,
+//     and the eviction block in gc(), which is commented out. Edges are only ever ADDED to live
+//     nodes, and adding an edge can only make more nodes reachable, never fewer.
+//
+//So if the root is the same node -- same slot AND same identity tag -- and the arena has not handed
+//out a single slot since a collection completed, a new collection would mark exactly the nodes the
+//last one marked and free exactly zero. That is not a prediction; it cannot be wrong while (3)
+//holds. Anyone reinstating eviction, or adding any other code that clears or re-points an edge,
+//must invalidate this (gc_completed_invalidate()) or delete the test.
+//
+//"Handed out" is read from arena.next_tag, which stamp_fresh() advances on every successful
+//allocation, bump and free list alike, and which nothing ever resets -- so it needs no new counter
+//on the allocation path.
+//
+//WHY THIS IS NOT THE FUTILITY GUARD THAT WAS REMOVED. That guard skipped whenever the PREVIOUS
+//collection had freed little, which predicted this one's yield from the last one's -- wrong
+//whenever the root had since moved into territory that orphaned most of the tree, and the tree it
+//kept full blocked expansion. This test skips only a collection that provably frees nothing, so
+//the tree after skipping is identical to the tree after collecting: it cannot keep anything fuller
+//than the collection would have left it.
+//
+//The case it exists for, measured in a lost-on-time endgame: Ponder on, the driver sends stop and
+//a fresh go rather than ponderhit, the ponder search is stopped before it simulates anything, and
+//the real search then re-marks an 11.6-million-node tree it had just marked -- 1.5 s of the move's
+//budget, ten times in one game.
+struct GcCompleted { bool valid = false; uint32_t root_idx = 0, root_tag = 0, next_tag = 0; };
+static std::mutex  gc_completed_mtx;
+static GcCompleted gc_completed;
+static void gc_completed_invalidate() {
+  std::lock_guard<std::mutex> lk(gc_completed_mtx);
+  gc_completed.valid = false;
+}
+//Is `target` reachable from `from` by following edges, within `max_depth` plies and at most
+//`max_visits` node visits? Breadth-first, no visited set -- the DAG means some nodes are seen twice,
+//which the visit cap bounds. Returns false when the cap is hit, which is always the safe answer.
+static bool reachable_within(const MCTSNode * from, const MCTSNode * target, int max_depth,
+                             size_t max_visits) {
+  if (from == target) return true;
+  std::vector<const MCTSNode *> frontier{from}, next;
+  size_t visits = 0;
+  for (int d = 0; d < max_depth && !frontier.empty(); ++d) {
+    next.clear();
+    for (const MCTSNode * n : frontier) {
+      const int    nc = n->num_children.load(std::memory_order_relaxed);
+      const Edge * ch = n->children.load(std::memory_order_relaxed);
+      if (!ch) continue;
+      for (int i = 0; i < nc; ++i) {
+        const MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+        if (!c) continue;
+        if (c == target) return true;
+        if (++visits > max_visits) return false;
+        next.push_back(c);
+      }
+    }
+    frontier.swap(next);
+  }
+  return false;
+}
+
+//WHY THE ROOT MAY MOVE. With Ponder on, `go ponder` searches the position after OUR move -- the
+//predicted reply is applied only on ponderhit -- and the driver answers with stop and a fresh go on
+//the position after the opponent's reply. So the real search's root is a CHILD of the root the
+//ponder search collected from, and a test demanding the same root never fires in the one pattern it
+//was written for.
+//
+//It does not need the same root. If the last completed collection marked from R, every live node is
+//reachable from R; if R is reachable from the current root R', so is every live node, and a
+//collection from R' frees nothing. That is exactly what happens in a shuffling endgame, where two or
+//three plies lead back to a position already in the tree -- and it is why 42 collections in the lost
+//game freed nothing at all. Still exact: it asserts reachability it has just observed, and it keeps
+//the no-allocation condition, because an allocated node is not guaranteed to be attached (an
+//expansion abandoned when the arena runs dry keeps the children it already created).
+//
+//The search is capped, so a failed test costs a few milliseconds against a collection that costs
+//hundreds; four plies covers the shortest shuffle back (three) with one to spare.
+static const int    GC_FUTILE_REACH_DEPTH  = 4;
+static const size_t GC_FUTILE_REACH_VISITS = 60000;
+
+//0 = a collection from search.root now might free something (collect). 1 = certainly frees nothing,
+//same root. 2 = certainly frees nothing, the last collection's root is reachable from this one.
+//Call with the search threads stopped and any background collection joined.
+static int gc_would_free_nothing() {
+  if (!search.root) return 0;
+  GcCompleted c;
+  { std::lock_guard<std::mutex> lk(gc_completed_mtx); c = gc_completed; }
+  if (!c.valid) return 0;
+  if (c.next_tag != search.arena.next_tag.load(std::memory_order_relaxed)) return 0;
+  //No allocation since, so the old root's slot cannot have changed hands -- but check its identity
+  //anyway rather than rest the whole argument on that.
+  if (c.root_idx >= search.arena.cap || search.arena.tag[c.root_idx].load(std::memory_order_relaxed) != c.root_tag)
+    return 0;
+  if (c.root_idx == search.arena.index_of(search.root)) return 1;
+  const MCTSNode * old_root = &search.arena.slots[c.root_idx];
+  return reachable_within(search.root, old_root, GC_FUTILE_REACH_DEPTH, GC_FUTILE_REACH_VISITS) ? 2 : 0;
+}
+//CREATICA_VERIFY_FUTILE=1: when the exact test says "free nothing", collect anyway and log what was
+//actually freed. Any line reporting more than 0 means the reasoning above has a hole.
+static const bool gc_locality_probe = [] {
+  const char * e = std::getenv("CREATICA_GC_LOCALITY");
+  return e && *e && *e != '0';
+}();
+static const bool verify_futile = [] {
+  const char * e = std::getenv("CREATICA_VERIFY_FUTILE");
+  return e && *e && *e != '0';
+}();
 
 void gc(MCTSNode * from = nullptr);
 
@@ -767,9 +890,140 @@ void gc_start(MCTSNode * from, bool wipe) {
   });
 }
 
+#if defined(__APPLE__) && (defined(__clang__) || defined(__GNUC__))
+//MARK BENCHMARK (CREATICA_MARK_BENCH=<rounds>, every CREATICA_MARK_BENCH_EVERY searches, default 4).
+//macOS only: it reads the Mach VM counters, and the prefetch variants use a GCC/Clang built-in. On any
+//other platform run_mark_bench() is an empty stub, so the Windows build is unaffected.
+//
+//WHAT IT FOUND, so nobody re-runs it to relearn this. On an 8.7M-node, 17.4M-edge endgame tree the mark
+//costs about 10.5 ns per node-plus-edge with its pages in RAM, even with the CPU caches flushed before
+//every run -- and 67.5 ns on the run right after another process allocated 4 GB, with 463,243
+//decompressions during that one run. The slow marks are the tree's idle pages being decompressed, not
+//CPU cache misses, and the prefetch variants are 10-15% SLOWER once pages are resident.
+//
+//Runs the MARK ALONE -- no sweep, nothing freed -- several times over the tree as it stands, flushing
+//the CPU caches before each run, and rotates through three versions of the walk:
+//  0  exactly the mark gc() does today
+//  1  + software prefetch: q[h+24]'s node, q[h+12]'s child array, and the mark stamps of q[h+6]'s
+//     children, so each is on its way into cache by the time the walk reaches it
+//  2  1 + read the stamp before writing it, so an edge to an already-marked node does not dirty it
+//It exists to test why the mark cost 17 ns a node early in a game and 125-148 ns late at the same
+//tree size: whether the cost follows edges per node, and whether it is memory latency, which
+//prefetching would cut. Harmless to the tree: it stamps reachable nodes with a fresh generation,
+//exactly as a mark does, so the next real collection simply re-stamps them.
+static const int mark_bench_rounds = [] {
+  const char * e = std::getenv("CREATICA_MARK_BENCH"); return e ? std::atoi(e) : 0; }();
+static const int mark_bench_every = [] {
+  const char * e = std::getenv("CREATICA_MARK_BENCH_EVERY"); return e && std::atoi(e) > 0 ? std::atoi(e) : 4; }();
+struct MarkBenchStats { size_t nodes = 0, edges = 0, edges_to_marked = 0; double ms = 0.0; };
+static MarkBenchStats mark_only(MCTSNode * root, int variant) {
+  MarkBenchStats st;
+  const uint32_t g = (uint32_t)(generation.fetch_add(1, std::memory_order_relaxed) + 1);
+  std::vector<MCTSNode *> q;
+  q.reserve(1u << 20);
+  const auto t0 = std::chrono::steady_clock::now();
+  search.arena.stamp(root, g);
+  q.push_back(root);
+  const bool pf = variant >= 1, read_first = variant >= 2;
+  const size_t D1 = 24, D2 = 12, D3 = 6;
+  for (size_t h = 0; h < q.size(); ++h) {
+    if (pf) {
+      const size_t n = q.size();
+      if (h + D1 < n) __builtin_prefetch(q[h + D1], 0, 1);
+      if (h + D2 < n) {
+        const Edge * e2 = q[h + D2]->children.load(std::memory_order_relaxed);
+        if (e2) __builtin_prefetch(e2, 0, 1);
+      }
+      if (h + D3 < n) {
+        const MCTSNode * n3 = q[h + D3];
+        const int    nc3 = n3->num_children.load(std::memory_order_relaxed);
+        const Edge * e3  = n3->children.load(std::memory_order_relaxed);
+        if (e3)
+          for (int j = 0; j < nc3; ++j) {
+            const MCTSNode * c = e3[j].child.load(std::memory_order_relaxed);
+            if (c) __builtin_prefetch(&search.arena.gen[search.arena.index_of(c)], 1, 1);
+          }
+      }
+    }
+    MCTSNode * node = q[h];
+    const int    nc = node->num_children.load(std::memory_order_relaxed);
+    const Edge * ch = node->children.load(std::memory_order_relaxed);
+    if (!ch) continue;
+    st.edges += (size_t)nc;
+    for (int i = 0; i < nc; ++i) {
+      MCTSNode * c = ch[i].child.load(std::memory_order_relaxed);
+      if (!c) continue;
+      if (read_first && search.arena.gen[search.arena.index_of(c)].load(std::memory_order_relaxed) == g) {
+        ++st.edges_to_marked;
+        continue;
+      }
+      if (search.arena.stamp_exchange(c, g) != g) q.push_back(c);
+      else ++st.edges_to_marked;
+    }
+  }
+  st.nodes = q.size();
+  st.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  return st;
+}
+//System-wide VM counters, so a slow mark can be attributed to page-ins or decompressions rather than
+//to CPU caching. host_statistics64 needs no privileges.
+#include <mach/mach.h>
+struct VmCounters { uint64_t pageins = 0, decompressions = 0, swapins = 0; };
+static VmCounters vm_counters() {
+  VmCounters c;
+  vm_statistics64_data_t vs;
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &count) == KERN_SUCCESS) {
+    c.pageins = vs.pageins; c.decompressions = vs.decompressions; c.swapins = vs.swapins;
+  }
+  return c;
+}
+static void run_mark_bench() {
+  static int calls = 0;
+  if (mark_bench_rounds <= 0 || !search.root) return;
+  if ((calls++ % mark_bench_every) != 0) return;
+  //Flush between runs: rewriting 128 MB evicts the whole last-level cache (12 MB on this machine)
+  //and far more pages than the TLB holds, so every run starts from the same cold state instead of
+  //the second run inheriting what the first loaded -- which is what swamped the last experiment.
+  static std::vector<uint8_t> flush(128u << 20);
+  double ms[3] = {0, 0, 0}; int cnt[3] = {0, 0, 0};
+  MarkBenchStats last;
+  for (int r = 0; r < mark_bench_rounds; ++r) {
+    std::memset(flush.data(), (r * 37 + 11) & 0xff, flush.size());
+    volatile uint64_t sink = 0;
+    for (size_t i = 0; i < flush.size(); i += 4096) sink += flush[i];
+    const int v = r % 3;
+    const VmCounters c0 = vm_counters();
+    last = mark_only(search.root, v);
+    const VmCounters c1 = vm_counters();
+    ms[v] += last.ms; ++cnt[v];
+    log_file("info string MARK BENCH round %d (%s): %.0f ms, %.1f ns per node+edge, during it %llu decompressions, "
+             "%llu page-ins, %llu swap-ins\n", r, v == 0 ? "baseline" : v == 1 ? "prefetch" : "prefetch+read-first",
+             last.ms, (last.nodes + last.edges) ? last.ms * 1e6 / (double)(last.nodes + last.edges) : 0.0,
+             (unsigned long long)(c1.decompressions - c0.decompressions),
+             (unsigned long long)(c1.pageins - c0.pageins), (unsigned long long)(c1.swapins - c0.swapins));
+  }
+  const double elems = (double)(last.nodes + last.edges);
+  auto nse = [&](int v) { return cnt[v] && elems > 0 ? ms[v] / cnt[v] * 1e6 / elems : 0.0; };
+  log_file("info string MARK BENCH: %zu nodes, %zu edges (%.2f per node), %.1f%% of edges lead to an already-marked node; "
+           "ns per node+edge, cold: baseline %.1f, prefetch %.1f, prefetch+read-first %.1f; ms: %.0f / %.0f / %.0f\n",
+           last.nodes, last.edges, last.nodes ? (double)last.edges / (double)last.nodes : 0.0,
+           last.edges ? 100.0 * (double)last.edges_to_marked / (double)last.edges : 0.0,
+           nse(0), nse(1), nse(2),
+           cnt[0] ? ms[0] / cnt[0] : 0.0, cnt[1] ? ms[1] / cnt[1] : 0.0, cnt[2] ? ms[2] / cnt[2] : 0.0);
+}
+#else
+static void run_mark_bench() {}
+#endif
+
 void gc(MCTSNode * from) {
   MCTSNode * const gc_root = from ? from : search.root;
   assert(gc_root);
+  //The exact futility test's snapshot, taken BEFORE marking and published only if this collection
+  //completes. Invalidated first, so a collection abandoned during the mark leaves no claim behind.
+  gc_completed_invalidate();
+  const GcCompleted gc_snapshot{ true, search.arena.index_of(gc_root), search.arena.stamp_of(gc_root),
+                                 search.arena.next_tag.load(std::memory_order_relaxed) };
   //fetch_add() updates generation but returns original value before addition; hence, we add 1
   int current_gen = generation.fetch_add(1, std::memory_order_relaxed) + 1;
   // BFS traversal to mark reachable nodes with the current generation.
@@ -794,6 +1048,8 @@ void gc(MCTSNode * from) {
   std::vector<MCTSNode *> q;
   q.reserve(1u << 16);
   size_t q_head = 0;
+  int64_t loc_prev_idx = -1, loc_prev_edges = 0;
+  size_t  loc_nodes = 0, loc_far_nodes = 0, loc_edge_arrays = 0, loc_far_edges = 0;
   auto push_node = [&](MCTSNode * n) { q.push_back(n); };
   search.arena.stamp(gc_root, (uint32_t)current_gen);
   push_node(gc_root);
@@ -816,6 +1072,23 @@ void gc(MCTSNode * from) {
       MCTSNode * node = q[q_head++];
       int num_children = node->num_children.load(std::memory_order_relaxed);
       Edge * children = node->children.load(std::memory_order_relaxed);
+      //LOCALITY PROBE (CREATICA_GC_LOCALITY=1). How often does the mark jump more than 2 MB between
+      //consecutive nodes, and between consecutive child arrays? 2 MB is a large page and far beyond
+      //any cache, so a jump that size is a cache miss and usually a TLB miss. It exists to test one
+      //explanation for the mark costing 17 ns a node at the start of a game and 150 ns by the end at
+      //the same tree size: the live tree spreading across the arena as freed slots are reused.
+      if (gc_locality_probe) {
+        const int64_t idx = (int64_t)search.arena.index_of(node);
+        if (loc_prev_idx >= 0 && std::llabs(idx - loc_prev_idx) > (int64_t)((2u << 20) / sizeof(MCTSNode))) ++loc_far_nodes;
+        loc_prev_idx = idx;
+        if (children) {
+          const int64_t addr = (int64_t)(intptr_t)children;
+          if (loc_prev_edges && std::llabs(addr - loc_prev_edges) > (int64_t)(2u << 20)) ++loc_far_edges;
+          loc_prev_edges = addr;
+          ++loc_edge_arrays;
+        }
+        ++loc_nodes;
+      }
 
       //The root always keeps its children: without them there is no move to choose.
       /*if (!is_root && num_children > 0 && soft_bytes) {
@@ -923,6 +1196,13 @@ void gc(MCTSNode * from) {
   //path -- the only one that runs with Ponder on -- had no futile-collection guard at all.
   last_gc_freed.store(gc_before ? (double)gc_freed / (double)gc_before : 1.0,
                       std::memory_order_relaxed);
+  last_gc_freed_count.store(gc_freed, std::memory_order_relaxed);
+  //Completed: the mark reached everything reachable from gc_root and the sweep retired the rest, so
+  //the tree is now exactly the set reachable from gc_root. See THE EXACT FUTILITY TEST.
+  {
+    std::lock_guard<std::mutex> lk(gc_completed_mtx);
+    gc_completed = gc_snapshot;
+  }
   //One line per collection that actually runs, which is now rare. Kept because the question it
   //answers -- how much of a collection is marking, how much is walking the map, and how many
   //nodes really died -- has to be re-asked every time collection feels slow, and it cannot be
@@ -938,6 +1218,14 @@ void gc(MCTSNode * from) {
            reap_pending.load(std::memory_order_relaxed),
            std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
            std::chrono::duration<double, std::milli>(gc_t2 - gc_t1).count());
+  if (gc_locality_probe && loc_nodes)
+    log_file("info string gc locality: %zu nodes marked, %.1f ns/node, far node jumps %.1f%%, "
+             "far child-array jumps %.1f%%, arena high water %u of %u slots, free list %zu\n",
+             loc_nodes, std::chrono::duration<double, std::nano>(gc_t1 - gc_t0).count() / (double)loc_nodes,
+             100.0 * (double)loc_far_nodes / (double)loc_nodes,
+             loc_edge_arrays ? 100.0 * (double)loc_far_edges / (double)loc_edge_arrays : 0.0,
+             search.arena.high_water(), search.arena.cap,
+             [] { std::lock_guard<std::mutex> lk(search.arena.free_mtx); return search.arena.free_list.size(); }());
   total_nodes.store(search.arena.live(), std::memory_order_relaxed);
   //update hash_full
   size_t total_memory = search.arena.live() * (sizeof(MCTSNode) + 24) + total_children.load(std::memory_order_relaxed) * sizeof(Edge);
@@ -2205,10 +2493,14 @@ void runMCTS(NNUEContext& ctx) {
     //signal pair: bestmove starts the collector, the next search stops it. Whatever it
     //managed to free is kept; whatever it did not is collected next time.
     gc_join();
+    //Before the timer, so the benchmark is not charged to the collection line. Test builds only.
+    run_mark_bench();
     const auto collect_start = std::chrono::steady_clock::now();
     //Ponder implies reuse: a pondered subtree destroyed before the next search was wasted.
     const bool reusing_tree = reuse_tree || chessEngine.optionCheck[Ponder].value;
     bool collected = !reusing_tree;   //cleanup() always "collects": it empties the tree entirely
+    bool futile_skip = false;         //skipped because it provably frees nothing
+    int  futile_why  = 0;             //gc_would_free_nothing()'s answer
     double set_root_ms = 0.0;
     if (reusing_tree) {
       {
@@ -2243,8 +2535,31 @@ void runMCTS(NNUEContext& ctx) {
       //the engine can pour 38M visits into a move whose refutation it never expanded and then
       //play it. That is exactly what happened in a live game: f5f3 took 98% of the visits with a
       //2.3% prior, at seldepth 16 after 38M simulations, and the engine's own cp for it was -322.
-      collected = tree_occupancy() >= gc_threshold;
-      if (collected) gc();
+      //EXCEPT when the collection is certain to free nothing -- see THE EXACT FUTILITY TEST. The
+      //tree after skipping is identical to the tree after collecting, so this cannot reintroduce
+      //the full-tree problem described above.
+      const bool wanted = tree_occupancy() >= gc_threshold;
+      futile_why  = wanted ? gc_would_free_nothing() : 0;
+      futile_skip = futile_why != 0;
+      //Under CREATICA_VERIFY_FUTILE, say which condition failed whenever a collection is NOT judged
+      //futile, so a test that expects the skip can see why it did not happen.
+      if (verify_futile && wanted && !futile_skip && search.root) {
+        std::lock_guard<std::mutex> lk(gc_completed_mtx);
+        log_file("info string FUTILE-CHECK: not futile: snapshot %s, root slot %u vs %u, root tag %u vs %u, "
+                 "next_tag %u vs %u\n", gc_completed.valid ? "valid" : "INVALID",
+                 gc_completed.root_idx, search.arena.index_of(search.root),
+                 gc_completed.root_tag, search.arena.stamp_of(search.root),
+                 gc_completed.next_tag, search.arena.next_tag.load(std::memory_order_relaxed));
+      }
+      collected = wanted && (!futile_skip || verify_futile);
+      if (collected) {
+        gc();
+        if (futile_skip)
+          log_file("info string FUTILE-CHECK: the exact test said nothing could be freed; "
+                   "the collection freed %zu nodes%s\n",
+                   last_gc_freed_count.load(std::memory_order_relaxed),
+                   last_gc_freed_count.load(std::memory_order_relaxed) ? "  <-- THE TEST IS WRONG" : "");
+      }
     } else {
       //Usually a no-op: the background wipe started after the last bestmove has already
       //emptied the tree, and gc_join() above waited for it. This remains as the fallback
@@ -2276,7 +2591,11 @@ void runMCTS(NNUEContext& ctx) {
              reusing_tree ? "gc" : "cleanup",
              std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - collect_start).count(),
-             set_root_ms, collected ? "yes" : "SKIPPED",
+             set_root_ms,
+             collected ? (futile_skip ? "yes (VERIFY_FUTILE)" : "yes")
+                       : (futile_skip ? (futile_why == 1 ? "SKIPPED-EXACT, same root, nothing allocated since the last collection"
+                                                           : "SKIPPED-EXACT, last collection's root reachable from this one, nothing allocated since")
+                                      : "SKIPPED"),
              pondering ? "ponder search" : "real search",
              search.arena.live());
     search_simulations.store(0, std::memory_order_relaxed);
