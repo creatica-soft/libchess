@@ -37,7 +37,8 @@ struct PolicySpatial {
   //what the whole-input divide by 127 did before SPATIAL_SCALE existed.
   int scale = 1;
   //Where plane 12's legal-move-source marks go. 1 = at plane 12 + (piece_type-1), which is what the
-  //trainer did under PIECE_INDEX before SPATIAL_FROM_PLANE_FIX; 0 = all in plane 12. Reproduced
+  //trainer did under PIECE_INDEX with SPATIAL_FROM_PLANE_FIX=0 (the default until 2026-09-14);
+  //0 = all in plane 12. Reproduced
   //exactly, because a model fed the planes it was not trained on is a different model.
   int layout = 0;
   std::vector<float> Wc1, bc1, Wc2, bc2, Wu, Wv;   // Wc1[ch][planes][9], Wc2[ch][ch][9], Wu/Wv[ch][dim]

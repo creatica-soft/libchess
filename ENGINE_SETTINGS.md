@@ -347,10 +347,19 @@ reproduce the planes a net saw, not the planes it should have seen. Under piece 
 wrote plane 12's marks at `12*64 + (legal_idx >> 6)`, and `legal_idx >> 6` is `(piece-1)*64 + from`,
 so the mark landed in plane 12 + (piece-1): pawn sources in plane 12, but knight sources in plane 13
 and bishop, rook, queen and king sources in planes 14–17, the first four own-piece attack planes.
-Layout 1 is that; layout 0 puts every mark in plane 12. `SPATIAL_FROM_PLANE_FIX=1` in the trainer
-builds layout 0. It defaults to 0 because the layout is written from the compile flag rather than
-read from the checkpoint, so exporting an existing layout-1 checkpoint with the flag on would
-mislabel it.
+Layout 1 is that; layout 0 puts every mark in plane 12. `SPATIAL_FROM_PLANE_FIX` in the trainer
+chooses between them, and since 2026-09-14 it defaults to 1, which builds layout 0.
+
+A wrong choice would be silent. An old layout-1 checkpoint exported by a build with the fix on
+gives a net the engine reproduces exactly, so the export check passes, and the net is simply
+less accurate than it should be. So checkpoints now carry the layout they were trained with, in a
+`plane_layout` buffer, and the trainer refuses to load one that disagrees with its build. A
+checkpoint without the buffer predates it and is taken to be layout 1 under piece indexing. Every
+piece-indexed spatial checkpoint trained before that date, including the one behind
+`nnue_policy_pisp.bin`, needs `-DSPATIAL_FROM_PLANE_FIX=0` to be validated, fine-tuned or exported.
+The engine's layout-0 path for a piece-indexed net was checked against the trainer on a short test
+run: over 2,000 held-out positions and 56,373 legal moves the largest score difference was 4.4e-6,
+and the top move agreed in every position.
 
 **Illegal castling in every policy net trained before 2026-09-13.** `castlingMoves()` refuses
 castling through pieces or through check using `CastlingPath`, a process-wide table that only
@@ -1443,17 +1452,37 @@ there is no reason for them to be UCI options).
 | `CHUNK_SIZE` | **250000** | Positions held in RAM per chunk. 1000000 made the OS memory compressor thrash and halved throughput. |
 | `LR_MAX` | **2e-3** | Peak learning rate. Measured better at batch 8192; the previous 2e-4 was roughly 5-10x too low, and the two belong together. |
 | `EPOCHS` | 1 | Drives both the loop and `TOTAL_STEPS`, so the cosine is sized to the whole run. |
-| `TOTAL_STEPS` | 300M/batch | Steps the cosine anneals over. Must match the real run length or the schedule bottoms out early or never reaches its floor. |
+| `TOTAL_STEPS` | exact | Steps the cosine anneals over. With `FEATURE_CACHE` set it is counted exactly from each shard's cache header, following the same chunking and batching as the loop, so the rate reaches `LR_MIN` on the last batch. Without a cache it falls back to a guess of 300M positions per epoch, and the trainer prints a warning. The guess was what every run used before 2026-09-14; the first full-corpus spatial run ended with the rate still at about 3e-5 instead of 1e-5. |
+| `RESUME` | 0 | 1 continues the run recorded in `<CKPT_PREFIX>run_state.txt` after a crash. See below. |
+| `SEED` | random | Fixes each epoch's shard order, the batch order within each shard and a fresh model's initial weights. A fresh run without it draws one and records it in the run state. |
+| `TRAIN_SHARDS` / `MAX_BATCHES_PER_SHARD` | all / all | Train on the first n shards, and stop each shard after n batches. For testing a change in minutes. Both are included in the exact step count. |
 | `LABEL_SMOOTH` | 0 | Share of target mass spread uniformly over the legal moves. 0 is the original loss. |
 | `VALIDATE_EVERY` / `VALIDATE_N` | 1 / 1000000 | Validation runs after every *file*, not every epoch — 28 times an epoch. Both were needed to stop validation costing more than training. |
 | `NUM_WORKERS` | 1 | DataLoader workers. **Leave at 1.** Two workers measured *half* the throughput of one: each holds its own accumulator cache, so they get colder caches and contend for memory bandwidth on the 1024-wide accumulator rows. The same shape as the engine's thread finding. |
 | `WEIGHTS` / `CKPT_PREFIX` | `nnue_policy.pt` / … | Lets a differently-shaped model train without colliding with the current one. |
 | `EXPORT_WEIGHTS` | — | Write the trained net as the flat `.bin` the engine loads, and exit. |
 
-The schedule resumes across restarts: a `.step` file beside the weights records the
-optimizer step, so a killed run continues its cosine instead of jumping back to `LR_MAX`.
-Delete it to start a schedule over. Note that changing `BATCH_SIZE` invalidates it, since a
-step no longer means the same number of positions.
+**Resuming a run.** After every shard the trainer writes `<CKPT_PREFIX>run_state.txt`. It holds the
+seed, the epoch in progress, the shards already trained in that epoch, the step counter, and the
+names of the checkpoint and of the Adam optimizer state saved after that shard. Both files are
+complete on disk before the state names them, and the state itself is replaced atomically.
+`RESUME=1` reads it back. The seed redraws the same shard order, the shards already done are
+skipped, and the weights, Adam's moment estimates and the step counter continue from the last
+completed shard, so a crash loses at most one shard. A test run killed partway through its second
+shard and resumed reproduced the uninterrupted run's validation numbers to within the GPU's run-to-run
+noise. A fresh run refuses to start while a run state exists under its `CKPT_PREFIX`, and
+`RESUME=1` on a finished run does nothing. Only the latest optimizer file is kept.
+
+Before this, a `.step` file beside the weights was the only thing saved. It kept the cosine from
+jumping back to `LR_MAX`, but a restarted epoch drew a new random shard order, so it could not tell
+which shards it had already trained on, and Adam restarted with empty moments. The `.step` file is
+still written, and is still honoured by a run that is not resuming, but only when the weights it
+belongs to exist.
+
+`train_unattended.sh <trainer>` supervises a long run. It waits until the feature cache is readable
+before every start, logs the SSD's USB link speed, restarts the trainer with `RESUME=1` after a
+crash, stops and restarts a trainer whose log has been silent for 20 minutes, keeps the machine
+awake with `caffeinate`, and gives up after three failures in a row at the same step.
 
 
 ### CREATICA_EDGE_VISITS
