@@ -235,8 +235,8 @@ visits had a bonus so small it could never be re-examined from a new parent.
 ran 2,280,402 simulations against 2,170,841 for one without them at all — free, within noise. The
 halving is the search genuinely exploring more and paying for expansions it used to skip, at
 roughly 33 NNUE child evaluations each. Both counters live in padding that already existed, so
-`sizeof(MCTSNode)` stays 56 and `sizeof(Edge)` stays 24 and the collector's accounting is
-unchanged.
+they did not change the collector's accounting. (The child table later removed the child pointer
+from `Edge`, which is now 16 bytes; see *The child table*.)
 
 **Whether better-directed search at half the volume beats worse-directed search at full volume is
 not known.** It is a switch rather than a decision for that reason, and it is runtime rather than
@@ -259,7 +259,7 @@ them with `setoption`, at any time, and see them listed in response to `uci`.
 
 | option | type | default | range | meaning |
 |---|---|---|---|---|
-| `PolicyWeights` | string | `nnue_policy.bin` | — | The exported policy net. Changing it reloads the net; if the load fails the previous net is kept and an `info string` says why, so the engine never runs on a half-loaded net. A reload is refused while a search is running, because the worker threads read the net without a lock. The `info string` names the row count, which is how you check which net is actually in use: **4096 = the narrow table, 24576 = piece-indexed.** See *Policy file formats*. |
+| `PolicyWeights` | string | `nnue_policy.bin` | — | The exported policy net. Changing it reloads the net; if the load fails the previous net is kept and an `info string` says why, so the engine never runs on a half-loaded net. A reload is refused while a search is running, because the worker threads read the net without a lock. The `info string` names the row count, which is how you check which net is actually in use: **4096 = the narrow table, 24576 = piece-indexed**, and then lists `legality term` and `spatial term: …` when the net has them. See *Policy file formats*. |
 | `PolicyMode` | spin | 1 | 0–2 | 0 = off, 1 = prior, 2 = full. See below. |
 | `PolicyBlend` | spin | 45 | 0–100 | Share of the prior taken from the policy head, in hundredths; the rest comes from the 1-ply child evaluations. 0 reproduces the incumbent prior exactly, 100 is policy-only. Ignored when `PolicyMode` is 2. |
 | `PolicyTemp` | spin | 75 | 0–300 | Temperature the policy logits are read at, in hundredths. Chosen so the resulting prior has the concentration the exploration constants were tuned for. |
@@ -299,8 +299,12 @@ independently: whether the move table is indexed by the moving piece, and whethe
 | 4 | W1 b1 W2 b2 emb | `(piece-1)*4096 + from*64 + to` | 24576 |
 | 5 | + `Wl` [h2,h2] | piece-indexed | 24576 |
 | 6 | + `Cl` [out,h2] | piece-indexed | 24576 |
+| 7 | 2 + spatial block | `from*64 + to` | 4096 |
+| 8 | 5 + spatial block | piece-indexed | 24576 |
 
-The engine implements 1, 2, 4 and 5. Versions 3 and 6 use the untied `Cl` table and are refused.
+The engine implements 1, 2, 4, 5, 7 and 8. Versions 3 and 6 use the untied `Cl` table and are
+refused. An engine older than versions 7 and 8 refuses them too, which is deliberate: read as a 2 or
+a 5, a spatial net would run without its spatial term.
 
 **The piece index** exists because `emb[from*64 + to]` gave a rook moving e1–e4 and a queen moving
 e1–e4 the same row, leaving the model to tell them apart through the 128-dim global position code.
@@ -324,6 +328,56 @@ have moved a deployed parameter the wrong way.
 an independent measurement. Here it is policy-only Top-1 against the trainer's own validation: it
 agreed for the old net and was five points out for the new one, which is what exposed the missing
 term.
+
+**The spatial term** (versions 7 and 8) adds `dot(u[from], v[to])` to each move's score, where `u`
+and `v` are per-square vectors computed from 8x8 planes by 3x3 convolutions. It is what lets the
+policy see the board as a board: which squares are defended, and by what. The planes, all oriented
+from the side to move's point of view, are: own pieces by type (0–5), enemy pieces (6–11), squares a
+legal move starts from (12), squares a legal move lands on (13), and squares attacked by each piece
+type of each side, empty squares included (14–25) — the part the NNUE threat features cannot supply,
+because they only index attacks on occupied squares.
+
+The spatial block after `Wl` is an 8-integer header — magic `SPAT`, planes, channels, dim, layers,
+scale, plane layout, attack planes — followed by `Wc1`, `bc1`, `Wc2`/`bc2` if there are two layers,
+`Wu` and `Wv`. The engine reads only shapes it implements (14 or 26 planes, up to 64 channels, dim up
+to 32, one or two layers) and refuses the rest.
+
+**Plane layout** records a trainer bug the weights were trained with, because the engine has to
+reproduce the planes a net saw, not the planes it should have seen. Under piece indexing the trainer
+wrote plane 12's marks at `12*64 + (legal_idx >> 6)`, and `legal_idx >> 6` is `(piece-1)*64 + from`,
+so the mark landed in plane 12 + (piece-1): pawn sources in plane 12, but knight sources in plane 13
+and bishop, rook, queen and king sources in planes 14–17, the first four own-piece attack planes.
+Layout 1 is that; layout 0 puts every mark in plane 12. `SPATIAL_FROM_PLANE_FIX=1` in the trainer
+builds layout 0. It defaults to 0 because the layout is written from the compile flag rather than
+read from the checkpoint, so exporting an existing layout-1 checkpoint with the flag on would
+mislabel it.
+
+**Illegal castling in every policy net trained before 2026-09-13.** `castlingMoves()` refuses
+castling through pieces or through check using `CastlingPath`, a process-wide table that only
+`fen2board()` fills. The trainer builds its boards with `board_from_record()` and never parsed a FEN,
+so the table stayed zero and any record with a castling right and its rook generated castling
+through pieces and through check. On 2,000 held-out positions 263 had at least one illegal castle
+in the legal list, which fed the softmax, the legality term and the spatial planes. The engine parses
+FENs and never had them. The trainer now fills the table once at startup from the start position.
+Measured on the first spatial net, the corrected lists cost it 0.10 Top-1 and 0.03 Top-6, so nets
+trained with the defect are fine to keep — but every comparison between nets from before and after
+the fix carries that small offset.
+
+**Checking an export.** `EXPORT_CHECK=<tsv>` alongside `EXPORT_WEIGHTS` makes the trainer write its
+own logit for every legal move of `EXPORT_CHECK_N` held-out positions (default 2,000), and
+`check_policy_export <net.bin> <tsv>` recomputes every one of them through `policy_net.h`, following
+the steps `eval_and_expand()` takes. A correct export matches to about 1e-5 with no position where the
+top move differs. It is the only test that catches a wrong plane, a flipped square or a misread
+tensor, which anywhere else would cost a point of Top-k and look like noise. For the first spatial
+net: 56,373 moves, largest difference 9.4e-6, no top-move disagreements.
+
+**The first spatial net**, `nnue_policy_pisp.bin` (version 8: piece-indexed, legality term, one 3x3
+convolution with 8 channels, layout 1), trained on all 28 shards for one epoch, validates at
+**Top-1 38.84, Top-4 74.52, Top-6 83.62** with correct legal lists, against 34.65 / — / 78.02 for the
+piece-indexed net without it. What it costs the engine depends on the mode: in `PolicyMode 2`, where
+an expansion does nothing but score moves, the convolution adds about 9 µs to an expansion that
+otherwise costs about 46 µs at `Hash 2048`; in the default `PolicyMode 1`, where every child is also
+evaluated with NNUE, single-threaded node rate fell 2.6–3.2% against the piece-indexed net.
 
 ### Policy modes
 
@@ -805,13 +859,117 @@ collections in a live game:
 
 Six of the twelve freed nothing at all. That is what reuse does to a mark-and-sweep: the cost
 is O(tree) but the yield is O(garbage), and a good prior concentrates the search on the move it
-then plays, so the sibling subtrees that become garbage are nearly empty. A collection is now
-skipped when the previous one reclaimed less than 5%, unless occupancy has reached
-`GcThreshold`, which still forces one. In a 20-move test that cut collections from 20 to 2
-while keeping the tree bounded.
+then plays, so the sibling subtrees that become garbage are nearly empty.
 
-Declining a futile collection is not the deferred-bulk-work pattern that `GcThreshold` exists
-to avoid: there is no work being deferred, because there is nothing there to reclaim.
+**Two guards, and only one of them still exists.** A guard that skipped a collection whenever the
+*previous* one reclaimed less than 5% was tried in both places collection runs. It survives only in
+the background collection after `bestmove`, which runs only with `Ponder` off. It was **removed**
+from the collection before a search, because it predicted this collection's yield from the last
+one's: a collection skipped on that basis kept the tree full, a full tree blocks expansion, and in a
+live game the engine then gave `f5f3` 98% of 38M visits without ever expanding its refutation.
+
+**The exact skip, which replaces it before a search.** A collection frees only nodes its mark cannot
+reach from the root, so it can free something only if what is reachable has changed since the last
+collection that completed. The skip applies when **(1)** a collection completed from some root R,
+**(2)** no expansion has been abandoned since, and **(3)** the current root is R, or R is reachable from
+it within four plies (a capped search of at most 60,000 nodes). Then every live node is reachable from the current root and the collection would free
+exactly zero, so skipping it leaves the tree exactly as collecting would have. It is not a
+prediction. It rests on edges only ever being *added* to live nodes, which holds today because
+eviction is commented out; any code that clears or re-points an edge must invalidate the test.
+
+It exists because of a game lost on time. With `Ponder` on, `go ponder` searches the position after
+the engine's own move, and the driver answers with `stop` and a fresh `go` one ply lower — so the
+root moves on every move, and in a shuffling endgame it moves to a position from which the old root
+is two or three plies away. In that game 57 collections ran on the engine's clock for 68.4 s, and 42
+of them freed nothing, 56.8 s in all; late on each took 1.3–2.8 s and left the search 2–3 ms. 
+
+**Why allocations do not break it.** The first version required that not one node had been
+allocated since the collection, which covered only the ten collections in that game that followed a
+ponder search stopped before it simulated (14.5 s). What actually matters is not allocation but
+*orphaning*: a node that is allocated and then attached to nothing. That can only happen when an
+expansion is abandoned after children may already exist. `eval_and_expand()` has three exits —
+checkmate and stalemate, which return before any child is evaluated, and `expand_node()` — so every
+abandon point is inside `expand_node()`: the child table's pool running dry, `make_child()` failing
+part way through, and a lost publication race (which should orphan nothing but is counted anyway), plus
+`process_check()` failing to get a node. Each increments a counter, and condition (2) requires it
+unchanged. With no abandon, every node allocated since the collection hangs under a node that was
+reachable from the search's root, edges are never removed, so R still reaches every live node — and if
+the current root reaches R, it reaches them all.
+
+Verified with `CREATICA_VERIFY_FUTILE`: 369 futile verdicts across a shuffling endgame and the opening,
+125 of them after searches that allocated in between (4.8M simulations over those intervals), every
+one freeing exactly 0 nodes, with no validator violations. In the opening the old root is often
+reachable too, because a minor piece stepping away and back returns to it in three plies.
+
+**A crash found on the way, and fixed.** `process_check()` dereferenced the result of `make_child()`
+without checking it, and `make_child()` returns null when the arena is exhausted. The occupancy gate
+keeps that from happening in practice, but it would have been a crash mid-game. It now scores the
+check as 0.0 and counts an abandon.
+
+`CREATICA_VERIFY_FUTILE=1` checks it: whenever the test says "free nothing" the engine collects
+anyway and logs what was freed, with `THE TEST IS WRONG` if that is more than zero. In a shuffling
+endgame test, 42 verdicts all freed 0 nodes, while collections the test did not call futile freed
+millions. Skips are logged as `collect SKIPPED-EXACT, …` so they can be told from threshold skips.
+
+**Why a mark gets slower through a game.** In the same lost game the mark cost 17.5 ns per node at
+the first collection and 125–148 ns by the end, at similar tree sizes. Two causes, both measured:
+
+- **The endgame tree is a dense graph.** Counted directly with the mark benchmark: opening trees have
+  1.07–1.17 edges per node, with 7–15% of edges leading to a node already marked by another path;
+  shuffling-endgame trees have 2.0–2.9 edges per node, with 50–66% leading to one already marked. The
+  lost game's logged occupancy implies about 3.4 by its end. The mark handles every edge, so an endgame
+  node costs two to three times the work of an opening node.
+- **Idle pages are compressed, and the mark decompresses them.** On an 8.7M-node, 17.4M-edge endgame
+  tree the mark costs about 10.5 ns per node-plus-edge when its pages are in RAM, even with the CPU
+  caches flushed before every run. The run right after another process allocated 4 GB took 67.5 ns
+  per element, with 463,243 decompressions during that single run; the run after it was back to 11 ns.
+  Between collections the search touches only the hot region near the root, so on a memory-pressed
+  machine the rest of a large tree goes idle and is compressed, and every collection pays to bring it
+  back. The bot's log has no memory counters, so this is shown to produce a slowdown of the lost
+  game's size, not proven to be what happened in that game.
+
+CPU-cache prefetching in the mark was tried and does not help: 10–15% slower whenever the pages are
+resident.
+
+`CREATICA_MARK_BENCH=<rounds>` (with `CREATICA_MARK_BENCH_EVERY=<n>`) runs the mark alone on the current
+tree before a search, flushing CPU caches between runs, and logs per-run cost with the system's
+decompression and page-in counts. `CREATICA_GC_LOCALITY=1` logs, per collection, how often the mark
+jumps more than 2 MB between consecutive nodes and child arrays. Both are macOS-only diagnostics.
+
+**The child table: what the mark reads now.** The fix for the compression cost is to make the mark
+read far less memory. It used to read each reachable node's 64-byte line and every child's 24-byte
+`Edge`, about 1.7 GB for an 11.6M-node, 39M-edge tree. It now reads only three arrays of its own:
+`kids[slot]` (8 bytes: where a node's children sit in a pool, and how many there are), the pool of
+4-byte child slot numbers, and the existing 4-byte mark stamps. A page is decompressed if any byte of it
+is read, so the saving only counts because these arrays live in pages of their own rather than beside
+the nodes and edges.
+
+To keep the table from *adding* memory, the 8-byte child pointer was removed from `Edge` (24 → 16 bytes),
+and every read of a child now goes through `child_at(parent, i)`, using a copy of the pool position kept
+in the node's spare bytes so the search pays no extra memory access for it. `NODE_BYTES` (96) and
+`EDGE_BYTES` (20) count the table's entries against `Hash`, which leaves capacity about where it was:
+roughly 3% fewer nodes for a tree-like middlegame and 3% more for a transposition-dense endgame.
+Blocks are recycled by exact size through the reaper, and a new game resets the pool.
+
+Measured on a 9.5M-node, 19.3M-edge endgame tree with 6 GB of memory pressure applied before every
+run: the old pointer traversal cost 18.9–20.7 ns per node+edge with about 49,000 decompressions per
+run; the child table cost 12.6–12.8 ns with about 18,600 — about 38% cheaper and 62% fewer
+decompressions. With the pages already in RAM the two cost the same (9.8 against 10.1 ns), which is
+expected: both make the same number of random accesses, and the table only shrinks how much memory
+those accesses span. The search pays for it too: single-threaded node rate fell 0.5–1.0% on three
+positions, close to the noise but consistently in the same direction.
+
+Verified before the pointer was removed, by checking the table against it on every collection (zero
+mismatches over 20M nodes and 27M edges), and after, by checking that the collector's and the search's
+copies agree and that every published edge leads to the position its move produces (8.5M edges across
+the opening, a shuffling endgame and `PolicyMode 2`, zero wrong, zero validator violations).
+`CREATICA_VERIFY_KIDS=1` runs those checks; they read the nodes, so they are a diagnostic, not a mode.
+
+**A bug found on the way, not fixed.** `go ponder` on a position with five pieces or fewer takes the
+local-tablebase path, which calls `drop_ponder()` and returns without searching and without ever
+sending `bestmove`, so a `stop` gets no answer. The lichess driver cannot trigger it, since it ponders
+only with more than seven pieces and does not wait for `bestmove` after `stop`, but a GUI that
+ponders into a tablebase ending would hang.
 
 **Sizing.** The tree reached 9.8M nodes on a 1 GB `Hash` in a single 3+2 game with pondering,
 i.e. the ceiling. Roughly 10M nodes per GB. Size `Hash` for the whole game, not for one move.
