@@ -19,6 +19,7 @@
 #include <fcntl.h>    // F_NOCACHE on the streaming feature-cache reads
 #include <torch/torch.h>
 #include <vector>
+#include <map>
 #include <string>
 #include <iostream>
 #include <fstream>
@@ -432,7 +433,10 @@ struct NNUEPolicyImpl : torch::nn::Module {
     //
     // That last product is every (from, to) pair at once: B*64*64*d multiply-adds, about an eighth
     // of the existing ctx @ emb^T readout at d=16.
-    torch::Tensor spatial(torch::Tensor x) {
+    // The two per-square halves of the term, uu and vv, each [B, 64, d]. Split out of spatial() so
+    // the sparse readout can take dot(uu[from], vv[to]) for just the legal moves instead of forming
+    // all 4096 pairs; spatial() below is exactly uu @ vv^T and is what the dense path still uses.
+    std::pair<torch::Tensor, torch::Tensor> spatial_uv(torch::Tensor x) {
         const int64_t B = x.size(0);
 #if SPATIAL == 2
         auto img = x.slice(1, NNUE_DIMS, NNUE_DIMS + SPATIAL_IN)
@@ -462,7 +466,11 @@ struct NNUEPolicyImpl : torch::nn::Module {
         //properties that matter: the term is still exactly zero at init, and d(term)/dWv is
         //proportional to uu and the planes, neither of which is zero.
         auto vv = torch::matmul(planes, Wv);                    // [B, 64, d]
-        return torch::matmul(uu, vv.transpose(1, 2)).reshape({B, 64 * 64});
+        return { uu, vv };
+    }
+    torch::Tensor spatial(torch::Tensor x) {
+        auto [uu, vv] = spatial_uv(x);
+        return torch::matmul(uu, vv.transpose(1, 2)).reshape({x.size(0), 64 * 64});
     }
 #endif
     // x [B, NNUE_DIMS] -> [B, POLICY_OUT]. No legality: BENCH_FORWARD times the trunk alone,
@@ -534,6 +542,81 @@ struct NNUEPolicyImpl : torch::nn::Module {
 #else
         logits = logits + sp;
 #endif
+#else
+        if (share2) *share2 = 0.0;
+#endif
+        return logits;
+    }
+
+    // THE SPARSE READOUT. Scores only the legal moves, never the whole move table.
+    //
+    // forward(x, mask) above computes a logit for every row of emb -- 24576 of them under
+    // PIECE_INDEX -- and the loss then masks all but the ~30 legal ones away. Every tensor on that
+    // path is [batch, 24576]: the mask, the logits, the masked copy, the log-softmax and their
+    // gradients. At batch 8192 each is 805 MB, about 5 GB per step on an 8 GB machine, and training
+    // measured 1,894 positions a second where the 4096-wide model did 45,000. At batch 2048 it no
+    // longer thrashes but still spends 99.8% of the readout on moves that cannot be played.
+    //
+    // This gathers the legal rows instead -- exactly what the engine does at inference -- so the
+    // readout is [batch, W, h2] with W the widest legal list in the batch, rounded up to a multiple
+    // of 32 (64 or 96 in almost every batch), rather than [batch, 24576]. It computes THE SAME FUNCTION: for every legal move the logit is identical to
+    // forward(x, mask)'s, and the legality term's mean runs over the same set. VERIFY_SPARSE=n in
+    // the training loop checks that against the dense path on real batches, loss and gradients.
+    //
+    // `legal` is [B, W] float, front-packed policy indices, -1 as padding -- tg.legal_idx narrowed
+    // to W. Returns logits [B, W]; entries where legal < 0 are meaningless and must be masked.
+    //
+    // share/share2 mean what they do in forward(x, mask), with one deliberate difference in share2:
+    // it is |spatial| / |base logit| over the LEGAL moves, because illegal logits are not computed
+    // here. The dense figure also averaged over ~24,500 illegal entries, so the two are not
+    // comparable and the validation line says which one it is printing.
+    torch::Tensor forward_legal(torch::Tensor x, const torch::Tensor& legal,
+                                double* share = nullptr, double* share2 = nullptr) {
+        //PADDED, [B, W, h2], deliberately -- not one row per legal move. A flat per-move gather
+        //(index_select / index_add / index_copy over [N, h2]) was tried to make memory independent
+        //of the widest position in a batch. It computed the same function to 1e-6 but on Metal ran
+        //at 2,195 positions a second with a 7.6 GB footprint, against 23,500 and ~3.8 GB for this
+        //padded form at the same batch size. The padded form's one weakness, a rare batch whose
+        //widest position pushes W to 160 or more, is handled by the allocator's high watermark
+        //rather than by changing the layout; see the launch notes at the top of the file.
+        auto ctx    = trunk(x);                                         // [B, h2]
+        auto valid  = (legal >= 0).to(ctx.scalar_type());               // [B, W]
+        auto idx    = legal.clamp_min(0).to(torch::kLong);              // [B, W]
+        auto E      = torch::embedding(emb, idx);                       // [B, W, h2]
+#if LEGAL_BIAS
+        auto n = valid.sum(1, /*keepdim=*/true).clamp_min(1.0f);        // [B, 1]
+#if LEGAL_BIAS == 1
+        auto L = torch::matmul((E * valid.unsqueeze(2)).sum(1) / n, Wl);
+#else
+        auto L = (torch::embedding(Cl, idx) * valid.unsqueeze(2)).sum(1) / n;
+#endif
+        if (share) {
+            const double a = ctx.abs().mean().item<double>();
+            *share = a > 0.0 ? L.abs().mean().item<double>() / a : 0.0;
+        }
+        ctx = ctx + L;
+#else
+        if (share) *share = 0.0;
+#endif
+        auto logits = torch::bmm(E, ctx.unsqueeze(2)).squeeze(2);       // [B, W]
+#if SPATIAL
+        //The spatial term depends only on the two squares, so reduce each index to from*64+to
+        //first -- a no-op without PIECE_INDEX, and the (pt-1)*4096 offset removed with it. Done in
+        //float: every index is below 24576, exactly representable, and it avoids integer division
+        //semantics differing between backends.
+        auto sqf  = torch::remainder(legal.clamp_min(0), 4096.0f);
+        auto frmf = torch::floor(sqf / 64.0f);
+        auto tof  = sqf - frmf * 64.0f;
+        auto [uu, vv] = spatial_uv(x);                                  // [B, 64, d] each
+        const int64_t B = x.size(0), W = legal.size(1), D = uu.size(2);
+        auto uf = uu.gather(1, frmf.to(torch::kLong).unsqueeze(2).expand({B, W, D}));
+        auto vt = vv.gather(1, tof.to(torch::kLong).unsqueeze(2).expand({B, W, D}));
+        auto sp = (uf * vt).sum(2);                                     // [B, W]
+        if (share2) {
+            const double a = (logits.abs() * valid).sum().item<double>();
+            *share2 = a > 0.0 ? (sp.abs() * valid).sum().item<double>() / a : 0.0;
+        }
+        logits = logits + sp;
 #else
         if (share2) *share2 = 0.0;
 #endif
@@ -1371,6 +1454,91 @@ static torch::Tensor pv1_is_legal(const torch::Tensor& mask, const torch::Tensor
     return (mask.gather(1, pv1).squeeze(1) > 0.5f) & (pv_idx.select(1, 0) >= 0);
 }
 
+// ---------------------------------------------------------------- sparse legal-move helpers
+// The counterparts of the dense loss, pv1_rank() and pv1_is_legal() for forward_legal(), which
+// returns one logit per slot of the legal list rather than one per row of the move table.
+
+// How many legal-list columns this batch actually uses, read from the n_legal column of the
+// CPU-side target tensor BEFORE it goes to the device, so it costs no GPU sync. get() writes the
+// legal indices front-packed and pads the rest with -1, so every legal move lies in the first
+// n_legal columns and narrowing to the batch maximum drops only padding. Without the narrowing the
+// gathered readout would be [batch, 200, h2] -- 838 MB at batch 8192, as bad as the dense path.
+//
+// ROUNDED UP TO A MULTIPLE OF 32, and that is not cosmetic. The widest legal list varies from batch to
+// batch -- 57 to 75 in the first 30 batches of a shard -- so without rounding every step asks the GPU
+// for differently-sized [batch, W, h2] buffers. PyTorch's Metal allocator caches freed buffers by
+// size and only starts reclaiming them past its low watermark (1.4x the recommended working set by
+// default, ~7.5 GB on an 8 GB machine), so shapes that never repeat meant it kept allocating new
+// buffers: the trainer reached 8.3 GB of GPU memory in 742 regions, the machine swapped, and
+// throughput halved two minutes in. Rounding leaves two or three distinct shapes it can reuse. The
+// extra columns are padding, masked exactly like the -1 padding every row already carries.
+static int64_t legal_width_cpu(const torch::Tensor& cpu_targets) {
+    const int64_t w = (int64_t)cpu_targets.select(1, 2 + 2 * MAX_PVS).max().item<float>();
+    const int64_t rounded = ((std::max<int64_t>(w, 1) + 31) / 32) * 32;
+    return std::min<int64_t>(rounded, MAX_LEGAL);
+}
+
+struct LegalLoss {
+    torch::Tensor valid;       // [B, W]  1 on a real legal slot
+    torch::Tensor masked;      // [B, W]  logits with padding at -1e9
+    torch::Tensor logp;        // [B, W]
+    torch::Tensor pv_slot;     // [B, P]  column of each PV move in the legal list (0 if absent)
+    torch::Tensor pv_legal;    // [B, P]  1 where that PV move is in the legal list
+    torch::Tensor per_sample;  // [B]
+    torch::Tensor has_pv;      // [B]
+    torch::Tensor loss;        // scalar
+};
+
+// The listwise cross-entropy, computed over the legal list. Mirrors the dense loss term for term:
+// the same PV weights, the same drop-and-renormalise of PV moves that are not legal in the decoded
+// position, the same label smoothing. The only change is where a PV move is looked up -- by
+// matching its policy index against the legal list, instead of by indexing a 24576-wide mask.
+//
+// Legal lists contain no duplicate indices (get() emits one entry per piece/from/to pair and does
+// not expand promotions), so each PV matches at most one slot and every move is counted once in
+// the softmax -- exactly as scatter_ into the dense mask counts it.
+static LegalLoss legal_policy_loss(const torch::Tensor& logits, const torch::Tensor& legal,
+                                   const PolicyBatch& tg, double label_smooth) {
+    LegalLoss r;
+    const auto dt = logits.scalar_type();
+    r.valid  = (legal >= 0).to(dt);
+    r.masked = logits.masked_fill(legal < 0, -1e9f);
+    r.logp   = torch::log_softmax(r.masked, 1);
+
+    auto pv     = tg.pv_idx;                                                  // [B, P] float
+    auto pv_on  = (pv >= 0);
+    auto hit    = (legal.unsqueeze(1) == pv.unsqueeze(2))                     // [B, P, W]
+                & (legal >= 0).unsqueeze(1) & pv_on.unsqueeze(2);
+    r.pv_legal  = hit.any(2).to(dt);
+    r.pv_slot   = hit.to(torch::kInt32).argmax(2);   // int32, not int64: half the size of [B, P, W]
+
+    auto wpv_raw = tg.pv_prob.to(dt) * pv_on.to(dt) * r.pv_legal;
+    auto wsum    = wpv_raw.sum(1, /*keepdim=*/true);
+    auto wpv     = wpv_raw / wsum.clamp_min(1e-6f);
+    r.per_sample = -(r.logp.gather(1, r.pv_slot) * wpv).sum(1);
+    if (label_smooth > 0.0) {
+        auto n_legal_f  = r.valid.sum(1).clamp_min(1.0f);
+        auto uniform_ce = -(r.logp * r.valid).sum(1) / n_legal_f;
+        r.per_sample = (1.0f - (float)label_smooth) * r.per_sample + (float)label_smooth * uniform_ce;
+    }
+    r.has_pv = (wsum.squeeze(1) > 0.0f).to(dt);
+    r.loss   = (r.per_sample * r.has_pv).sum() / r.has_pv.sum().clamp_min(1.0f);
+    return r;
+}
+
+// 0-based rank of PV1 among the legal moves. Identical to pv1_rank() wherever PV1 is legal. Where it
+// is not, pv1_rank() compares against a -1e9 logit and returns n_legal, while this compares against
+// slot 0 and returns something else -- but every caller multiplies the rank by legal_pv1_is_legal(),
+// exactly as it does with the dense pair, so that value is never counted.
+static torch::Tensor legal_pv1_rank(const LegalLoss& r) {
+    auto slot  = r.pv_slot.select(1, 0).unsqueeze(1);
+    auto logit = r.masked.gather(1, slot);
+    return ((r.masked > logit) & (r.valid > 0.5f)).sum(1);
+}
+static torch::Tensor legal_pv1_is_legal(const LegalLoss& r, const PolicyBatch& tg) {
+    return (r.pv_legal.select(1, 0) > 0.5f) & (tg.pv_idx.select(1, 0) >= 0);
+}
+
 //Build the feature cache for every shard in file_list.
 //
 //Resumable per shard, because a 1h41m job on this machine will be interrupted. A shard is
@@ -1576,6 +1744,14 @@ int main() {
     //0.05-0.15 is the usual range; the right value here depends on how often an unlisted
     //move is actually good, which is exactly what the experiment measures.
     const double label_smooth = env_d("LABEL_SMOOTH", 0.0);
+    //SPARSE_LEGAL=1 (default) scores only each position's legal moves -- forward_legal() and
+    //legal_policy_loss() -- instead of a [batch, POLICY_OUT] logit table. 0 restores the dense step,
+    //kept as the reference the sparse one is verified against.
+    const bool sparse_legal = env_d("SPARSE_LEGAL", 1.0) != 0.0;
+    //VERIFY_SPARSE=n runs BOTH steps on the first n training batches and prints how far apart they
+    //are: loss, per-sample loss, PV1 rank, and every parameter's gradient. Run it at batch 2048 or
+    //below -- the dense half is the path that thrashes at 8192 under PIECE_INDEX.
+    const int verify_sparse = (int)env_d("VERIFY_SPARSE", 0.0);
     //FEATURE_CACHE=<dir> reads pre-extracted features instead of computing them.
     //
     //A shard's cache is 10.1 GB, far more than this machine's RAM, and the DataLoader
@@ -1998,73 +2174,141 @@ int main() {
 
                     optimizer.zero_grad();
 
-                    //The mask is built BEFORE the forward pass now, because LEGAL_BIAS feeds it in.
-                    //It is the same tensor the loss masks with, so nothing is computed twice.
-                    auto mask   = legality_mask_dims(data.size(0), POLICY_OUT, data.options(),
-                                                     tg.legal_idx);
-                    auto policy_logits = model->forward(data, mask);      // [batch, POLICY_OUT]
-
-                    auto masked = policy_logits.masked_fill(mask < 0.5f, -1e9f);
-                    auto logp   = torch::log_softmax(masked, 1);
-
-
-                    // Listwise cross-entropy over the LEGAL moves only, against the
-                    // softmaxed PV scores. Samples carrying no PV contribute nothing.
-                    // A PV move is not always legal in the decoded position -- about 1.2%
-                    // of records, measured. Its target index then points at an entry
-                    // masked to -1e9, contributing ~1e9 to the loss and a gradient that
-                    // uniformly suppresses every legal move. Drop those PV entries and
-                    // renormalise what is left.
-                    auto pvi      = tg.pv_idx.clamp_min(0).to(torch::kLong);
-                    auto pv_legal = mask.gather(1, pvi);                       // [B,3]
-                    auto wpv_raw  = tg.pv_prob * (tg.pv_idx >= 0).to(logp.scalar_type()) * pv_legal;
-                    auto wsum     = wpv_raw.sum(1, /*keepdim=*/true);
-                    auto wpv      = wpv_raw / wsum.clamp_min(1e-6f);
-                    auto per_sample = -(logp.gather(1, pvi) * wpv).sum(1);
-
-                    // Label smoothing over the LEGAL moves.
-                    //
-                    // The target above is a proper softmax over the PV centipawn scores,
-                    // so the loss is already score-aware where there are several PVs to be
-                    // aware of. The trouble is that 57% of records carry exactly ONE PV, and
-                    // for those the target is a one-hot: 1.0 on PV1 and exactly 0.0 on the
-                    // other ~28 legal moves. Cross-entropy then drives the probability of
-                    // every unlisted move toward zero, which asserts something the data never
-                    // says. Stockfish did not report those moves as bad; it only reported
-                    // fewer PVs. On a position where four moves are near-equal, three of them
-                    // are being actively punished for being good.
-                    //
-                    // Mixing in a uniform distribution over the legal moves removes the false
-                    // part of the claim while keeping the true part: PV1 is still by far the
-                    // most likely move, the rest are merely no longer impossible. This is the
-                    // usual remedy for confidently-wrong labels and it costs one extra masked
-                    // sum per batch.
-                    //
-                    // LABEL_SMOOTH=0 reproduces the old loss exactly, so this is A/B-able
-                    // against the existing checkpoints rather than a one-way change.
-                    if (label_smooth > 0.0) {
-                        auto n_legal_f  = mask.sum(1).clamp_min(1.0f);
-                        auto uniform_ce = -(logp * mask).sum(1) / n_legal_f;
-                        per_sample = (1.0f - (float)label_smooth) * per_sample
-                                   + (float)label_smooth * uniform_ce;
-                    }
-                    auto has_pv     = (wsum.squeeze(1) > 0.0f).to(logp.scalar_type());
-                    auto n_have     = has_pv.sum().clamp_min(1.0f);
-                    auto loss_policy = (per_sample * has_pv).sum() / n_have;
-
-                    //Top-1 costs several tensor ops plus an .item() that forces a GPU->CPU
-                    //sync, and it is only ever read when printing. On MPS every operation is
-                    //a synchronous dispatch -- profiling showed the step dominated by
-                    //dispatch_sync_with_rethrow -- so paying this on every batch is pure
-                    //latency. Compute it only on the batches that print it.
+                    torch::Tensor loss_policy;
                     double batch_top1 = last_top1;
-                    if ((epoch_total_batches + 1) % 100 == 0) {
-                      auto rank1  = pv1_rank(masked, mask, tg.pv_idx);
-                      auto ok_pv1 = pv1_is_legal(mask, tg.pv_idx).to(logp.scalar_type()) * has_pv;
-                      auto nn     = ok_pv1.sum().clamp_min(1.0f);
-                      batch_top1  = 100.0 * (((rank1 == 0).to(logp.scalar_type()) * ok_pv1).sum()
-                                             / nn).item<double>();
-                      last_top1   = batch_top1;
+                    //Gradients from the dense step on a VERIFY_SPARSE batch, compared against the
+                    //sparse step's once it has run its own backward below.
+                    std::vector<std::pair<std::string, torch::Tensor>> verify_grads;
+
+                    if (sparse_legal) {
+                        const int64_t W = legal_width_cpu(batch.target);
+                        auto legal  = tg.legal_idx.narrow(1, 0, W);
+
+                        //VERIFY: the dense step first, on the same batch and the same weights.
+                        torch::Tensor v_loss, v_ps, v_rank, v_ok, v_has;
+                        const bool verifying = epoch_total_batches < verify_sparse;
+                        if (verifying) {
+                            auto vmask   = legality_mask_dims(data.size(0), POLICY_OUT, data.options(), tg.legal_idx);
+                            auto vlogits = model->forward(data, vmask);
+                            auto vmasked = vlogits.masked_fill(vmask < 0.5f, -1e9f);
+                            auto vlogp   = torch::log_softmax(vmasked, 1);
+                            auto pvi     = tg.pv_idx.clamp_min(0).to(torch::kLong);
+                            auto wraw    = tg.pv_prob * (tg.pv_idx >= 0).to(vlogp.scalar_type()) * vmask.gather(1, pvi);
+                            auto ws      = wraw.sum(1, true);
+                            v_ps = -(vlogp.gather(1, pvi) * (wraw / ws.clamp_min(1e-6f))).sum(1);
+                            if (label_smooth > 0.0) {
+                                auto nl = vmask.sum(1).clamp_min(1.0f);
+                                v_ps = (1.0f - (float)label_smooth) * v_ps
+                                     + (float)label_smooth * (-(vlogp * vmask).sum(1) / nl);
+                            }
+                            v_has  = (ws.squeeze(1) > 0.0f).to(vlogp.scalar_type());
+                            v_loss = (v_ps * v_has).sum() / v_has.sum().clamp_min(1.0f);
+                            v_rank = pv1_rank(vmasked, vmask, tg.pv_idx);
+                            v_ok   = pv1_is_legal(vmask, tg.pv_idx);
+                            v_loss.backward();
+                            for (const auto& kv : model->named_parameters())
+                                if (kv.value().grad().defined())
+                                    verify_grads.emplace_back(kv.key(), kv.value().grad().detach().clone());
+                            optimizer.zero_grad();
+                        }
+
+                        auto logits = model->forward_legal(data, legal);
+                        auto r      = legal_policy_loss(logits, legal, tg, label_smooth);
+                        loss_policy = r.loss;
+
+                        if ((epoch_total_batches + 1) % 100 == 0) {
+                          auto rank1  = legal_pv1_rank(r);
+                          auto ok_pv1 = legal_pv1_is_legal(r, tg).to(r.logp.scalar_type()) * r.has_pv;
+                          auto nn     = ok_pv1.sum().clamp_min(1.0f);
+                          batch_top1  = 100.0 * (((rank1 == 0).to(r.logp.scalar_type()) * ok_pv1).sum()
+                                                 / nn).item<double>();
+                          last_top1   = batch_top1;
+                        }
+
+                        if (verifying) {
+                            auto s_rank = legal_pv1_rank(r);
+                            auto s_ok   = legal_pv1_is_legal(r, tg);
+                            auto both   = (s_ok & v_ok);
+                            const double dl   = (loss_policy - v_loss).abs().item<double>();
+                            const double dps  = ((r.per_sample - v_ps).abs() * v_has).max().item<double>();
+                            const int64_t rk   = ((s_rank != v_rank) & both).sum().item<int64_t>();
+                            const int64_t okd  = (s_ok != v_ok).sum().item<int64_t>();
+                            const int64_t hasd = (r.has_pv != v_has).sum().item<int64_t>();
+                            std::printf("\n  VERIFY batch %ld  W=%lld  loss dense %.6f sparse %.6f |d| %.2e  "
+                                        "per-sample max|d| %.2e  rank mismatches %lld  pv1-legal mismatches %lld  "
+                                        "has-pv mismatches %lld\n",
+                                        epoch_total_batches, (long long)W, v_loss.item<double>(),
+                                        loss_policy.item<double>(), dl, dps,
+                                        (long long)rk, (long long)okd, (long long)hasd);
+                        }
+                    } else {
+                        //The mask is built BEFORE the forward pass now, because LEGAL_BIAS feeds it in.
+                        //It is the same tensor the loss masks with, so nothing is computed twice.
+                        auto mask   = legality_mask_dims(data.size(0), POLICY_OUT, data.options(),
+                                                         tg.legal_idx);
+                        auto policy_logits = model->forward(data, mask);      // [batch, POLICY_OUT]
+
+                        auto masked = policy_logits.masked_fill(mask < 0.5f, -1e9f);
+                        auto logp   = torch::log_softmax(masked, 1);
+
+
+                        // Listwise cross-entropy over the LEGAL moves only, against the
+                        // softmaxed PV scores. Samples carrying no PV contribute nothing.
+                        // A PV move is not always legal in the decoded position -- about 1.2%
+                        // of records, measured. Its target index then points at an entry
+                        // masked to -1e9, contributing ~1e9 to the loss and a gradient that
+                        // uniformly suppresses every legal move. Drop those PV entries and
+                        // renormalise what is left.
+                        auto pvi      = tg.pv_idx.clamp_min(0).to(torch::kLong);
+                        auto pv_legal = mask.gather(1, pvi);                       // [B,3]
+                        auto wpv_raw  = tg.pv_prob * (tg.pv_idx >= 0).to(logp.scalar_type()) * pv_legal;
+                        auto wsum     = wpv_raw.sum(1, /*keepdim=*/true);
+                        auto wpv      = wpv_raw / wsum.clamp_min(1e-6f);
+                        auto per_sample = -(logp.gather(1, pvi) * wpv).sum(1);
+
+                        // Label smoothing over the LEGAL moves.
+                        //
+                        // The target above is a proper softmax over the PV centipawn scores,
+                        // so the loss is already score-aware where there are several PVs to be
+                        // aware of. The trouble is that 57% of records carry exactly ONE PV, and
+                        // for those the target is a one-hot: 1.0 on PV1 and exactly 0.0 on the
+                        // other ~28 legal moves. Cross-entropy then drives the probability of
+                        // every unlisted move toward zero, which asserts something the data never
+                        // says. Stockfish did not report those moves as bad; it only reported
+                        // fewer PVs. On a position where four moves are near-equal, three of them
+                        // are being actively punished for being good.
+                        //
+                        // Mixing in a uniform distribution over the legal moves removes the false
+                        // part of the claim while keeping the true part: PV1 is still by far the
+                        // most likely move, the rest are merely no longer impossible. This is the
+                        // usual remedy for confidently-wrong labels and it costs one extra masked
+                        // sum per batch.
+                        //
+                        // LABEL_SMOOTH=0 reproduces the old loss exactly, so this is A/B-able
+                        // against the existing checkpoints rather than a one-way change.
+                        if (label_smooth > 0.0) {
+                            auto n_legal_f  = mask.sum(1).clamp_min(1.0f);
+                            auto uniform_ce = -(logp * mask).sum(1) / n_legal_f;
+                            per_sample = (1.0f - (float)label_smooth) * per_sample
+                                       + (float)label_smooth * uniform_ce;
+                        }
+                        auto has_pv     = (wsum.squeeze(1) > 0.0f).to(logp.scalar_type());
+                        auto n_have     = has_pv.sum().clamp_min(1.0f);
+                        loss_policy = (per_sample * has_pv).sum() / n_have;
+
+                        //Top-1 costs several tensor ops plus an .item() that forces a GPU->CPU
+                        //sync, and it is only ever read when printing. On MPS every operation is
+                        //a synchronous dispatch -- profiling showed the step dominated by
+                        //dispatch_sync_with_rethrow -- so paying this on every batch is pure
+                        //latency. Compute it only on the batches that print it.
+                                            if ((epoch_total_batches + 1) % 100 == 0) {
+                          auto rank1  = pv1_rank(masked, mask, tg.pv_idx);
+                          auto ok_pv1 = pv1_is_legal(mask, tg.pv_idx).to(logp.scalar_type()) * has_pv;
+                          auto nn     = ok_pv1.sum().clamp_min(1.0f);
+                          batch_top1  = 100.0 * (((rank1 == 0).to(logp.scalar_type()) * ok_pv1).sum()
+                                                 / nn).item<double>();
+                          last_top1   = batch_top1;
+                        }
                     }
 
                     //Policy only: NNUE supplies the value, better than anything trainable
@@ -2083,6 +2327,29 @@ int main() {
                     auto loss = loss_policy;
         
                     loss.backward();
+
+                    if (!verify_grads.empty()) {
+                        //Worst relative difference and lowest cosine similarity over every parameter.
+                        double worst_rel = 0.0, min_cos = 1.0;
+                        std::string worst_name = "-", cos_name = "-";
+                        std::map<std::string, torch::Tensor> now;
+                        for (const auto& kv : model->named_parameters())
+                            if (kv.value().grad().defined()) now[kv.key()] = kv.value().grad();
+                        for (const auto& [name, gd] : verify_grads) {
+                            auto it = now.find(name);
+                            if (it == now.end()) { std::printf("    grad %s: MISSING in sparse step\n", name.c_str()); continue; }
+                            const auto& gs = it->second;
+                            const double scale = std::max(gd.abs().max().item<double>(), 1e-12);
+                            const double rel   = (gs - gd).abs().max().item<double>() / scale;
+                            const double nd = gd.norm().item<double>(), ns = gs.norm().item<double>();
+                            const double cs = (nd > 0 && ns > 0) ? (gs * gd).sum().item<double>() / (nd * ns) : 1.0;
+                            if (rel > worst_rel) { worst_rel = rel; worst_name = name; }
+                            if (cs < min_cos)    { min_cos = cs;    cos_name = name; }
+                        }
+                        std::printf("    grads: %zu params, worst max|d|/max|g| %.2e (%s), lowest cosine %.8f (%s)\n",
+                                    verify_grads.size(), worst_rel, worst_name.c_str(), min_cos, cos_name.c_str());
+                        std::fflush(stdout);
+                    }
         
                     // Optional but recommended with policy head added
                     torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
@@ -2221,13 +2488,26 @@ int main() {
                     auto tg = unpack_targets(targets);
                     auto value_target = tg.value.to(torch::kFloat32);
 
+                    double lb_share = 0.0, sp_share = 0.0;
+                    torch::Tensor per_sample, has_pv, n_have, loss_policy, rank1, ok_pv1;
+                    if (sparse_legal) {
+                        //Same metrics from the legal list; see forward_legal(). No label smoothing
+                        //here, matching the dense validation below, which never applied it either.
+                        const int64_t W = legal_width_cpu(batch.target);
+                        auto legal  = tg.legal_idx.narrow(1, 0, W);
+                        auto logits = model->forward_legal(data, legal, &lb_share, &sp_share).to(torch::kFloat32);
+                        auto r      = legal_policy_loss(logits, legal, tg, 0.0);
+                        per_sample  = r.per_sample;
+                        has_pv      = r.has_pv;
+                        n_have      = has_pv.sum();
+                        loss_policy = r.loss;
+                        rank1       = legal_pv1_rank(r);
+                        ok_pv1      = legal_pv1_is_legal(r, tg).to(torch::kFloat32);
+                    } else {
                     // Cast BEFORE masking: -1e9 is not representable in half.
                     auto mask   = legality_mask_dims(data.size(0), POLICY_OUT, data.options(),
                                                      tg.legal_idx);
-                    double lb_share = 0.0, sp_share = 0.0;
                     auto policy_logits = model->forward(data, mask, &lb_share, &sp_share).to(torch::kFloat32);
-                    lb_share_sum += lb_share; ++lb_share_n;
-                    sp_share_sum += sp_share; ++sp_share_n;
 
                     // --- Policy metrics, over legal moves only ---
                     auto masked = policy_logits.masked_fill(mask < 0.5f, -1e9f);
@@ -2238,15 +2518,18 @@ int main() {
                     auto wpv_raw  = tg.pv_prob.to(torch::kFloat32) * (tg.pv_idx >= 0).to(torch::kFloat32) * pv_legal;
                     auto wsum     = wpv_raw.sum(1, /*keepdim=*/true);
                     auto wpv      = wpv_raw / wsum.clamp_min(1e-6f);
-                    auto per_sample = -(logp.gather(1, pvi) * wpv).sum(1);
-                    auto has_pv     = (wsum.squeeze(1) > 0.0f).to(torch::kFloat32);
-                    auto n_have     = has_pv.sum();
-                    auto loss_policy = (per_sample * has_pv).sum() / n_have.clamp_min(1.0f);
+                    per_sample  = -(logp.gather(1, pvi) * wpv).sum(1);
+                    has_pv      = (wsum.squeeze(1) > 0.0f).to(torch::kFloat32);
+                    n_have      = has_pv.sum();
+                    loss_policy = (per_sample * has_pv).sum() / n_have.clamp_min(1.0f);
 
                     // Directly comparable to bench_prior_acc.cpp: 26.9% top-1 and
                     // 77.4% top-6 are what the engine's current NNUE prior scores.
-                    auto rank1  = pv1_rank(masked, mask, tg.pv_idx);
-                    auto ok_pv1 = pv1_is_legal(mask, tg.pv_idx).to(torch::kFloat32);
+                    rank1  = pv1_rank(masked, mask, tg.pv_idx);
+                    ok_pv1 = pv1_is_legal(mask, tg.pv_idx).to(torch::kFloat32);
+                    }
+                    lb_share_sum += lb_share; ++lb_share_n;
+                    sp_share_sum += sp_share; ++sp_share_n;
                     has_pv = ok_pv1;   // top-K is only meaningful where PV1 is legal
                     n_have = has_pv.sum();
                     pol_top1  += (((rank1 == 0).to(torch::kFloat32) * has_pv).sum()).item<double>();
@@ -2287,9 +2570,12 @@ int main() {
 #endif
             
 #if SPATIAL
+            //The sparse path measures this over LEGAL moves only; the dense one averaged over all
+            //POLICY_OUT logits, illegal ones included. Say which, so the two are never compared.
             std::cout << "    Spatial term:    "
                       << (sp_share_n ? 100.0 * sp_share_sum / sp_share_n : 0.0)
-                      << "% of |logits|  (0% = Wv never left zero, so nothing was tested)\n";
+                      << (sparse_legal ? "% of |legal logits|" : "% of |logits|")
+                      << "  (0% = Wv never left zero, so nothing was tested)\n";
 #endif
             std::cout << "    Avg CP Error:    " << avg(mean_cp_error_total) << " centipawns\n";
             std::cout << "    Sign Accuracy:   " << avg(sign_accuracy_total) << "%\n";
