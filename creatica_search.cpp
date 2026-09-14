@@ -241,7 +241,6 @@ int           nnue_features(const Board&, NNUEContext&, unsigned char*);
 
 
 std::mutex mtx, log_mtx, print_mtx, pool_mutex, search_done_mtx, probe_mutex;
-std::shared_mutex map_mutex;
 std::condition_variable cv, pool_cv, pool_done_cv, cv_search_done;
 std::atomic<bool> searchFlag {false};
 std::atomic<bool> stopFlag {false};
@@ -966,30 +965,18 @@ static void sweep_func(uint32_t threshold, uint32_t n_slots) {
     retired_bits[i >> 6] |= 1ull << (i & 63);
   }
   const auto t1 = std::chrono::steady_clock::now();
-  //The map: drop the entries for those slots, one cluster at a time under the exclusive lock, yielding
-  //between steps so a searching thread waiting on the lock gets it. Not needed at all when nothing died.
+  //The map: drop the entries for those slots, one lock range at a time, so the search is only ever kept
+  //waiting by the one range being cleaned. Not needed at all when nothing died.
   size_t dropped = 0, steps = 0;
   const char * map_state = "nothing to drop";
   if (!aborted && !dead.empty() && map_clean_enabled) {
-    size_t cursor = 0, scanned = 0;
-    uint64_t epoch = 0;
-    {
-      std::unique_lock lk(map_mutex);
-      epoch  = search.tree.epoch();
-      cursor = search.tree.first_empty();
-    }
+    const uint64_t epoch = search.tree.epoch();
     std::vector<NodeMap::Slot> keep;
-    map_state = "stopped by the next collection";
-    while (!sweep_abort.load(std::memory_order_relaxed)) {
-      bool done;
-      {
-        std::unique_lock lk(map_mutex);
-        ++steps;
-        //32,768 table slots a step: about half a megabyte of the table.
-        done = search.tree.clean_step(cursor, scanned, epoch, 1u << 15, dropped, keep, retired_bits.data());
-      }
-      if (done) { map_state = "clean"; break; }
-      std::this_thread::yield();
+    map_state = "clean";
+    for (size_t li = 0; li < NodeMap::LOCKS; ++li) {
+      if (sweep_abort.load(std::memory_order_relaxed)) { map_state = "stopped by the next collection"; break; }
+      ++steps;
+      if (!search.tree.clean_range(li, epoch, dropped, keep, retired_bits.data())) { map_state = "rebuilt meanwhile"; break; }
     }
   }
   //Only now do the slots go back. Until the walk has passed, a retired slot must not become a new node,
@@ -999,7 +986,7 @@ static void sweep_func(uint32_t threshold, uint32_t n_slots) {
   reap_enqueue(std::move(dead), dead_edges);
   const auto t2 = std::chrono::steady_clock::now();
   log_file("info string background sweep: retired %zu slots in %.1f ms; map: %s, %zu stale entries dropped "
-           "in %zu locked steps, %.1f ms\n",
+           "in %zu range steps, %.1f ms\n",
            retired, std::chrono::duration<double, std::milli>(t1 - t0).count(),
            map_state, dropped, steps, std::chrono::duration<double, std::milli>(t2 - t1).count());
 }
@@ -1352,12 +1339,7 @@ void set_root(NNUEContext& ctx) {
   //Cheap when Hash has not moved -- it compares one integer and returns. This is the only place
   //the arena is created, so it has to run before the first lookup.
   arena_size_check();
-  //Under the lock even here, with no search running: the background sweep may be cleaning the map.
-  MCTSNode * root = nullptr;
-  {
-    std::shared_lock lk(map_mutex);
-    root = search.tree.lookup(zh.hash);
-  }
+  MCTSNode * root = search.tree.lookup(zh.hash);
   if (!root) {
     root = search.arena.alloc();
     //The arena is sized so the hash_full gate stops expansion long before it runs dry -- the gate
@@ -1371,10 +1353,7 @@ void set_root(NNUEContext& ctx) {
     }
     root->hash.store(zh.hash, std::memory_order_relaxed);
     search.arena.stamp(root, (uint32_t)generation.load(std::memory_order_relaxed));
-    {
-      std::unique_lock lk(map_mutex);
-      search.tree.insert(zh.hash, root);
-    }
+    search.tree.insert(zh.hash, root);
     total_nodes.fetch_add(1, std::memory_order_relaxed);
   }
   //Expand whether the root is new or REUSED. The expansion used to sit inside the !root branch,
@@ -1404,9 +1383,7 @@ void set_root(NNUEContext& ctx) {
 //returns new or existing node
 MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
   //first, try to find child_hash in the tree
-  std::shared_lock search_lock(map_mutex);
   MCTSNode * child = search.tree.lookup(hash);
-  search_lock.unlock();
   if (!child) { //if the child_hash is not found, create a child
     child = search.arena.alloc();
     //Out of slots. Returning nullptr is safe because expand_node() builds the whole Edge array
@@ -1435,7 +1412,6 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
     MCTSNode * winner = nullptr;
     bool inserted = false;
     {
-      std::unique_lock insert_lock(map_mutex);
       auto [w, ins] = search.tree.insert(hash, child);
       inserted = ins;
       winner   = w;
@@ -2612,9 +2588,7 @@ void uci_output_thread() {
       d++;
     }
     depth.store(d, std::memory_order_relaxed);
-    std::shared_lock lock(map_mutex);
     size_t unique_nodes = live_tree_nodes();
-    lock.unlock();
     size_t total_memory = unique_nodes * NODE_BYTES + total_children.load(std::memory_order_relaxed) * EDGE_BYTES;
     size_t max_capacity = chessEngine.optionSpin[Hash].value * 1024 * 1024;  // MB to bytes
     int hashfull = max_capacity ? (total_memory * 1000) / max_capacity : 0;
