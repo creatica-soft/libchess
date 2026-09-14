@@ -44,6 +44,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `GcThreshold` | spin | 700 | 0–1000 | Per-mille of `Hash` at which the tree is collected. It reclaims only memory — an unreachable node is never traversed — so collecting every move used to pay a large cost for nothing. Since the arena that cost is roughly 100 ms at `Hash` 1024, and the value is now set by the *expansion ceiling* rather than by collection cost: occupancy climbs a p99 of 299 per-mille during one search, so 700 is about the highest value that keeps the tree off the 1000 ceiling. Raise it and roughly one search in ten overshoots; lowering it is now affordable. See *The node arena*. `creatica` only. |
 | `TreeResetBelow` | spin | 0 | 0–1000000000 | **Off at 0.** Before a search, if the tree is at `TreeResetOccupancy` or more and the root inherited fewer than this many informed simulations (its evidence), discard the whole tree instead of collecting it. Aimed at the one case a full tree turns into a blunder: a root the last search barely looked at, on a tree nothing can be freed from. 1000 is the value tested in replays; it has not been measured in games. See *A full tree that cannot be collected*. |
 | `TreeResetOccupancy` | spin | 950 | 0–1000 | Per-mille of `Hash` at or above which `TreeResetBelow` applies. Below 950 no search in 22 games froze, so resetting there would only throw knowledge away. |
+| `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. 900 is the value tested in replays; not yet measured in games. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
 | `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
@@ -1198,6 +1199,14 @@ inherited; where it did not, the frozen root had inherited a lot (a median of 67
 band). By Stockfish the two choices were equivalent in 39 of 50 positions; the fresh move was better in
 7 and worse in 4, and it lost a pawn or more 5 times against 7. Fifty positions cannot separate those,
 so the measurement says a reset in a frozen position costs nothing measurable, not that it gains.
+
+**`TreeResetHollow`** acts on that: it resets when the previous search was at least that many per-mille
+hollow and the tree is at `TreeResetOccupancy`, whatever the root inherited. Replaying `QHWLWAbv` at
+`Hash` 1024 with its clocks and pondering, `TreeResetHollow 900` fired 4 times and cut the searches that
+were at least 90% hollow from 10 to 4 and those at least 50% hollow from 15 to 6. Each reset follows one
+frozen search, since it reacts to the search before. Two of the four discarded roots that had inherited
+1.6 and 3.3 million informed simulations — permitted by design, because a frozen tree would have taught
+the next search nothing, but the case to watch in games.
 
 ### The sweep off the clock
 

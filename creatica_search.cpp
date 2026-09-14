@@ -190,6 +190,11 @@ int64_t       gc_threshold = 700;
 //at or above which the rule applies. See the reset in runMCTS() for why and for the measurements.
 int64_t       tree_reset_below = 0;
 int64_t       tree_reset_occupancy = 950;
+//TreeResetHollow: also reset when the PREVIOUS search was at least this many per-mille hollow -- the tree
+//was frozen, whatever the new root inherited. 0 = off. See the reset in runMCTS().
+int64_t       tree_reset_hollow = 0;
+//The previous search's hollow simulations, per-mille, written when it finishes. -1 before the first.
+static std::atomic<int> last_search_hollow_permille{-1};
 
 //Simulations performed by THIS search. The info lines used to report search.root->N for
 //"nodes", which the comment at the ponder-output site still calls "total simulations" -- and it
@@ -2693,10 +2698,20 @@ void runMCTS(NNUEContext& ctx) {
       //TreeResetBelow informed simulations, keeping the tree buys almost nothing and costs the whole
       //search. Retire every node, root included, and start this search on an empty tree. A new root
       //that set_root() just created counts as having inherited 1.
-      if (tree_reset_below > 0 && search.root) {
+      //
+      //TreeResetHollow is the second trigger, and does not look at the inheritance: the previous search was
+      //itself hollow, so the tree is frozen and this search would learn nothing either. Measured on 50 frozen
+      //positions from real games, searched again from an empty tree for the same time and scored by
+      //Stockfish: the fresh search's move was equivalent in 39, better in 7 and worse in 4, and lost a pawn
+      //or more in 5 against 7 -- a reset in a frozen tree costs nothing measurable. Fewer pieces make it
+      //cheaper still: a fresh search runs about 1.8 times as fast with ten pieces or fewer as on a full board.
+      const int last_hollow = last_search_hollow_permille.load(std::memory_order_relaxed);
+      if ((tree_reset_below > 0 || tree_reset_hollow > 0) && search.root) {
         const int      occ       = tree_occupancy();
         const uint64_t inherited = search.root->evidence.load(std::memory_order_relaxed);
-        if (occ >= tree_reset_occupancy && inherited < (uint64_t)tree_reset_below) {
+        const bool starved = tree_reset_below > 0 && inherited < (uint64_t)tree_reset_below;
+        const bool frozen  = tree_reset_hollow > 0 && last_hollow >= tree_reset_hollow;
+        if (occ >= tree_reset_occupancy && (starved || frozen)) {
           const size_t before = live_tree_nodes();
           gc(search.root, /*retire_all=*/true);
           search.root = nullptr;
@@ -2705,10 +2720,12 @@ void runMCTS(NNUEContext& ctx) {
           set_root_ms += std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - t).count();
           tree_reset = true;
-          log_file("info string tree reset: root inherited %llu informed simulations (TreeResetBelow %lld) "
-                   "with the tree at %d permille (TreeResetOccupancy %lld); retired %zu nodes, now %d permille\n",
-                   (unsigned long long)inherited, (long long)tree_reset_below, occ,
-                   (long long)tree_reset_occupancy, before, tree_occupancy());
+          log_file("info string tree reset (%s): root inherited %llu informed simulations (TreeResetBelow %lld), "
+                   "previous search %d permille hollow (TreeResetHollow %lld), tree at %d permille "
+                   "(TreeResetOccupancy %lld); retired %zu nodes, now %d permille\n",
+                   starved && frozen ? "starved and frozen" : starved ? "starved" : "frozen",
+                   (unsigned long long)inherited, (long long)tree_reset_below, last_hollow,
+                   (long long)tree_reset_hollow, occ, (long long)tree_reset_occupancy, before, tree_occupancy());
         }
       }
       const bool wanted = !tree_reset && tree_occupancy() >= gc_threshold;
@@ -2851,6 +2868,7 @@ void runMCTS(NNUEContext& ctx) {
                             std::chrono::steady_clock::now() - iter_start).count();
       const uint64_t sims = search_simulations.load(std::memory_order_relaxed);
       const uint64_t hollow = uninformed_sims.exchange(0, std::memory_order_relaxed);
+      last_search_hollow_permille.store(sims ? (int)(1000 * hollow / sims) : 0, std::memory_order_relaxed);
       //The repetition history's shape, which is the cheap way to see that the counts are real and
       //that the per-command replay is not multiplying them: `positions` should track the ply count
       //and `max rep` should stay small. `flipped` is how many of those boards have also occurred
