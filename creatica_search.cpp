@@ -14,6 +14,7 @@
 
 #include "creatica_search.hpp"
 #include "policy_net.h"
+#include <memory>     // std::unique_ptr for the spatial term's re-entry fallback
 
 //The policy head replaces the engine's incumbent prior. creatica-shared-root builds its
 //priors by playing every legal move and evaluating the child with NNUE -- around 29
@@ -231,6 +232,7 @@ static inline uint64_t ev_of(const MCTSNode * n) {
 }
 int           nnue_feature_dims();
 int           nnue_features(const Board&, NNUEContext&, unsigned char*);
+
 
 std::mutex mtx, log_mtx, print_mtx, pool_mutex, search_done_mtx, probe_mutex;
 std::shared_mutex map_mutex;
@@ -1649,6 +1651,10 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
   const bool use_policy = policy_enabled && !checkers;
   float pctx[POLICY_MAX_H2];
   bool  flip = false;
+  //The spatial forward's output for this position, set once the legal move list is known (see THE
+  //SPATIAL TERM below) and read by every policy_score() call in this function. Declared here so
+  //evaluate() captures it; it is null whenever the net has no spatial term.
+  const PolicySpatialScratch* sp_buf = nullptr;
   if (use_policy) {
     unsigned char feat[POLICY_MAX_IN];
     //Free at a search node: the accumulator this reads is the one do_move_dp() has been
@@ -1671,7 +1677,9 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
   //it has to be applied once, with every move known, before a single move is scored. Scoring a
   //move against a partially-accumulated mean would give it a different value from the same move
   //scored later.
-  const bool need_legal_set = use_policy && policy_net.has_wl;
+  //The SPATIAL term needs the whole set for the same reason: planes 12 and 13 mark every square a
+  //legal move starts from or lands on, so they cannot be built until every move is known.
+  const bool need_legal_set = use_policy && (policy_net.has_wl || policy_net.spatial.loaded);
   const bool collect_first  = gating || need_legal_set;
   std::vector<Move> legal;
   if (collect_first) legal.reserve(64);
@@ -1697,14 +1705,14 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
     const int      move_idx = (m.promoType << 12) | (m.src << 6) | m.dst;
     if (use_policy && policy_mode == POLICY_FULL) {
       auto [cp, terminal] = make_move_policy(chess_board, board_hash, m, child_hash, pos_history, iter);
-      move_evals.push_back({policy_score(policy_net, pctx, pre_pt, m.src, pre_dst, flip) * pscale,
+      move_evals.push_back({policy_score(policy_net, pctx, pre_pt, m.src, pre_dst, flip, sp_buf) * pscale,
                             move_idx, cp, terminal, child_hash});
     } else {
       auto [res, terminal] = make_move(chess_board, board_hash, m, ctx, child_hash, pos_history, iter);
       //get_prob() divides by `temperature`, so push temperature * (the logit we want).
       const double prior = use_policy
           ? temperature * policy_blend_scale
-                * (policy_blend * policy_score(policy_net, pctx, pre_pt, m.src, pre_dst, flip) / policy_temperature
+                * (policy_blend * policy_score(policy_net, pctx, pre_pt, m.src, pre_dst, flip, sp_buf) / policy_temperature
                    + (1.0 - policy_blend) * res / temperature)
           : res;
       move_evals.push_back({prior, move_idx,
@@ -1743,13 +1751,54 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
   }
   //The legality term, applied to ctx once the full move list is known and BEFORE the gate, which
   //ranks by policy score and so must see the corrected scores.
-  if (need_legal_set && !legal.empty()) {
+  //
+  //DEDUPLICATED, because the trainer's legal list holds one entry per piece/from/to while this list
+  //holds four for every promotion (knight, bishop, rook, queen), all mapping to the same row. Without
+  //it a promotion counts four times in the mean the term is built from -- a different function from
+  //the one trained, in exactly the positions where a promotion is available. Order does not matter
+  //to a mean, so sort-and-unique is enough, and on ~35 rows it is noise beside an expansion.
+  if (need_legal_set && policy_net.has_wl && !legal.empty()) {
     std::vector<size_t> rows;
     rows.reserve(legal.size());
     for (const Move& m : legal)
       rows.push_back(policy_row(policy_net, chess_board.piecesOnSquares[m.src] & 7,
                                 m.src, m.dst, flip));
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
     policy_apply_legal_bias(policy_net, pctx, rows.data(), (int)rows.size());
+  }
+
+  //THE SPATIAL TERM (formats 7 and 8). Builds the 8x8 planes from the board and the legal list,
+  //runs the convolution once, and leaves u and v in sp_buf so every move below scores
+  //dot(u[from], v[to]) on top of its embedding score. Before the gate, which ranks by that score.
+  //
+  //The output buffer is per thread, which is safe because a policy-using expansion never runs inside
+  //another one: the only recursion is process_check() expanding a position IN CHECK, and use_policy
+  //is false in check. That invariant is not enforced by anything else, so it is checked here -- if
+  //this thread's buffer is already in use by an outer frame, this frame takes its own instead of
+  //overwriting the outer frame's u and v halfway through its scoring.
+  static thread_local PolicySpatialScratch sp_tls;
+  static thread_local int sp_tls_busy = 0;
+  struct SpBusy { int& busy; bool held = false; ~SpBusy() { if (held) --busy; } } sp_hold{sp_tls_busy};
+  std::unique_ptr<PolicySpatialScratch> sp_own;
+  if (use_policy && policy_net.spatial.loaded && !legal.empty()) {
+    PolicySpatialScratch* buf = &sp_tls;
+    if (sp_tls_busy) { sp_own = std::make_unique<PolicySpatialScratch>(); buf = sp_own.get(); }
+    else             { ++sp_tls_busy; sp_hold.held = true; }
+    //Consumed by the forward straight away, with nothing in between that can recurse, so these
+    //can be per thread too.
+    static thread_local unsigned char planes[26 * 64];
+    static thread_local std::vector<int> sq_from, sq_to, sq_pt;
+    sq_from.clear(); sq_to.clear(); sq_pt.clear();
+    for (const Move& m : legal) {
+      sq_from.push_back(flip ? (m.src ^ 56) : m.src);
+      sq_to.push_back(flip ? (m.dst ^ 56) : m.dst);
+      sq_pt.push_back(chess_board.piecesOnSquares[m.src] & 7);
+    }
+    policy_build_planes(chess_board, policy_net.spatial, sq_from.data(), sq_to.data(), sq_pt.data(),
+                        (int)legal.size(), planes);
+    policy_spatial_forward(policy_net.spatial, planes, *buf);
+    sp_buf = buf;
   }
 
   //The gate. Runs between enumeration and evaluation, so a dropped move costs nothing.
@@ -1763,7 +1812,7 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
     double mx = -1e300;
     for (size_t i = 0; i < n; ++i) {
       logit[i] = policy_score(policy_net, pctx, chess_board.piecesOnSquares[legal[i].src] & 7,
-                              legal[i].src, legal[i].dst, flip) / policy_temperature;
+                              legal[i].src, legal[i].dst, flip, sp_buf) / policy_temperature;
       if (logit[i] > mx) mx = logit[i];
     }
     //Softmax over the policy logits alone. Shifted by the maximum before exponentiating, so a
