@@ -38,9 +38,10 @@ Move& idx2move(const int move_idx, Move& move) {
   return move;
 }
 
+//uci_move must hold 6 chars: four for the squares, one for a promotion letter and the terminator.
+//(sizeof(uci_move) is the size of the pointer, so it cannot check that.)
 char * idx2uci(const int move_idx, char * uci_move) {
   assert(uci_move);
-  assert(sizeof(uci_move) >= 6);
   uci_move[0] = 0;
   const Square dst = (Square)(move_idx & 63);
   const Square src = (Square)((move_idx >> 6) & 63);
@@ -48,6 +49,10 @@ char * idx2uci(const int move_idx, char * uci_move) {
   strcat(uci_move, square[src]);
   strcat(uci_move, square[dst]);
   uci_move[4] = uciPromoLetter[promo]; //index 0, 1, 6 and 7 are '\0'
+  //TERMINATE AFTER THE PROMOTION LETTER. The letter overwrites the terminator strcat() left at [4], so
+  //without this a promotion was followed by whatever the buffer held before. Callers with a local
+  //buffer printed that: creatica's visit dump carried moves like "e7e8n" plus stray bytes.
+  uci_move[5] = '\0';
   return uci_move;
 }
 
