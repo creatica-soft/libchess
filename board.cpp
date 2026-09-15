@@ -704,6 +704,48 @@ static inline bool castlingDiscoversCheck(const Board& board, const Square kingD
   return (Stockfish::attacks_bb<Stockfish::ROOK>(static_cast<Stockfish::Square>(kingDst), occ) & enemyRQ) != 0;
 }
 
+//CASTLING FROM THE BOARD ALONE. Castling rights exist only while the king and that rook are still on the
+//squares they started on, so a position's king square and board.castlingRooks say everything the old
+//global tables (CastlingPath, CastlingRights[64], CastlingRooks[64]) said -- without fen2board() having
+//to set them, and without one board's FEN changing the rules for every other board in the process. See
+//the note in libchess.h for what that sharing cost.
+//
+//The squares castling needs empty (path) and unattacked (checkZone), for colour c on side 0 (kingside)
+//or 1 (queenside), from the king's and the rook's current squares.
+static inline CastlingData castling_path(const Color c, const int side, const Square kSrc, const Square rSrc) {
+  const Square kDst = castlingKingSquare[c][side];
+  const Square rDst = castlingRookSquare[c][side];
+  // all squares involved in the king and rook shuffle, destinations included (for 960 "quiet" castling),
+  // minus the two pieces themselves so they do not block their own path
+  const uint64_t fullSpan = Stockfish::BetweenBB[kSrc][kDst] | Stockfish::BetweenBB[rSrc][rDst]
+                          | SQ_BIT(kDst) | SQ_BIT(rDst);
+  CastlingData cd;
+  cd.path      = fullSpan & ~(SQ_BIT(kSrc) | SQ_BIT(rSrc));
+  cd.checkZone = (Stockfish::BetweenBB[kSrc][kDst] | SQ_BIT(kDst)) & ~SQ_BIT(kSrc);
+  return cd;
+}
+
+//What a move does to castling rights and castling rooks. A king move ends both of its side's rights; a move
+//from or to a castling rook's square -- the rook moving, or being captured -- ends that rook's. Call it with
+//the side to move not yet toggled. It never needs the moving piece's own square: a king that moves has
+//already cleared its side's rooks, so every king looked up here is standing still.
+static inline void update_castling(Board& board, const PieceType mpType, const Square src, const Square dst) {
+  if (!board.castlingRights) return;
+  const Color us = board.sideToMove;
+  if (mpType == King) {
+    board.castlingRights &= static_cast<uint8_t>(~(0x3u << (2 * us)));
+    board.castlingRooks  &= ~base_rank_bb[us];
+  }
+  uint64_t hit = board.castlingRooks & (SQ_BIT(src) | SQ_BIT(dst));
+  while (hit) {
+    const Square  r = popLSB(hit);
+    const Color   c = (SQ_BIT(r) & base_rank_bb[ColorWhite]) ? ColorWhite : ColorBlack;
+    const uint8_t right = static_cast<uint8_t>((r > kingSquare(board, c) ? CastlingKingside : CastlingQueenside) << (2 * c));
+    board.castlingRights &= static_cast<uint8_t>(~right);
+    board.castlingRooks  &= ~SQ_BIT(r);
+  }
+}
+
 uint64_t castlingMoves(const Board& board, const Square kingSq, uint64_t attackedSquares) {
   uint64_t moves = 0;
   uint64_t rooks = board.castlingRooks & board.side[board.sideToMove];
@@ -714,7 +756,7 @@ uint64_t castlingMoves(const Board& board, const Square kingSq, uint64_t attacke
   // We must ensure the rook we found is actually a Kingside rook.
   // In Standard Chess, this is File H. In 960, we compare to King position.
   if (kRookSq > kingSq) { 
-    const auto& cp = CastlingPath[board.sideToMove][0];
+    const CastlingData cp = castling_path(board.sideToMove, 0, kingSq, kRookSq);
     //printf("castlingMoves() debug: cp.path %llx, cp.checkZone %llx\n", cp.path, cp.checkZone);
     if (!(cp.path & occupations(board)) && !(cp.checkZone & attackedSquares)
         && !(board.isChess960 && castlingDiscoversCheck(board, castlingKingSquare[board.sideToMove][0], kRookSq))) {
@@ -727,7 +769,7 @@ uint64_t castlingMoves(const Board& board, const Square kingSq, uint64_t attacke
   // We must ensure the rook we found is actually a Queenside rook.
   // In Standard Chess, this is File A. In 960, we compare to King position.
   if (qRookSq < kingSq) { 
-    const auto& cp = CastlingPath[board.sideToMove][1];
+    const CastlingData cp = castling_path(board.sideToMove, 1, kingSq, qRookSq);
     //printf("castlingMoves() debug: cp.path %llx, cp.checkZone %llx\n", cp.path, cp.checkZone);
     if (!(cp.path & occupations(board)) && !(cp.checkZone & attackedSquares)
         && !(board.isChess960 && castlingDiscoversCheck(board, castlingKingSquare[board.sideToMove][1], qRookSq))) {
@@ -844,10 +886,7 @@ PieceType ff_move(Board& board, Move& move) {
 
 	//the above commented branched code is replaced with these 4 simple lines, which also take care of castling:
   const uint64_t castlingRooks = board.castlingRooks; //preserve for castling section
-  board.castlingRights &= CastlingRights[move.src];
-  board.castlingRights &= CastlingRights[move.dst];
-  board.castlingRooks &= CastlingRooks[move.src];
-  board.castlingRooks &= CastlingRooks[move.dst];
+  update_castling(board, mpType, static_cast<Square>(move.src), static_cast<Square>(move.dst));
 
 	move.type = MoveTypeNormal; //init type
 	PieceType capturedType = PieceTypeNone; //init capturedType
@@ -972,10 +1011,7 @@ PieceType do_move(Board& board, Move& move, StateInfo& state) {
   state.castlingRooks = board.castlingRooks;
   state.castlingRights = board.castlingRights;
   
-	board.castlingRights &= CastlingRights[move.src];
-  board.castlingRights &= CastlingRights[move.dst];
-  board.castlingRooks &= CastlingRooks[move.src];
-  board.castlingRooks &= CastlingRooks[move.dst];
+  update_castling(board, mpType, static_cast<Square>(move.src), static_cast<Square>(move.dst));
 
 	move.type = MoveTypeNormal; //initialize/reset moving type
 	state.capturedType = PieceTypeNone; //initialize/reset the captured type
@@ -1219,12 +1255,7 @@ PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::Dirt
   //if (move.type >= MoveTypeNormal) update_piece_threats<false>(board, static_cast<Stockfish::Piece>(dp.pc), static_cast<Stockfish::Square>(move.src), &dts);
 	  
 	//printf("do_move_dp() debug: castlingRights %hhx\n", board.castlingRights);
-	board.castlingRights &= CastlingRights[move.src];
-	//printf("do_move_dp() debug: %s move from %s, castlingRights %hhx : %hhx\n", pieceType[mpType], square[move.src], board.castlingRights, CastlingRights[move.src]);
-  board.castlingRights &= CastlingRights[move.dst];
-	//printf("do_move_dp() debug: %s move to %s, castlingRights %hhx : %hhx\n", pieceType[mpType], square[move.dst], board.castlingRights, CastlingRights[move.dst]);
-  board.castlingRooks &= CastlingRooks[move.src];
-  board.castlingRooks &= CastlingRooks[move.dst];
+  update_castling(board, mpType, static_cast<Square>(move.src), static_cast<Square>(move.dst));
   
 	//normal capture
 	uint64_t dstBit = SQ_BIT(move.dst);

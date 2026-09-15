@@ -7,77 +7,6 @@
 #include "nnue/bitboard.h"
 #include "libchess.h"
 
-CastlingData CastlingPath[Color_NB][2]; // [Color][0: Kingside, 1: Queenside]
-
-void initCastlingPath(Board& board) {
-  for (Color color = ColorWhite; color <= ColorBlack; ++color) {
-    //Square kSrc = lsBit(board.side[color] & board.pieceTypes[King - 1]);
-    Square kSrc = kingSquare(board, color);
-    for (int side = 0; side <= 1; ++side) {
-      const uint64_t rooks = board.castlingRooks & board.side[color];
-			if (!(rooks)) {
-        CastlingPath[color][side].path = 0; // Block if no rights
-        continue;
-      }
-      Square rSrc = side == 0 ? msBit(rooks) : lsBit(rooks);
-      Square kDst = (side == 0) ? SQ(baseRank[color], FileG) : SQ(baseRank[color], FileC);
-      Square rDst = (side == 0) ? SQ(baseRank[color], FileF) : SQ(baseRank[color], FileD);
-			// PATH: Squares that must be EMPTY.
-			// We take the squares between King and its destination, 
-			// and the squares between Rook and its destination.
-			// 1. All squares involved in the King and Rook shuffle
-			uint64_t fullSpan = Stockfish::BetweenBB[kSrc][kDst] | Stockfish::BetweenBB[rSrc][rDst];
-			// 2. Add destinations ONLY if kSrc==kDst or rSrc==rDst (for 960 "quiet" castling)
-			fullSpan |= (SQ_BIT(kDst) | SQ_BIT(rDst));
-			// 3. Remove the pieces themselves so they don't block their own path
-			CastlingPath[color][side].path = fullSpan & ~(SQ_BIT(kSrc) | SQ_BIT(rSrc));
-			// 4. CheckZone is just where the King goes
-			CastlingPath[color][side].checkZone = Stockfish::BetweenBB[kSrc][kDst] | SQ_BIT(kDst);
-			CastlingPath[color][side].checkZone &= ~SQ_BIT(kSrc);
-    }    
-  }  
-}
-
-// 0xF is 1111 in binary (all 4 rights active)
-uint8_t  CastlingRights[64]; 
-// 0xFF... is all bits set
-uint64_t CastlingRooks[64];  
-
-void initCastlingMasks(Board& board) {
-    // Start by assuming every square leaves rights untouched
-    for(int i = 0; i < 64; i++) {
-        CastlingRights[i] = 0xF; 
-        CastlingRooks[i] = ~0ULL;
-    }
-
-    // Now, specific squares "kill" specific rights
-    for (Color color = ColorWhite; color <= ColorBlack; ++color) {
-        Square kSq = kingSquare(board, color);
-        // If the King moves, all rights for that color (bits 0,1 or 2,3) are lost
-        CastlingRights[kSq] = (color == ColorWhite) ? 0xC : 0x3; 
-        CastlingRooks[kSq] &= ~board.side[color]; 
-
-        uint64_t rooks = board.castlingRooks & board.side[color];
-        if (!rooks) continue;
-        // Kingside (Highest index rook)
-        Square rSq = msBit(rooks); 
-        // We must ensure the rook we found is actually a Kingside rook.
-        // In Standard Chess, this is File H. In 960, we compare to King position.
-        if (rSq > kSq) { 
-            CastlingRights[rSq] &= ~(CastlingKingside << (static_cast<int>(color) * 2));
-            CastlingRooks[rSq] &= ~SQ_BIT(rSq);
-        }
-        // Queenside (Highest index rook)
-        rSq = lsBit(rooks); 
-        // We must ensure the rook we found is actually a Queenside rook.
-        // In Standard Chess, this is File A. In 960, we compare to King position.
-        if (rSq < kSq) { 
-            CastlingRights[rSq] &= ~(CastlingQueenside << (static_cast<int>(color) * 2));
-            CastlingRooks[rSq] &= ~SQ_BIT(rSq);
-        } 
-    }
-}
-
 //Outermost rook on one side of the king, for X-FEN castling.
 //
 //X-FEN writes Chess960 castling as plain KQkq, where K means "the OUTERMOST rook on the king's
@@ -406,7 +335,7 @@ int fen2board(Board& board, const char * fenstr) {
         fprintf(stderr, "fen2board() error: incorrect number of ranks. FEN = %s\n", fenstr);
         return 1;
     }
-    initCastlingPath(board);
-    initCastlingMasks(board);
+    //No global castling tables to rebuild any more: see the note in libchess.h. fen2board() now touches
+    //nothing but the Board it is given, so it is safe to call from any thread at any time.
     return 0;
 }

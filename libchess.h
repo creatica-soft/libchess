@@ -564,9 +564,14 @@ struct CastlingData {
     uint64_t checkZone; // Must not be attacked
 };
 
-extern CastlingData CastlingPath[Color_NB][2]; // [Color][0: Kingside, 1: Queenside]
-extern uint8_t  CastlingRights[64]; 
-extern uint64_t CastlingRooks[64];  
+//NO GLOBAL CASTLING TABLES. There used to be three -- CastlingPath[][], CastlingRights[64] and
+//CastlingRooks[64] -- rebuilt by every fen2board() call from THAT position's king and rook squares, and
+//read by castling generation and by every do_move, do_move_dp and ff_move in the process. So parsing
+//any FEN changed the castling rules for every other board: an engine thread that parsed an endgame FEN
+//while a search ran made the search castle through pieces and after its king had moved, and crashed it
+//(35 crashes in 652 local match games). Everything they encoded follows from the board itself -- castling
+//rights exist only while the king and that rook are still on the squares they started on -- so castling
+//is now computed from the Board alone; see castling_path() and update_castling() in board.cpp.
 extern uint64_t LineThrough[64][64];
 
 //having two hashes and verifying the second one when the first is the same for two positions,
