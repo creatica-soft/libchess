@@ -40,6 +40,7 @@
 #include "policy_net.h"
 #include "uci_engine.h"
 #include <sys/stat.h>
+#include <unistd.h>
 #if defined(__APPLE__)
 #include <pthread.h>
 #include <sys/qos.h>
@@ -170,7 +171,8 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
 //same three-second stall is paid repeatedly for an answer already known. Failures are cached too,
 //and deliberately: a position that just failed will very likely fail again within the same game,
 //and paying the timeout a second time to find that out is exactly what loses on time. Cleared per
-//game alongside position_history. Only run_go() touches it, and only on the UCI thread.
+//game alongside position_history. Shared by run_go() and the probe worker, so every access, the
+//per-game clear included, holds tb_cache_mtx.
 static std::unordered_map<std::string, std::pair<int, std::string>> tb_cache;
 static std::mutex                                                   tb_cache_mtx;
 //Identifies the move a probe answer belongs to, so a reply arriving after its move is discarded
@@ -185,6 +187,9 @@ static uint64_t                tb_req_id   = 0;
 static bool                    tb_req_live = false;
 //A prefetch is speculative and belongs to no move: its answer goes into the cache and nowhere else.
 static bool                    tb_req_prefetch = false;
+//The position a prefetch was requested from, as a Board, so the worker never has to rebuild one from
+//the FEN. See the prefetch in the worker loop for why that matters.
+static Board                   tb_req_board{};
 static std::thread             tb_worker;
 //NOT tb_worker.joinable(): the thread is detached, after which joinable() is false, so guarding on
 //it would start a fresh worker on every move -- each with its own curl handle, losing the warm
@@ -588,7 +593,11 @@ public:
         stop();
         cleanup();
         position_history.clear();
-        tb_cache.clear();          //a new game; last game's endgames are not this one's
+        {   //a new game; last game's endgames are not this one's. Under the lock: the probe worker may still
+            //be inserting an answer from the previous game's endgame.
+            std::lock_guard<std::mutex> lk(tb_cache_mtx);
+            tb_cache.clear();
+        }
         tb_probe.want.store(0, std::memory_order_release);
         tb_probe.have.store(0, std::memory_order_release);
         last_move.clear();
@@ -660,8 +669,18 @@ public:
         //makes the history exactly the set of positions that have occurred, which is what the draw
         //rule is about and what the forcing test has to reason over.
         ++position_history[zh.hash];
+        //Kept so that a refused move can be reported with the command that carried it, including
+        //the last move, which is only played later by go or ponderhit.
+        last_position_fen_ = fen;
+        last_position_moves_ = moves;
         if (!moves.empty()) {
-            for (size_t i = 0; i + 1 < moves.size(); ++i) play(moves[i]);
+            //STOP AT THE FIRST REFUSED MOVE. Every move after it would be applied to a board the driver
+            //does not have, with the wrong side to move, and one of them could happen to be legal there
+            //and silently produce a position that never occurred. The board is left at the last
+            //position both sides agree on, and the deferred last move is dropped with the rest.
+            for (size_t i = 0; i + 1 < moves.size(); ++i) {
+                if (!play(moves[i])) { log_position_command(); return; }
+            }
             last_move = moves.back();
         }
     }
@@ -686,7 +705,7 @@ public:
         log_file("ponderhit: stop\n");
         stop();
         if (!last_move.empty()) {
-            play(last_move);
+            if (!play(last_move)) log_position_command();
             char fenString[MAX_FEN_STRING_LEN];
             log_file("position fen %s\n", board2fen(board, fenString));
             last_move.clear();
@@ -756,6 +775,8 @@ private:
     std::thread    search_thread_;
     uci::Limits    last_limits_;
     bool           have_limits_ = false;
+    std::string    last_position_fen_;               //the last "position" command, for log_position_command()
+    std::vector<std::string> last_position_moves_;
 
     //Lichess reports castling as KING-TAKES-ROOK -- "e8a8", never "e8c8" -- in every game created
     //from a position, which is the Chess960 convention. The opening book makes every bot-vs-bot
@@ -812,19 +833,33 @@ private:
         return (mv >> m.dst) & 1ULL;
     }
 
-    void play(const std::string& uci_move) {
+    bool play(const std::string& uci_move) {
         Move move = {};
         uci2move_idx(uci_move.c_str(), move);
         normalise_castling(board, move);
         if (!is_legal(board, move)) {
             char fen[MAX_FEN_STRING_LEN];
-            log_file("play() error: refusing illegal move %s in %s\n",
-                     uci_move.c_str(), board2fen(board, fen));
+            log_file("play() error: refusing illegal move %s in %s (pid %d)\n",
+                     uci_move.c_str(), board2fen(board, fen), (int)getpid());
             print("info string illegal move %s ignored\n", uci_move.c_str());
-            return;
+            return false;
         }
         updateHash(zh, board, move, ff_move(board, move), z);
         ++position_history[zh.hash];
+        return true;
+    }
+
+    //A refused move means the driver and the engine disagree about the game. The refusal line alone
+    //shows only the board the move was refused on, and several engines usually append to the same
+    //creatica.log, so log the whole command and the process: an old session left two refusals
+    //(e5d4, then e5d4 f8b4, on a board where neither was legal) whose sender could not be found.
+    void log_position_command() {
+        std::string line = "position fen " + last_position_fen_;
+        if (!last_position_moves_.empty()) {
+            line += " moves";
+            for (const auto& m : last_position_moves_) line += " " + m;
+        }
+        log_file("play() error: the refused move came from: %s (pid %d)\n", line.c_str(), (int)getpid());
     }
 
     //Called from the search the moment our own move has been made on the board, so `board` is the
@@ -839,11 +874,12 @@ private:
         if (tb_worker_started.exchange(true)) return;
         tb_worker = std::thread([] {
             for (;;) {
-                std::string fen; uint64_t id; bool prefetch = false;
+                std::string fen; uint64_t id; bool prefetch = false; Board req_board{};
                 {
                     std::unique_lock<std::mutex> lk(tb_req_mtx);
                     tb_req_cv.wait(lk, [] { return tb_req_live; });
                     fen = tb_req_fen; id = tb_req_id; prefetch = tb_req_prefetch;
+                    if (prefetch) req_board = tb_req_board;
                     tb_req_live = false;
                 }
                 int score = 0; std::string move; bool answered = false; bool unique = false;
@@ -877,12 +913,24 @@ private:
                              answered ? "answered" : "FAILED",
                              move.empty() ? "(none)" : move.c_str(), unique ? "yes" : "no -- stopping");
                     if (!answered || move.empty() || !unique) continue;
-                    Board b{};
-                    std::string plain = fen;
-                    for (auto& c : plain) if (c == '_') c = ' ';
-                    if (fen2board(b, plain.c_str()) != 0) continue;
+                    //THE REQUESTER'S BOARD, NOT fen2board(). fen2board() used to rebuild libchess's
+                    //PROCESS-WIDE castling tables -- the castling paths, and the rights and rook masks
+                    //every do_move, do_move_dp and ff_move applied -- from the position it parsed. This
+                    //thread runs while a search does, so parsing an endgame FEN here rewrote the castling
+                    //rules under a search of a different position. Measured in local matches: 35 engine
+                    //crashes in 652 games, all in the first four plies of a game, because a prefetch
+                    //from the previous game's endgame, delayed by the rate limit, landed as the next game's
+                    //search started. A thread calling fen2board() on an endgame alongside that first
+                    //search crashed it 15 times in 16; without it, 460 searches ran clean. libchess no
+                    //longer has those tables (see libchess.h), so fen2board() would now be safe too, but
+                    //copying the board the requester already had is simpler and parses nothing.
+                    Board b = req_board;
                     Move m{};
-                    if (uci2move_idx(move.c_str(), m) != 0) continue;
+                    //uci2move_idx() returns the move's INDEX, not an error code, so this used to read
+                    //"!= 0 -> give up" and stopped every prefetch here: 1,645 attempts in one local match,
+                    //none of which ever fetched anything. The legality test below is the real check.
+                    if (move.size() < 4) continue;
+                    uci2move_idx(move.c_str(), m);
                     if (!is_legal(b, m)) continue;
                     ff_move(b, m);
                     char buf[MAX_FEN_STRING_LEN];
@@ -1099,7 +1147,7 @@ private:
         if (!chessEngine.ponder && !last_move.empty()) {
             //last move in ponder mode (go ponder) should only be executed on ponderhit.
             //It is usually the opponent's move2 in "bestmove move1 ponder move2".
-            play(last_move);
+            if (!play(last_move)) log_position_command();
             last_move.clear();
         }
 
@@ -1284,6 +1332,7 @@ void tb_prefetch_after_our_move() {
         //queued, leave it alone.
         if (tb_req_live) return;
         tb_req_fen = fen; tb_req_id = 0; tb_req_prefetch = true; tb_req_live = true;
+        tb_req_board = board;
     }
     tb_req_cv.notify_one();
 }
