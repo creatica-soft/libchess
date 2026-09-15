@@ -509,6 +509,9 @@ input.fenline{
       <label class="field">Games
         <input type="number" id="tGames" value="20" min="1" step="1">
       </label>
+      <label class="field">End games from the tablebase at 7 pieces or fewer
+        <input type="checkbox" id="tTbAdjudicate" checked>
+      </label>
     </div>
     <div class="row" style="margin-top:10px;">
       <label class="field" style="flex:1 1 auto;min-width:0;">Opening positions — one FEN per line
@@ -593,7 +596,7 @@ input.fenline{
      GET  /api/engines                               -> engines
      POST /api/analyse          {fen,engine,movetime_ms,env}
                                 -> bestmove,ponder,score_cp|score_mate,depth,nodes,pv,info
-     POST /api/tournament/start {white,black,movetime_ms,games} -> id
+     POST /api/tournament/start {white,black,movetime_ms,games,openings,tb_adjudicate} -> id
      GET  /api/tournament/state?id=...
      POST /api/tournament/stop  {id}
    Every response is expected to carry "ok"; ok:false carries "error".
@@ -1940,6 +1943,7 @@ async function tourStart(){
       black: {engine: bEng, options: tEnvB.read()},
       movetime_ms: movetime,
       games: games,
+      tb_adjudicate: $("tTbAdjudicate").checked,
         openings: $("tOpenings").value
     });
     T.id = String(d.id);

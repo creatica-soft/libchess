@@ -29,7 +29,9 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.error import URLError
+from urllib.parse import quote, urlparse, parse_qs
+from urllib.request import Request, urlopen
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -78,6 +80,13 @@ HELPER_TIMEOUT = 20.0
 
 # Safety net so a tournament game cannot run forever if adjudication is missed.
 MAX_PLIES = 600
+
+# Tablebase adjudication. A match game ends as soon as the online tablebase can state its
+# result, instead of being played out: in past matches about 22-24% of all moves were played
+# after the board first had 7 pieces or fewer. 7 is the most tablebase.lichess.ovh covers.
+TB_ADJUDICATE_PIECES = 7
+TB_URL = "https://tablebase.lichess.ovh/standard?fen="
+TB_TIMEOUT = 5.0
 
 DEFAULT_MOVETIME_MS = 2000
 DEFAULT_GAMES = 20
@@ -854,12 +863,59 @@ def fen_halfmove_clock(fen):
     return 0
 
 
+def tablebase_adjudication(fen):
+    """The game's result from the online tablebase, or None to keep playing.
+
+    Asked only when all of these hold:
+      - 7 pieces or fewer, the most the tablebase covers;
+      - no castling rights, which the tables do not encode;
+      - the fifty-move counter is 0, i.e. the move just played was a capture or a pawn move.
+        The tablebase separates a win from a "cursed" win (one that needs more than fifty moves
+        without a capture or pawn move) by counting from a fresh counter, so only at 0 is that
+        split exact. It also limits the requests to one per change of material or pawns.
+
+    The answer is from the side to move. "win" and "loss" end the game decisively; "draw",
+    "cursed-win" and "blessed-loss" end it drawn, because this match enforces the fifty-move
+    rule and a cursed win cannot be forced under it. Every other category ("maybe-win",
+    "syzygy-win", "unknown", ...) and every network failure returns None, and the game simply
+    continues until the next capture or pawn move asks again.
+    """
+    parts = fen.split()
+    if len(parts) < 4:
+        return None
+    pieces = sum(ch.isalpha() for ch in parts[0])
+    if pieces > TB_ADJUDICATE_PIECES or parts[2] != "-" or fen_halfmove_clock(fen) != 0:
+        return None
+    try:
+        req = Request(TB_URL + quote(fen), headers={"User-Agent": "creatica-chess-gui"})
+        with urlopen(req, timeout=TB_TIMEOUT) as resp:
+            category = json.loads(resp.read().decode("utf-8")).get("category")
+    except (URLError, OSError, ValueError) as exc:
+        sys.stderr.write("tablebase adjudication: no answer for %s (%s)\n" % (fen, exc))
+        return None
+    mover = "White" if parts[1] == "w" else "Black"
+    other = "Black" if parts[1] == "w" else "White"
+    win_for = lambda side: "1-0" if side == "White" else "0-1"
+    if category == "win":
+        return win_for(mover), "tablebase: win for %s, %d pieces" % (mover, pieces)
+    if category == "loss":
+        return win_for(other), "tablebase: win for %s, %d pieces" % (other, pieces)
+    if category == "draw":
+        return "1/2-1/2", "tablebase: draw, %d pieces" % pieces
+    if category == "cursed-win":
+        return "1/2-1/2", "tablebase: draw by the fifty-move rule (cursed win for %s), %d pieces" % (mover, pieces)
+    if category == "blessed-loss":
+        return "1/2-1/2", "tablebase: draw by the fifty-move rule (cursed win for %s), %d pieces" % (other, pieces)
+    return None
+
+
 class Tournament:
     """One engine-vs-engine match, played on a background thread."""
 
     def __init__(self, tid, white_cfg, black_cfg, movetime_ms, games,
-                 openings=None):
+                 openings=None, tb_adjudicate=True):
         self.id = tid
+        self.tb_adjudicate = tb_adjudicate   # end a game at 7 pieces or fewer from the tablebase
         # Paired: entry k is used by games 2k+1 and 2k+2, so both configurations get
         # each opening from both sides.
         self.openings = list(openings) if openings else list(DEFAULT_OPENINGS)
@@ -1092,6 +1148,10 @@ class Tournament:
                 return "1/2-1/2", "fifty-move", plies
             if plies >= MAX_PLIES:
                 return "1/2-1/2", "move limit", plies
+            if self.tb_adjudicate:
+                adjudicated = tablebase_adjudication(fen)
+                if adjudicated:
+                    return adjudicated[0], adjudicated[1], plies
 
             cfg = white if turn == "w" else black
             loser_result = "0-1" if turn == "w" else "1-0"
@@ -1242,7 +1302,8 @@ def api_tournament_start(body):
 
     tid = uuid.uuid4().hex[:12]
     openings = _parse_openings(body.get("openings"))
-    tour = Tournament(tid, white, black, movetime, games, openings)
+    tour = Tournament(tid, white, black, movetime, games, openings,
+                      tb_adjudicate=bool(body.get("tb_adjudicate", True)))
     reap_tournaments()
     with TOURNAMENTS_LOCK:
         TOURNAMENTS[tid] = tour
