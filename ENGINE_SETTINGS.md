@@ -1413,6 +1413,19 @@ matched with no code change. There are no environment variables any more; an ear
 of this section said there were. `tournament.cpp` takes per-side named option lists for the
 same purpose, and `self-play-optimization.cpp` sweeps one option at a time.
 
+**Tablebase adjudication** (on by default, a checkbox in the Tournament tab). Once a game has 7 pieces
+or fewer, the GUI asks `tablebase.lichess.ovh` for the result right after each capture or pawn move and
+ends the game with it: a win or loss ends it decisively, and a draw or a win that needs more than fifty
+moves (a "cursed" win) ends it drawn, because the GUI enforces the fifty-move rule. Positions with castling
+rights, ambiguous answers and network failures are simply played on. The PGN's `Termination` tag says
+`tablebase: ...` for these games. In the two largest matches so far, 22% and 24% of all moves were played
+after the board first reached 7 pieces, so this cuts roughly a fifth of a match's time.
+
+What it gives up: with it on, the engines' own endgame play and their online tablebase code are no longer
+tested by local matches. That matters, because the crashes described in *Engine crashes in local matches*
+started in exactly that code and would have stayed hidden. Turn it off for any change that touches
+endgames, tablebase probing or time use late in a game; lichess games exercise that code either way.
+
 **The binaries left by the 2026-09-10 work**, oldest first, each adding to the one before, so a
 result can be attributed to a step rather than to the whole stack:
 
