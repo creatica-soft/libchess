@@ -330,8 +330,8 @@ static void generate(Board& board, std::vector<Move>& out) {
 static std::string to_uci(const Move& m) {
     std::string s = std::string(square[m.src]) + square[m.dst];
     // uciPromoLetter is '\0' for everything that is not a promotion piece.
-    // idx2uci() is not used here: it writes the promotion letter into index 4 without
-    // terminating index 5.
+    // idx2uci() was not used here because it wrote the promotion letter into index 4 without
+    // terminating index 5 (fixed 2026-09-15); a std::string needs no fixed buffer anyway.
     if (m.promoType != PieceTypeNone && uciPromoLetter[m.promoType])
         s += uciPromoLetter[m.promoType];
     return s;
