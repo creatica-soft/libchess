@@ -423,7 +423,8 @@ void cleanup_locked() {
     std::lock_guard<std::mutex> lk(search.arena.free_mtx);
     search.arena.free_list.clear();
   }
-  search.tree.clear();
+  //reset(), not clear(): keep the map's size for the tree that is about to grow again. See NodeMap::reset().
+  search.tree.reset();
   search.root = nullptr;
   total_children.store(0, std::memory_order_relaxed);
   total_nodes.store(0, std::memory_order_relaxed);
