@@ -447,7 +447,7 @@ class NodeMap {
     static constexpr size_t TAIL  = 1024;
 
     NodeMap() = default;
-    ~NodeMap() { delete[] slots_.load(std::memory_order_relaxed); }
+    ~NodeMap() { std::free(slots_.load(std::memory_order_relaxed)); }
     NodeMap(const NodeMap&)            = delete;
     NodeMap& operator=(const NodeMap&) = delete;
 
@@ -457,12 +457,34 @@ class NodeMap {
     // and must not be used as the node count.
     size_t entries() const noexcept { return size_.load(std::memory_order_relaxed); }
 
+    // Drops the table entirely. For a change of Hash, where the old size means nothing any more.
     void clear() {
         lock_all();
-        delete[] slots_.load(std::memory_order_relaxed);
+        std::free(slots_.load(std::memory_order_relaxed));
         slots_.store(nullptr, std::memory_order_relaxed);
         cap_.store(0, std::memory_order_relaxed);
         shift_.store(0, std::memory_order_relaxed);
+        size_.store(0, std::memory_order_relaxed);
+        used_.store(0, std::memory_order_relaxed);
+        epoch_.fetch_add(1, std::memory_order_relaxed);
+        unlock_all();
+    }
+
+    // EMPTIES THE TABLE BUT KEEPS ITS SIZE. A new game used to clear() it back to nothing, so every game
+    // grew it again from 1,024 slots by doubling: 16 rebuilds and about 600 ms a game at Hash 2048 in 17
+    // lichess games, each rebuild under all the locks, so every search thread stood still while it ran.
+    // The next game grows a tree of the same size, so the table it needs is the one it already had.
+    // A fresh zeroed table rather than zeroing this one in place: see alloc_table().
+    void reset() {
+        lock_all();
+        const size_t cap   = cap_.load(std::memory_order_relaxed);
+        Slot *       fresh = cap ? alloc_table(cap + TAIL) : nullptr;
+        std::free(slots_.load(std::memory_order_relaxed));
+        slots_.store(fresh, std::memory_order_relaxed);
+        if (!fresh) {                                    // there was no table, or no memory for one:
+            cap_.store(0, std::memory_order_relaxed);    // start from nothing, exactly as clear() does
+            shift_.store(0, std::memory_order_relaxed);
+        }
         size_.store(0, std::memory_order_relaxed);
         used_.store(0, std::memory_order_relaxed);
         epoch_.fetch_add(1, std::memory_order_relaxed);
@@ -663,13 +685,20 @@ class NodeMap {
         unlock_all();
     }
 
+    // A zeroed table of n slots. calloc, not new[]: a value-initialised new[] writes every slot, which for
+    // tens of millions of them is hundreds of milliseconds, while a large calloc is handed pages the system
+    // has already zeroed and they are only filled as entries arrive. Slot is an aggregate, so all-zero
+    // bytes are its default value.
+    static Slot * alloc_table(size_t n) { return static_cast<Slot *>(std::calloc(n, sizeof(Slot))); }
+
     // Under all the locks: rebuild at ncap slots plus the tail, keeping only valid entries.
     void rehash_locked(size_t ncap) {
         const auto rt0 = std::chrono::steady_clock::now();
         const Slot * old = slots_.load(std::memory_order_relaxed);
         const size_t oc  = cap_.load(std::memory_order_relaxed);
         for (;;) {
-            Slot * t = new Slot[ncap + TAIL];
+            Slot * t = alloc_table(ncap + TAIL);
+            if (!t) throw std::bad_alloc();             // what new[] did
             size_t n = 0;
             bool fits = true;
             if (old)
@@ -682,7 +711,7 @@ class NodeMap {
                     t[q] = s;
                     ++n;
                 }
-            if (!fits) { delete[] t; ncap <<= 1; continue; }  // a run reached the end: larger, and again
+            if (!fits) { std::free(t); ncap <<= 1; continue; }  // a run reached the end: larger, and again
             unsigned sh = 0;
             while (((ncap + TAIL) >> sh) >= LOCKS) ++sh;       // ranges of 2^sh slots, fewer than LOCKS of them
             slots_.store(t, std::memory_order_relaxed);
@@ -692,7 +721,7 @@ class NodeMap {
             used_.store(n, std::memory_order_relaxed);
             break;
         }
-        delete[] old;
+        std::free(const_cast<Slot *>(old));
         epoch_.fetch_add(1, std::memory_order_relaxed);
         rehashes.fetch_add(1, std::memory_order_relaxed);
         rehash_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
