@@ -474,8 +474,15 @@ on both sides, 500 ms a move, `Hash 512`, 2 threads, `pisp` at `BlendScale 105` 
 `pisp2` scored 70.5 (21 wins, 99 draws, 32 losses), about −25 Elo with a 95% range of −58 to +7.
 Eleven games were crash forfeits, eight of them lost by `pisp2`. Without them `pisp2` is 18 wins, 99
 draws and 24 losses in 141 games: **about −15 Elo, with a 95% range of −46 to +16**. That is no
-measurable difference, which is what the blended accuracy above predicts. A match on an engine
-without the crash (`creatica_prefetch` or later) is needed before reading anything more into it.
+measurable difference, which is what the blended accuracy above predicts.
+
+A second match, 300 games, on `creatica_prefetch` (the engine with the crash fixed) on both sides and
+otherwise the same settings, with tablebase adjudication on: `pisp2` scored **153 to 147** (54 wins,
+198 draws, 48 losses), **about +7 Elo, with a 95% range of −16 to +30**. No engine crashed. So the two
+matches agree: there is no measurable difference in strength between `pisp2` and `pisp`. The retraining
+fixed the trainer's defects without gaining or losing strength that a 300-game match can see. (The
+missing crashes in this match do not confirm the crash fix, because adjudication kept the engines out
+of the tablebase code where the crash started; see *Tablebase adjudication* below.)
 
 ### Policy modes
 
@@ -952,8 +959,8 @@ without a crash.
    Checked with every perft suite (the standard suite to depth 5; all three Chess960 suites to depth 4;
    `--check --make all` with `reconcile()` on every suite, including 10,800 runs on the Chess960
    middlegame suite at depth 4) and `test_pos test_fen_strings`: no failures.
-   Every engine binary loads `libchess.dylib` when it starts, so **the older `creatica_*` binaries get
-   this fix too**, without being rebuilt.
+   Every engine binary loads `libchess.dylib` when it starts, so **an engine built before the fix gets
+   it too**, without being rebuilt.
 2. **The worker no longer parses anything.** The thread that asks for the prefetch hands over the
    `Board` it already has, and the worker copies it.
 
@@ -961,8 +968,9 @@ without a crash.
 error code. It is the move's index, so the check failed for every real move and the worker gave up
 before fetching anything: 1,645 attempts in one match, none fetched. Now the move is checked for
 legality instead. Tested on two seven-piece endings where the opponent has one best reply: the log shows
-`prefetched the position after e8d7 -- cached`. Old binaries still have this defect, so their prefetch
-still does nothing. `creatica_prefetch` (built 15 September) is the first binary with a working one.
+`prefetched the position after e8d7 -- cached`. An engine built before 15 September still has this
+defect, so its prefetch does nothing. In 17 lichess games afterwards, all 26 positions where the opponent
+had a single best reply were prefetched.
 
 **Refused moves.** An old log contained `play() error: refusing illegal move e5d4` and then `e5d4` and
 `f8b4` refused together, on a board where neither move was legal. That engine was built before 14
@@ -1399,6 +1407,25 @@ failures, and no child-table errors — for the single-lock version and again fo
 which ran 52 searches with every check on and 39 with a reset forced before each. `CREATICA_MAP_CLEAN=0`
 skips the map walk, for measurement.
 
+**The map keeps its size between games.** A new game used to drop the map entirely, so every game grew
+it again from 1,024 slots by doubling. In 17 lichess games at `Hash` 2048 that was exactly 16 rebuilds
+a game, about 600 ms a game, and each rebuild holds all 1,024 locks, so all four search threads stand
+still while it runs. A new game now empties the map but keeps its size (`NodeMap::reset()`); only a
+change of `Hash` drops it. Tables are allocated with `calloc` instead of `new[]`, so a new or rebuilt table
+is not written slot by slot before use: the system's zeroed pages are filled as entries arrive. Measured
+over two 9-move games at `Hash` 2048, three runs each:
+
+| | rebuilds, game 1 | rebuilds, game 2 | time stalled in rebuilds, game 2 |
+|---|---|---|---|
+| before (`creatica_prefetch`) | 16 | 16 | 513–580 ms |
+| after (`creatica_mapkeep`) | 16 | 0 | 0 |
+
+Simulations per game did not change beyond run-to-run noise (game 2: 10.0–10.9 million after, 10.1–11.7
+million before). Because the table starts a game at its full size, its memory is back in use early in
+the game rather than growing with the tree; the full-tree footprint is unchanged. Validated with
+`ValidateTree` over three games at `Hash` 256: no violations in 27 searches, and 13 rebuilds in game 1,
+none in games 2 and 3.
+
 
 ## Running comparisons
 
@@ -1413,35 +1440,40 @@ matched with no code change. There are no environment variables any more; an ear
 of this section said there were. `tournament.cpp` takes per-side named option lists for the
 same purpose, and `self-play-optimization.cpp` sweeps one option at a time.
 
-**Tablebase adjudication** (on by default, a checkbox in the Tournament tab). Once a game has 7 pieces
+**Tablebase adjudication** (on by default, a checkbox in the Tournament tab; on because it keeps the
+engines' online tablebase requests down, so fast matches do not run into lichess's rate limit). Once a game has 7 pieces
 or fewer, the GUI asks `tablebase.lichess.ovh` for the result right after each capture or pawn move and
 ends the game with it: a win or loss ends it decisively, and a draw or a win that needs more than fifty
 moves (a "cursed" win) ends it drawn, because the GUI enforces the fifty-move rule. Positions with castling
 rights, ambiguous answers and network failures are simply played on. The PGN's `Termination` tag says
-`tablebase: ...` for these games. In the two largest matches so far, 22% and 24% of all moves were played
-after the board first reached 7 pieces, so this cuts roughly a fifth of a match's time.
+`tablebase: ...` for these games.
 
-What it gives up: with it on, the engines' own endgame play and their online tablebase code are no longer
-tested by local matches. That matters, because the crashes described in *Engine crashes in local matches*
-started in exactly that code and would have stayed hidden. Turn it off for any change that touches
+**It saves almost no time.** The estimate made when it was added was that it would cut about a fifth of a
+match, because 22–24% of all moves in earlier matches came after the board first reached 7 pieces. That
+assumed every move costs the full 500 ms, and those moves do not. Measured over two matches at 500 ms a move:
+
+| | games | moves a game | time a game | time a move |
+|---|---|---|---|---|
+| 15 Sep 09:22, played out | 152 | 137 | 56.7 s | 414 ms |
+| 15 Sep 14:03, adjudicated | 300 | 113 | 56.6 s | 502 ms |
+
+Adjudication removed 24 moves a game, and the games took just as long. The engine log for the played-out
+match explains why: 15% of all its moves were answered instantly from the local 5-piece tables, with no
+search at all, and many of the 6- and 7-piece moves ended early when the online tablebase answered. The
+moves that adjudication removes were nearly free already.
+
+What it gives up: with it on, the engines' own endgame play and their tablebase code are no longer tested
+by local matches. In the adjudicated 300-game match the engine log shows no online tablebase answer and no
+local tablebase move at all. That matters, because the crashes described in *Engine crashes in local
+matches* started in exactly that code and would have stayed hidden. Turn it off for any change that touches
 endgames, tablebase probing or time use late in a game; lichess games exercise that code either way.
 
-**The binaries left by the 2026-09-10 work**, oldest first, each adding to the one before, so a
-result can be attributed to a step rather than to the whole stack:
-
-| binary | adds |
-|---|---|
-| `creatica_base` | nothing — the engine as it was when the endgame drew |
-| `creatica_cp` | eviction floor; repetition-filter visit floor; honest reported score |
-| `creatica_edge` | search-summary logging; edge-local *N(s,a)* |
-| `creatica_tb` | async tablebase probe, warm connection, cache, one-move prefetch |
-| `creatica` | the above plus repetition counting, the Q guard, and both new options |
-
-`creatica` against `creatica_base` compares everything from that day *except* the two experiments,
-since `EdgeVisits` defaults off and `RepetitionGuard` defaults to the old threshold. One caveat when
-reading such a result: `creatica_base` carries the old blocking tablebase probe, and in a self-play
-match the two bots share an IP and rate-limit each other at that endpoint, which penalises the old
-engine harder than a real opponent would.
+**Engine binaries.** Only `creatica` is kept, built from the current source with the command on the
+first line of `creatica.cpp`. The step-by-step binaries of September 2026 (`creatica_base`, `creatica_cp`,
+`creatica_edge`, `creatica_tb`, `creatica_sp`, `creatica_frozenreset`, `creatica_prefetch`,
+`creatica_mapkeep` and the rest) were deleted on 15 September. Measurements in this file that name one of
+them describe that build as it was then. To compare against an older state, build that commit's source
+under another name.
 
 Two practical notes on sample size. Draw rates run 55–75% between configurations this
 similar, so a 20-game match cannot separate a 50-Elo gap from zero — a result that looks
@@ -1555,8 +1587,25 @@ Things that have actually cost time here:
   what looks like one engine emitting two `bestmove` lines. That artefact was read as a protocol
   violation and a driver change was made on the strength of it. The bot now sets `CREATICA_LOG`
   per instance by default.
-- **`CREATICA_HASH=1024` on both bots swaps an 8 GB machine.** Trees reach 10M nodes, which is
-  about a gigabyte each. 512 is the safer pairing.
+- **`CREATICA_HASH=1024` on both bots swaps an 8 GB machine.** Each engine takes about 1.8 GB once its
+  tree is full (see the next point), so two of them take 3.7 GB. 512 is the safer pairing.
+- **What `Hash` really costs in RAM.** `Hash` sets the tree's budget, not the process size. Measured
+  with `footprint` on `creatica_prefetch`, 4 threads, `pisp2`, 15 September 2026:
+
+  | `Hash` | tree almost empty | tree full |
+  |---|---|---|
+  | 64 | 309 MB | 376 MB |
+  | 256 | — | 584 MB |
+  | 1024 | 1,319 MB | 1,841 MB |
+
+  About 240 MB is fixed (nets, threads, tables). The node arena has one 64-byte slot for every 64 bytes
+  of `Hash`, plus two 4-byte stamps a slot, and all of it is written when the arena is created, so
+  about 1.05 MB of RAM per MB of `Hash` is in use before the first search. The rest of the tree — map
+  entries, edges and child tables — adds about another 0.5 MB per MB as it fills. So a full tree costs
+  roughly **240 MB + 1.56 × `Hash`**: about 3.4 GB at `Hash 2048` and **about 6.6 GB at `Hash 4096`**,
+  which cannot fit in an 8 GB Mac beside macOS itself. The slot array is deliberately larger than the
+  byte budget can ever fill (the budget charges at least 96 bytes a node, a slot is 64), so that the
+  arena never runs dry before the budget does; see the comment in `set_root()`.
 - **Only the challenging side's clock settings are used.** Setting `CREATICA_CLOCK` on the
   `--no-challenge` instance does nothing.
 - **`CREATICA_SPEEDS` decides what the ACCEPTING side will take**, and it is easy to trip over,
