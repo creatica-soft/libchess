@@ -19,7 +19,7 @@
 // fen2board() trusts its caller: it does not check that the position has exactly one
 // king per side, that castling rights are backed by a king and a rook that could
 // actually castle, or that the en passant field is meaningful. Feeding it a position
-// that violates those invariants crashes inside kingMoves()/initCastlingPath()
+// that violates those invariants crashes inside kingMoves()/castlingMoves()
 // rather than returning an error, and this program must never crash on bad input.
 // So the FEN is pre-scanned and repaired here, before fen2board() ever sees it.
 //
@@ -154,7 +154,7 @@ static bool scan_placement(const std::string& board_field, Placement& p, std::st
         if (PC_TYPE(pc) == Pawn && (s < 8 || s >= 56)) { err = "illegal position: pawn on the first or last rank"; return false; }
     }
     // kingSquare() is lsBit() over an empty bitboard when a king is missing, and
-    // initCastlingPath() indexes BetweenBB with the result - so this must be rejected
+    // castlingMoves() indexes BetweenBB with the result - so this must be rejected
     // before fen2board() runs, not after.
     if (wk != 1) { err = "illegal position: expected exactly one white king, found " + std::to_string(wk); return false; }
     if (bk != 1) { err = "illegal position: expected exactly one black king, found " + std::to_string(bk); return false; }
@@ -171,7 +171,7 @@ static bool scan_placement(const std::string& board_field, Placement& p, std::st
 // Drop castling letters that no king-and-rook pair could honour. libchess derives the
 // castling path from whatever rooks it finds, so an unbacked right does not error out,
 // it generates a bogus castling move (or walks off BetweenBB). Repairing the FEN text
-// before fen2board() means initCastlingPath() is computed from the repaired rights.
+// before fen2board() means the castling moves are generated from the repaired rights.
 // ASSUMPTION: repairing is preferable to rejecting. A stale castling right is a common
 // bug in FENs pasted into GUIs, and the position is still perfectly playable without it.
 static std::string sanitize_castling(const std::string& field, const Placement& p) {
