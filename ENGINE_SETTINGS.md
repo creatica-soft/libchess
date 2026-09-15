@@ -364,13 +364,16 @@ The engine's layout-0 path for a piece-indexed net was checked against the train
 run: over 2,000 held-out positions and 56,373 legal moves the largest score difference was 4.4e-6,
 and the top move agreed in every position.
 
-**Illegal castling in every policy net trained before 2026-09-13.** `castlingMoves()` refuses
-castling through pieces or through check using `CastlingPath`, a process-wide table that only
-`fen2board()` fills. The trainer builds its boards with `board_from_record()` and never parsed a FEN,
+**Illegal castling in every policy net trained before 2026-09-13.** `castlingMoves()` used to refuse
+castling through pieces or through check with `CastlingPath`, a process-wide table that only
+`fen2board()` filled. The trainer builds its boards with `board_from_record()` and never parsed a FEN,
 so the table stayed zero and any record with a castling right and its rook generated castling
 through pieces and through check. On 2,000 held-out positions 263 had at least one illegal castle
 in the legal list, which fed the softmax, the legality term and the spatial planes. The engine parses
-FENs and never had them. The trainer now fills the table once at startup from the start position.
+FENs and never had them. The first fix filled the table once at trainer startup from the start
+position. Since 2026-09-15 libchess has no such table at all: the castling path is computed from each
+board's own king and rook squares, so a board built from a record is complete by itself (see *Engine
+crashes in local matches* below for why the table had to go).
 Measured on the first spatial net, the corrected lists cost it 0.10 Top-1 and 0.03 Top-6, so nets
 trained with the defect are fine to keep — but every comparison between nets from before and after
 the fix carries that small offset.
@@ -394,16 +397,27 @@ evaluated with NNUE, single-threaded node rate fell 2.6–3.2% against the piece
 **In play.** Three matches have been played between `pisp` and `pi`, all at 500 ms a move, `Hash 512`
 and 2 threads. Only the third is a clean comparison.
 
+Every one of them also contains games that an engine lost by crashing, not by playing. The cause was
+a thread-safety defect in libchess, described in *Engine crashes in local matches* below. A crash
+forfeits the game to the other side, and which side it hits is chance, so those games say nothing about
+the nets. The figures below give each match as played and then with the crashed games removed.
+
 - The first, 100 games, ran the older `creatica` binary on both sides. That binary cannot read
   version 8, so it refused `pisp` and kept its default net. It did not test `pisp` at all.
 - The second, 100 games at default settings: `pisp` scored 49 (17 wins, 64 draws, 19 losses), about
   −7 Elo with a 95% range of −48 to +34. But its `pisp` side ran `creatica_sp` and its `pi` side ran
-  the older `creatica`, so it changed the engine binary and the net at the same time.
+  the older `creatica`, so it changed the engine binary and the net at the same time. Three games were
+  crash forfeits (two lost by `pisp`, one by `pi`); without them `pisp` is 16 wins, 64 draws and 17
+  losses, about −4 Elo, range −44 to +37.
 - The third, 200 games, with `creatica_sp` on both sides and `pisp` at `BlendScale 105` (see below):
   `pisp` scored 108 (37 wins, 142 draws, 21 losses), about +28 Elo with a 95% range of +2 to +54.
+  **Ten of those games were crash forfeits, and seven of the ten went in `pisp`'s favour** (`pi`
+  crashed seven times, `pisp` three). Without them `pisp` is 30 wins, 142 draws and 18 losses in 190
+  games: about **+22 Elo, with a 95% range of −3 to +47**. So the one match that looked significant
+  is not significant once the crashes are removed. It is still a lead for `pisp`, but it could be noise.
 
 No clean match has been played with `pisp` at any other `BlendScale`. So these results do not show
-whether 105 is better than the default 115 for `pisp`. They show only that `pisp` at 105 beat `pi` at
+whether 105 is better than the default 115 for `pisp`. They show only that `pisp` at 105 led `pi` at
 the default, on the same binary.
 
 **Half of its gain survives the blend.** `bench_blend` on 200,000 positions of the test file, with the
@@ -454,6 +468,14 @@ investigated, and the table compares like with like.)
 several BlendScale values in one pass, since the scale changes concentration but never the ranking. It
 reproduces the earlier calibration — `pi` at 1.15 puts 0.4163 on its top move, `pisp` at 1.05 puts
 0.4155 — and `pisp2` is slightly sharper, with 0.4098 at 1.00 and 0.4254 at 1.05, so 1.02 matches.
+
+**`pisp2` against `pisp` in play.** One match, stopped by hand after 152 games: `creatica_frozenreset`
+on both sides, 500 ms a move, `Hash 512`, 2 threads, `pisp` at `BlendScale 105` and `pisp2` at 102.
+`pisp2` scored 70.5 (21 wins, 99 draws, 32 losses), about −25 Elo with a 95% range of −58 to +7.
+Eleven games were crash forfeits, eight of them lost by `pisp2`. Without them `pisp2` is 18 wins, 99
+draws and 24 losses in 141 games: **about −15 Elo, with a 95% range of −46 to +16**. That is no
+measurable difference, which is what the blended accuracy above predicts. A match on an engine
+without the crash (`creatica_prefetch` or later) is needed before reading anything more into it.
 
 ### Policy modes
 
@@ -882,6 +904,88 @@ go wtime 180000 btime 180000 winc 3000 binc 3000
 ```
 
 Broken, both searches answer `e2e4`. Fixed, the second answers a legal Black move.
+
+### Engine crashes in local matches
+
+**What was seen.** In five GUI matches played between 13 and 15 September, an engine exited in the middle
+of a search 35 times in 652 games. The GUI records each one as a loss with the termination
+`engine error: <engine> exited during search`.
+
+| match | games | crash forfeits |
+|---|---|---|
+| 13 Sep 12:53, default net against `pi` | 100 | 4 |
+| 14 Sep 00:16, first `pisp` against `pi` | 100 | 7 |
+| 14 Sep 11:00, second `pisp` against `pi` | 100 | 3 |
+| 14 Sep 14:48, third `pisp` against `pi` | 200 | 10 |
+| 15 Sep 09:22, `pisp2` against `pisp` | 152 | 11 |
+
+Every crash happened in the first four plies of a game, that is, in each engine's first or second search.
+
+**The cause.** Until 15 September, libchess's `fen2board()` did more than fill the `Board` it was given.
+It also rebuilt three process-wide tables from the position it had just parsed: `CastlingPath`, which
+says which squares castling needs empty and unattacked, and `CastlingRights[64]` and `CastlingRooks[64]`,
+the per-square masks that `do_move()`, `do_move_dp()` and `ff_move()` apply to clear castling rights when
+a king or rook moves. So parsing one FEN changed the castling rules for every board in the process.
+
+The engine's online tablebase worker is a separate thread. After our own move in a six- or seven-piece
+ending it prefetches the position one move ahead, and to do that it called `fen2board()` on the endgame
+position. The GUI starts the next game at once, and the rate-limited tablebase request often answers a
+little later. So the worker parsed an endgame, with no castling rights, while the search of the next
+game's opening was running. From that moment the search generated castling through pieces and did not
+clear castling rights when a king moved. The boards became invalid, and the search crashed reading them.
+This also explains why only the start of a game was hit: in the endgame itself there are no castling
+rights for the wrong tables to spoil.
+
+**How it was confirmed.** One match log shows 1,645 prefetch attempts. A diagnostic build that calls
+`fen2board()` on an endgame FEN from a background thread every 2 ms crashed in 15 of its first 16
+searches, with the same crash locations as the match (`kingMoves()` and the NNUE evaluation). The same
+build without that thread ran 460 searches without a crash. After the fix below, that same diagnostic
+binary, still calling `fen2board()` every 2 ms but now loading the rebuilt library, ran 100 searches
+without a crash.
+
+**The fix, in two places.**
+
+1. **libchess has no global castling tables any more.** `castlingMoves()` computes the path from the
+   board's own king square and `board.castlingRooks`, and the three move functions clear rights from the
+   piece that moved: a king move ends both of its side's rights, and a move from or onto a castling rook's
+   square ends that rook's right. `fen2board()` now only fills its `Board`, so it is safe on any thread.
+   Checked with every perft suite (the standard suite to depth 5; all three Chess960 suites to depth 4;
+   `--check --make all` with `reconcile()` on every suite, including 10,800 runs on the Chess960
+   middlegame suite at depth 4) and `test_pos test_fen_strings`: no failures.
+   Every engine binary loads `libchess.dylib` when it starts, so **the older `creatica_*` binaries get
+   this fix too**, without being rebuilt.
+2. **The worker no longer parses anything.** The thread that asks for the prefetch hands over the
+   `Board` it already has, and the worker copies it.
+
+**The prefetch had never worked.** The same code checked the result of `uci2move_idx()` as if it were an
+error code. It is the move's index, so the check failed for every real move and the worker gave up
+before fetching anything: 1,645 attempts in one match, none fetched. Now the move is checked for
+legality instead. Tested on two seven-piece endings where the opponent has one best reply: the log shows
+`prefetched the position after e8d7 -- cached`. Old binaries still have this defect, so their prefetch
+still does nothing. `creatica_prefetch` (built 15 September) is the first binary with a working one.
+
+**Refused moves.** An old log contained `play() error: refusing illegal move e5d4` and then `e5d4` and
+`f8b4` refused together, on a board where neither move was legal. That engine was built before 14
+September, and no driver in this repository sends a move list to an analysis engine, so the sender could
+not be identified afterwards. Two changes make the next occurrence both safe and traceable. The engine
+now stops at the first refused move in a `position` command, instead of applying the remaining moves to
+a board the driver does not have, with the wrong side to move, where one of them could happen to be legal.
+And it logs the whole `position` command and its process id, because several engines usually append to
+the same `creatica.log`.
+
+**A stale library, found on the way.** `libchess.dylib` had last been built on 10 September at 16:15.
+Two minutes later, commit `a4b9804` raised `MAX_UCI_OPTION_SPIN_NUM` from 16 to 32, which changes the
+layout of `struct Engine`. Tools that drive an external engine through the library's `engine.cpp`
+(`lichess_bot`, `tournament`, `test_pos`) were built after that change, so they and the library disagreed
+about where the fields of that struct are. What that did in practice was not investigated. The engine
+itself was not affected, because it keeps its own `Engine` and never passes it to the library. The
+library, those three tools, `gen_targets` and `self-play-optimization` are now rebuilt. The older
+`tournament_*` variants and `eval_saved_kan` were built before the change and now disagree with the
+library the other way, so rebuild them before using them.
+
+**Reading older match results.** Any match played before 15 September with engines that probe the
+online tablebase can contain these forfeits. Count the `exited during search` terminations in the PGN,
+note which side lost each one, and remove those games before computing a score.
 
 ### The repetition history learns to count
 
