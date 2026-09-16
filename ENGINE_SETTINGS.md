@@ -1261,6 +1261,35 @@ measured over 1,301 searches, occupancy climbs by a median of 53 per-mille durin
 would overshoot. Lowering it is now affordable for the first time, and lower is what keeps the tree
 away from the ceiling.
 
+**The arena is sized by what the budget can hold, not by the slot size** (16 September 2026). The arena
+used to have one 64-byte slot per 64 bytes of `Hash`, as though a node cost only its slot. It costs
+`NODE_BYTES` (96) plus at least one edge, so no more than about `Hash`/112 nodes can be alive at once, and
+in 17 lichess games at `Hash` 2048 the largest tree ever reached was 18.3 million nodes — `Hash`/117. The
+other 45% of the slots could never be used, and all of them are written when the arena is created, which is
+why a full tree cost about 1.56 × `Hash`. A slot is now worth `ARENA_BYTES_PER_SLOT` (100) bytes of `Hash`,
+which is about 17% more slots than the largest tree measured; the child-table pool, whose ceiling was also
+unreachable, went from `Hash`/16 to `Hash`/40 entries. In the same change `Edge`'s prior became a float, so
+an edge is 12 bytes and its charge against `Hash` 16 rather than 20 — the same `Hash` therefore holds more
+tree.
+
+The margin matters because slots freed by a collection return through the background sweep and the reaper,
+so a slot can briefly be neither live nor available. Measured: in the 17 lichess games the reaper was never
+behind at a collection (0 nodes in all 384 of them); in self-play games of 60 and 100 moves at `Hash` 2048
+and 512, and in 20-second single searches, the arena never ran dry. If it ever does, the expansion is
+abandoned and the node stays a leaf, which is how a full tree already behaves.
+
+What it bought, and what it cost:
+
+| | before | after |
+|---|---|---|
+| memory, full tree at `Hash` 2048 | 3,508 MB | 2,622 MB |
+| nodes in a 60-move self-game at `Hash` 2048 | 13.5 million | 15.8 million |
+| simulations a second, three alternating 20 s fills | 304,000 | 308,000 |
+| mistakes test set, solved of 139 | 57 | 61 |
+
+Validated with `ValidateTree` and `CREATICA_VERIFY_KIDS` over a self-game: no tree violations and no
+child-table errors across 19 million published edges.
+
 ### A full tree that cannot be collected, and the tree reset
 
 **The failure.** In game `QHWLWAbv` (14 September) the engine lost its queen with 32.Qxh6. The tree
@@ -1468,6 +1497,37 @@ local tablebase move at all. That matters, because the crashes described in *Eng
 matches* started in exactly that code and would have stayed hidden. Turn it off for any change that touches
 endgames, tablebase probing or time use late in a game; lichess games exercise that code either way.
 
+**The mistakes test set** (`mistakes/`). Positions from the bot's own lichess games where creatica played a
+move that lost at least a pawn, used to judge nets, search changes and Hash sizes where games are actually
+lost rather than by average top-k accuracy. Built from 124 games of 12–15 September 2026 in three steps:
+
+1. `scan_games.py`: Stockfish at 150 ms scores every creatica move with 8 or more pieces on the board
+   (11,684 moves). 407 lost at least 100 cp; 216 of those came when the game was already decided (still
+   at least +4 after the move, or at most -4 before it) and are left out.
+2. `confirm.py`: Stockfish MultiPV 8 at 2 s on the remaining 191. A move is *acceptable* if it scores
+   within 50 cp of the best. 139 positions still show a loss of at least 100 cp and form `testset.tsv`.
+   72 of them have exactly one acceptable move.
+3. `solve.py`: the engine searches each position from an empty tree for 8 s with the bot's settings
+   (Hash 2048, 4 threads, `pisp2` at `BlendScale 102`), and records its preferred move every second. A
+   position is *solved at t* if the preferred move is acceptable from t to the end of the search.
+
+Baseline, `creatica` of 16 September (`baseline_creatica_2026-09-16.tsv`), about 2.6 million simulations
+in 8 s:
+
+| solved | positions | cumulative |
+|---|---|---|
+| within 1 s | 43 | 31% |
+| within 2 s | 3 | 33% |
+| within 4 s | 4 | 36% |
+| within 8 s | 7 | 41% |
+| not within 8 s | 82 | |
+
+In 59 positions the engine still plays the move it lost with. Positions with a single acceptable move are
+solved less often (23 of 72) than those with several (34 of 67). In the unsolved positions the best
+acceptable move starts with a median prior of 5.8% (rank 4) against 8.0% for the move actually played; in
+the solved ones it is 11.4% (rank 2) against 5.8%. The root prior does not show everything: in 21...Qe4 the
+right move had the top prior, and the failure was a 1% prior on the opponent's refutation one move deeper.
+
 **Engine binaries.** Only `creatica` is kept, built from the current source with the command on the
 first line of `creatica.cpp`. The step-by-step binaries of September 2026 (`creatica_base`, `creatica_cp`,
 `creatica_edge`, `creatica_tb`, `creatica_sp`, `creatica_frozenreset`, `creatica_prefetch`,
@@ -1589,23 +1649,20 @@ Things that have actually cost time here:
   per instance by default.
 - **`CREATICA_HASH=1024` on both bots swaps an 8 GB machine.** Each engine takes about 1.8 GB once its
   tree is full (see the next point), so two of them take 3.7 GB. 512 is the safer pairing.
-- **What `Hash` really costs in RAM.** `Hash` sets the tree's budget, not the process size. Measured
-  with `footprint` on `creatica_prefetch`, 4 threads, `pisp2`, 15 September 2026:
+- **What `Hash` really costs in RAM.** `Hash` sets the tree's budget, not the process size. Measured with
+  `footprint`, 4 threads, `pisp2`, 16 September 2026, once the tree is full:
 
-  | `Hash` | tree almost empty | tree full |
+  | `Hash` | before 16 September | after the arena and edge changes |
   |---|---|---|
-  | 64 | 309 MB | 376 MB |
-  | 256 | — | 584 MB |
-  | 1024 | 1,319 MB | 1,841 MB |
+  | 1024 | 1,842 MB | 1,396 MB |
+  | 2048 | 3,508 MB | 2,622 MB |
+  | 3072 | (about 5.2 GB, not measured) | 4,113 MB |
 
-  About 240 MB is fixed (nets, threads, tables). The node arena has one 64-byte slot for every 64 bytes
-  of `Hash`, plus two 4-byte stamps a slot, and all of it is written when the arena is created, so
-  about 1.05 MB of RAM per MB of `Hash` is in use before the first search. The rest of the tree — map
-  entries, edges and child tables — adds about another 0.5 MB per MB as it fills. So a full tree costs
-  roughly **240 MB + 1.56 × `Hash`**: about 3.4 GB at `Hash 2048` and **about 6.6 GB at `Hash 4096`**,
-  which cannot fit in an 8 GB Mac beside macOS itself. The slot array is deliberately larger than the
-  byte budget can ever fill (the budget charges at least 96 bytes a node, a slot is 64), so that the
-  arena never runs dry before the budget does; see the comment in `set_root()`.
+  About 170 MB is fixed (nets, threads, tables). The rest is roughly 1.2–1.4 MB per MB of `Hash`; it is not
+  quite linear because the node map's size doubles in steps, and at `Hash` 3072 that table alone is about
+  1 GB. `Hash 4096` should now cost about 5.3 GB rather than 6.6 GB, so it fits an 8 GB Mac only with the
+  apps closed. Two thirds of the saving is the arena sizing described in *The node arena*, the rest is the
+  12-byte `Edge`.
 - **Only the challenging side's clock settings are used.** Setting `CREATICA_CLOCK` on the
   `--no-challenge` instance does nothing.
 - **`CREATICA_SPEEDS` decides what the ACCEPTING side will take**, and it is easy to trip over,
