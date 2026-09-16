@@ -45,6 +45,9 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `TreeResetBelow` | spin | 0 | 0–1000000000 | **Off at 0.** Before a search, if the tree is at `TreeResetOccupancy` or more and the root inherited fewer than this many informed simulations (its evidence), discard the whole tree instead of collecting it. Aimed at the one case a full tree turns into a blunder: a root the last search barely looked at, on a tree nothing can be freed from. 1000 is the value tested in replays; it has not been measured in games. See *A full tree that cannot be collected*. |
 | `TreeResetOccupancy` | spin | 950 | 0–1000 | Per-mille of `Hash` at or above which `TreeResetBelow` applies. Below 950 no search in 22 games froze, so resetting there would only throw knowledge away. |
 | `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. 900 is the value tested in replays; not yet measured in games. |
+| `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
+| `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0.** Evidence every reply to the root's most-visited move must have before the search may ignore it. Aimed at a refutation that starts with a sacrifice, which PUCT starves after its first few visits. |
+| `VerifyAfter` | spin | 600 | 0–1000 | Per-mille of the search's own time after which `VerifyReplies` starts. Verifying from the first simulation costs the early search. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
 | `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
@@ -1376,6 +1379,51 @@ were at least 90% hollow from 10 to 4 and those at least 50% hollow from 15 to 6
 frozen search, since it reacts to the search before. Two of the four discarded roots that had inherited
 1.6 and 3.3 million informed simulations — permitted by design, because a frozen tree would have taught
 the next search nothing, but the case to watch in games.
+
+### Balancing the visits: the share cap and the reply floor
+
+**The search spends almost everything on one move.** Over 15,569 real searches of at least 10,000
+simulations, taken from the bot's visit dumps: the most-visited root move holds a **median 93%** of the
+root's visits, more than 80% in 68% of searches, and the top two together 98% — so about 27 legal moves
+share the remaining 2%. Those visits mostly refine a value that is already decided.
+
+**What that costs, in one position.** In the lichess game `1Gx0Osx2` the engine played 21...Qe4, refuted
+by 22.Qxf7+ Kxf7 23.Ng5+ and 24.Nxe4. The priors along that line are 1.0% for the sacrifice, then 81.5%
+and 99.9%, so only its first move is badly rated. Searched on its own the position after the sacrifice is
+valued correctly within **2,000 simulations**; inside the search it held 17 visits after 50,000
+simulations and 61 after 150,000, and took over only after about 900,000. The first visits see a queen
+given away, the value drops, and PUCT stops returning. Raising `ExplorationMax` cannot fix that: against a
+value gap of about 0.93 with a 1% prior, the exploration term sustains about 6 visits at today's constant
+and about 17 at C = 4, where 500 are needed.
+
+**Two rules were built and measured on the mistakes test set** (139 positions, 8 s each from an empty
+tree, `Hash` 2048, 4 threads, `pisp2`):
+
+| solved | within 1 s | 2 s | 4 s | 8 s | median simulations |
+|---|---|---|---|---|---|
+| neither rule | 45 | 48 | 54 | 61 | 2.63 M |
+| `VerifyReplies 500` from the start | 43 | 50 | 58 | 66 | 2.44 M |
+| `VerifyReplies 2000` from the start | 31 | 41 | 54 | 66 | 2.29 M |
+| `VerifyReplies 500`, `VerifyAfter 600` | 49 | 53 | 60 | 66 | 2.44 M |
+| **`BalanceShare 900`** | **62** | **69** | **75** | **81** | 1.01 M |
+
+`BalanceShare 900` gained 32 positions and lost 12 against the plain engine, which is the only margin here
+beyond churn. At a game-like 2 s a position it solves 68 against 58, gaining 22 and losing 12.
+
+**What the cap costs.** It converts depth into breadth: each simulation expands more, so fewer run. On a
+middlegame position at 12 s, `Hash` 2048:
+
+| | simulations | `seldepth` | tree filled |
+|---|---|---|---|
+| no cap | 2.85 M | 56 | 310‰ |
+| `BalanceShare 900` | 1.24 M | 46 | 366‰ |
+| `BalanceShare 700` | 0.57 M | 27 | 400‰ |
+
+In a 60-move self-game at 2 s a move it ran 106,000 simulations a second against 318,000, with the largest
+tree slightly smaller (14.1 M nodes against 16.0 M) and no frozen searches or resets either way. So it does
+not cost memory, and 700 costs half the depth for no gain the test set can see.
+
+**Not yet measured in games.** Both rules are off by default.
 
 ### The sweep off the clock
 
