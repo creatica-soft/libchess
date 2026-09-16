@@ -1,4 +1,5 @@
-# solve.py <confirmed.tsv> <out.tsv> <engine> <movetime ms>: search each mistake position from an EMPTY tree with the
+# solve.py <confirmed.tsv> <out.tsv> <engine> <movetime ms>:  EXTRA="Option=value,..." adds UCI options.
+# search each mistake position from an EMPTY tree with the
 # bot's settings, and record which move the engine prefers after every second of search, and the root priors.
 # SOLVED AT t: the preferred move is Stockfish-acceptable from t to the end of the search.
 import subprocess, sys, os, threading, time, re, queue
@@ -14,7 +15,7 @@ threading.Thread(target=lambda: [q.put(l) for l in p.stdout], daemon=True).start
 def send(s): p.stdin.write(s + "\n"); p.stdin.flush()
 opts = [("Hash", 2048), ("Threads", 4), ("SyzygyPath", "/Users/ap/syzygy"), ("PolicyWeights", "/Users/ap/libchess/nnue_policy_pisp2.bin"),
         ("BlendScale", 102), ("TreeResetBelow", 1000), ("TreeResetHollow", 900), ("MultiPV", 1),
-        ("IntermittentInfoLines", "true"), ("FinalInfoLines", "true"), ("VisitDumpFile", dump)]
+        ("IntermittentInfoLines", "true"), ("FinalInfoLines", "true"), ("VisitDumpFile", dump)] + [tuple(kv.split("=", 1)) for kv in os.environ.get("EXTRA", "").split(",") if "=" in kv]
 send("uci")
 for k, v in opts: send("setoption name %s value %s" % (k, v))
 out = open(out_path, "w")

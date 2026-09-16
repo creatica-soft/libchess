@@ -61,6 +61,9 @@ extern bool      reuse_tree;
 extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 extern int64_t   tree_reset_below;
+extern int64_t   verify_replies;
+extern int64_t   verify_after;
+extern int64_t   balance_share;
 extern int64_t   tree_reset_occupancy;
 extern int64_t   tree_reset_hollow;
 void gc_join();
@@ -372,6 +375,10 @@ void persistent_worker_func(int thread_id) {
       //mcts_search(); ending the loop here made the engine stop searching altogether the
       //moment the tree filled, which with tree reuse happens routinely in a long game.
 
+      //The verification phase: see VerifyReplies. Recomputed every simulation because it depends on the
+      //clock, and it costs one comparison.
+      params.verify = verify_replies > 0 &&
+                      elapsed * 1000.0 >= (double)params.time_alloc * (verify_after * 0.001);
       accumulator_stack_reset(ctx);
       mcts_search(params, ctx);
       //Keep the expansion guard current during the search, not just between searches. Cheap:
@@ -509,6 +516,15 @@ public:
         o.spin("TreeResetOccupancy", &tree_reset_occupancy, 950, 0, 1000);
         // Also discard it when the previous search was at least this many per-mille hollow: a frozen tree.
         o.spin("TreeResetHollow",    &tree_reset_hollow,    0,   0, 1000);
+        // Before the search may ignore a reply to the move it currently means to play, that reply must
+        // have this much evidence. 0 = off. See select_best_child().
+        o.spin("VerifyReplies",      &verify_replies,       0,   0, 1000000);
+        // Per-mille of the search's time after which that verification starts. 0 verifies from the
+        // first simulation, which costs the early search; see creatica_search.cpp.
+        o.spin("VerifyAfter",        &verify_after,       600,   0, 1000);
+        // Share of a node's visits, per-mille, that one child may hold before the search prefers the
+        // next one. 1000 = off. See select_best_child().
+        o.spin("BalanceShare",       &balance_share,     1000,  100, 1000);
         // Where to append the root visit distribution after each search, and a tag written on
         // every line so records can be joined back to a game and its result. Empty = off.
         o.string("VisitDumpFile", &visit_dump_path, "");
