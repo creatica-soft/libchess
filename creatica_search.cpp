@@ -410,6 +410,9 @@ void arena_size_check() {
   const size_t   bytes = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
   const uint32_t want  = (uint32_t)std::min<size_t>(bytes / ARENA_BYTES_PER_SLOT, 0xFFFFFFFEu);
   if (search.arena.cap == want) return;
+  //Resizing frees the slot array, the stamps and the child table, so no mark may be walking them.
+  //Reachable once CollectDuringPonder lets a collection outlive the search that started it.
+  gc_join();
   sweep_stop();
   reap_drain();
   search.tree.clear();
@@ -885,6 +888,13 @@ static const bool verify_kids = [] {
   const char * e = std::getenv("CREATICA_VERIFY_KIDS");
   return e && *e && *e != '0';
 }();
+//TEST ONLY (CREATICA_MARK_DELAY_US): sleep this long every 4096 nodes of the mark, to widen the window
+//in which a mark is running beside a search. Races that need a mark of seconds -- a tree reset landing
+//inside one, for instance -- cannot be reproduced on a small tree without it.
+static const long mark_delay_us = [] {
+  const char * e = std::getenv("CREATICA_MARK_DELAY_US");
+  return e && *e ? std::atol(e) : 0L;
+}();
 static const bool verify_futile = [] {
   const char * e = std::getenv("CREATICA_VERIFY_FUTILE");
   return e && *e && *e != '0';
@@ -1320,6 +1330,8 @@ void gc(MCTSNode * from, bool retire_all) {
       //next collection re-marks from scratch (exchange() below makes leftover stamps harmless).
       if (gc_abort.load(std::memory_order_relaxed)) return;
       const uint32_t idx          = q[q_head++];
+      if (mark_delay_us && (q_head & 0xFFF) == 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(mark_delay_us));
       const uint64_t k            = kids[idx].load(std::memory_order_relaxed);
       const uint32_t num_children = NodeArena::kids_count(k);
       const uint64_t off          = NodeArena::kids_off(k);
@@ -1471,6 +1483,8 @@ void set_root(NNUEContext& ctx) {
     //wiping the tree is better than proceeding without a root, which is not survivable.
     if (!root) {
       log_file("info string node arena exhausted at the root; resetting the tree\n");
+      //Same rule as the tree reset: cleanup_locked() destroys every node, so no mark may be walking.
+      gc_join();
       cleanup_locked();
       root = search.arena.alloc();
       if (!root) { search.root = nullptr; return; }
@@ -2898,6 +2912,16 @@ void runMCTS(NNUEContext& ctx) {
         const bool starved = tree_reset_below > 0 && inherited < (uint64_t)tree_reset_below;
         const bool frozen  = tree_reset_hollow > 0 && last_hollow >= tree_reset_hollow;
         if (occ >= tree_reset_occupancy && (starved || frozen)) {
+          //NEVER BESIDE A BACKGROUND COLLECTION. The reset retires the whole tree, so running it while a
+          //mark is walking that same tree puts two collectors on it: in a lichess game with
+          //CollectDuringPonder on, a reset fired while a post-move collection was still marking, and a
+          //search worker then walked into freed memory (SIGSEGV in king_moves() inside an expansion).
+          //Whatever the mark had reached is abandoned, which costs nothing: the reset frees all of it.
+          //-DCREATICA_TEST_NO_RESET_GUARD builds the broken version, to show the crash is this and not
+          //something else; see the validation note in ENGINE_SETTINGS.md.
+#ifndef CREATICA_TEST_NO_RESET_GUARD
+          gc_join();
+#endif
           const size_t before = live_tree_nodes();
           gc(search.root, /*retire_all=*/true);
           search.root = nullptr;
