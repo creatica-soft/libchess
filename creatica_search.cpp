@@ -2951,8 +2951,14 @@ void runMCTS(NNUEContext& ctx) {
     }
     //Both paths, so a run with ValidateTree on says whether reuse specifically is what breaks
     //the invariants, rather than leaving it ambiguous.
+    const auto validate_start = std::chrono::steady_clock::now();
     validate_tree(collected ? (reusing_tree ? "after gc" : "after cleanup")
                             : "before search (collection skipped)", collected);
+    //Reported separately for the same reason set_root is: with ValidateTree on, walking every edge of
+    //a seven-million-node tree took up to 1.15 s a move in a real game, and it was being read as the
+    //cost of collection. It is a check, not part of the engine's normal work.
+    const double validate_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - validate_start).count();
     //What the collection actually cost. It runs inline, before the search starts, so it is dead
     //time on the clock; logging it turns "gc feels slow" into a number.
     //Report set_root SEPARATELY. This line used to time the whole block and call the result
@@ -2966,11 +2972,11 @@ void runMCTS(NNUEContext& ctx) {
     //it is never paid for again. A collection at the start of a real search comes straight out
     //of this move's own budget. The two are the same number of milliseconds and completely
     //different in what they cost, and the line could not tell them apart.
-    log_file("info string %s took %.1f ms (set_root %.1f ms, collect %s, %s), %zu nodes\n",
+    log_file("info string %s took %.1f ms (set_root %.1f ms, validate %.1f ms, collect %s, %s), %zu nodes\n",
              reusing_tree ? "gc" : "cleanup",
              std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - collect_start).count(),
-             set_root_ms,
+             set_root_ms, validate_ms,
              tree_reset ? "RESET" :
              collected ? (futile_skip ? "yes (VERIFY_FUTILE)" : "yes")
                        : (futile_skip ? (futile_why == 1 ? "SKIPPED-EXACT, same root, no expansion abandoned since the last collection"
