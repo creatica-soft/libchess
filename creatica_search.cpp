@@ -189,6 +189,24 @@ int64_t       gc_threshold = 700;
 //simulations it inherited -- below which to reset, 0 = off. TreeResetOccupancy is the per-mille of Hash
 //at or above which the rule applies. See the reset in runMCTS() for why and for the measurements.
 int64_t       tree_reset_below = 0;
+//VERIFY THE MOVE WE MEAN TO PLAY. Minimum evidence every reply to the root's most-visited move must
+//have before the search is free to ignore it; 0 turns it off. See select_best_child() and the note
+//at the descent in mcts_search().
+int64_t       verify_replies = 0;
+//When the verification starts, in per-mille of the search's own time. Verifying from the first
+//simulation costs the opening of the search, where the engine is still deciding which moves are
+//worth anything: on the mistakes test set a floor from the start solved 31 of 139 positions within
+//a second against 45 without it, while solving more by eight seconds. Late verification keeps the
+//early search as it was and spends the tail confirming the move that won.
+int64_t       verify_after = 600;
+//BALANCING THE TREE. The share of a node's visits, in per-mille, that one child may hold before the
+//search prefers the next child instead; 1000 is off. Measured over 15,569 real searches of at least
+//10,000 simulations: the most-visited root move takes a median 93% of the visits, more than 80% in
+//68% of searches, and the top two together 98% -- so about 27 legal moves share the remaining 2%.
+//Those visits mostly refine a value that is already decided, while the move that refutes the choice
+//may be sitting a few visits deep. The cap sends the surplus to the other children instead. It skips
+//nothing: the capped child is chosen again as soon as its share falls back under the cap.
+int64_t       balance_share = 1000;
 int64_t       tree_reset_occupancy = 950;
 //TreeResetHollow: also reset when the PREVIOUS search was at least this many per-mille hollow -- the tree
 //was frozen, whatever the new root inherited. 0 = off. See the reset in runMCTS().
@@ -1820,7 +1838,17 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
 
 //called from mcts_search() in selection phase
 //returns child index with the best PUCT value  
-int select_best_child(MCTSNode * parent, const int depth) {
+//floor_ev > 0: every child must have that much evidence before the ordinary PUCT score decides. While
+//one does not, the least-informed child is selected instead. `most_visited` returns the index of the
+//child with the most visits, which the caller uses to find the move the engine would play right now.
+//
+//WHY IT EXISTS. A refutation that begins with a sacrifice is scored by its first few visits, which see
+//the material gone, and PUCT then starves it: in the position after 21...Qe4 of a real game, 22.Qxf7+
+//(a 1% prior) held 17 visits after 50,000 simulations and 61 after 150,000, and only took over after
+//about 900,000. Searched on its own, the position after that sacrifice is valued correctly -- the fork
+//that wins the queen back has a 82% and a 99.9% prior -- within 2,000 simulations. The visits were
+//there in the game (about 130,000 in the whole subtree) but never concentrated where they mattered.
+int select_best_child(MCTSNode * parent, const int depth, uint64_t floor_ev, int * most_visited) {
   int num_children = parent->num_children.load(std::memory_order_acquire);
   Edge * children = parent->children.load(std::memory_order_acquire);
   double best_score = -INFINITY;
@@ -1835,6 +1863,15 @@ int select_best_child(MCTSNode * parent, const int depth) {
   // OPTIONAL: Bonus for Root Node (Depth 0) to ensure wide scanning
   //if (depth == 0) C = 2.0;
   const uint64_t parentN = parent->N.load(std::memory_order_acquire);
+  uint64_t  most_visits = 0;     //for most_visited, which the caller reads
+  int       most_idx    = 0;
+  uint64_t  starved_ev  = UINT64_MAX;
+  int       starved_idx = -1;
+  //For the share cap: the best score, the runner-up, and the visits behind everything here.
+  double    second_score = -INFINITY;
+  int       second_idx   = -1;
+  uint64_t  best_visits  = 0;
+  uint64_t  total_visits = 0;
   //The exploration numerator: descents THROUGH this node, which is the sum of its edges' n and
   //therefore on the same scale as the per-edge denominator below.
   const uint32_t parentD = parent->descents.load(std::memory_order_relaxed);
@@ -1866,11 +1903,31 @@ int select_best_child(MCTSNode * parent, const int depth) {
     //One branch on a flag that never changes during a search, so it predicts perfectly.
     double score = use_edge ? Q + C * P * sqrt((double)parentD) / (1.0 + en)
                             : Q + C * P * sqrt((double)parentN) / (1.0 + N);
+    //The same quantity select_best_moves() ranks by, so "most visited" means the move that would be
+    //played if the search stopped here.
+    const uint64_t visits = use_edge ? (uint64_t)en : Ne;
     if (score > best_score) {
+      second_score = best_score; second_idx = selected;
       best_score = score;
       selected = i;
+      best_visits = visits;
+    } else if (score > second_score) {
+      second_score = score; second_idx = i;
     }
+    total_visits += visits;
+    if (visits > most_visits) { most_visits = visits; most_idx = i; }
+    if (floor_ev && Ne < floor_ev && Ne < starved_ev) { starved_ev = Ne; starved_idx = i; }
   }
+  //THE SHARE CAP (BalanceShare), before the floor because the floor is the more specific rule. A child
+  //over its share yields to the runner-up for this simulation; nothing is removed from consideration.
+  if (balance_share < 1000 && second_idx >= 0 && total_visits > 0 &&
+      best_visits * 1000ull > (uint64_t)balance_share * total_visits)
+    selected = second_idx;
+  //THE FLOOR, applied after the scores so that the ordinary selection is untouched when every reply
+  //has its evidence. The least-informed reply goes first, so the visits spread evenly rather than
+  //filling one reply before the next is touched.
+  if (starved_idx >= 0) selected = starved_idx;
+  if (most_visited) *most_visited = most_idx;
   // Apply virtual loss to selected child to avoid contention among threads for the same node
   //children = parent.children.load(std::memory_order_acquire);
   MCTSNode * child = search.arena.child_at(parent, selected);
@@ -2354,10 +2411,26 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
   //iterate down the tree updating sim_board by initiating and making moves
   //thread-local map to prevent repetition cycles - it should be global I think but thread-safety may be a problem
   std::unordered_set<uint64_t> pos_history;
+  //The root child the engine would play if the search stopped now; see the note at select_best_child().
+  //Per simulation and per thread: it is set while leaving the root and read one level below, so no two
+  //threads share it and it can never name a node from an earlier root.
+  const MCTSNode * intended_child = nullptr;
   while (node->num_children.load(std::memory_order_relaxed) > 0) { //traversal stops at a leaf or at repetition (mate or stalemate node should not have children)
     //return child node index with the best score using PUCT (Predictor + Upper Confidence Bound)
     //it also adds virtual loss to the node to reduce contention for the same node in multi-threaded engine
-    int idx = select_best_child(node, params.seldepth);
+    //VERIFYING THE MOVE WE MEAN TO PLAY (VerifyReplies > 0, off by default). At the root the selection
+    //also reports the most-visited child -- the move the engine would play if the search stopped now --
+    //and the level below that one move, and only that one, is given a floor: every reply to it must
+    //collect VerifyReplies evidence before PUCT is free to ignore it. The cost is bounded by the
+    //number of replies times the floor, paid once per candidate move that reaches the top, and is
+    //spent exactly where a refutation would be. Replies to moves we are not about to play are not
+    //touched, and no move anywhere is skipped.
+    int most_visited = -1;
+    const uint64_t floor_ev = (params.verify && params.seldepth == 1 && node == intended_child)
+                              ? (uint64_t)verify_replies : 0;
+    int idx = select_best_child(node, params.seldepth, floor_ev, params.seldepth == 0 ? &most_visited : nullptr);
+    if (params.seldepth == 0 && most_visited >= 0)
+      intended_child = search.arena.child_at(node, most_visited);
     Edge * children = node->children.load(std::memory_order_acquire);
     int move_idx = children[idx].move.load(std::memory_order_relaxed);
     path.push_back(node);  // Add parent node to path

@@ -134,6 +134,8 @@ struct ThreadParams {
     int thread_id;
     uint64_t time_alloc;
     int seldepth;
+    //Whether this simulation is in the verification phase; see VerifyReplies and VerifyAfter.
+    bool verify;
 };
 struct Edge;
 struct alignas(64) MCTSNode {
@@ -856,6 +858,9 @@ extern bool reuse_tree;
 extern bool post_move_collect;
 extern int64_t gc_threshold;
 extern int64_t tree_reset_below;
+extern int64_t verify_replies;
+extern int64_t verify_after;
+extern int64_t balance_share;
 extern int64_t tree_reset_occupancy;
 extern int64_t tree_reset_hollow;
 //Nodes in the tree, excluding those retired by a collection and still waiting for the reaper.
