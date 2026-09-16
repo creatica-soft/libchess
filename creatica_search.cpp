@@ -214,6 +214,9 @@ int64_t       balance_share = 1000;
 //The concentration the cap is aimed at is at the top (a median 93% of the root's visits on one move),
 //so 0 caps the root only and 1 also the opponent's replies to it, leaving the deep line alone.
 int64_t       balance_depth = 1000;
+//Let the collection run while the engine ponders, instead of paying it inline before every search.
+//Safe only because of the write barrier; see mark_barrier(). Off by default.
+bool          collect_during_ponder = false;
 int64_t       tree_reset_occupancy = 950;
 //TreeResetHollow: also reset when the PREVIOUS search was at least this many per-mille hollow -- the tree
 //was frozen, whatever the new root inherited. 0 = off. See the reset in runMCTS().
@@ -692,6 +695,43 @@ int validate_tree(const char * where, bool collected) {
 //engine is idle, and the abort simply bounds how long the next command has to wait for it.
 std::thread       gc_thread;
 std::atomic<bool> gc_abort{false};
+extern std::atomic<bool> gc_in_flight;
+//THE MARK'S WRITE BARRIER.
+//
+//A mark walks the tree from the root and stamps what it reaches; everything else becomes invisible
+//when it publishes its generation. That is safe while no search runs. With a search running, a thread
+//can attach an EXISTING node -- a transposition it found through the map -- under a node the mark has
+//already passed, so the mark would never reach it and the sweep would free a node that is reachable.
+//
+//The barrier closes it: while a mark is running, a node handed back by the map is stamped with the
+//mark's generation and pushed onto the grey list, which the mark drains as extra starting points. A
+//node can be pushed at most once per collection -- the stamp is the record -- so the mark still ends.
+//The mutex is taken only when a mark is active AND the node needs stamping; with no mark running the
+//barrier is one relaxed load. mark_active is cleared and the generation published together under the
+//same mutex, so a thread either hands its node over or finds the node already invisible; make_child()
+//and set_root() re-check visibility afterwards and build a fresh node rather than attach a doomed one.
+std::atomic<bool>            mark_active{false};
+std::atomic<uint32_t>        mark_generation{0};
+static std::mutex            grey_mtx;
+static std::vector<uint32_t> grey;
+//How many nodes the barrier handed to a mark, in total and in the collection being reported. A run where
+//this stays zero has not tested the barrier at all, whatever else it validated.
+static std::atomic<uint64_t> barrier_handovers{0};
+static std::atomic<uint64_t> barrier_handovers_total{0};
+
+void mark_barrier(MCTSNode * n) {
+  if (!mark_active.load(std::memory_order_acquire)) return;
+  const uint32_t idx = search.arena.index_of(n);
+  std::lock_guard<std::mutex> lk(grey_mtx);
+  if (!mark_active.load(std::memory_order_relaxed)) return;       //the mark finished while we waited
+  const uint32_t g   = mark_generation.load(std::memory_order_relaxed);
+  const uint32_t cur = search.arena.gen[idx].load(std::memory_order_relaxed);
+  if (cur == 0 || cur == g) return;                               //free, or the mark already has it
+  search.arena.gen[idx].store(g, std::memory_order_relaxed);
+  grey.push_back(idx);
+  barrier_handovers.fetch_add(1, std::memory_order_relaxed);
+  barrier_handovers_total.fetch_add(1, std::memory_order_relaxed);
+}
 //Fraction of the tree the most recent collection actually reclaimed.
 //
 //Measured in a live game: six of twelve consecutive collections freed EXACTLY NOTHING while
@@ -1044,6 +1084,7 @@ void gc_join() {
   gc_abort.store(true, std::memory_order_relaxed);
   if (gc_thread.joinable()) gc_thread.join();
   gc_abort.store(false, std::memory_order_relaxed);
+  gc_in_flight.store(false, std::memory_order_relaxed);
 }
 
 //wipe==true means "destroy the whole tree" (the no-reuse path) rather than "collect from the
@@ -1051,8 +1092,13 @@ void gc_join() {
 //it the no-reuse side paid cleanup() on its own clock -- 64-89 ms a move -- while the reuse
 //side deferred its collection, making an A/B between them asymmetric by roughly 8% of search
 //time at a 1000 ms movetime.
+//True from the moment a background collection is spawned until its thread has finished, so a search
+//can tell that one is already doing the work; see the pre-search branch in runMCTS().
+std::atomic<bool> gc_in_flight{false};
+
 void gc_start(MCTSNode * from, bool wipe) {
   gc_join();                                   //never two collectors at once
+  gc_in_flight.store(true, std::memory_order_relaxed);
   const size_t before = live_tree_nodes();
   const auto   t0     = std::chrono::steady_clock::now();
   gc_thread = std::thread([from, before, t0, wipe] {
@@ -1071,6 +1117,7 @@ void gc_start(MCTSNode * from, bool wipe) {
              std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t0).count(),
              gc_abort.load(std::memory_order_relaxed) ? " (interrupted)" : "");
+    gc_in_flight.store(false, std::memory_order_relaxed);
   });
 }
 
@@ -1196,6 +1243,23 @@ void gc(MCTSNode * from, bool retire_all) {
                                  expansion_abandons.load(std::memory_order_relaxed) };
   //fetch_add() updates generation but returns original value before addition; hence, we add 1
   int current_gen = generation.fetch_add(1, std::memory_order_relaxed) + 1;
+  //Arm the write barrier for this mark; see mark_barrier(). The guard disarms it on every exit,
+  //including the abort inside the loop, so a barrier can never outlive the collection that armed it.
+  struct MarkPhase {
+    ~MarkPhase() {
+      std::lock_guard<std::mutex> lk(grey_mtx);
+      mark_active.store(false, std::memory_order_release);
+      grey.clear();
+    }
+  };
+  {
+    std::lock_guard<std::mutex> lk(grey_mtx);
+    grey.clear();
+    barrier_handovers.store(0, std::memory_order_relaxed);
+    mark_generation.store((uint32_t)current_gen, std::memory_order_relaxed);
+    mark_active.store(true, std::memory_order_release);
+  }
+  MarkPhase mark_phase;
   // BFS traversal to mark reachable nodes with the current generation.
   // Use queue to avoid recursion and potential stack overflow in deep trees.
   const auto gc_t0 = std::chrono::steady_clock::now();
@@ -1246,6 +1310,10 @@ void gc(MCTSNode * from, bool retire_all) {
   //FUTILITY TEST, which relies on edges never being removed from a live node.
   size_t kept_nodes = retire_all ? 0 : 1, kept_edges = 0, truncated = 0;
 
+  //The outer loop takes whatever the barrier handed over while the inner loop was walking, and stops
+  //only when both are empty -- decided while holding grey_mtx, so nothing can be handed over after the
+  //decision. Publishing current_gen there, rather than after the loop, closes the same window.
+  for (;;) {
   while (q_head < q.size()) {
       //Abandoning during the MARK means nothing may be swept: the marks are incomplete, so a
       //sweep would delete live nodes. Leaving the tree entirely alone is always safe, and the
@@ -1298,6 +1366,21 @@ void gc(MCTSNode * from, bool retire_all) {
           }
       }
   }
+  //Both empty? Then the mark is complete, and the barrier is disarmed and the generation published in
+  //the same critical section, so no thread can hand over a node afterwards believing the mark will
+  //take it. Otherwise take what the barrier collected and keep walking: those nodes are reachable
+  //again, and their subtrees carry the previous generation.
+  {
+    std::lock_guard<std::mutex> lk(grey_mtx);
+    if (grey.empty()) {
+      search.arena.visible_gen.store((uint32_t)current_gen, std::memory_order_relaxed);
+      mark_active.store(false, std::memory_order_release);
+      break;
+    }
+    for (const uint32_t idx : grey) { q.push_back(idx); ++gc_marked; ++kept_nodes; }
+    grey.clear();
+  }
+  }
   if (truncated)
     log_file("info string gc: truncated %zu nodes to fit %d permille of Hash "
              "(kept %zu nodes, %zu edges)\n",
@@ -1338,11 +1421,14 @@ void gc(MCTSNode * from, bool retire_all) {
   }
   //One line per collection that actually runs. The sweep reports separately when it finishes.
   log_file("info string gc breakdown: %zu nodes -> %zu, marked %zu, freed %zu nodes + %llu edges, "
-           "reaper backlog %zu, mark %.1f ms, sweep in the background; map rehashes so far %llu (%.1f ms)\n",
+           "reaper backlog %zu, mark %.1f ms, sweep in the background; map rehashes so far %llu (%.1f ms), "
+           "barrier handovers %llu (%llu since start)\n",
            nodes_before, kept_nodes, gc_marked, freed_nodes, (unsigned long long)freed_edges,
            reap_pending.load(std::memory_order_relaxed),
            std::chrono::duration<double, std::milli>(gc_t1 - gc_t0).count(),
-           (unsigned long long)NodeMap::rehashes.load(), NodeMap::rehash_us.load() / 1000.0);
+           (unsigned long long)NodeMap::rehashes.load(), NodeMap::rehash_us.load() / 1000.0,
+           (unsigned long long)barrier_handovers.load(std::memory_order_relaxed),
+           (unsigned long long)barrier_handovers_total.load(std::memory_order_relaxed));
   if (verify_kids)
     log_file("info string KIDS-CHECK: %zu nodes, %zu edges checked; count or offset mismatches %zu, children in free slots %zu; "
              "since start %llu edges published, %llu reached the wrong position%s\n",
@@ -1371,6 +1457,12 @@ void set_root(NNUEContext& ctx) {
   //the arena is created, so it has to run before the first lookup.
   arena_size_check();
   MCTSNode * root = search.tree.lookup(zh.hash);
+  //Same rule as make_child(): hand the node to a running mark, and treat one the mark has just left
+  //behind as absent. set_root() runs on the UCI thread, which a background collection does not stop.
+  if (root) {
+    mark_barrier(root);
+    if (!search.arena.visible(root)) root = nullptr;
+  }
   if (!root) {
     root = search.arena.alloc();
     //The arena is sized so the hash_full gate stops expansion long before it runs dry -- the gate
@@ -1416,6 +1508,12 @@ void set_root(NNUEContext& ctx) {
 MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
   //first, try to find child_hash in the tree
   MCTSNode * child = search.tree.lookup(hash);
+  if (child) {
+    //See mark_barrier(). Hand the node to a running mark, and if the mark finished without reaching
+    //it, build a fresh node for the position instead of attaching one the sweep is about to free.
+    mark_barrier(child);
+    if (!search.arena.visible(child)) child = nullptr;
+  }
   if (!child) { //if the child_hash is not found, create a child
     child = search.arena.alloc();
     //Out of slots. Returning nullptr is safe because expand_node() builds the whole Edge array
@@ -2714,7 +2812,11 @@ void runMCTS(NNUEContext& ctx) {
     //Stop and join any collection still running from the last move. This is the "go" edge of
     //signal pair: bestmove starts the collector, the next search stops it. Whatever it
     //managed to free is kept; whatever it did not is collected next time.
-    gc_join();
+    //
+    //With CollectDuringPonder a ponder search leaves it alone instead: the mark is safe beside a
+    //search (see mark_barrier()), so it finishes on the opponent's clock rather than being aborted
+    //here and paid again inline before the real search.
+    if (!(collect_during_ponder && chessEngine.ponder)) gc_join();
     //Before the timer, so the benchmark is not charged to the collection line. Test builds only.
     run_mark_bench();
     const auto collect_start = std::chrono::steady_clock::now();
@@ -2810,7 +2912,12 @@ void runMCTS(NNUEContext& ctx) {
                    (long long)tree_reset_hollow, occ, (long long)tree_reset_occupancy, before, tree_occupancy());
         }
       }
-      const bool wanted = !tree_reset && tree_occupancy() >= gc_threshold;
+      //With CollectDuringPonder the collection started after the last bestmove is still running beside
+      //this ponder search. Collecting inline as well would put two marks on the tree at once, and the
+      //one already running does the same work on the opponent's clock instead of this one.
+      const bool background_running = collect_during_ponder && chessEngine.ponder &&
+                                      gc_in_flight.load(std::memory_order_relaxed);
+      const bool wanted = !tree_reset && !background_running && tree_occupancy() >= gc_threshold;
       futile_why  = wanted ? gc_would_free_nothing() : 0;
       futile_skip = futile_why != 0;
       //Under CREATICA_VERIFY_FUTILE, say which condition failed whenever a collection is NOT judged
@@ -3162,6 +3269,27 @@ void runMCTS(NNUEContext& ctx) {
       //the tree is still bounded; it is paid on the opponent's clock rather than on a join.
       //No background collection after a ponder search: the next "go" is imminent and would
       //abort it before it finished anything. The search that follows collects inline instead.
+      //
+      //CollectDuringPonder changes that: the collection is started here and the ponder search that
+      //follows does not join it, so the mark runs beside the ponder instead of before it. The sweep
+      //was already a background thread that can be stopped, so the unbounded join described above is
+      //gone; what remained was the mark, which the write barrier now makes safe to run beside a search.
+      if (collect_during_ponder && reuse_active && search.root && !bestmove.empty() && bestmove != "(none)") {
+        Move bm;
+        uci2move_idx(bestmove.c_str(), bm);
+        const int want = (bm.promoType << 12) | (bm.src << 6) | bm.dst;
+        const int nc = search.root->num_children.load(std::memory_order_relaxed);
+        Edge * ch  = search.root->children.load(std::memory_order_acquire);
+        MCTSNode * next_root = nullptr;
+        for (int i = 0; i < nc && ch; ++i)
+          if (ch[i].move.load(std::memory_order_relaxed) == want) { next_root = search.arena.child_at(search.root, i); break; }
+        const bool worth_collecting = last_gc_freed.load(std::memory_order_relaxed) >= GC_MIN_YIELD
+                                   || tree_occupancy() >= gc_threshold;
+        if (next_root && worth_collecting) {
+          search.root = next_root;
+          gc_start(next_root, /*wipe=*/false);
+        }
+      }
     } else if (!reuse_active) {
       //No reuse: the tree is discarded every move anyway, so discard it HERE, after the move
       //has been sent, rather than on the clock before the next search.

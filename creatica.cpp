@@ -65,6 +65,7 @@ extern int64_t   verify_replies;
 extern int64_t   verify_after;
 extern int64_t   balance_share;
 extern int64_t   balance_depth;
+extern bool      collect_during_ponder;
 extern int64_t   tree_reset_occupancy;
 extern int64_t   tree_reset_hollow;
 void gc_join();
@@ -529,6 +530,9 @@ public:
         // The deepest ply BalanceShare applies to: 0 is the root alone, 1 adds the replies to it.
         // 1000 caps every depth, which cost a match badly; see select_best_child().
         o.spin("BalanceDepth",       &balance_depth,     1000,    0, 1000);
+        // Run the collection beside the ponder search instead of inline before every search. Safe
+        // because of the mark's write barrier; see mark_barrier() in creatica_search.cpp.
+        o.check("CollectDuringPonder", &collect_during_ponder, false);
         // Where to append the root visit distribution after each search, and a tag written on
         // every line so records can be joined back to a game and its result. Empty = off.
         o.string("VisitDumpFile", &visit_dump_path, "");

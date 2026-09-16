@@ -45,6 +45,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `TreeResetBelow` | spin | 0 | 0–1000000000 | **Off at 0.** Before a search, if the tree is at `TreeResetOccupancy` or more and the root inherited fewer than this many informed simulations (its evidence), discard the whole tree instead of collecting it. Aimed at the one case a full tree turns into a blunder: a root the last search barely looked at, on a tree nothing can be freed from. 1000 is the value tested in replays; it has not been measured in games. See *A full tree that cannot be collected*. |
 | `TreeResetOccupancy` | spin | 950 | 0–1000 | Per-mille of `Hash` at or above which `TreeResetBelow` applies. Below 950 no search in 22 games froze, so resetting there would only throw knowledge away. |
 | `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. 900 is the value tested in replays; not yet measured in games. |
+| `CollectDuringPonder` | check | false | — | Run the collection beside the ponder search instead of inline before every search. Safe because of the mark's write barrier. See *The mark beside the search*. |
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
 | `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0.** Evidence every reply to the root's most-visited move must have before the search may ignore it. Aimed at a refutation that starts with a sacrifice, which PUCT starves after its first few visits. |
 | `VerifyAfter` | spin | 600 | 0–1000 | Per-mille of the search's own time after which `VerifyReplies` starts. Verifying from the first simulation costs the early search. |
@@ -1379,6 +1380,36 @@ were at least 90% hollow from 10 to 4 and those at least 50% hollow from 15 to 6
 frozen search, since it reacts to the search before. Two of the four discarded roots that had inherited
 1.6 and 3.3 million informed simulations — permitted by design, because a frozen tree would have taught
 the next search nothing, but the case to watch in games.
+
+### The mark beside the search (`CollectDuringPonder`)
+
+With `Ponder` on, which is how the bot plays, **every search pays its collection inline**. The background
+collection after a bestmove was disabled for pondering because the next `go` arrives within milliseconds
+and `gc_join()` would have waited for an uninterruptible sweep. The sweep has since become a background
+thread that can be stopped, so what was left was the mark — and a mark could not run beside a search.
+
+**Why it could not, and the barrier that fixes it.** The mark walks the tree from the root and stamps what
+it reaches; everything else becomes invisible when it publishes its generation. A search thread that finds
+an existing node through the map — a transposition — can attach it under a node the mark has already
+passed, so the mark would never reach it and the sweep would free a node that is reachable. `mark_barrier()`
+stamps such a node with the mark's generation and hands it to the mark as a further starting point; a node
+can be handed over at most once per collection, so the mark still terminates. The barrier is one relaxed
+load when no mark is running. `mark_active` is cleared and the generation published in the same critical
+section, and `make_child()` and `set_root()` re-check visibility afterwards, so a thread either hands its
+node over or finds it already invisible and builds a fresh node instead of attaching a doomed one.
+
+`CollectDuringPonder` (off by default) then starts the collection after the bestmove even when pondering,
+and the ponder search neither joins nor collects inline. On a ponderhit the root is unchanged, so the
+exact futility test skips the collection before the real search — which is the collection that was on our
+own clock.
+
+**State of the evidence.** In a forced-collection run (`GcThreshold 0`) the collections do move off the
+clock: none before a search against one inline, with 42 collections running beside searches and no
+`ValidateTree` violation, no child-table error and no futility failure over 805,350 published edges. But
+the barrier itself is **barely exercised offline**: the driver's games simplify quickly, the largest tree
+reached 1.2 million nodes and the longest mark 19 ms, and the barrier handed over **one** node in all of
+those runs. Real games reach 18 million nodes and marks of 300–500 ms, which is where both the benefit and
+the hazard live, so the option has to be measured there before it is turned on by default.
 
 ### Balancing the visits: the share cap and the reply floor
 
