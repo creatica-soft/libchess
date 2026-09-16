@@ -189,6 +189,19 @@ static_assert(sizeof(MCTSNode) == 64, "MCTSNode must stay one cache line; see po
 //has the plain integer's size and alignment.
 static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t) && alignof(std::atomic<uint64_t>) == alignof(uint64_t),
               "the child table relies on std::atomic<uint64_t> being laid out as uint64_t");
+//HOW MUCH Hash ONE ARENA SLOT IS WORTH, which decides how many slots exist.
+//
+//The arena used to have one 64-byte slot per 64 bytes of Hash, as if a node cost nothing but its slot.
+//It costs NODE_BYTES (96) plus at least one edge, so at most Hash/112 nodes can be alive at once, and in
+//17 lichess games at Hash 2048 the largest tree ever reached was 18.3 million nodes -- Hash/117. The
+//other 45% of the slots could never be used, yet all of them are written when the arena is created:
+//1.05 MB of RAM per MB of Hash before the first search, which is why a full tree cost about 1.56 x Hash.
+//
+//100 bytes a slot keeps about 17% more slots than the largest tree measured. The margin matters because
+//slots freed by a collection come back through the background sweep and the reaper, so for a moment a
+//slot can be neither live nor available; if the arena does run dry the expansion is abandoned and the
+//node stays a leaf, which is how a full tree already behaves.
+inline constexpr size_t ARENA_BYTES_PER_SLOT = 100;
 struct NodeArena {
     MCTSNode * slots = nullptr;
     //THE MARK STAMPS LIVE HERE, NOT IN THE NODE, and that is the difference between a sweep that
@@ -287,7 +300,7 @@ struct NodeArena {
     static uint32_t kids_count(uint64_t k) { return (uint32_t)(k & 0xFFFFFFFFu); }
 
     void size_to(size_t bytes_for_nodes) {
-        const uint32_t want = (uint32_t)std::min<size_t>(bytes_for_nodes / sizeof(MCTSNode),
+        const uint32_t want = (uint32_t)std::min<size_t>(bytes_for_nodes / ARENA_BYTES_PER_SLOT,
                                                          0xFFFFFFFEu);
         if (want == cap) return;
         delete[] slots;
@@ -303,7 +316,13 @@ struct NodeArena {
         //std::atomic<uint64_t> has uint64_t's size and layout, and zero bytes are a zero value.
         kids  = static_cast<std::atomic<uint64_t> *>(std::calloc(want, sizeof(std::atomic<uint64_t>)));
         //An Edge is never smaller than 16 bytes, so Hash / 16 bounds the edges that can ever exist.
-        pool_cap = std::min<uint64_t>(bytes_for_nodes / 16, 0xFFFFFFFFull);
+        //An edge is charged EDGE_BYTES (16) against Hash, so Hash/16 edges is the absolute ceiling and was
+        //the size used here. It cannot be reached: a node is charged 96 on top, so even a tree of nothing
+        //but transpositions -- 2.16 edges a node, measured on a full endgame tree -- fits in Hash/61, and
+        //real game trees run at about 1.07 edges a node. Hash/40 leaves half as much again above the
+        //transposition-dense case while saving 0.15 x Hash of pool. Running out is not fatal: the
+        //expansion is abandoned and the node stays a leaf, exactly as when the arena is full.
+        pool_cap = std::min<uint64_t>(bytes_for_nodes / 40, 0xFFFFFFFFull);
         pool     = static_cast<uint32_t *>(std::malloc(pool_cap * sizeof(uint32_t)));
         pool_reset();
         for (uint32_t i = 0; i < want; ++i) {
@@ -777,12 +796,17 @@ struct Edge {
     //want the per-edge count; only the value estimate Q wants the per-position one. Occupies the
     //four bytes of padding that already sat between `move` and `P`.
     std::atomic<uint32_t> n {0};
-    std::atomic<double> P {0.0};            // Prior probability - model move_probs for a given move in the node
+    //FLOAT, not double. The prior is a softmax output that nothing accumulates into, so the extra
+    //precision bought nothing and cost four bytes on the busiest array in the engine: an Edge fell
+    //from 16 bytes to 12, and the occupancy charge per edge from 20 to 16, so the same Hash now
+    //holds more tree. Every reader widens it to double for the arithmetic, as before.
+    std::atomic<float> P {0.0f};            // Prior probability - model move_probs for a given move in the node
     //NO CHILD POINTER. It was an 8-byte pointer here; the child's slot now lives in the child table's
     //pool, and search.arena.child_at(parent, i) returns it. Keeping both would have been 12 bytes an edge
     //of duplicated state that could disagree, and would have grown the tree's footprint -- the very
-    //thing the table exists to shrink. sizeof(Edge) is 16.
+    //thing the table exists to shrink. sizeof(Edge) is 12.
 };
+static_assert(sizeof(Edge) == 12, "an Edge is move, edge visits and a float prior; see EDGE_BYTES");
 //WHAT ONE NODE AND ONE EDGE COST AGAINST Hash. Every occupancy figure is built from these, so the child
 //table's entries are counted where they are spent: 8 bytes of kids[] per node, 4 bytes of pool per edge.
 //The 24 per node is the map entry and the two stamp arrays, as before. With the child pointer gone from
@@ -790,6 +814,7 @@ struct Edge {
 //about 3% fewer nodes for a tree-like middlegame, about 3% more for a transposition-dense endgame.
 inline constexpr size_t NODE_BYTES = sizeof(MCTSNode) + 24 + sizeof(uint64_t);
 inline constexpr size_t EDGE_BYTES = sizeof(Edge) + sizeof(uint32_t);
+
 
 
 //ASYNC ONLINE TABLEBASE PROBE.

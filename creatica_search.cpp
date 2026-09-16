@@ -380,7 +380,7 @@ static void arena_reset_slot(MCTSNode * n) {
 //into the slot array, and resizing frees that array underneath it.
 void arena_size_check() {
   const size_t   bytes = (size_t)chessEngine.optionSpin[Hash].value * 1024 * 1024;
-  const uint32_t want  = (uint32_t)std::min<size_t>(bytes / sizeof(MCTSNode), 0xFFFFFFFEu);
+  const uint32_t want  = (uint32_t)std::min<size_t>(bytes / ARENA_BYTES_PER_SLOT, 0xFFFFFFFEu);
   if (search.arena.cap == want) return;
   sweep_stop();
   reap_drain();
@@ -390,8 +390,8 @@ void arena_size_check() {
   total_children.store(0, std::memory_order_relaxed);
   search.arena.size_to(bytes);
   gc_completed_invalidate();
-  log_file("info string node arena: %u slots of %zu bytes (%d MB Hash)\n",
-           search.arena.cap, sizeof(MCTSNode), chessEngine.optionSpin[Hash].value);
+  log_file("info string node arena: %u slots of %zu bytes, one per %zu bytes of the %d MB Hash\n",
+           search.arena.cap, sizeof(MCTSNode), ARENA_BYTES_PER_SLOT, chessEngine.optionSpin[Hash].value);
 }
 
 //The body, with no join. Callable from the background collector itself, which must not try
@@ -1349,7 +1349,8 @@ void set_root(NNUEContext& ctx) {
   if (!root) {
     root = search.arena.alloc();
     //The arena is sized so the hash_full gate stops expansion long before it runs dry -- the gate
-    //charges NODE_BYTES (96) a node and a slot is 64 -- so this is a should-not-happen. If it ever does,
+    //charges NODE_BYTES (96) a node and a slot is worth ARENA_BYTES_PER_SLOT (100) of Hash -- so this is
+    //a should-not-happen at the root. If it ever does,
     //wiping the tree is better than proceeding without a root, which is not survivable.
     if (!root) {
       log_file("info string node arena exhausted at the root; resetting the tree\n");
