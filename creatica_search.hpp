@@ -366,6 +366,10 @@ struct NodeArena {
         released.fetch_add(1, std::memory_order_relaxed);
     }
     uint32_t index_of(const MCTSNode * n) const { return (uint32_t)(n - slots); }
+    //Still visible to the map: reached by the latest mark, or created since it finished.
+    bool visible(const MCTSNode * n) const {
+        return gen[index_of(n)].load(std::memory_order_relaxed) >= visible_gen.load(std::memory_order_relaxed);
+    }
     //What the map files: the slot's identity, not its mark.
     uint32_t stamp_of(const MCTSNode * n) const {
         return tag[index_of(n)].load(std::memory_order_relaxed);
@@ -862,6 +866,7 @@ extern int64_t verify_replies;
 extern int64_t verify_after;
 extern int64_t balance_share;
 extern int64_t balance_depth;
+extern bool    collect_during_ponder;
 extern int64_t tree_reset_occupancy;
 extern int64_t tree_reset_hollow;
 //Nodes in the tree, excluding those retired by a collection and still waiting for the reaper.
