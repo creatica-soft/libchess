@@ -2813,10 +2813,12 @@ void runMCTS(NNUEContext& ctx) {
     //signal pair: bestmove starts the collector, the next search stops it. Whatever it
     //managed to free is kept; whatever it did not is collected next time.
     //
-    //With CollectDuringPonder a ponder search leaves it alone instead: the mark is safe beside a
-    //search (see mark_barrier()), so it finishes on the opponent's clock rather than being aborted
-    //here and paid again inline before the real search.
-    if (!(collect_during_ponder && chessEngine.ponder)) gc_join();
+    //With CollectDuringPonder no search joins it: the mark is safe beside a search (see
+    //mark_barrier()), so it finishes while the engine thinks rather than being aborted here and paid
+    //again inline. Joining only in the ponder case was not enough -- in a real game 111 background
+    //collections started and 41 collections still ran on the clock, because the real search aborted
+    //the mark that was still going and then had to do it itself.
+    if (!collect_during_ponder) gc_join();
     //Before the timer, so the benchmark is not charged to the collection line. Test builds only.
     run_mark_bench();
     const auto collect_start = std::chrono::steady_clock::now();
@@ -2912,10 +2914,10 @@ void runMCTS(NNUEContext& ctx) {
                    (long long)tree_reset_hollow, occ, (long long)tree_reset_occupancy, before, tree_occupancy());
         }
       }
-      //With CollectDuringPonder the collection started after the last bestmove is still running beside
-      //this ponder search. Collecting inline as well would put two marks on the tree at once, and the
-      //one already running does the same work on the opponent's clock instead of this one.
-      const bool background_running = collect_during_ponder && chessEngine.ponder &&
+      //With CollectDuringPonder the collection started after the last bestmove may still be running
+      //beside this search, ponder or real. Collecting inline as well would put two marks on the tree
+      //at once, and the one already running is doing the same work without spending this move's clock.
+      const bool background_running = collect_during_ponder &&
                                       gc_in_flight.load(std::memory_order_relaxed);
       const bool wanted = !tree_reset && !background_running && tree_occupancy() >= gc_threshold;
       futile_why  = wanted ? gc_would_free_nothing() : 0;
