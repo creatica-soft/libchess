@@ -1403,13 +1403,28 @@ and the ponder search neither joins nor collects inline. On a ponderhit the root
 exact futility test skips the collection before the real search — which is the collection that was on our
 own clock.
 
-**State of the evidence.** In a forced-collection run (`GcThreshold 0`) the collections do move off the
-clock: none before a search against one inline, with 42 collections running beside searches and no
-`ValidateTree` violation, no child-table error and no futility failure over 805,350 published edges. But
-the barrier itself is **barely exercised offline**: the driver's games simplify quickly, the largest tree
-reached 1.2 million nodes and the longest mark 19 ms, and the barrier handed over **one** node in all of
-those runs. Real games reach 18 million nodes and marks of 300–500 ms, which is where both the benefit and
-the hazard live, so the option has to be measured there before it is turned on by default.
+**Measured in a lichess game**, 180+3, `Hash` 2048, 2 threads, `pisp2` at `BlendScale 102`, both tree
+resets on, the two accounts differing only in this option:
+
+| | `CollectDuringPonder true` | off |
+|---|---|---|
+| collections on the engine's own clock | **0** (0 ms) | 13 (5,384 ms, worst 778 ms) |
+| collections before ponder searches | 0 | 12 (6,315 ms) |
+| collections in the background | 36 (15,075 ms of marking, longest 1,181 ms) | 0 |
+| median simulations a search | 479,477 | 442,992 |
+| `ValidateTree` violations / child-table errors | 0 / 0 | 0 / 0 |
+
+So a single game kept 5.4 s of its own clock and searched about 8% more per move.
+
+**The barrier is necessary, and now proven so.** In that game it handed over **3,059** nodes — nodes that
+a transposition made reachable again after the mark had passed them, and which the sweep would otherwise
+have freed while they were in the tree. Earlier runs showed zero handovers and therefore proved nothing:
+the driver's games stayed under 1.2 million nodes with 19 ms marks, and a lichess game with the mark
+running beside the *ponder* search only still showed none. The hazard appears once the mark runs beside a
+real search, which is what the option does after `e86d967`.
+
+**Not yet measured:** whether the extra search per move is worth Elo, which needs a session of bot-versus-bot
+games on lichess, since a GUI match never ponders and the option then does nothing.
 
 ### Balancing the visits: the share cap and the reply floor
 
