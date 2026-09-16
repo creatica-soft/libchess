@@ -424,6 +424,10 @@ std::string challenge_target;
 //casual is right for an A/B between two of your own bots, which would otherwise drag both
 //ratings around for a result that has nothing to do with the ladder.
 bool challenge_rated = true;
+//--rated-only: refuse casual challenges. The incoming challenge's `rated` flag was read and then
+//never used, so a casual game was accepted exactly like a rated one. Ladder measurements only count
+//rated games, and a casual one still occupies the bot -- it plays one game at a time.
+bool accept_rated_only = false;
 static bool challengerAllowed(const std::string& challenger_id) {
     return accept_only.empty() || accept_only.count(challenger_id) > 0;
 }
@@ -1429,8 +1433,9 @@ void ProcessEvent(const json& event) {
             //and "position startpos" otherwise -- so both a custom position and a normal game
             //are handled by the same path.
             const bool variant_ok = (variant == "standard" || variant == "fromPosition" || variant == bot_variant);
+            const bool rated_ok = (!accept_rated_only || rated);
             if ((!game_in_progress.load() && !challengeStillOutstanding() && variant_ok) &&
-                speedAllowed(speed) && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
+                rated_ok && speedAllowed(speed) && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -1443,6 +1448,8 @@ void ProcessEvent(const json& event) {
                 if (game_in_progress.load() || challengeStillOutstanding()) reason += "later";
                 else if (!variant_ok) reason += "variant";
                 else if (!speedAllowed(speed)) reason += "timeControl";
+                //lichess's own decline reason for "I only play rated", so the challenger is told why.
+                else if (!rated_ok) reason += "casual";
                 else reason += "generic";
                 if (HttpRequest("POST", decline_url, reason)) {
                     std::cout << "ProcessEvent() debug: challenge declined successfully with " << reason << std::endl;
@@ -1576,6 +1583,7 @@ int main(int argc, char ** argv) {
     if (arg == "--no-challenge") no_challenge = true;
     else if (arg == "--print-challenge") print_challenge = true;
     else if (arg == "--casual") challenge_rated = false;
+    else if (arg == "--rated-only") accept_rated_only = true;
     else if (arg.rfind("--challenge=", 0) == 0) {
       challenge_target = arg.substr(12);
       if (challenge_target.empty()) {
@@ -1619,6 +1627,7 @@ int main(int argc, char ** argv) {
         "  --no-challenge              do not challenge anyone; only answer incoming challenges\n"
         "  --challenge=<user>          challenge this opponent instead of a random online bot\n"
         "  --casual                    send unrated challenges\n"
+        "  --rated-only                decline casual challenges (accepts any by default)\n"
         "  --accept-only=<a>[,<b>...]  only accept challenges from these users. May be\n"
         "                              repeated. Omit entirely to accept anyone.\n"
         "  --print-challenge           print the challenge POST body this configuration would\n"
