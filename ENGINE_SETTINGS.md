@@ -1749,6 +1749,12 @@ LICHESS_USERNAME=creaticachessbot2 CREATICA_VARIANT=chess960 CREATICA_VISITS=bot
   ./lichess_bot --no-challenge --accept-only=creaticachessbot
 ```
 
+**Rated games only.** `--rated-only` declines casual challenges, with lichess's own `casual` reason so the
+challenger is told why. Without it any challenge is accepted: the incoming challenge's `rated` flag was
+read and never used. It matters because the bot plays one game at a time, so a casual game keeps it off
+the ladder for its whole length. `--casual` is the opposite setting and applies only to challenges the bot
+SENDS.
+
 Things that have actually cost time here:
 
 - **Give each bot its own `CREATICA_VISITS` and let it have its own `CREATICA_LOG`.** Two engines
