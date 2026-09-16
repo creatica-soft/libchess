@@ -1423,7 +1423,23 @@ In a 60-move self-game at 2 s a move it ran 106,000 simulations a second against
 tree slightly smaller (14.1 M nodes against 16.0 M) and no frozen searches or resets either way. So it does
 not cost memory, and 700 costs half the depth for no gain the test set can see.
 
-**Not yet measured in games.** Both rules are off by default.
+**Measured in games, and it loses.** Two self-play matches, the same binary on both sides, 500 ms a move,
+`Hash` 512, `pisp2` at `BlendScale 102`, tablebase adjudication on:
+
+| the capped side | games | result |
+|---|---|---|
+| `BalanceShare 900` at every depth | 24 | 7.5–16.5, about −150 Elo |
+| `BalanceShare 900`, `BalanceDepth 1` | 212 | 25 wins, 141 draws, 46 losses, **about −35 Elo (95% −62 to −8)** |
+
+So the test set and the games disagree about this change, and the games decide. A test-set position is
+searched from an empty tree, which rewards breadth; a move in a game stands on a tree the engine has been
+deepening for many moves, and the concentration the cap breaks up is partly that accumulated depth being
+reused. **Treat the test set as a diagnostic that explains a failure, never as evidence of strength.**
+
+Both rules stay in the code, off by default. What survives from the work is the diagnosis: the refutation
+of a losing move is usually one move deep, it needs a couple of thousand visits concentrated in it, PUCT
+gives it a few dozen, and no exploration constant can close that gap — which places the problem in the
+prior, not in the search's shape.
 
 ### The sweep off the clock
 

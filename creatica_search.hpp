@@ -861,6 +861,7 @@ extern int64_t tree_reset_below;
 extern int64_t verify_replies;
 extern int64_t verify_after;
 extern int64_t balance_share;
+extern int64_t balance_depth;
 extern int64_t tree_reset_occupancy;
 extern int64_t tree_reset_hollow;
 //Nodes in the tree, excluding those retired by a collection and still waiting for the reaper.

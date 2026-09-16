@@ -64,6 +64,7 @@ extern int64_t   tree_reset_below;
 extern int64_t   verify_replies;
 extern int64_t   verify_after;
 extern int64_t   balance_share;
+extern int64_t   balance_depth;
 extern int64_t   tree_reset_occupancy;
 extern int64_t   tree_reset_hollow;
 void gc_join();
@@ -525,6 +526,9 @@ public:
         // Share of a node's visits, per-mille, that one child may hold before the search prefers the
         // next one. 1000 = off. See select_best_child().
         o.spin("BalanceShare",       &balance_share,     1000,  100, 1000);
+        // The deepest ply BalanceShare applies to: 0 is the root alone, 1 adds the replies to it.
+        // 1000 caps every depth, which cost a match badly; see select_best_child().
+        o.spin("BalanceDepth",       &balance_depth,     1000,    0, 1000);
         // Where to append the root visit distribution after each search, and a tag written on
         // every line so records can be joined back to a game and its result. Empty = off.
         o.string("VisitDumpFile", &visit_dump_path, "");

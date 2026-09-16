@@ -207,6 +207,13 @@ int64_t       verify_after = 600;
 //may be sitting a few visits deep. The cap sends the surplus to the other children instead. It skips
 //nothing: the capped child is chosen again as soon as its share falls back under the cap.
 int64_t       balance_share = 1000;
+//The deepest ply the cap applies to. Capping at every depth flattens the whole tree: in a match at
+//500 ms a move that scored 7.5-16.5 against the same engine without it, while solving far more
+//positions of the mistakes test set -- a test set searches one position from an empty tree, which
+//rewards breadth, while a game move stands on a tree the engine has been deepening for many moves.
+//The concentration the cap is aimed at is at the top (a median 93% of the root's visits on one move),
+//so 0 caps the root only and 1 also the opponent's replies to it, leaving the deep line alone.
+int64_t       balance_depth = 1000;
 int64_t       tree_reset_occupancy = 950;
 //TreeResetHollow: also reset when the PREVIOUS search was at least this many per-mille hollow -- the tree
 //was frozen, whatever the new root inherited. 0 = off. See the reset in runMCTS().
@@ -1920,7 +1927,7 @@ int select_best_child(MCTSNode * parent, const int depth, uint64_t floor_ev, int
   }
   //THE SHARE CAP (BalanceShare), before the floor because the floor is the more specific rule. A child
   //over its share yields to the runner-up for this simulation; nothing is removed from consideration.
-  if (balance_share < 1000 && second_idx >= 0 && total_visits > 0 &&
+  if (balance_share < 1000 && depth <= balance_depth && second_idx >= 0 && total_visits > 0 &&
       best_visits * 1000ull > (uint64_t)balance_share * total_visits)
     selected = second_idx;
   //THE FLOOR, applied after the scores so that the ordinary selection is untouched when every reply
