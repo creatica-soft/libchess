@@ -1426,6 +1426,45 @@ real search, which is what the option does after `e86d967`.
 **Not yet measured:** whether the extra search per move is worth Elo, which needs a session of bot-versus-bot
 games on lichess, since a GUI match never ponders and the option then does nothing.
 
+### A mate behind a check extension was backed up with the wrong sign
+
+In lichess game `iP6FoytR` the engine had three legal moves at move 41. Two draw; the third, 41...Kf6,
+allows 42.g5+ (Black's only reply is 42...hxg5) 43.hxg5#. It played Kf6, with **94% of 733,527 visits**
+on it and the position scored at −11 centipawns, on a tree 14% full. It was mated two moves later.
+
+**The cause.** A simulation that ends on a mate node used to back up
+
+```cpp
+result = scorecp == -MATE_SCORE ? -1 : 1;     // exact test against -20000
+```
+
+A mate found inside a check extension carries its depth in the score (`-MATE_SCORE * 0.01 + iter`, so
+−19800 two plies down), which fails that equality and takes the `: 1` branch — **the mated side is
+credited with a win**. Dumping the node one move from mate, as the tree held it:
+
+```
+h4g5   child N 170    W  +168.000  Q -0.9882  cp -19800  terminal 1   <- the mating move
+f4g4   child N 11417  W  +352.191  Q -0.0308  cp     20  terminal 0   <- what it played instead
+```
+
+So the mating move scored −0.99 from the mating side's point of view, and the search spent 11,417 of
+11,802 visits avoiding it. Mates found at the root's own expansion are stored as exactly −MATE_SCORE and
+were always right, which is why this survived: only mates deeper than the root were inverted, and the
+deeper the mate the more surely the engine ran toward it.
+
+`terminal == 1` means the side to move is mated, in both places that set it, so the value is simply −1
+from that node. After the fix the same node reads `Q +1.0000` with every visit on the mating move, the
+mate-in-2 position is solved (`bestmove g4g5`), and the game position gives `bestmove e7f8`, a draw.
+
+**What it is not visible in.** The mistakes test set is unchanged (61 of 139 both ways, 13 gained and 13
+lost), and 40 positions from real games where Stockfish sees a mate in five or fewer score identically
+(median 1,634 cp against 1,628). Both sets hold mates at or near the root, where the old code was
+correct. The cost of the defect is in games, so an engine-versus-engine match is what would price it.
+
+`CREATICA_DUMP_NODE=<fen>` prints a node's children as the tree holds them — move, edge visits, evidence,
+W, Q, one-ply cp, terminal flag and prior — which is how this was found; no root-level output shows a
+node three plies down.
+
 ### Balancing the visits: the share cap and the reply floor
 
 **The search spends almost everything on one move.** Over 15,569 real searches of at least 10,000

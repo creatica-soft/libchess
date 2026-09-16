@@ -1768,7 +1768,40 @@ static void dump_visits(const std::vector<std::tuple<uint64_t, int>>& visits, co
 
 //no locking, call only when search threads finished
 //called from runMCTS()
-int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) { 
+//CREATICA_DUMP_NODE=<fen>: after a search, print that position's node as the tree holds it -- every
+//child with its move, edge visits, evidence, W, the search's value, the one-ply cp, the terminal flag
+//and the prior. Written to answer "is the mate child there, and what does the search think of it?",
+//which no root-level output can show: the root reports its own children, not a node three plies down.
+static void dump_node_if_asked() {
+  const char * fen = std::getenv("CREATICA_DUMP_NODE");
+  if (!fen || !*fen || !search.root) return;
+  Board b{};
+  if (fen2board(b, fen) != 0) { log_file("dump_node: cannot parse %s\n", fen); return; }
+  ZobristHash h{};
+  getHash(h, b, z);
+  MCTSNode * n = search.tree.lookup(h.hash);
+  if (!n) { log_file("dump_node: %s is not in the tree\n", fen); return; }
+  const int nc = n->num_children.load(std::memory_order_relaxed);
+  Edge * ch = n->children.load(std::memory_order_acquire);
+  log_file("dump_node: %s\n  node N %llu evidence %llu W %.3f cp %d terminal %d children %d\n",
+           fen, (unsigned long long)n->N.load(std::memory_order_relaxed),
+           (unsigned long long)ev_of(n), n->W.load(std::memory_order_relaxed),
+           n->cp.load(std::memory_order_relaxed), n->terminal.load(std::memory_order_relaxed), nc);
+  char uci[6];
+  for (int i = 0; i < nc && ch; ++i) {
+    MCTSNode * c = search.arena.child_at(n, i);
+    idx2uci(ch[i].move.load(std::memory_order_relaxed), uci);
+    log_file("    %-6s edge n %8u  child N %10llu evidence %10llu  W %12.3f  Q %+.4f  cp %7d  terminal %d  prior %.4f\n",
+             uci, ch[i].n.load(std::memory_order_relaxed),
+             (unsigned long long)c->N.load(std::memory_order_relaxed), (unsigned long long)ev_of(c),
+             c->W.load(std::memory_order_relaxed), child_q(c),
+             c->cp.load(std::memory_order_relaxed), c->terminal.load(std::memory_order_relaxed),
+             ch[i].P.load(std::memory_order_relaxed));
+  }
+}
+
+int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
+  dump_node_if_asked(); 
   int num_children = search.root->num_children.load(std::memory_order_relaxed);
   if (!num_children) {
     log_file("select_best_moves() warning: root node has no children!\n");
@@ -2719,8 +2752,23 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
   } //end of else if (terminal <= 0) - check or non-terminal
   else { //terminal (mate, stalemate, repetition)
     if (terminal == 1) { //mate
+      //THE SIDE TO MOVE HERE IS MATED, always: position_eval() sets terminal 1 from isMate, and
+      //eval_and_expand() sets it when a node has no legal moves while in check. So the value is -1
+      //from this node's point of view, and the backpropagation below alternates the sign up the path.
+      //
+      //This used to read `scorecp == -MATE_SCORE ? -1 : 1`, an exact test against -20000 -- but a mate
+      //found inside a check extension is stored with its depth folded in (-MATE_SCORE * 0.01 + iter,
+      //so -19800 two plies down), and every one of those took the `: 1` branch and was backed up as a
+      //WIN for the side being mated. Measured in a real game: the node one move from mating held
+      //W +168 over 170 visits, so the mating move scored -0.99 from the mating side's view and the
+      //search spent 11,417 of its 11,802 visits avoiding it -- the engine walked into mate in 2 from a
+      //drawn position (lichess iP6FoytR, move 41). Mates found at the root's own expansion were stored
+      //as exactly -MATE_SCORE and were unaffected, which is why this survived: the deeper the mate, the
+      //more certainly the sign was wrong.
       scorecp = node->cp.load(std::memory_order_relaxed);
-      result = scorecp == -MATE_SCORE ? -1 : 1;
+      if (scorecp > 0)
+        log_file("mcts_search() warning: mate node with a positive cp %d -- check the terminal flag\n", scorecp);
+      result = -1;
     } //for stalemate the result is initiated to 0, so no need for this check    
   }
   // Backpropagation: update node visits and results regardless of whether we expand the node or not
