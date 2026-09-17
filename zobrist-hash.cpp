@@ -1,4 +1,6 @@
+#ifdef _MSC_VER
 #pragma warning(disable:4334)
+#endif
 
 #include <assert.h>
 #include <errno.h>

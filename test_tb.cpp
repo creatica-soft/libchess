@@ -1,4 +1,4 @@
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess test_tb.cpp tbcore.c tbprobe.c -o test_tb
+//c++ -std=c++20 -Wall -O3 -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess test_tb.cpp tbprobe.c -o test_tb
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -19,7 +19,6 @@
   int main(int argc, char ** argv) {
     struct Board board;
     char fenString[MAX_FEN_STRING_LEN] = "";
-    char uciMove[6] = "";
   	if (argc == 1) strncpy(fenString, startPos, MAX_FEN_STRING_LEN);
   	else if (argc >= 7) {
   	  for (int i = 1; i < 7; i++) {

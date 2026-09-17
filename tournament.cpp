@@ -1,4 +1,4 @@
-// compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o tournament tournament.cpp
+// compile with c++ -std=c++20 -Wall -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o tournament tournament.cpp
 
 #include <errno.h>
 #include <ctype.h>
@@ -261,8 +261,6 @@ void play_match(int n_games, FILE* pgnFile) {
     double score_engine_2 = 0;
     
     for (int i = 1; i <= n_games; ++i) {
-        double result; // Score from White's perspective
-        
         // Pick an opening based on pair index. 
         // Games 1 & 2 use opening 0. Games 3 & 4 use opening 1, and so on.
         int fen_idx = ((i - 1) / 2) % opening_fens.size();
@@ -300,8 +298,6 @@ int main(int argc, char ** argv) {
     printf("engine_1: %s\nengine_2: %s\n", engine_1.id, engine_2.id);
 
     FILE* logFile = fopen(PGN_FILE, "a");
-
-    int pass_num = 0;
 
     play_match(GAMES_PER_MATCH, logFile);
     fflush(logFile);

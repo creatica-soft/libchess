@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o test_pos test_pos.cpp
+// c++ -std=c++20 -Wall -O3 -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o test_pos test_pos.cpp
 
 //NNUE full eval vs incremental eval test confirms that incremental is faster by one order of magnitude, i.e. about 10 times on average
 //full eval is tens of microseconds per position vs incremental eval is just microseconds per position on M1
@@ -207,7 +207,6 @@ int main(int argc, char ** argv) {
   zobristHash(z);
   evaluations[0] = &evaluation;
   evaluations[0]->maxPlies = 1;
-  char uciMove[6] = "";
   int total_failures = 0;
   bool file_source = false;
   std::string fenString(startPos);

@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess tbcore.c tbprobe.c test_smp.cpp -o test_smp
+// c++ -std=c++20 -Wall -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess tbprobe.c test_smp.cpp -o test_smp
 
 #include "nnue/types.h"
 #include "nnue/nnue/nnue_accumulator.h"

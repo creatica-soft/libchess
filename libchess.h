@@ -1,5 +1,5 @@
 /// 
-/// c++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -DUSE_PTHREADS -DNDEBUG -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -DUSE_NEON_DOTPROD -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
+/// c++ -std=c++20 -Wall -shared -O3 -flto -DUSE_PTHREADS -DNDEBUG -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -DUSE_NEON_DOTPROD -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
 
 /// Call Stockfish::Bitboards::init() once at start -- move generation segfaults without it.
 /// (init_magic_bitboards()/cleanup_magic_bitboards() are gone; board.cpp uses attacks_bb<>.)
@@ -15,7 +15,7 @@
 /// g++ -std=c++20 -shared -Wno-write-strings -Wno-deprecated -Wno-deprecated-declarations -fPIC -O3 -o libchess.dll board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
 /// 
 /// or in MSYS2 MINGW with clang
-/// clang++ -std=c++20 -shared -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -o libchess.dll board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
+/// clang++ -std=c++20 -shared -O3 -flto -o libchess.dll board.cpp engine.cpp fen.cpp move.cpp piece.cpp square.cpp tag.cpp zobrist-hash.cpp magic_bitboards.c nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp nnue/position.cpp -Wl,--out-implib,libchess.dll.a
 /// 
 
 /// To build python bindings, use:
@@ -195,14 +195,14 @@ inline constexpr uint64_t antidiag_bb[] = { ADIAG_A1A1, ADIAG_A2B1, ADIAG_A3C1, 
 
 enum Castling : uint8_t { CastlingNone, CastlingKingside, CastlingQueenside, CastlingBoth };
 
-inline constexpr char * color[] = { "white", "black" };
+inline constexpr const char * color[] = { "white", "black" };
 inline constexpr char fenColor[] = { 'w', 'b' };
 
 inline constexpr char enumFiles[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'N'};
 enum Rank : uint8_t {Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7, Rank8, RankNone, Rank_NB = 8};
 inline constexpr char enumRanks[] = {'1', '2', '3', '4', '5', '6', '7', '8', 'N'};
 
-inline constexpr char * square[] = {
+inline constexpr const char * square[] = {
 	"a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
 	"a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
 	"a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
@@ -224,8 +224,8 @@ enum Antidiagonal : uint8_t {
 	AntidiagonalA6F1, AntidiagonalA7G1, AntidiagonalA8H1, AntidiagonalB8H2, AntidiagonalC8H3,
 	AntidiagonalD8H4, AntidiagonalE8H5, AntidiagonalF8H6, AntidiagonalG8H7, AntidiagonalH8H8, AntidiagonalNone, Antidiag_NB = 15
 };
-inline constexpr char * pieceType[] = {"any", "pawn", "knight", "bishop", "rook", "queen", "king", "none"};
-//inline constexpr char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
+inline constexpr const char * pieceType[] = {"any", "pawn", "knight", "bishop", "rook", "queen", "king", "none"};
+//inline constexpr const char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
 inline constexpr float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
 inline constexpr int pieceValueCP[] = { 0, 100, 300, 320, 500, 900, 10000 };
 inline constexpr float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
@@ -239,7 +239,7 @@ inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
     {0, 100, 200, 300, 400, 500, 600}  // King attacking - last value is illegal, of course, king cannot attack king
 };    
 
-inline constexpr char * piece[] = {
+inline constexpr const char * piece[] = {
 	"whites", "white pawn", "white knight", "white bishop", "white rook", "white queen", "white king", "none",
 	"blacks", "black pawn", "black knight", "black bishop", "black rook", "black queen", "black king", "none"
 };
@@ -256,14 +256,14 @@ inline constexpr char uciPromoLetter[] = { '\0', '\0', 'n', 'b', 'r', 'q', '\0',
 //promo has 3 bits and uses 5 PieceType enum values {PieceTypeNone = 0, Knight = 2, Bishop, Rook or Queen}
 //move_type has 3 bits
 enum MoveType : uint8_t {MoveTypeEnPassantCapture, MoveTypeCastlingKingside, MoveTypeCastlingQueenside, MoveTypeNormal, MoveTypeCapture, MoveTypeEnPassant, MoveTypeNull};
-inline constexpr char * moveType[] = { "en passant capture", "castling kingside", "castling queenside", "normal", "capture", "en passant", "null" };
+inline constexpr const char * moveType[] = { "en passant capture", "castling kingside", "castling queenside", "normal", "capture", "en passant", "null" };
 
 enum ProblemType : uint8_t { ProblemTypeNone, ProblemTypeBestMove, ProblemTypeAvoidMove };
 
 enum GameStage : uint8_t { OpeningGame, MiddleGame, EndGame, FullGame };
-inline constexpr char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
+inline constexpr const char * gameStage[] = { "opening", "middlegame", "endgame", "fullgame" };
 
-inline constexpr char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+inline constexpr const char * startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 inline constexpr Square castlingKingSquare[Color_NB][2] = { { SquareG1, SquareC1 }, { SquareG8, SquareC8 } };
 inline constexpr Square castlingRookSquare[Color_NB][2] = { { SquareF1, SquareD1 }, { SquareF8, SquareD8 } };
@@ -659,7 +659,7 @@ enum EngineCheckOptions : uint8_t {FinalInfoLines, IntermittentInfoLines, Ponder
 enum OptionType : uint8_t {
 	Button, Check, Combo, Spin, String
 };
-constexpr char * optionTypes[] = {
+constexpr const char * optionTypes[] = {
 	"button", "check", "combo", "spin", "string"
 };
 
@@ -764,12 +764,12 @@ enum EcoTags : uint8_t {
 	eECO, eOpening, eVariation
 };
 
-constexpr char * tags[] = {
+constexpr const char * tags[] = {
 	"Unknown", "Event", "Site", "Date", "Round", "White", "Black", "Result",
 	"Annotator", "PlyCount", "TimeControl", "Time", "Termination", "Mode", "FEN", "SetUp", "Opening", "Variation", "Variant", "WhiteElo", "BlackElo", "ECO"
 };
 
-constexpr char * ecotags[] = {
+constexpr const char * ecotags[] = {
 	"ECO", "Opening", "Variation"
 };
 
@@ -777,7 +777,7 @@ enum Variant : uint8_t {
 	Standard, Chess960
 };
 
-constexpr char * variant[] = {
+constexpr const char * variant[] = {
 	"Standard", "chess 960"
 };
 

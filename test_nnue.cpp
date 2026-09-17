@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o test_nnue tbcore.c tbprobe.c test_nnue.cpp
+// c++ -std=c++20 -Wall -O3 -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o test_nnue tbprobe.c test_nnue.cpp
 //#include "nnue/types.h"
 //#include "nnue/position.h"
 //#include "nnue/evaluate.h"
@@ -184,10 +184,8 @@ void compute_move_evals(Board& chess_board, ZobristHash& board_hash, NNUEContext
 int main(int argc, char ** argv) {
   Board board;
   ZobristHash zh;
-	Move move;
   NNUEContext ctx, ctx2;
   char fen[MAX_FEN_STRING_LEN] = "";
-  char uciMove[6] = "";
 	if (argc == 1) strncpy(fen, startPos, MAX_FEN_STRING_LEN);
 	else if (argc >= 7) {
 	  for (int i = 1; i < 7; i++) {

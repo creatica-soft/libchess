@@ -208,7 +208,7 @@ char * board2fen(const Board& board, char * fenString) {
     en_passant[0] = board.enPassant + 'a';
     en_passant[1] = (board.sideToMove == ColorWhite) ? '6' : '3';
   }
-  sprintf(fenString, "%s %c %s %s %d %d", position, fenColor[board.sideToMove], castling, en_passant, board.halfmoveClock, board.moveNumber);
+  snprintf(fenString, MAX_FEN_STRING_LEN, "%s %c %s %s %d %d", position, fenColor[board.sideToMove], castling, en_passant, board.halfmoveClock, board.moveNumber);
   return fenString;
 }
 
@@ -1180,7 +1180,7 @@ void update_piece_threats(Board& board, Piece pc, Square s, DirtyThreats * const
         Square srcSq = pop_lsb(incoming_threats);
         Piece srcPc = static_cast<Stockfish::Piece>(board.piecesOnSquares[srcSq]);
         assert(srcSq != s);
-        assert(srcPc != PieceNone);
+        assert(srcPc != static_cast<Piece>(::PieceNone));
         add_dirty_threat<PutPiece>(dts, srcPc, pc, srcSq, s);
     }
 }
