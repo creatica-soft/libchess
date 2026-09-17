@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -O2 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o mistakes/san2fen mistakes/san2fen.cpp
+// c++ -std=c++20 -Wall -O2 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o mistakes/san2fen mistakes/san2fen.cpp
 // SAN moves on stdin (optionally preceded by a line "FEN <fen>"): prints the final FEN and the UCI move list.
 #include <cstdio>
 #include <cstring>

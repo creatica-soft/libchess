@@ -345,25 +345,25 @@ int setOption(const Engine& engine, const char * name, OptionType type, void * v
 	case Button: //button
 		idx = nametoindex(engine, name, Button);
 		if (idx < 0) return 1;
-		sprintf(line, "setoption name %s", name);
+		snprintf(line, sizeof line, "setoption name %s", name);
 		break;
 	case Check: //check
 		idx = nametoindex(engine, name, Check);
 		if (idx < 0) return 1;
 		val = *(bool *)value;
-		sprintf(line, "setoption name %s value %s", name, val ? "true" : "false");
+		snprintf(line, sizeof line, "setoption name %s value %s", name, val ? "true" : "false");
 		break;
 	case Combo: //combo
 		idx = nametoindex(engine, name, Combo);
 		if (idx < 0) return 1;
-		sprintf(line, "setoption name %s value %s", name, (char *)value);
+		snprintf(line, sizeof line, "setoption name %s value %s", name, (char *)value);
 		break;
 	case Spin: //spin
 		v = *(long long *)value;
 		idx = nametoindex(engine, name, Spin);
 		if (idx < 0) return 1;
 		if (v <= engine.optionSpin[idx].max && v >= engine.optionSpin[idx].min)
-			sprintf(line, "setoption name %s value %lld", name, v);
+			snprintf(line, sizeof line, "setoption name %s value %lld", name, v);
 		else {
 			fprintf(stderr, "setOption() failed: spin option %s value (%lld) is outside min-max range: %lld - %lld\n", name, v, engine.optionSpin[idx].min, engine.optionSpin[idx].max);
 			return 1;
@@ -372,7 +372,7 @@ int setOption(const Engine& engine, const char * name, OptionType type, void * v
 	case String: //string
 		idx = nametoindex(engine, name, String);
 		if (idx < 0) return 1;
-		sprintf(line, "setoption name %s value %s", name, (char *)value);
+		snprintf(line, sizeof line, "setoption name %s value %s", name, (char *)value);
 		break;
 	}
 	fprintf(engine.toEngine, "%s\n", line);
@@ -570,8 +570,8 @@ void quit(const Engine& engine) {
 bool position(const Engine& engine) {
 	char line[5206];
 	if (strlen(engine.position) >= 25) //min FEN length I think
-		sprintf(line, "position fen %s", engine.position);
-	else sprintf(line, "position startpos");
+		snprintf(line, sizeof line, "position fen %s", engine.position);
+	else snprintf(line, sizeof line, "position startpos");
 	if (strlen(engine.moves) >= 4) { //min uci move length
 		strcat(line, " moves ");
 		strncat(line, engine.moves, sizeof line - strlen(line) - 1);
@@ -782,45 +782,45 @@ int go(const Engine& engine, struct Evaluation ** eval) {
 	assert(eval);
 
 	char line[4096], tmp[256];
-	sprintf(line, "go");
+	snprintf(line, sizeof line, "go");
 	if (engine.movetime) {
-		sprintf(tmp, " movetime %lld", engine.movetime);
+		snprintf(tmp, sizeof tmp, " movetime %lld", engine.movetime);
 		strcat(line, tmp);
 	}
 	if (engine.depth) {
-		sprintf(tmp, " depth %d", engine.depth);
+		snprintf(tmp, sizeof tmp, " depth %d", engine.depth);
 		strcat(line, tmp);
 	}
 	if (engine.nodes) {
-		sprintf(tmp, " nodes %llu", engine.nodes);
+		snprintf(tmp, sizeof tmp, " nodes %llu", engine.nodes);
 		strcat(line, tmp);
 	}
 	if (engine.mate) {
-		sprintf(tmp, " mate %d", engine.mate);
+		snprintf(tmp, sizeof tmp, " mate %d", engine.mate);
 		strcat(line, tmp);
 	}
 	if (engine.searchmoves) {
-		sprintf(tmp, " searchmoves %s", engine.searchmoves);
+		snprintf(tmp, sizeof tmp, " searchmoves %s", engine.searchmoves);
 		strcat(line, tmp);
 	}
 	if (engine.wtime) {
-		sprintf(tmp, " wtime %lld", engine.wtime);
+		snprintf(tmp, sizeof tmp, " wtime %lld", engine.wtime);
 		strcat(line, tmp);
 	}
 	if (engine.btime) {
-		sprintf(tmp, " btime %lld", engine.btime);
+		snprintf(tmp, sizeof tmp, " btime %lld", engine.btime);
 		strcat(line, tmp);
 	}
 	if (engine.winc) {
-		sprintf(tmp, " winc %lld", engine.winc);
+		snprintf(tmp, sizeof tmp, " winc %lld", engine.winc);
 		strcat(line, tmp);
 	}
 	if (engine.binc) {
-		sprintf(tmp, " binc %lld", engine.binc);
+		snprintf(tmp, sizeof tmp, " binc %lld", engine.binc);
 		strcat(line, tmp);
 	}
 	if (engine.movestogo) {
-		sprintf(tmp, " movestogo %d", engine.movestogo);
+		snprintf(tmp, sizeof tmp, " movestogo %d", engine.movestogo);
 		strcat(line, tmp);
 	}
 	if (engine.ponder) strcat(line, " ponder");

@@ -18,12 +18,12 @@ add_library(chess SHARED board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp z
 
 # Define the executable
 #add_executable(creatica attic/creatica.cpp attic/uci.cpp tbcore.c tbprobe.c)  # historical; does not compile against the current API
-add_executable(creatica creatica_search.cpp creatica.cpp uci_frontend.cpp tbcore.c tbprobe.c)
+add_executable(creatica creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c)
 add_executable(test_pos test_pos.cpp)
 add_executable(perft perft.cpp)
-add_executable(test_nnue tbcore.c tbprobe.c test_nnue.cpp)
-add_executable(test_tb tbcore.c tbprobe.c test_tb.cpp)
-add_executable(test_smp tbcore.c tbprobe.c test_smp.cpp)
+add_executable(test_nnue tbprobe.c test_nnue.cpp)
+add_executable(test_tb tbprobe.c test_tb.cpp)
+add_executable(test_smp tbprobe.c test_smp.cpp)
 add_executable(tournament tournament.cpp)
 add_executable(lichess_bot lichess_bot.cpp)
 
@@ -32,14 +32,14 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # clang-cl specific options
     message(STATUS "clang-cl compiler detected. Using Clang-style flags.")
     
-    target_compile_options(chess PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    #target_compile_options(creatica PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_tb PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_nnue PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_smp PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_pos PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(tournament PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(lichess_bot PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
+    target_compile_options(chess PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
+    #target_compile_options(creatica PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_tb PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_nnue PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_smp PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_pos PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
+    target_compile_options(tournament PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
+    target_compile_options(lichess_bot PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
     
     # Release-specific optimizations
     target_compile_options(chess PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
@@ -86,26 +86,20 @@ else()
     set(CMAKE_INSTALL_RPATH "/Users/ap/libchess")
     set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
-    target_compile_options(chess PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
     target_link_options(chess PRIVATE -Wl,-rpath,/Users/ap/libchess)
-    target_compile_options(creatica PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_nnue PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_tb PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_smp PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(test_pos PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(perft PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(tournament PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
-    target_compile_options(lichess_bot PRIVATE -Wno-deprecated-declarations -Wno-conversion -Wno-writable-strings -Wno-unused-variable -Wno-unused-function)
     
-    target_compile_options(chess PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(creatica PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(test_nnue PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(test_tb PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(test_smp PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(test_pos PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(perft PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(tournament PRIVATE -O3 -march=native -DNDEBUG)
-    target_compile_options(lichess_bot PRIVATE -O3 -march=native -DNDEBUG)
+    # -Wall rather than a list of -Wno-*: every source below is clean under it.
+    # tbcore.c is deliberately not a target source -- tbprobe.c #includes it, and the
+    # separate object exported nothing while producing a dozen unused-symbol warnings.
+    target_compile_options(chess PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(creatica PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(test_nnue PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(test_tb PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(test_smp PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(test_pos PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(perft PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(tournament PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(lichess_bot PRIVATE -Wall -O3 -march=native -DNDEBUG)
 endif()
 
 # Include directories

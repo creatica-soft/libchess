@@ -9,8 +9,11 @@
 
 bool isEmptyLine(const char * line) {
 	size_t len = strlen(line);
-	for (char c = 0; c < len; c++) {
-		if (!isspace(line[c])) return false;
+	//size_t, not char. The counter indexes the line, and char is signed here, so any
+	//line longer than 127 bytes -- an ordinary PGN move-text line -- wrapped it to -128
+	//and read before the start of the buffer.
+	for (size_t i = 0; i < len; i++) {
+		if (!isspace(static_cast<unsigned char>(line[i]))) return false;
 	}
 	return true;
 }
@@ -165,7 +168,6 @@ int movesOnly(char * moves) {
 uint64_t countGames(FILE * file, const char * firstLine, uint64_t gameStartPositions[], uint64_t maxNumberOfGames) {
 	uint64_t numberOfGames = 0;
 	char line[8];
-	int res;
 	long long pos = ftell(file);
 	while (fgets(line, sizeof line, file)) {
 		if (strstr(line, firstLine)) {
