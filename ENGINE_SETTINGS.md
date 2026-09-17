@@ -1423,6 +1423,22 @@ the driver's games stayed under 1.2 million nodes with 19 ms marks, and a liches
 running beside the *ponder* search only still showed none. The hazard appears once the mark runs beside a
 real search, which is what the option does after `e86d967`.
 
+**The crash, reproduced and fixed.** A lichess game with the option on crashed when a tree reset fired while
+a post-move collection was still marking. Under AddressSanitizer, with a reset forced before every search
+(`TreeResetOccupancy 0`, `TreeResetBelow` at maximum), a collection after every bestmove (`GcThreshold 0`)
+and `CREATICA_MARK_DELAY_US=2000` to widen the window, the build **with the guard compiled out**
+(`-DCREATICA_TEST_NO_RESET_GUARD`) dies at the first opportunity with `thread::join failed: Invalid
+argument` — two collectors driving the same collector thread, which is the same collision that corrupted
+the tree in the game. The guarded build runs the identical stress to completion: 30 resets beside 21
+background collections, no sanitizer error. A realistic ASAN run (`GcThreshold 700`, resets at 950/900,
+60 plies) also reports nothing.
+
+Two red herrings from that hunt, recorded so they are not chased again. The ponder driver reports "no
+bestmove after go ponder + stop"; the engine's own log shows the bestmove emitted immediately after the
+stop, and the driver misses it because its timed wait uses `select()` on a line-buffered stream, where a
+line already in Python's buffer reads as "nothing to read". The illegal-move refusals that follow are the
+driver's move list desynchronising after that, not an engine fault.
+
 **Not yet measured:** whether the extra search per move is worth Elo, which needs a session of bot-versus-bot
 games on lichess, since a GUI match never ponders and the option then does nothing.
 
