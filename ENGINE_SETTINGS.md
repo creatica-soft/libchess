@@ -44,7 +44,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `GcThreshold` | spin | 700 | 0–1000 | Per-mille of `Hash` at which the tree is collected. It reclaims only memory — an unreachable node is never traversed — so collecting every move used to pay a large cost for nothing. Since the arena that cost is roughly 100 ms at `Hash` 1024, and the value is now set by the *expansion ceiling* rather than by collection cost: occupancy climbs a p99 of 299 per-mille during one search, so 700 is about the highest value that keeps the tree off the 1000 ceiling. Raise it and roughly one search in ten overshoots; lowering it is now affordable. See *The node arena*. `creatica` only. |
 | `TreeResetBelow` | spin | 0 | 0–1000000000 | **Off at 0.** Before a search, if the tree is at `TreeResetOccupancy` or more and the root inherited fewer than this many informed simulations (its evidence), discard the whole tree instead of collecting it. Aimed at the one case a full tree turns into a blunder: a root the last search barely looked at, on a tree nothing can be freed from. 1000 is the value tested in replays; it has not been measured in games. See *A full tree that cannot be collected*. |
 | `TreeResetOccupancy` | spin | 950 | 0–1000 | Per-mille of `Hash` at or above which `TreeResetBelow` applies. Below 950 no search in 22 games froze, so resetting there would only throw knowledge away. |
-| `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. 900 is the value tested in replays; not yet measured in games. |
+| `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. Use 900: see *Which reset threshold*. |
 | `CollectDuringPonder` | check | false | — | Run the collection beside the ponder search instead of inline before every search. Safe because of the mark's write barrier. See *The mark beside the search*. |
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
 | `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0.** Evidence every reply to the root's most-visited move must have before the search may ignore it. Aimed at a refutation that starts with a sacrifice, which PUCT starves after its first few visits. |
@@ -1525,6 +1525,28 @@ Both rules stay in the code, off by default. What survives from the work is the 
 of a losing move is usually one move deep, it needs a couple of thousand visits concentrated in it, PUCT
 gives it a few dozen, and no exploration constant can close that gap — which places the problem in the
 prior, not in the search's shape.
+
+### Which reset threshold, and how much the frozen tree still costs
+
+Measured over 21 lichess games at `Hash` 2048, 4 threads, `pisp2` at `BlendScale 102`, both resets on
+(2,358 searches, median 720,802 simulations each):
+
+- 93 searches ran on a tree at 950 per-mille or more, and **39 of those were at least half hollow** — 1.7%
+  of all searches. Runs of consecutive frozen searches were never longer than two.
+- The reset fired 27 times: **19 on the hollow trigger, 5 on the starvation trigger, 3 on both**. So
+  `TreeResetHollow` does the work in games, while the replay work had only tested `TreeResetBelow`.
+- A reset costs nothing measurable: each retired about 18.9 million nodes in **1 ms at worst**, because the
+  retirement goes to the background sweep.
+
+**900 against 500, 300 games at 500 ms, `Hash` 512, the same binary and net on both sides:** the 900 side
+scored 44 wins, 221 draws and 35 losses — 154.5 to 145.5, about **+10 Elo with a 95% range of −10 to +31**.
+No measurable difference, which is what the search counts predicted: lowering the threshold to 500 would
+have caught the second search of each two-search frozen run, at most 14 searches of 2,358. Keep 900, and
+treat the threshold as settled rather than promising.
+
+The frozen tree itself is still worth attention — those 39 searches are ones the engine largely wasted —
+but the reset is not the lever. What costs more, and is already built, is collection on the engine's own
+clock: 301 collections over the same 21 games, 79.7 s in total, about 3.8 s a game.
 
 ### The sweep off the clock
 
