@@ -169,8 +169,19 @@ still in the tree but are not built.
 
 ## Licence
 
-Top-level code is MIT — see `LICENSE`. `nnue/` is a fork of Stockfish and retains its GPL-3
-headers.
+The top-level libchess sources are MIT — see `LICENSE`. `nnue/` is a modified fork of
+Stockfish and is GPL-3 — see `COPYING` for the licence text and `nnue/README.md` for the
+required notice of what was changed.
+
+**Anything you build here is a GPL-3 work.** Every CMake target compiles or links the
+Stockfish-derived evaluation, so `libchess.dylib`, `creatica`, `lichess_bot`, `tournament`
+and the `test_*` binaries are all covered by the GPL-3 and must be redistributed under it,
+with source. This is not a conflict — MIT code may be combined into a GPL work — but "libchess
+is MIT" is true only of the top-level source files, never of the built artifacts.
+
+`THIRD-PARTY-NOTICES.md` inventories every third-party component, its origin and its terms:
+Stockfish and its NNUE networks, incbin, Ronald de Man's Syzygy probing code, Fathom,
+nlohmann/json and uthash.
 
 Fathom Syzygy tablebase probing code is included under its own terms:
 

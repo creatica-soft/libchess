@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `libchess` is a C++20 chess library (board representation, legal move generation, FEN/SAN/PGN, Zobrist hashing, Syzygy probing, NNUE evaluation) plus `creatica`, a UCI engine built on it that uses MCTS with NNUE leaf evaluation. `nnue/` is a heavily stripped and modified fork of Stockfish, ported to evaluate libchess's own `Board` instead of Stockfish's `Position`.
 
-Top-level code is MIT (see `LICENSE`); `nnue/` retains Stockfish's GPL-3 headers.
+The top-level sources are MIT (see `LICENSE`); `nnue/` is a modified Stockfish fork under GPL-3 (see `COPYING`, and `nnue/README.md` for the modification notice the GPL requires). Every build target links the two, so **the built library and all the executables are GPL-3 works**, not MIT. `THIRD-PARTY-NOTICES.md` inventories every third-party component — Stockfish and its NNUE nets, incbin, Ronald de Man's Syzygy code, Fathom, nlohmann/json, uthash. When adding a vendored dependency, add it there too.
 
 ## Build
 

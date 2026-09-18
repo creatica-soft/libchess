@@ -1,5 +1,9 @@
 // nnue/board.h -- FORWARDER ONLY.
 //
+// A libchess file with no upstream Stockfish counterpart, but part of the GPL-3
+// work in this directory. Copyright (C) 2025-2026 creatica-soft, distributed
+// under the GNU General Public License version 3 or later; see ../COPYING.
+//
 // struct Board has exactly one definition and it lives in ../chess_types.h.
 // This file keeps its name and location so that the ten
 //     #include "../board.h" / #include "../../board.h"

@@ -1,4 +1,16 @@
-// nnue.cpp
+// nnue.cpp -- the wrapper the rest of libchess uses to reach the NNUE evaluation.
+//
+// This file is written for this project; it has no upstream Stockfish counterpart.
+// It is nevertheless part of the GPL-3 work in this directory, because it is only
+// usable as part of the Stockfish-derived evaluation it wraps.
+//
+// Copyright (C) 2025-2026 creatica-soft
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version. See ../COPYING for the full text, and ../THIRD-PARTY-NOTICES.md for
+// how this directory relates to the MIT-licensed sources above it.
 
 #if defined(_WIN32) || defined(__CYGWIN__)
   #define CHESS_API __declspec(dllexport)
