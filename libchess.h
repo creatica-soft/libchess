@@ -22,12 +22,23 @@
 /// clang++ -std=c++20 -Wall -shared -O3 -march=native -flto -DNDEBUG -o libchess.dll board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp -Wl,--out-implib,libchess.dll.a
 ///
 
-/// To build python bindings, use:
-/// conda install cffi
-/// cc -E libchess.h > libchess.ph
-/// vi tasks.py
-/// python3.12 tasks.py (it should produce chess.cpython-312-darwin.so from libchess.so and libchess.ph)
-/// python3.12 test.py (to test chess module stored in chess.cpython-312-darwin.so)
+/// HISTORICAL -- the cffi python bindings no longer regenerate, and the recipe below is kept
+/// only as a record of how they were built before the C->C++20 rework. It was:
+///
+///   conda install cffi
+///   cc -E libchess.h > libchess.ph
+///   vi tasks.py
+///   python3.12 tasks.py   (produced chess.cpython-312-darwin.so from libchess.so + libchess.ph)
+///   python3.12 test.py    (exercised the chess module in chess.cpython-312-darwin.so)
+///
+/// Two things stop it. First, the scripts are not here: tasks.py, eval.py and the generated
+/// libchess.ph all live in attic/ now, and test.py is gone altogether. Second, and the reason
+/// it cannot simply be revived, cffi's cdef() parses a subset of C and this header stopped
+/// being C a long time ago -- it declares 11 function templates, 52 CHESS_API functions that
+/// take or return references, and 3 that return std::pair or std::tuple. None of those parse.
+/// Reviving python bindings means writing a flat extern "C" shim over the API, not
+/// preprocessing this file. The chess.cpython-312-darwin.so sitting in the repo root is a
+/// leftover from June 2025 and does not match the current library.
 ///
 #pragma once
 
