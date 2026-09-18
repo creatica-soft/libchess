@@ -25,7 +25,7 @@ Notes:
 - The library is ~110 MB because both NNUE nets are embedded at compile time via `incbin`. Net filenames are `#define`s in `nnue/evaluate.h` (`EvalFileDefaultNameBig` / `EvalFileDefaultNameSmall`); switching nets means editing that header and rebuilding `chess`.
 - `CMakeLists.txt` hardcodes `-rpath /Users/ap/libchess` and `-O3 -march=native`. Adjust the rpath when building elsewhere.
 - The build compiles with `-Wall` and **no `-Wno-*` suppressions**, and is warning-free. Keep it that way: fix the warning rather than silencing it, and do not paste `-Wno-*` flags into a new file's build-command comment. `tbcore.c` is deliberately not a target source — `tbprobe.c` `#include`s it, so a separate object would export nothing and only add warnings.
-- Files outside CMake carry their exact compile command in the **first comment line of the file** — that is the convention here. E.g. `creatica.cpp` starts with the `c++ -std=c++20 ... creatica_search.cpp creatica.cpp uci_frontend.cpp tbcore.c tbprobe.c -o creatica` line. Use it rather than inventing flags.
+- Files outside CMake carry their exact compile command in the **first comment line of the file** — that is the convention here. E.g. `creatica.cpp` starts with the `c++ -std=c++20 -Wall ... creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica` line. Use it rather than inventing flags. Each of those lines names the same sources as its CMake target and must be kept in step with `CMakeLists.txt`; the g++/mingw variants carry a note saying they are not compile-tested, because there is no GCC and no Windows here.
 
 ## Tests
 
@@ -55,7 +55,7 @@ init_nnue();                    // loads the embedded nets
 init_nnue_context(ctx);         // one NNUEContext per search thread
 ```
 
-`README.md`, the comment at the top of `libchess.h`, and several older root-level `.cpp` files still say to call `init_magic_bitboards()` / `cleanup_magic_bitboards()`. That is obsolete: `board.cpp` now uses `Stockfish::attacks_bb<>` from `nnue/bitboard.h`, and `magic_bitboards.cpp` is dead code kept only for the unbuilt experiment files.
+`README.md`, the comment at the top of `libchess.h`, and several older root-level `.cpp` files still say to call `init_magic_bitboards()` / `cleanup_magic_bitboards()`. That is obsolete: `board.cpp` now uses `Stockfish::attacks_bb<>` from `nnue/bitboard.h`, and `magic_bitboards.cpp` has been moved to `attic/` — there is no longer any `magic_bitboards.*` in the repo root.
 
 ## Architecture
 

@@ -1,8 +1,10 @@
 //For MacOS using clang
 // c++ -std=c++20 -Wall -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica
 
-// For linux or Windows using mingw
-//g++ -std=c++20 -Wall -mpopcnt -Wno-stringop-overflow -O3 -I /home/ap/libchess -L /home/ap/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica -lchess -lcurl
+// For linux or Windows using mingw. Not compile-tested: this machine has no GCC and no Windows.
+// GCC may still warn inside the vendored Syzygy code that tbprobe.c #includes; if it does,
+// -Wno-stringop-overflow is the flag that silenced it before.
+//g++ -std=c++20 -Wall -O3 -march=native -DNDEBUG -I /home/ap/libchess -L /home/ap/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica -lchess -lcurl
 
 // creatica is creatica's search driven by the shared UCI layer
 // (uci_engine.h / uci_options.h / uci_frontend.cpp) instead of its own copy of the
