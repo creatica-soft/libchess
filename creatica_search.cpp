@@ -4,13 +4,13 @@
 // -O3 -g -fno-omit-frame-pointer - options for profiling
 //
 
-// For linux or Windows using mingw
-// add -mpopcnt for X86_64
-// might need to add -Wno-stringop-overflow to avoid some warnings in tbcore.h
-//g++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -Wno-stringop-overflow -O3 -I /home/ap/libchess -L /home/ap/libchess creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica -lchess
+// For linux or Windows using mingw. Not compile-tested: this machine has no GCC and no Windows.
+// GCC may still warn inside the vendored Syzygy code that tbprobe.c #includes; if it does,
+// -Wno-stringop-overflow is the flag that silenced it before.
+//g++ -std=c++20 -Wall -O3 -march=native -DNDEBUG -I /home/ap/libchess -L /home/ap/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica -lchess -lcurl
 
 //or with clang in MSYS2 MINGW64 or CLANG64
-//clang++ -std=c++20 -mpopcnt -Wno-deprecated -Wno-write-strings -Wno-deprecated-declarations -O3 -flto -I /home/ap/libchess -L /home/ap/libchess creatica.cpp uci.cpp tbcore.c tbprobe.c -o creatica -lchess
+//clang++ -std=c++20 -Wall -O3 -march=native -flto -DNDEBUG -I /home/ap/libchess -L /home/ap/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica -lchess -lcurl
 
 #include "creatica_search.hpp"
 #include "policy_net.h"
