@@ -199,6 +199,40 @@ int64_t       verify_replies = 0;
 //a second against 45 without it, while solving more by eight seconds. Late verification keeps the
 //early search as it was and spends the tail confirming the move that won.
 int64_t       verify_after = 600;
+//MINIMAX CORRECTION AT THE ROOT (MinimaxBackup, 0 = off, today's behaviour exactly).
+//
+//Q is a MEAN over every leaf a subtree has ever visited, and most of those leaves are on lines
+//nobody will play. Measured against Stockfish over 24 positions, the engine reports about 60% of
+//the true magnitude; a diagnostic that averages the same backup WITHOUT the tanh recovers only
+//0.94-0.96 of that, so the squashing is nearly innocent and the averaging is the whole problem.
+//It is also what lost a queen in lichess Gr3fzghd: Kh8's subtree was forty quiet White replies
+//plus one queen sacrifice, the mean came to -0.02, and the move took 753,670 of 845,346 visits.
+//
+//So blend the root child's mean with the value the OPPONENT would get by choosing best at it:
+//
+//    Q_eff = (1 - lambda) * mean  +  lambda * min over grandchildren of their root-POV value
+//
+//MIN, not max: the grandchildren are the opponent's replies and the opponent picks the one worst
+//for us. That is a two-ply minimax at the root, in the same spirit as NodeMinimax's one-ply
+//minimax at expansion.
+//
+//Only at the root, and cached. Doing it inside the selection would cost one pass over the
+//GRANDCHILDREN per simulation -- about 1,200 atomic loads at a normal root, 1.5 million times a
+//second. Instead one thread refreshes the table every 1024 simulations, which amortises to about
+//two loads a simulation, and neither MCTSNode nor Edge grows: both are exactly full (64 and 12
+//bytes) and widening either would shrink the tree that the same Hash can hold.
+int64_t       minimax_backup = 0;
+//Evidence a grandchild needs before its value is allowed into the min. The minimum of a set of
+//noisy estimates is biased low, and an unvisited reply carries no information at all, so without
+//a floor a single unlucky evaluation would condemn a perfectly good move.
+int64_t       minimax_min_ev = 32;
+//The cached correction, one entry per root child, in the ROOT's point of view. MMX_NONE means no
+//grandchild cleared minimax_min_ev, so there is nothing to blend and the plain mean is used.
+//Atomic per element rather than a vector under a lock: it is written by one thread and read by
+//all of them inside the hottest loop in the engine, and a float store cannot tear.
+#define MMX_NONE 2.0f
+std::atomic<float> root_minimax[256];
+
 //BALANCING THE TREE. The share of a node's visits, in per-mille, that one child may hold before the
 //search prefers the next child instead; 1000 is off. Measured over 15,569 real searches of at least
 //10,000 simulations: the most-visited root move takes a median 93% of the visits, more than 80% in
@@ -294,6 +328,19 @@ std::atomic<uint64_t> total_children{0};
 std::atomic<size_t>   reap_pending{0};
 std::atomic<uint64_t> reap_pending_edges{0};
 std::atomic<uint64_t> tbhits{0};
+//Leaves that were inside TB_LARGEST but whose table is not actually on disk.
+//
+//TB_LARGEST is the size of the LARGEST table present, not a promise that everything at or below
+//that size is covered. That distinction did not exist while the local set was the complete 3-4-5
+//piece one; it appears the moment a PARTIAL 6-piece set is installed, and then every leaf in a
+//configuration that has not been downloaded reaches the failed-probe path.
+//
+//That path used to write a full error line through log_file(), which takes a global mutex. At a
+//few hundred thousand leaves a second across four threads it would not merely fill the log, it
+//would serialise the search on that mutex. So count them instead and log the FIRST one of each
+//search, which keeps the diagnostic -- with a complete set a miss still means something is wrong,
+//a corrupt or unreadable file -- without putting a lock in the hot path.
+std::atomic<uint64_t> tb_probe_misses{0};
 //STARTS AT 1, because 0 now means "this arena slot is free". gc() hands out fetch_add(1)+1, so
 //the first real generation is 2 and nothing live ever carries 0.
 std::atomic<int> generation{1};
@@ -2000,6 +2047,39 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
 //about 900,000. Searched on its own, the position after that sacrifice is valued correctly -- the fork
 //that wins the queen back has a 82% and a 99.9% prior -- within 2,000 simulations. The visits were
 //there in the game (about 130,000 in the whole subtree) but never concentrated where they mattered.
+//Recompute the root's minimax table. Called from the worker loop on one thread every 1024
+//simulations; see the note at minimax_backup. Everything it touches is reachable from the root, so
+//it is exactly as safe against the collector as an ordinary descent -- the collector frees only
+//unreachable nodes, and no collection runs beside a search in any case.
+void refresh_root_minimax() {
+  MCTSNode * root = search.root;
+  if (!root) return;
+  const int n = root->num_children.load(std::memory_order_acquire);
+  Edge * kids = root->children.load(std::memory_order_acquire);
+  if (!kids) return;
+  for (int i = 0; i < n && i < 256; ++i) {
+    MCTSNode * c = search.arena.child_at(root, i);
+    if (!c) { root_minimax[i].store(MMX_NONE, std::memory_order_relaxed); continue; }
+    const int gn = c->num_children.load(std::memory_order_acquire);
+    if (gn <= 0 || !c->children.load(std::memory_order_acquire)) {
+      root_minimax[i].store(MMX_NONE, std::memory_order_relaxed); continue;
+    }
+    double worst = INFINITY;                 //the opponent's best reply is our worst outcome
+    for (int j = 0; j < gn; ++j) {
+      MCTSNode * g = search.arena.child_at(c, j);
+      if (!g) continue;
+      const uint64_t ge = ev_of(g);
+      if (ge < (uint64_t)minimax_min_ev) continue;
+      //g is two plies below the root, so the side to move at g is the side to move at the root and
+      //g's stored W is already in the root's point of view. No sign flip.
+      const double q = g->W.load(std::memory_order_relaxed) / (double)ge;
+      if (q < worst) worst = q;
+    }
+    root_minimax[i].store(std::isinf(worst) ? MMX_NONE : (float)worst,
+                          std::memory_order_relaxed);
+  }
+}
+
 int select_best_child(MCTSNode * parent, const int depth, uint64_t floor_ev, int * most_visited) {
   int num_children = parent->num_children.load(std::memory_order_acquire);
   Edge * children = parent->children.load(std::memory_order_acquire);
@@ -2048,6 +2128,16 @@ int select_best_child(MCTSNode * parent, const int depth, uint64_t floor_ev, int
     //Q still comes from the POSITION: a node's accumulated value is about the position, and a
     //transposition legitimately shares it. Only the exploration term moves to the edge.
     double Q = Ne ? W / Ne : (parentQ - fpu_reduction);
+    //THE MINIMAX CORRECTION (MinimaxBackup). Root only, cached, and only once the child has enough
+    //evidence for its own mean to mean anything -- below that Q is still the FPU guess and there is
+    //nothing to correct.
+    if (minimax_backup > 0 && depth == 0 && Ne >= (uint64_t)minimax_min_ev && i < 256) {
+      const float mmx = root_minimax[i].load(std::memory_order_relaxed);
+      if (mmx != MMX_NONE) {
+        const double lambda = minimax_backup * 0.001;
+        Q = (1.0 - lambda) * Q + lambda * (double)mmx;
+      }
+    }
     //PUCT formula. Numerator and denominator are both edge counts now. Using the child's lifetime
     //N as the denominator meant a child carrying a million inherited visits had an exploration
     //term so small it could never be re-examined from a new parent, which is how a node frozen
@@ -2183,7 +2273,10 @@ std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& boar
     const unsigned int wdl = tb_probe_wdl(chess_board.side[ColorWhite], chess_board.side[ColorBlack], chess_board.pieceTypes[King - 1], chess_board.pieceTypes[Queen - 1], chess_board.pieceTypes[Rook - 1], chess_board.pieceTypes[Bishop - 1], chess_board.pieceTypes[Knight - 1], chess_board.pieceTypes[Pawn - 1], 0, 0, ep == SquareNone ? 0 : ep, chess_board.sideToMove == ColorWhite ? 1 : 0);
     if (wdl == TB_RESULT_FAILED) {
       char fen[MAX_FEN_STRING_LEN];
-      log_file("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, fen %s, err %s\n", TB_LARGEST, pieceCount, ep, chess_board.halfmoveClock, chess_board.sideToMove == ColorWhite ? 1 : 0, chess_board.side[ColorWhite], chess_board.side[ColorBlack], chess_board.pieceTypes[King - 1], chess_board.pieceTypes[Queen - 1], chess_board.pieceTypes[Rook - 1], chess_board.pieceTypes[Bishop - 1], chess_board.pieceTypes[Knight - 1], chess_board.pieceTypes[Pawn - 1], board2fen(chess_board, fen), strerror(errno));
+      //First miss of this search only; see tb_probe_misses.
+      if (tb_probe_misses.fetch_add(1, std::memory_order_relaxed) == 0) {
+      log_file("info string tablebase miss (not on disk, invalid or illegal); TB_LARGEST %d, occupations %u, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, fen %s, err %s\n", TB_LARGEST, pieceCount, ep, chess_board.halfmoveClock, chess_board.sideToMove == ColorWhite ? 1 : 0, chess_board.side[ColorWhite], chess_board.side[ColorBlack], chess_board.pieceTypes[King - 1], chess_board.pieceTypes[Queen - 1], chess_board.pieceTypes[Rook - 1], chess_board.pieceTypes[Bishop - 1], chess_board.pieceTypes[Knight - 1], chess_board.pieceTypes[Pawn - 1], board2fen(chess_board, fen), strerror(errno));
+      }
       //if (!terminal)
       //  res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
   	  //else if (terminal == -1) res = process_check(chess_board, board_hash, ctx, pos_history, iter);
@@ -2270,6 +2363,9 @@ std::pair<int, int> make_move_policy(Board& chess_board, const ZobristHash& boar
         else               cp = 0;
         tbhits.fetch_add(1, std::memory_order_relaxed);
       }
+      //Counted but never logged here: this site has always failed silently, and the count is what
+      //tells you a partial set is being probed for tables it does not have.
+      else tb_probe_misses.fetch_add(1, std::memory_order_relaxed);
     }
   }
   undo_move(chess_board, move, state);
@@ -2630,6 +2726,10 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
   // We could actually improve the eval by using move_evals calculated later in the code for the children nodes before expansion for evaluating its parent (this node), kind of look ahead eval
   int scorecp = 0;
   double result = 0.0;
+  //The same value the backup carries, but in pawns and never squashed. See ThreadParams::root_pawns.
+  //Mates are clamped rather than carried as +-20000: the point of the comparison is the ordinary
+  //evaluation range, and one mate would otherwise dominate the mean of a million backups.
+  double result_pawns = 0.0;
   bool informed = true;      //see the note at the leaf below
   if (terminal <= 0) {
     //A full tree stops the search GROWING, not the search THINKING.
@@ -2696,6 +2796,7 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
         evaluate_nnue(sim_board, ctx); //the leaf node is evaluated but we call it to make subsequent evals faster
       }
       result = eval_and_expand(node, sim_board, sim_zh, ctx, pos_history, 0);
+      result_pawns = result;                       //eval_and_expand returns pawns
       result = tanh(result / eval_scale);
       node->expanding.store(0, std::memory_order_release);
     } //end of if (node.expanding.exchange(1, acquire) == 0)
@@ -2748,6 +2849,7 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
         return;
       }
       result = tanh(scorecp * 0.01 / eval_scale);
+      result_pawns = scorecp * 0.01;
     }
   } //end of else if (terminal <= 0) - check or non-terminal
   else { //terminal (mate, stalemate, repetition)
@@ -2769,17 +2871,24 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
       if (scorecp > 0)
         log_file("mcts_search() warning: mate node with a positive cp %d -- check the terminal flag\n", scorecp);
       result = -1;
+      result_pawns = -MATE_PAWNS_CLAMP;
     } //for stalemate the result is initiated to 0, so no need for this check    
   }
   // Backpropagation: update node visits and results regardless of whether we expand the node or not
+  if (result_pawns >  MATE_PAWNS_CLAMP) result_pawns =  MATE_PAWNS_CLAMP;
+  if (result_pawns < -MATE_PAWNS_CLAMP) result_pawns = -MATE_PAWNS_CLAMP;
   for (auto n = path.rbegin(); n != path.rend(); ++n) {
     node = *n;
     node->N.fetch_add(1, std::memory_order_relaxed);      //attention, always
     if (informed) {
       node->evidence.fetch_add(1, std::memory_order_relaxed);
       node->W.fetch_add(result, std::memory_order_relaxed);
+      //path[0] is the root, so this is the last iteration and result_pawns has been flipped to the
+      //root's point of view exactly as result has. Counted only when informed, to match W's sample.
+      if (node == search.root) { params.root_pawns += result_pawns; ++params.root_pawn_backups; }
     }
     result = -result;
+    result_pawns = -result_pawns;
   }
   // Revert virtual loss for the selected path (skip root, as no loss was applied to it) regardless of expansion
   // because virtual loss was applied in select_best_child() which is called in the selection phase
@@ -2871,6 +2980,7 @@ void runMCTS(NNUEContext& ctx) {
 	isCheckMateStaleMate(board); //it calculates board.num_moves as well as part of all legal moves generation
   if (board.num_moves > 1) { //run MCTS using multiple threads
     tbhits.store(0, std::memory_order_relaxed);
+    tb_probe_misses.store(0, std::memory_order_relaxed);
     //Stop and join any collection still running from the last move. This is the "go" edge of
     //signal pair: bestmove starts the collector, the next search stops it. Whatever it
     //managed to free is kept; whatever it did not is collected next time.
@@ -3080,7 +3190,11 @@ void runMCTS(NNUEContext& ctx) {
         pool_params[i].thread_id = i;
         pool_params[i].time_alloc = search_budget;
         pool_params[i].seldepth = 0;
+        pool_params[i].root_pawns = 0.0;          //compression diagnostic, per search
+        pool_params[i].root_pawn_backups = 0;
     }
+    //The root changed, so last search's minimax table describes a different position entirely.
+    for (int i = 0; i < 256; ++i) root_minimax[i].store(MMX_NONE, std::memory_order_relaxed);
     //The predicate must change while pool_mutex is HELD, or the wake can be lost. A worker in
     //pool_cv.wait() evaluates its predicate holding the lock and only then atomically releases
     //and blocks; if these stores land in that window and the notify fires before the worker is
@@ -3150,13 +3264,40 @@ void runMCTS(NNUEContext& ctx) {
       log_file("info string search: %llu simulations in %.0f ms (%.0f/s), "
                "last collection %.1f ms, tree %zu nodes, %d permille, "
                "history %zu positions, max rep %d, %d also seen with the tempo flipped, "
-               "%llu hollow (%.1f%%)\n",
+               "%llu hollow (%.1f%%), %llu tablebase misses\n",
                (unsigned long long)sims, secs * 1000.0,
                secs > 0 ? sims / secs : 0.0,
                last_gc_ms.load(std::memory_order_relaxed),
                live_tree_nodes(), tree_occupancy(),
                position_history.size(), max_rep, flipped,
-               (unsigned long long)hollow, sims ? 100.0 * hollow / sims : 0.0);
+               (unsigned long long)hollow, sims ? 100.0 * hollow / sims : 0.0,
+               (unsigned long long)tb_probe_misses.load(std::memory_order_relaxed));
+
+      //COMPRESSION DIAGNOSTIC. Two means of the SAME backup sample: the one the engine actually
+      //uses, atanh(W/evidence) * eval_scale, and the same leaves averaged in pawns without ever
+      //being squashed. The gap between them is the tanh's own contribution -- Jensen's inequality,
+      //which bites in proportion to how much the subtree's leaves disagree. Whatever gap remains
+      //between the linear mean and an external judge is mixture dilution instead: a mean over a
+      //subtree counts lines nobody is going to play. Knowing the split decides whether averaging
+      //in eval space is worth anything or whether the backup operator itself has to change.
+      double   pawn_sum = 0.0;
+      uint64_t pawn_n   = 0;
+      for (int i = 0; i < num_threads; ++i) {
+          pawn_sum += pool_params[i].root_pawns;
+          pawn_n   += pool_params[i].root_pawn_backups;
+      }
+      if (pawn_n) {
+          const uint64_t ev = search.root->evidence.load(std::memory_order_relaxed);
+          const double   q  = ev ? search.root->W.load(std::memory_order_relaxed) / (double)ev : 0.0;
+          const double   qc = q > 0.999999 ? 0.999999 : (q < -0.999999 ? -0.999999 : q);
+          const int tanh_cp   = (int)std::lround(100.0 * eval_scale * std::atanh(qc));
+          const int linear_cp = (int)std::lround(100.0 * pawn_sum / (double)pawn_n);
+          log_file("info string compression: squashed %d cp, linear %d cp, ratio %.3f "
+                   "over %llu backups\n",
+                   tanh_cp, linear_cp,
+                   linear_cp ? (double)tanh_cp / (double)linear_cp : 1.0,
+                   (unsigned long long)pawn_n);
+      }
     }
     if (chessEngine.optionCheck[FinalInfoLines].value) {    
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();

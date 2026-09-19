@@ -49,6 +49,8 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
 | `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0.** Evidence every reply to the root's most-visited move must have before the search may ignore it. Aimed at a refutation that starts with a sacrifice, which PUCT starves after its first few visits. |
 | `VerifyAfter` | spin | 600 | 0–1000 | Per-mille of the search's own time after which `VerifyReplies` starts. Verifying from the first simulation costs the early search. |
+| `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
+| `MinimaxMinEv` | spin | 32 | 1–1000000 | Evidence a grandchild needs before it may set the `MinimaxBackup` correction. The minimum of a set of noisy estimates is biased low, so without a floor one unlucky evaluation condemns a good move; at 32 a position test showed measurable harm, at 2000 and above it did not. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
 | `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
@@ -2164,3 +2166,116 @@ win/draw/loss split, its Elo, and its sigma.
 
 At startup the tuner prints every parameter with the range the engine actually advertises,
 and skips any option the engine does not have.
+
+## The value is compressed, and the tanh is not why
+
+A node's value is `Q = W / evidence`, and `W` is a running sum of `tanh(pawns / eval_scale)` — a **mean
+over every leaf the subtree has ever visited**. Measured against Stockfish over 682 searches from fourteen
+lichess games, the engine reports about **60–70% of the true magnitude** once a position is unbalanced:
+
+| Stockfish says | n | median Stockfish | median creatica | ratio |
+|---|---|---|---|---|
+| 0–50 cp | 217 | 24 | 20 | 0.83 |
+| 50–150 cp | 164 | 85 | 61 | 0.72 |
+| 150–300 cp | 71 | 201 | 134 | 0.67 |
+| 300–600 cp | 143 | 425 | 297 | 0.70 |
+| 600–1500 cp | 38 | 763 | 580 | 0.76 |
+
+They agree on **who** is better in 99% of positions. It is only the magnitude that is lost.
+
+**The tanh was the obvious suspect and it is nearly innocent.** A diagnostic accumulator carries the same
+backup in pawns without ever squashing it (`ThreadParams::root_pawns`), and one `info string compression:`
+line per search reports both means. Over 24 positions:
+
+| Stockfish says | median Stockfish | squashed | linear, no tanh | tanh's share | total |
+|---|---|---|---|---|---|
+| 0–100 cp | 47 | 30 | 35 | 0.86 | 0.64 |
+| 100–300 cp | 197 | 118 | 123 | **0.96** | 0.60 |
+| 300–1500 cp | 374 | 226 | 240 | **0.94** | 0.60 |
+
+Removing the tanh entirely would recover four to six per cent of a forty per cent problem. Jensen's
+inequality only bites when a subtree's leaves disagree *wildly* — half of them four or more pawns apart —
+and real subtrees are not that spread out. So **averaging in eval space is not worth doing**, and
+`EvalScale` is irrelevant to this (it is also the 600 cp constant the policy was trained against).
+
+What remains is **mixture dilution**: a mean counts lines nobody will play, where a minimax takes the best.
+The sharpest case is the position after 24...Kh8 in lichess `Gr3fzghd`, which Stockfish scores **+680 for
+White**: `squashed 14 cp, linear 10 cp over 960471 backups`. Both agree with each other and both are wrong
+by seven pawns, because the refutation is one queen sacrifice among a million ordinary backups.
+
+**Why this is not a display bug.** The compression is proportional to a subtree's *variance*, so it is not a
+scaling you could divide out. A move whose subtree hides one refutation among forty quiet lines is penalised;
+a move that is honestly a little worse is not. That is the same arithmetic that lost a queen in `Gr3fzghd`
+(the blunder held 753,670 of 845,346 visits at `cp -13`, with its own one-ply value at `stale -514`) and the
+same arithmetic behind the silent slides below.
+
+### Silent slides
+
+A scan of fourteen games for stretches where Stockfish falls by 250 cp or more over at most twelve of
+creatica's moves while creatica's own value moves less than 100 cp found **six of fourteen games affected**,
+in the opening, middlegame and endgame alike:
+
+| game | moves | Stockfish | creatica |
+|---|---|---|---|
+| `Gr3fzghd` | 24→36 | −32 → −1000 | −14 → −6 (**+8**) |
+| `gPdH6u8p` | 84→90 | 1000 → 557 | 996 → 1000 |
+| `XSu1CIQ7` | 60→66 | −64 → −473 | −53 → −142 |
+| `YcP9DAbG` | 28→38 | 450 → 63 | 127 → 58 |
+| `Ecq2KhAg` | 32→37 | 426 → 139 | 183 → 90 |
+| `7ZApAVTR` | 4→14 | −7 → −288 | 5 → −54 |
+
+`XSu1CIQ7` was lost this way from a dead draw: 0.00 through move 58, mated at move 72, with **no single move
+losing 100 cp from a level position**. A per-move blunder threshold cannot see this, which is worth
+remembering when reading any blunder-rate figure here.
+
+### `MinimaxBackup`, and why it measured nothing
+
+The obvious repair is to back up something less lossy than a mean. `MinimaxBackup` blends a root child's
+mean with the value the opponent gets by choosing best at it — a **min** over the grandchildren, since they
+are the opponent's replies. It is root-only and cached (one thread refreshes a 256-entry table every 1024
+simulations) because neither `MCTSNode` nor `Edge` has a spare byte: they are exactly 64 and 12, and
+widening either shrinks the tree a given `Hash` can hold. Cost measured at −2.8% and +0.7% simulations.
+
+**In a 126-game self-play match it scored 48.8%, about −8 Elo with a 95% interval of −51 to +34.** That is a
+coin flip. A match that size is a disaster detector — `BalanceShare` announced itself at 31% within 24
+games — so the result means "not harmful", not "helpful". Resolving ±10 Elo would need ~2,300 games.
+
+The null result is what the diagnosis predicts. The compression is a whole-tree averaging problem, and this
+corrects one level, at one node, on the root's children only. It is the version that fits in the current
+node layout, not the version the measurement calls for. Left in at default 0 as scaffolding.
+
+## Tablebase routing when the local set is incomplete
+
+`TB_LARGEST` is the size of the **largest table present**, not a promise that everything at or below that
+size is covered. With the complete 3-4-5 piece set the distinction never mattered. It appears the moment a
+**partial 6-piece set** is installed, and all three routing decisions were deciding by piece count:
+
+- **In the search**, a leaf inside `TB_LARGEST` whose table is absent took a path that wrote a full error
+  line through `log_file()`, which takes a global mutex. At a few hundred thousand leaves a second across
+  four threads that would not merely fill the log, it would **serialise the search**. Now counted in
+  `tb_probe_misses`, logged once per search, and reported in the `info string search:` line. The value
+  fallback was already correct and is unchanged: a miss returns the ordinary NNUE leaf value and the
+  simulation continues. **The search never falls back to the network** — at 10⁵–10⁶ leaves a second that is
+  not slow, it is impossible.
+- **At the root**, `numberOfPieces > TB_LARGEST` sent a position to lichess. With a partial set, a 6-piece
+  configuration that had not been downloaded took the local branch instead, failed, and searched — *strictly
+  worse than before the download began*. Now the local probe runs first and the lichess path is the
+  fall-through whenever it did not answer. `drop_ponder()` moved after the probe, so a ponder is no longer
+  abandoned for a table we do not have.
+- **The prefetch** used the same piece-count test and now probes WDL locally to decide.
+
+Positions with castling rights go to lichess: Syzygy cannot express castling.
+
+This also makes a **WDL-only download** work, which is what you want since only `.rtbw` is needed in the
+search. `tb_probe_root` needs DTZ, so it fails for every 6-piece position even where the WDL table is
+present — unless the best move captures into 5-piece territory, where the existing DTZ answers. Verified
+with 26 of 59 configurations installed, WDL only:
+
+| case | result |
+|---|---|
+| quiet `KRPvKRP` (downloaded) | root probe fails → lichess answers in 774 ms; search gets **594,627 tbhits** |
+| `KRRvKRP` (absent entirely) | **140,009 misses, one log line**, 696,051 simulations/s, lichess answers |
+| best move captures into 5 pieces | instant root move in 0.1 s, as before |
+
+The miss count is the better guide to what to download next than any offline frequency list: it counts what
+the *search* actually wanted, not what the game happened to reach.
