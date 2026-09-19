@@ -63,6 +63,8 @@ extern bool      reuse_tree;
 extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 extern int64_t   tree_reset_below;
+extern int64_t   minimax_backup;
+extern int64_t   minimax_min_ev;
 extern int64_t   verify_replies;
 extern int64_t   verify_after;
 extern int64_t   balance_share;
@@ -393,6 +395,11 @@ void persistent_worker_func(int thread_id) {
         if (hf > 1000) hf = 1000;
         hash_full.store(hf, std::memory_order_relaxed);
       }
+      //The root's minimax table (MinimaxBackup). Thread 0 only, every 1024 simulations, and only
+      //when the option is on -- see the note at minimax_backup for why it is cached rather than
+      //computed inside the selection.
+      if (minimax_backup > 0 && params.thread_id == 0 && (occupancy_tick & 0x3FF) == 0)
+        refresh_root_minimax();
       int expected = seldepth.load(std::memory_order_relaxed);
       while (params.seldepth > expected && !seldepth.compare_exchange_strong(expected, params.seldepth, std::memory_order_relaxed)) expected = seldepth.load(std::memory_order_relaxed);
       if ((chessEngine.depth && depth.load(std::memory_order_relaxed) >= chessEngine.depth) ||
@@ -401,6 +408,11 @@ void persistent_worker_func(int thread_id) {
       }
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
     }
+    //`params` is a COPY, so the compression diagnostic mcts_search() accumulated into it would be
+    //thrown away here. Hand the two counters back to the slot runMCTS() reads. Nothing else in
+    //ThreadParams is written back: the rest is input, and seldepth is already published atomically.
+    pool_params[thread_id].root_pawns        = params.root_pawns;
+    pool_params[thread_id].root_pawn_backups = params.root_pawn_backups;
     //Decrement under pool_mutex, notify after releasing it. runMCTS() waits on
     //pool_done_cv with the predicate active_workers == 0, and evaluates that predicate while
     //holding the lock; a decrement-and-notify from outside the lock can land in the window
@@ -522,6 +534,13 @@ public:
         o.spin("TreeResetHollow",    &tree_reset_hollow,    0,   0, 1000);
         // Before the search may ignore a reply to the move it currently means to play, that reply must
         // have this much evidence. 0 = off. See select_best_child().
+        // Weight, per mille, of the two-ply minimax correction blended into a ROOT child's value:
+        // Q_eff = (1-lambda)*mean + lambda*(opponent's best reply). 0 is off and reproduces the
+        // plain mean exactly. See the long note at minimax_backup in creatica_search.cpp.
+        o.spin("MinimaxBackup",      &minimax_backup,       0,   0, 1000);
+        // Evidence a grandchild needs before it may set the correction. Guards against a single
+        // noisy evaluation condemning a good move.
+        o.spin("MinimaxMinEv",       &minimax_min_ev,      32,   1, 1000000);
         o.spin("VerifyReplies",      &verify_replies,       0,   0, 1000000);
         // Per-mille of the search's time after which that verification starts. 0 verifies from the
         // first simulation, which costs the early search; see creatica_search.cpp.
@@ -1252,7 +1271,54 @@ private:
         const int numberOfPieces = bitCount(board.side[ColorWhite] | board.side[ColorBlack]);
         if (numberOfPieces > 7) {
             start_search();
-        } else if ((unsigned)numberOfPieces > TB_LARGEST) {
+        } else {
+            //LOCAL FIRST, THEN LICHESS -- decided by whether the local probe ANSWERED, not by the
+            //piece count. TB_LARGEST is the size of the largest table present, which with a
+            //complete set does mean "everything at or below this is covered", but with a PARTIAL
+            //6-piece set does not. A configuration that has not been downloaded still raises
+            //TB_LARGEST to 6, so under the old piece-count test every 6-piece position was routed
+            //to the local tables, failed, and was never sent to lichess -- strictly worse than
+            //before the download began. Probing first and falling through lets tables be added one
+            //at a time, each one simply starting to be used, with lichess covering the rest.
+            //
+            //It also covers a WDL-only download: tb_probe_root needs DTZ, so with .rtbw files and
+            //no .rtbz it fails for every 6-piece position even where the WDL table is present. The
+            //search still gets its exact values from tb_probe_wdl; the root gets its move from
+            //lichess instead of from a table that cannot supply one.
+            //
+            //castlingRights is excluded because the Syzygy probe has no way to express castling --
+            //those positions go to lichess, which does.
+            if ((unsigned)numberOfPieces <= TB_LARGEST && !board.castlingRights) {
+                unsigned int ep = legalEnPassantMove(board);
+                unsigned int result = tb_probe_root(board.side[ColorWhite], board.side[ColorBlack],
+                                                    board.pieceTypes[King - 1], board.pieceTypes[Queen - 1],
+                                                    board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1],
+                                                    board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1],
+                                                    board.halfmoveClock, 0, ep == SquareNone ? 0 : ep,
+                                                    (board.sideToMove ^ 1) == ColorBlack ? 1 : 0, NULL);
+                if (result != TB_RESULT_FAILED) {
+                    //Commit only now. drop_ponder() clears the ponder flag, and calling it before
+                    //we knew the probe had answered would abandon a ponder search for a table we
+                    //do not have.
+                    if (drop_ponder()) return;
+                    best_move[0] = '\0';
+                    unsigned int wdl = TB_GET_WDL(result); //0 - loss, 4 - win, 1..3 - draw
+                    int scorecp = 0;
+                    if (wdl == 4) scorecp = MATE_SCORE;
+                    else if (wdl == 0) scorecp = -MATE_SCORE;
+                    unsigned int from = TB_GET_FROM(result);
+                    unsigned int to   = TB_GET_TO(result);
+                    unsigned int promotes = TB_GET_PROMOTES(result);
+                    strncat(best_move, square[from], 2);
+                    strncat(best_move, square[to], 2);
+                    best_move[4] = uciPromoLetter[6 - promotes];
+                    best_move[5] = '\0';
+                    report_tb_move(scorecp);
+                    return;
+                }
+                //Not in the tables we actually hold. No log line: with a partial set this is the
+                //ordinary case rather than an error, and the search line already reports the count.
+            }
             //Between the local 5-piece tables and lichess's 7-piece ones, ask lichess -- but ask
             //ASYNCHRONOUSLY, and search at the same time.
             //
@@ -1288,36 +1354,6 @@ private:
             tb_req_cv.notify_one();
 
             start_search();
-        } else {
-            if (drop_ponder()) return;
-            best_move[0] = '\0';
-            unsigned int ep = legalEnPassantMove(board);
-            unsigned int result = tb_probe_root(board.side[ColorWhite], board.side[ColorBlack],
-                                                board.pieceTypes[King - 1], board.pieceTypes[Queen - 1],
-                                                board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1],
-                                                board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1],
-                                                board.halfmoveClock, 0, ep == SquareNone ? 0 : ep,
-                                                (board.sideToMove ^ 1) == ColorBlack ? 1 : 0, NULL);
-            if (result == TB_RESULT_FAILED) {
-                log_file("run_go() error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, numberOfPieces %d\n", TB_LARGEST, numberOfPieces);
-                //A failed ROOT probe is not fatal. tb_probe_root is stricter than
-                //tb_probe_wdl, so one missing, unreadable or rejected table used to kill
-                //the whole process mid-game -- on lichess that is a forfeit.
-                start_search();
-                return;
-            }
-            unsigned int wdl = TB_GET_WDL(result); //0 - loss, 4 - win, 1..3 - draw
-            int scorecp = 0;
-            if (wdl == 4) scorecp = MATE_SCORE;
-            else if (wdl == 0) scorecp = -MATE_SCORE;
-            unsigned int from = TB_GET_FROM(result);
-            unsigned int to   = TB_GET_TO(result);
-            unsigned int promotes = TB_GET_PROMOTES(result);
-            strncat(best_move, square[from], 2);
-            strncat(best_move, square[to], 2);
-            best_move[4] = uciPromoLetter[6 - promotes];
-            best_move[5] = '\0';
-            report_tb_move(scorecp);
         }
     }
 
@@ -1346,7 +1382,21 @@ private:
 void tb_prefetch_after_our_move() {
     if (!tb_worker_started.load(std::memory_order_relaxed)) return;
     const int pieces = bitCount(board.side[ColorWhite] | board.side[ColorBlack]);
-    if (pieces > 7 || (unsigned)pieces <= TB_LARGEST) return;   //local tables or out of range
+    if (pieces > 7) return;                                     //out of lichess's range too
+    //Same rule as the root: ask lichess only when the LOCAL tables cannot actually answer, rather
+    //than assuming that a piece count inside TB_LARGEST means coverage. With a partial 6-piece set
+    //it does not. Testing it by probing is cheap -- a failed tb_probe_wdl is a material-key lookup
+    //that finds nothing, with no disk I/O -- and it is the same question the search will ask.
+    if ((unsigned)pieces <= TB_LARGEST && !board.castlingRights) {
+        const unsigned int ep = legalEnPassantMove(board);
+        const unsigned int wdl = tb_probe_wdl(board.side[ColorWhite], board.side[ColorBlack],
+                                              board.pieceTypes[King - 1], board.pieceTypes[Queen - 1],
+                                              board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1],
+                                              board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1],
+                                              0, 0, ep == SquareNone ? 0 : ep,
+                                              board.sideToMove == ColorWhite ? 1 : 0);
+        if (wdl != TB_RESULT_FAILED) return;                    //covered locally; nothing to fetch
+    }
     char buf[MAX_FEN_STRING_LEN];
     std::string fen(board2fen(board, buf));
     while (!fen.empty() && std::isspace(fen.back())) fen.pop_back();

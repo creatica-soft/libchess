@@ -130,12 +130,31 @@ struct NNUEContext {
     Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
     Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
 };
+//Compression diagnostic: the largest magnitude, in pawns, a single backed-up leaf may contribute to
+//the linear mean. A mate is +-20000 centipawns and one of them in a million backups would swamp the
+//average it is meant to be compared against, so mates and tablebase certainties are pinned here
+//instead. 15 pawns is comfortably outside any ordinary evaluation and still finite.
+#define MATE_PAWNS_CLAMP 15.0
+
 struct ThreadParams {
     int thread_id;
     uint64_t time_alloc;
     int seldepth;
     //Whether this simulation is in the verification phase; see VerifyReplies and VerifyAfter.
     bool verify;
+    //COMPRESSION DIAGNOSTIC. The root's value is atanh(W/N) * eval_scale, and W is a sum of
+    //tanh(pawns / eval_scale). Averaging tanh values and inverting the average does NOT return the
+    //average of the pawns: tanh is concave above zero, so the result is pulled toward zero by an
+    //amount that grows with how much the subtree's leaves disagree. Measured against Stockfish over
+    //682 searches, the engine reports about 70% of the true magnitude once a position is unbalanced.
+    //
+    //These two accumulate the SAME backup without the tanh, so the two means can be compared
+    //directly and the tanh's share of that 70% separated from plain mixture dilution -- the fact
+    //that a mean over a subtree includes lines nobody will play. Per thread and non-atomic: the
+    //backup runs millions of times a second and a shared counter would both contend and distort
+    //the thing being measured. Summed over pool_params after the search; see the report in runMCTS().
+    double   root_pawns = 0.0;        //sum of leaf values in pawns, from the ROOT's point of view
+    uint64_t root_pawn_backups = 0;   //how many were counted, so the mean can be taken
 };
 struct Edge;
 struct alignas(64) MCTSNode {
@@ -862,6 +881,9 @@ extern bool reuse_tree;
 extern bool post_move_collect;
 extern int64_t gc_threshold;
 extern int64_t tree_reset_below;
+extern int64_t minimax_backup;
+extern int64_t minimax_min_ev;
+void refresh_root_minimax();
 extern int64_t verify_replies;
 extern int64_t verify_after;
 extern int64_t balance_share;

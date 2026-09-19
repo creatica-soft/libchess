@@ -1,0 +1,60 @@
+file	times_reached	cumulative_coverage  size  status
+KRPvKNP.rtbw	55	12% 1119221264  downloaded
+KRPvKRP.rtbw	46	21% 516280976 downloaded
+KRPPvKR.rtbw	43	31% 247897168 downloaded
+KBBvKBP.rtbw	35	38% 267107024 downloaded
+KRBPvKR.rtbw	33	45% 440252880 downloaded
+KRPvKBP.rtbw	20	49% 1242134480  downloaded
+KBPvKPP.rtbw	15	52% 535094928 downloaded
+KRBPvKP.rtbw	14	55% 209506576
+KBBPvKB.rtbw	14	58% 526699216
+KQPvKQP.rtbw	14	61% 517138768
+KNNPvKN.rtbw	13	64% 616794832
+KRBvKBP.rtbw	11	66% 957809296
+KPPvKPP.rtbw	10	68% 114901200
+KQPPvKR.rtbw	9	70%  25167504  downloaded
+KBNPvKP.rtbw	9	72%  453956880
+KQBNPvK.rtbw	8	74%  60937552  downloaded
+KPPPvKP.rtbw	8	76%  53683536  downloaded
+KBPPvKN.rtbw	8	77%  320832464
+KRRvKRP.rtbw	7	79%  303307984
+KQRPPvK.rtbw	6	80%  23539984  downloaded
+KBPvKBP.rtbw	5	81%  501348304
+KQBPPvK.rtbw	5	82%  21417552  downloaded
+KNPvKPP.rtbw	4	83%  593794384
+KQRBvKR.rtbw	4	84%  15078224  downloaded
+KQBBPvK.rtbw	4	85%  37927120  downloaded
+KNPPvKB.rtbw	4	86%  441594256
+KNPPPvK.rtbw	4	86%  2316304 downloaded
+KQNPPvK.rtbw	4	87%  17307984
+KRPvKPP.rtbw	4	88%  249114448
+KQRNvKP.rtbw	3	89%  40129616  downloaded
+KQPPvKP.rtbw	3	89%  25058384  downloaded
+KBPvKNP.rtbw	3	90%  1282012304
+KQRBPvK.rtbw	3	91%  83146960  downloaded
+KQRvKRP.rtbw	3	91%  175112784
+KQNPvKP.rtbw	3	92%  62303952  downloaded
+KPPPvKR.rtbw	3	93%  170310736
+KQQBPvK.rtbw	2	93%  54013456  downloaded
+KRBvKRP.rtbw	2	93%  818979472
+KBBPPvK.rtbw	2	94%  7576912 downloaded
+KQQPvKR.rtbw	2	94%  14401360  downloaded
+KRBvKRB.rtbw	2	95%  110375440
+KQRNPvK.rtbw	2	95%  69077968  downloaded
+KBPPvKB.rtbw	2	96%  441693840
+KRNvKRP.rtbw	2	96%  802331920
+KRPPPvK.rtbw	2	96%  2506512 downloaded
+KQQQPvK.rtbw	2	97%  23528976  downloaded
+KNPPvKP.rtbw	2	97%  199769872
+KRBvKPP.rtbw	2	98%  299028816
+KNPPvKN.rtbw	1	98%  353494800
+KRNvKNP.rtbw	1	98%  1011698768
+KNPPvKQ.rtbw	1	98%  443491216
+KRNPvKP.rtbw	1	99%  246958352
+KBNvKPP.rtbw	1	99%  482900880
+KBNPvKR.rtbw	1	99%  1450159760
+KQPvKPP.rtbw	1	99%  120272016
+KBPPvKP.rtbw	1	99%  166772624
+KQPPPvK.rtbw	1	100% 3804560 downloaded
+KQQPPvK.rtbw	1	100% 15839504
+KNNPvKB.rtbw	1	100% 617920016
