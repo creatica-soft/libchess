@@ -2471,6 +2471,15 @@ expansion work and the priors, and refresh only the **values**, so a new search 
 Decaying `N` and `W` by a factor at each root change would do that, and would have fixed both blunders
 without touching what this match says is worth 41 Elo.
 
+**The match was played at 0.5 s a move, which is the condition most favourable to reuse.** The lichess bot
+searches for roughly 2.4–5.5 s a move, and a fresh search is far stronger there: on one endgame position
+from an empty tree, 500 ms gives about 152,000 simulations at seldepth 12 while 2,760 ms gives about
+1,380,000 at seldepth 21 — nine times the simulations and nearly double the depth. Discarding the tree
+therefore costs most at 0.5 s and less at game speed, so **−41 Elo is an upper bound on the cost under
+lichess conditions, not a transferable figure.** The sign is unlikely to flip, but the magnitude is not
+comparable across controls, and the same caveat attaches to every other Elo number in this document measured
+at 0.5 s a move — `BalanceShare` among them.
+
 **The threshold that was actually tested was 15, not the 12 suggested here.** That matters for how far the
 result generalises. Measured over 13,297 real searches, a root has fewer than 15 pieces in **38.3%** of
 searches and fewer than 12 in **25.8%**, so `=15` resets about **1.5 times as often** as `=12` would — it
