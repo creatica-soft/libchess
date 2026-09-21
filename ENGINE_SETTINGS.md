@@ -2441,18 +2441,18 @@ leverage, in the phase where the engine is six times weaker, is worth testing pr
 
 **So this is an option to be matched, not a default.** A position scan cannot settle it — the effect is
 cumulative over a game, and such scans have already mis-sold `BalanceShare` and `VerifyReplies` in this
-document. The test is a head-to-head at the real time control, `ReuseTreeMinPieces=0` against `=12`, same
+document. The test is a head-to-head at the real time control, `ReuseTreeMinPieces=0` against a non-zero value, same
 binary both sides. A trigger that only fires in the endgame cannot touch the opening or middlegame, so the
 downside is bounded.
 
 
 ### Measured: resetting the tree in the endgame loses about 40 Elo
 
-`ReuseTreeMinPieces=12` against `=0`, same binary both sides, 300 games:
+`ReuseTreeMinPieces=15` against `=0`, same binary both sides, 300 games:
 
 | | score | Elo | 95% interval |
 |---|---|---|---|
-| reset below 12 pieces | **132.5 / 300 = 44.2%** | **−41** | −69 to −13 |
+| reset below 15 pieces | **132.5 / 300 = 44.2%** | **−41** | −69 to −13 |
 
 A 35-point margin against a standard error of about 12, so this is not noise: **discarding the tree in the
 endgame costs real strength**, and the hypothesis it was built to test is refuted.
@@ -2470,6 +2470,14 @@ visits against a search of 1,537,455 simulations. Both facts hold. They are simp
 expansion work and the priors, and refresh only the **values**, so a new search can outvote an old belief.
 Decaying `N` and `W` by a factor at each root change would do that, and would have fixed both blunders
 without touching what this match says is worth 41 Elo.
+
+**The threshold that was actually tested was 15, not the 12 suggested here.** That matters for how far the
+result generalises. Measured over 13,297 real searches, a root has fewer than 15 pieces in **38.3%** of
+searches and fewer than 12 in **25.8%**, so `=15` resets about **1.5 times as often** as `=12` would — it
+reaches well into late middlegames rather than only endgames. The −41 Elo is therefore the cost of the more
+aggressive setting. A smaller threshold would fire less often and so cost less, but there is no reason in
+this data to expect it to turn *positive*: the mechanism is the same and the sign is against it at every
+piece count the scan looked at. Treat 12 as untested and unpromising rather than as refuted.
 
 **And a third strike for position scans.** The scan that motivated this — 60 positions, mean loss 57 cp with
 the tree against 50 fresh at ≤12 pieces — pointed the *wrong way*, as `BalanceShare` and `VerifyReplies` did
