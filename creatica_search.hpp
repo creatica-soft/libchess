@@ -881,6 +881,7 @@ extern bool reuse_tree;
 extern bool post_move_collect;
 extern int64_t gc_threshold;
 extern int64_t tree_reset_below;
+extern int64_t reuse_tree_min_pieces;
 extern int64_t minimax_backup;
 extern int64_t minimax_min_ev;
 void refresh_root_minimax();
