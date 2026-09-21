@@ -425,24 +425,40 @@ static void clearChallengeOutstanding() {
 //the event loop and from the challenge path. A cancel that FAILS is reported loudly, because the
 //usual reason is that the opponent accepted in the meantime -- in which case a gameStart is already
 //on its way and game_in_progress will cover us.
+//Cancel the challenge we sent, if one is still live, and clear the flag. The compare_exchange means
+//exactly one caller wins, so the POST happens once however many threads arrive here.
+//
+//A CHALLENGE MUST NOT OUTLIVE THE PROCESS. If the bot is killed with one pending, lichess keeps it,
+//the opponent accepts it minutes or hours later, and it arrives as a gameStart in some FUTURE run --
+//a game that session never asked for, landing in the middle of one it is already playing. That is
+//exactly what happened on 2026-09-21: WrGe9RLU appeared at ply 56 of 36ufjfS0, with the bot playing
+//BLACK although every challenge that session had gone out as white, because CreateChallenge()
+//alternates colours by games_started. It was a leftover from an earlier run.
+static void cancelOutstandingChallenge(const char * why) {
+    bool expected = true;
+    if (!challenge_outstanding.compare_exchange_strong(expected, false)) return;
+    std::string id;
+    { std::lock_guard<std::mutex> lk(outstanding_id_mtx); id.swap(outstanding_challenge_id); }
+    if (id.empty()) {
+        std::cerr << "cancelOutstandingChallenge(): flag was set but no id was recorded (" << why
+                  << ")" << std::endl;
+        return;
+    }
+    std::cerr << "cancelOutstandingChallenge(): cancelling our challenge " << id << " (" << why
+              << ")" << std::endl;
+    const std::string cancel_url = "https://lichess.org/api/challenge/" + id + "/cancel";
+    if (!HttpRequest("POST", cancel_url, "", nullptr, "application/json", true, -1))
+        std::cerr << "cancelOutstandingChallenge(): FAILED to cancel " << id
+                  << " -- it may still be live, so a stray game is possible later" << std::endl;
+}
+//True only while a challenge we sent is still plausibly live.
 static bool challengeStillOutstanding() {
     if (!challenge_outstanding.load()) return false;
     const long long age = nowMs() - challenge_sent_ms.load();
     if (age > CHALLENGE_OUTSTANDING_TIMEOUT_MS) {
-        bool expected = true;
-        if (challenge_outstanding.compare_exchange_strong(expected, false)) {
-            std::string id;
-            { std::lock_guard<std::mutex> lk(outstanding_id_mtx); id.swap(outstanding_challenge_id); }
-            std::cerr << "challengeStillOutstanding(): our challenge " << (id.empty() ? "(id unknown)" : id)
-                      << " has been outstanding for " << age << " ms - cancelling it on lichess"
-                      << std::endl;
-            if (!id.empty()) {
-                const std::string cancel_url = "https://lichess.org/api/challenge/" + id + "/cancel";
-                if (!HttpRequest("POST", cancel_url, "", nullptr, "application/json", true, -1))
-                    std::cerr << "challengeStillOutstanding(): FAILED to cancel " << id
-                              << " -- it may still be live, so a second game is possible" << std::endl;
-            }
-        }
+        //Cancel it rather than merely forgetting it: clearing the local flag while the challenge is
+        //still live on lichess is what let this bot believe it was idle and take a second game.
+        cancelOutstandingChallenge("stale");
         return false;
     }
     return true;
@@ -1909,6 +1925,9 @@ int main(int argc, char ** argv) {
       std::this_thread::sleep_for(std::chrono::seconds(3));
   }
   if (challenge.joinable()) challenge.join();
+  //Shutdown is the other place a challenge can outlive its purpose -- see
+  //cancelOutstandingChallenge(). curl is still initialised here; the cleanup is below.
+  cancelOutstandingChallenge("shutting down");
   quit(creatica);
   releaseChessEngine(creatica);
   for (int i = 0; i < multiPV; i++) delete evaluations[i];
