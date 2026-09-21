@@ -49,7 +49,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
 | `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0, and LEAVE IT OFF — it loses games. See *Why `VerifyReplies` backfires*.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
 | `VerifyAfter` | spin | 600 | 0–1000 | When the floor switches on, as a per-mille fraction of **this move's own time budget**. `600` = after 60% of the move's time; on a 2 s move it starts at 1.2 s and the floor has the last 0.8 s to work in. `0` would verify from the first simulation, which measurably costs the early search. |
-| `ReuseTreeMinPieces` | spin | 0 | 0–32 | **Off at 0.** Do not reuse the tree once the root has fewer than this many pieces — discard it and search the position fresh. Unlike the other two reset triggers it is **not** gated on `TreeResetOccupancy`, because the tree it targets is *wrong* rather than *full*. Fires once per root, so a ponder search and the real search after it do not reset twice. See *The inherited tree in the endgame*. |
+| `ReuseTreeMinPieces` | spin | 0 | 0–32 | **Off at 0, and LEAVE IT OFF — measured at −41 Elo over 300 games.** Do not reuse the tree once the root has fewer than this many pieces — discard it and search the position fresh. Unlike the other two reset triggers it is **not** gated on `TreeResetOccupancy`, because the tree it targets is *wrong* rather than *full*. Fires once per root, so a ponder search and the real search after it do not reset twice. See *The inherited tree in the endgame*. |
 | `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
 | `MinimaxMinEv` | spin | 32 | 1–1000000 | Evidence a grandchild needs before it may set the `MinimaxBackup` correction. The minimum of a set of noisy estimates is biased low, so without a floor one unlucky evaluation condemns a good move; at 32 a position test showed measurable harm, at 2000 and above it did not. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
@@ -2444,3 +2444,34 @@ cumulative over a game, and such scans have already mis-sold `BalanceShare` and 
 document. The test is a head-to-head at the real time control, `ReuseTreeMinPieces=0` against `=12`, same
 binary both sides. A trigger that only fires in the endgame cannot touch the opening or middlegame, so the
 downside is bounded.
+
+
+### Measured: resetting the tree in the endgame loses about 40 Elo
+
+`ReuseTreeMinPieces=12` against `=0`, same binary both sides, 300 games:
+
+| | score | Elo | 95% interval |
+|---|---|---|---|
+| reset below 12 pieces | **132.5 / 300 = 44.2%** | **−41** | −69 to −13 |
+
+A 35-point margin against a standard error of about 12, so this is not noise: **discarding the tree in the
+endgame costs real strength**, and the hypothesis it was built to test is refuted.
+
+**What it means.** The accumulated tree's *depth* is worth more than the occasional entrenched wrong value.
+Endgames are where depth matters most and where a 2–3 second search from nothing goes least far, so throwing
+the tree away each move loses more than the stale averages cost. That is consistent with the original
+`ReuseTree` measurement of about +232 Elo.
+
+**The blunders are still real.** `Gr3fzghd` 24…Kh8 and `hKCOETfO` 56…g5 are both correct 0/6 and 0/7 times
+from an empty tree and wrong with an inherited one, and in the second the losing move carried 2,255,709
+visits against a search of 1,537,455 simulations. Both facts hold. They are simply rarer than the benefit.
+
+**So the correct target is narrower than the option was.** Not *discard the tree* — keep the structure, the
+expansion work and the priors, and refresh only the **values**, so a new search can outvote an old belief.
+Decaying `N` and `W` by a factor at each root change would do that, and would have fixed both blunders
+without touching what this match says is worth 41 Elo.
+
+**And a third strike for position scans.** The scan that motivated this — 60 positions, mean loss 57 cp with
+the tree against 50 fresh at ≤12 pieces — pointed the *wrong way*, as `BalanceShare` and `VerifyReplies` did
+before it. Its n=30 buckets were explicitly reported as not significant, and they were not merely
+inconclusive but actively misleading. A position scan can explain a mechanism; it cannot rank an option.
