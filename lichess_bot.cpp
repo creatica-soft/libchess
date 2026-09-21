@@ -295,6 +295,10 @@ std::atomic<bool> challenge_outstanding {false};
 //challenging anyone, permanently and silently. This makes that failure self-heal.
 #define CHALLENGE_OUTSTANDING_TIMEOUT_MS 30000
 std::atomic<long long> challenge_sent_ms {0};
+//The id of the challenge we sent, so a stale one can be CANCELLED rather than merely forgotten.
+//See challengeStillOutstanding().
+std::mutex  outstanding_id_mtx;
+std::string outstanding_challenge_id;
 //WALL clock, in seconds. nowMs() below is a steady clock, which is right for measuring how long a
 //challenge has been outstanding and useless for comparing against a timestamp lichess sends us.
 static long long nowEpochSeconds() {
@@ -392,21 +396,53 @@ static long long nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-static void markChallengeSent() {
+//Defined further down; declared here so a stale challenge can be cancelled on lichess.
+//Defaults are supplied at the definition, which is legal and keeps this declaration short.
+bool HttpRequest(const std::string& method, const std::string& url, const std::string& postfields,
+                 std::string * response_out, const std::string& accept, bool auth_required,
+                 int max_retries_override);
+
+static void markChallengeSent(const std::string& id) {
+    { std::lock_guard<std::mutex> lk(outstanding_id_mtx); outstanding_challenge_id = id; }
     challenge_sent_ms.store(nowMs());
     challenge_outstanding.store(true);
 }
 static void clearChallengeOutstanding() {
+    { std::lock_guard<std::mutex> lk(outstanding_id_mtx); outstanding_challenge_id.clear(); }
     challenge_outstanding.store(false);
 }
 //True only while a challenge we sent is still plausibly live.
+//
+//THE STALE BRANCH MUST CANCEL, NOT JUST FORGET. It used to clear the local flag and return false,
+//which made this bot believe it was free while its challenge was still live on lichess. The
+//sequence that follows is two simultaneous games: the timeout passes, an incoming challenge is
+//accepted because the guard now says we are idle, and then the original opponent accepts as well.
+//On an 8 GB machine the second game is unplayable and is lost or aborted -- seen as two aborts 55
+//seconds apart in results_creaticachessbot.csv on 2026-09-21.
+//
+//So make the belief TRUE instead of convenient: cancel the challenge, and only then report idle.
+//The compare_exchange means exactly one thread does the cancelling even though this is called from
+//the event loop and from the challenge path. A cancel that FAILS is reported loudly, because the
+//usual reason is that the opponent accepted in the meantime -- in which case a gameStart is already
+//on its way and game_in_progress will cover us.
 static bool challengeStillOutstanding() {
     if (!challenge_outstanding.load()) return false;
     const long long age = nowMs() - challenge_sent_ms.load();
     if (age > CHALLENGE_OUTSTANDING_TIMEOUT_MS) {
-        std::cerr << "challengeStillOutstanding(): our challenge has been outstanding for "
-                  << age << " ms with no accept, decline or cancel - clearing it" << std::endl;
-        clearChallengeOutstanding();
+        bool expected = true;
+        if (challenge_outstanding.compare_exchange_strong(expected, false)) {
+            std::string id;
+            { std::lock_guard<std::mutex> lk(outstanding_id_mtx); id.swap(outstanding_challenge_id); }
+            std::cerr << "challengeStillOutstanding(): our challenge " << (id.empty() ? "(id unknown)" : id)
+                      << " has been outstanding for " << age << " ms - cancelling it on lichess"
+                      << std::endl;
+            if (!id.empty()) {
+                const std::string cancel_url = "https://lichess.org/api/challenge/" + id + "/cancel";
+                if (!HttpRequest("POST", cancel_url, "", nullptr, "application/json", true, -1))
+                    std::cerr << "challengeStillOutstanding(): FAILED to cancel " << id
+                              << " -- it may still be live, so a second game is possible" << std::endl;
+            }
+        }
         return false;
     }
     return true;
@@ -787,7 +823,7 @@ bool CreateChallenge(const std::string& opponent, bool rated, int time_sec, int 
         std::cerr << "CreateChallenge(): challengeId is empty" << std::endl;
         return false;
       }
-      markChallengeSent(); //committed until accepted, declined, cancelled or stale
+      markChallengeSent(challengeId); //committed until accepted, declined, cancelled or stale
       std::cout << "CreateChallenge(): Challenge " <<  challengeId << " sent to " << opponent << " successfully" << std::endl;      
     } else {
       std::string error;
