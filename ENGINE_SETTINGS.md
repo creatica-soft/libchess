@@ -49,6 +49,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
 | `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0, and LEAVE IT OFF — it loses games. See *Why `VerifyReplies` backfires*.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
 | `VerifyAfter` | spin | 600 | 0–1000 | When the floor switches on, as a per-mille fraction of **this move's own time budget**. `600` = after 60% of the move's time; on a 2 s move it starts at 1.2 s and the floor has the last 0.8 s to work in. `0` would verify from the first simulation, which measurably costs the early search. |
+| `ReuseTreeMinPieces` | spin | 0 | 0–32 | **Off at 0.** Do not reuse the tree once the root has fewer than this many pieces — discard it and search the position fresh. Unlike the other two reset triggers it is **not** gated on `TreeResetOccupancy`, because the tree it targets is *wrong* rather than *full*. Fires once per root, so a ponder search and the real search after it do not reset twice. See *The inherited tree in the endgame*. |
 | `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
 | `MinimaxMinEv` | spin | 32 | 1–1000000 | Evidence a grandchild needs before it may set the `MinimaxBackup` correction. The minimum of a set of noisy estimates is biased low, so without a floor one unlucky evaluation condemns a good move; at 32 a position test showed measurable harm, at 2000 and above it did not. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
@@ -2385,3 +2386,61 @@ for this search. It would need a **min over the verified replies** rather than t
 different opponents, a denominator that grows when the engine does not blunder, and a threshold metric that
 cannot see slow drift. It should not have been read as evidence for the option. The twelve-run controlled
 replay above is what a test of it actually looks like.
+
+
+## The inherited tree in the endgame
+
+Four blunders were examined from lichess games, and replaying each from an **empty tree** at the game's own
+clock splits them into two different failures:
+
+| game | move | loses | from an empty tree | in the game |
+|---|---|---|---|---|
+| `Gr3fzghd` | 24…Kh8 | 670 cp | **0/6** — always correct | blundered |
+| `hKCOETfO` | 56…g5 | 618 cp | **0/7** — correct even at 20 s | blundered |
+| `UU5b1QSz` | 13.Nxd5 | 218 cp | 4/6 — usually blunders | blundered |
+| `A5rTtcRP` | 18…Rd5 | 254 cp | 6/6 — always blunders | blundered |
+
+The bottom two are evaluation failures: the position is misjudged with a clean tree and plenty of time. The
+top two are not — the engine finds the right move every time from scratch and only fails with a large
+inherited tree.
+
+`hKCOETfO` 56…g5 shows the mechanism. A dead-drawn rook endgame (Stockfish gives its top five moves 0.00);
+`g5` is −618. The engine's record:
+
+    visits 2,255,709   engine cp -10   stale cp -259
+    1,537,455 simulations, tree 10,019,621 nodes, 594 permille
+
+**More visits on that one move than the whole search performed**, so most were inherited from earlier
+searches where `g5` was a sideline. The node's own one-ply value was −259, roughly right; its accumulated
+mean was −10. A mean with two million samples cannot be outvoted by one search, so the correct assessment
+the node was born with is averaged away permanently. Note the occupancy: 594 per mille, nowhere near the
+950 the other reset triggers require, which is why this one ignores occupancy.
+
+It also explains why every visit-allocation option has failed to help here. `BalanceShare`, `MinimaxBackup`
+and `VerifyReplies` all act on *this* search's visits; none can touch a value that arrived with two million
+inherited ones already in it. The `RepetitionGuard` filter's own source comment describes the same root
+cause reaching it from a different direction — ranking by a lifetime `N` that nothing resets.
+
+**Ruled out:** repetition avoidance. Across all four games the filter fired four times in total, every one
+of them on a *ponder* search with the opponent to move, and never on a move actually played.
+
+**Measured support, directional only.** Over 60 real game positions where a substantial tree had been
+inherited (`hashfull` > 300), each position's played move compared with the same position searched fresh,
+Stockfish scoring both:
+
+| bucket | n | same move | mean loss with tree | mean loss fresh |
+|---|---|---|---|---|
+| endgame ≤12 pieces | 30 | 12/30 | **57 cp** | **50 cp** |
+| middlegame ≥17 pieces | 30 | 21/30 | **9 cp** | **14 cp** |
+
+The sign matches the hypothesis in both buckets — reuse slightly worse in endgames, slightly better in
+middlegames — and **neither difference is significant at n = 30**. Two things in that table are clear
+regardless: the engine is about six times worse in endgames than middlegames whatever the tree does, and
+reuse changes the endgame move 60% of the time against 30% in the middlegame. A mechanism with that much
+leverage, in the phase where the engine is six times weaker, is worth testing properly.
+
+**So this is an option to be matched, not a default.** A position scan cannot settle it — the effect is
+cumulative over a game, and such scans have already mis-sold `BalanceShare` and `VerifyReplies` in this
+document. The test is a head-to-head at the real time control, `ReuseTreeMinPieces=0` against `=12`, same
+binary both sides. A trigger that only fires in the endgame cannot touch the opening or middlegame, so the
+downside is bounded.

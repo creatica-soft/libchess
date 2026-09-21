@@ -252,6 +252,35 @@ int64_t       balance_depth = 1000;
 //Safe only because of the write barrier; see mark_barrier(). Off by default.
 bool          collect_during_ponder = false;
 int64_t       tree_reset_occupancy = 950;
+//ENDGAME RESET (ReuseTreeMinPieces, 0 = off). Do not reuse the tree at all once the root has fewer
+//than this many pieces: discard it and search the position fresh.
+//
+//Why a separate trigger rather than a tighter TreeResetBelow. The two existing triggers both require
+//the tree to be nearly full (TreeResetOccupancy, 950 per mille) because they are about a tree that
+//has stopped being useful. This one is about a tree that is actively WRONG, and that happens at any
+//occupancy: in lichess hKCOETfO the tree was at 594 per mille when the engine played 56...g5 into a
+//lost rook endgame from a dead draw. That move carried 2,255,709 visits while the search itself ran
+//only 1,537,455 simulations, so most of its visits were inherited from earlier searches, where it
+//had been a sideline; its averaged value was -10 centipawns against a true -618, while the node's
+//own one-ply value said -259. From an EMPTY tree the same engine plays a drawing move 7 times out
+//of 7 at the same clock, and at 20 seconds. The evaluation is adequate; the inherited average is
+//not, and with two million samples a fresh search cannot outvote it.
+//
+//Cheap, as the note on TreeResetHollow already records: a fresh search runs about 1.8 times as fast
+//with ten pieces or fewer as on a full board, so the position is re-derived at a discount.
+//
+//Measured support is directional only: over 60 real game positions with a substantial tree
+//inherited, the move played with the tree lost a mean 57 centipawns at 12 pieces or fewer against
+//50 for the same position searched fresh, and 9 against 14 at 17 pieces or more. The sign matches
+//in both buckets and neither difference is significant at that sample size, which is why this is an
+//option to be matched rather than a default.
+int64_t       reuse_tree_min_pieces = 0;
+//The root this trigger last fired on. Without it the reset would fire again for the REAL search
+//after firing for the ponder search on the same position, and pondering in the endgame would be
+//pure waste -- see the note on ReuseTree, which records that pondering REQUIRES reuse. Firing once
+//per root means the ponder search rebuilds the position fresh and the real search then inherits
+//that one move's work, which is the whole point: discard the accumulation, keep this move's search.
+uint64_t      last_endgame_reset_root = 0;
 //TreeResetHollow: also reset when the PREVIOUS search was at least this many per-mille hollow -- the tree
 //was frozen, whatever the new root inherited. 0 = off. See the reset in runMCTS().
 int64_t       tree_reset_hollow = 0;
@@ -3064,12 +3093,21 @@ void runMCTS(NNUEContext& ctx) {
       //or more in 5 against 7 -- a reset in a frozen tree costs nothing measurable. Fewer pieces make it
       //cheaper still: a fresh search runs about 1.8 times as fast with ten pieces or fewer as on a full board.
       const int last_hollow = last_search_hollow_permille.load(std::memory_order_relaxed);
-      if ((tree_reset_below > 0 || tree_reset_hollow > 0) && search.root) {
+      if ((tree_reset_below > 0 || tree_reset_hollow > 0 || reuse_tree_min_pieces > 0) && search.root) {
         const int      occ       = tree_occupancy();
         const uint64_t inherited = search.root->evidence.load(std::memory_order_relaxed);
         const bool starved = tree_reset_below > 0 && inherited < (uint64_t)tree_reset_below;
         const bool frozen  = tree_reset_hollow > 0 && last_hollow >= tree_reset_hollow;
-        if (occ >= tree_reset_occupancy && (starved || frozen)) {
+        //See ReuseTreeMinPieces. NOT gated on occupancy: the tree this trigger is aimed at is wrong
+        //rather than full. Once per root, so a ponder search and the real search that follows it on
+        //the same position do not reset twice and throw the pondering away.
+        const int root_pieces = bitCount(board.side[ColorWhite] | board.side[ColorBlack]);
+        const uint64_t root_hash = search.root->hash.load(std::memory_order_relaxed);
+        const bool endgame = reuse_tree_min_pieces > 0
+                          && root_pieces < (int)reuse_tree_min_pieces
+                          && root_hash != last_endgame_reset_root;
+        if (endgame || (occ >= tree_reset_occupancy && (starved || frozen))) {
+          if (endgame) last_endgame_reset_root = root_hash;
           //NEVER BESIDE A BACKGROUND COLLECTION. The reset retires the whole tree, so running it while a
           //mark is walking that same tree puts two collectors on it: in a lichess game with
           //CollectDuringPonder on, a reset fired while a post-move collection was still marking, and a
@@ -3091,7 +3129,7 @@ void runMCTS(NNUEContext& ctx) {
           log_file("info string tree reset (%s): root inherited %llu informed simulations (TreeResetBelow %lld), "
                    "previous search %d permille hollow (TreeResetHollow %lld), tree at %d permille "
                    "(TreeResetOccupancy %lld); retired %zu nodes, now %d permille\n",
-                   starved && frozen ? "starved and frozen" : starved ? "starved" : "frozen",
+                   endgame ? "endgame" : starved && frozen ? "starved and frozen" : starved ? "starved" : "frozen",
                    (unsigned long long)inherited, (long long)tree_reset_below, last_hollow,
                    (long long)tree_reset_hollow, occ, (long long)tree_reset_occupancy, before, tree_occupancy());
         }

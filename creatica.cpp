@@ -63,6 +63,7 @@ extern bool      reuse_tree;
 extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 extern int64_t   tree_reset_below;
+extern int64_t   reuse_tree_min_pieces;
 extern int64_t   minimax_backup;
 extern int64_t   minimax_min_ev;
 extern int64_t   verify_replies;
@@ -537,6 +538,10 @@ public:
         // Weight, per mille, of the two-ply minimax correction blended into a ROOT child's value:
         // Q_eff = (1-lambda)*mean + lambda*(opponent's best reply). 0 is off and reproduces the
         // plain mean exactly. See the long note at minimax_backup in creatica_search.cpp.
+        // Do not reuse the tree once the root has fewer than this many pieces: discard it and
+        // search fresh. 0 is off. Not gated on occupancy, and fires once per root so a ponder
+        // search and the real search after it do not reset twice. See reuse_tree_min_pieces.
+        o.spin("ReuseTreeMinPieces", &reuse_tree_min_pieces,  0,   0,   32);
         o.spin("MinimaxBackup",      &minimax_backup,       0,   0, 1000);
         // Evidence a grandchild needs before it may set the correction. Guards against a single
         // noisy evaluation condemning a good move.
