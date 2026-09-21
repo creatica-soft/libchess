@@ -47,7 +47,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. Use 900: see *Which reset threshold*. |
 | `CollectDuringPonder` | check | false | — | Run the collection beside the ponder search instead of inline before every search. Safe because of the mark's write barrier. See *The mark beside the search*. |
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
-| `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
+| `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0, and LEAVE IT OFF — it loses games. See *Why `VerifyReplies` backfires*.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
 | `VerifyAfter` | spin | 600 | 0–1000 | When the floor switches on, as a per-mille fraction of **this move's own time budget**. `600` = after 60% of the move's time; on a 2 s move it starts at 1.2 s and the floor has the last 0.8 s to work in. `0` would verify from the first simulation, which measurably costs the early search. |
 | `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
 | `MinimaxMinEv` | spin | 32 | 1–1000000 | Evidence a grandchild needs before it may set the `MinimaxBackup` correction. The minimum of a set of noisy estimates is biased low, so without a floor one unlucky evaluation condemns a good move; at 32 a position test showed measurable harm, at 2000 and above it did not. |
@@ -2354,3 +2354,34 @@ known blunders, `Kh8` sits at 501 and would fire, while `Nxd5` sits at 198 and w
 
 Untested as code. The obvious experiment is to gate `VerifyReplies` on the disagreement, which would let the
 floor be raised a long way while being paid for only where the engine is far more likely to be wrong.
+
+
+## Why `VerifyReplies` backfires
+
+Measured on lichess `A5rTtcRP`, move 19: Black played `exd4` into `20.Qe8+ Rxe8 21.Rxe8#`, a forced mate in
+two. Replayed from an empty tree, 3 s a move, `Hash` 2048, 4 threads, twelve runs per setting:
+
+| setting | walked into the mate |
+|---|---|
+| `VerifyReplies 0` | **0 / 12** |
+| `VerifyReplies 500`, `VerifyAfter 600` | **4 / 12** |
+| `VerifyReplies 2000`, `VerifyAfter 200` | **12 / 12** |
+
+A clean dose-response, in the direction opposite to the option's purpose. It does not merely fail to find
+the refutation; **it causes the blunder.**
+
+**Why, and it follows directly from the compression result.** `Q` is a *mean*. The floor forces evidence onto
+*every* reply to the move the engine is about to play — here about forty answers to `exd4`, of which one
+(`Qe8+`) refutes it and the rest are mediocre for White. Averaging thirty-nine mediocre replies into the
+move's value pulls it **up**. The single refutation the floor exists to find is outvoted by the siblings it
+was found among, and the harder the floor is driven the more thoroughly the losing move is whitewashed.
+
+So the option's premise is sound — spend evidence where a refutation would be — and its arithmetic is wrong
+for this search. It would need a **min over the verified replies** rather than their mean: exactly what
+`MinimaxBackup` computes. Verifying and then averaging is worse than not verifying at all.
+
+**This also invalidates an earlier claim in this document.** A blunder-rate scan that reported 1 blunder in
+187 balanced moves with `VerifyReplies` on, against 6 in 101 with it off, was confounded — different games,
+different opponents, a denominator that grows when the engine does not blunder, and a threshold metric that
+cannot see slow drift. It should not have been read as evidence for the option. The twelve-run controlled
+replay above is what a test of it actually looks like.
