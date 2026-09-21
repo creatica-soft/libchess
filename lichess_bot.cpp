@@ -1533,6 +1533,38 @@ void ProcessEvent(const json& event) {
         //Tag the visit records with this game, so a dataset row can be joined to the result the
         //gameFinish handler writes. Without it the dump is usable for policy training but not for
         //anything that needs the outcome -- calibrating the value mapping, for instance.
+        //A SECOND GAME WHILE ONE IS ALREADY BEING PLAYED.
+        //
+        //This test has to come FIRST, before the GameTag option and before current_game_id is
+        //touched. It used to fall through: current_game_id was overwritten with the new game's id
+        //while the old game was still running, so the bot forgot which game it was actually
+        //playing. Observed on 2026-09-21 -- the bot was at ply 64 of 36ufjfS0, started TrGlDOtQ,
+        //played TrGlDOtQ from move 0 and abandoned 36ufjfS0, which could only be resumed by
+        //killing and restarting the bot.
+        //
+        //One game at a time is a hard limit here: an 8 GB machine cannot run two searches, so a
+        //second game is lost or aborted whatever we do. Aborting it immediately is the honest
+        //response -- it frees the opponent straight away instead of making them wait out a clock.
+        //Abort works while the game has barely started; if it has moves, resign instead.
+        std::string ongoing_other;
+        {
+            //Decide under the lock, act outside it: the calls below go to the network and must not
+            //hold a mutex that the game thread also wants.
+            std::lock_guard<std::mutex> lk(mutex);
+            if (game_in_progress.load() && !current_game_id.empty() && game_id != current_game_id)
+                ongoing_other = current_game_id;
+        }
+        if (!ongoing_other.empty()) {
+            std::cerr << "ProcessEvent() warning: game " << game_id << " started while "
+                      << ongoing_other << " is still being played - abandoning the NEW one"
+                      << std::endl;
+            const std::string base = "https://lichess.org/api/bot/game/" + game_id;
+            if (!HttpRequest("POST", base + "/abort", "", nullptr, "", true, -1) &&
+                !HttpRequest("POST", base + "/resign", "", nullptr, "", true, -1))
+                std::cerr << "ProcessEvent() error: could neither abort nor resign " << game_id
+                          << std::endl;
+            return;
+        }
         if (!visits_path.empty()) {
           std::string tag = game_id;
           setOption(creatica, "GameTag", String, (void *)tag.c_str());
@@ -1568,6 +1600,22 @@ void ProcessEvent(const json& event) {
     } else if (event.contains("type") && event["type"] == "gameFinish") {
         std::string game_id = event["game"]["gameId"];
         std::cout << "ProcessEvent() debug: game " << game_id << " (" << event["game"]["fullId"] << ") finished with " << event["game"]["status"]["name"] << std::endl;
+        //ONLY THE GAME WE ARE PLAYING MAY CLEAR THE BUSY FLAG.
+        //
+        //game_in_progress is one boolean with no game identity, so a gameFinish for ANY game used
+        //to clear it. That is what turned a single stray game into a cascade: the spare game was
+        //aborted, its gameFinish freed the bot while the real game was still running, the bot
+        //challenged someone else, and the next spare game arrived. It also wrote a 0.5 into the
+        //results file for a game that was never played, quietly corrupting the score.
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            if (!current_game_id.empty() && game_id != current_game_id) {
+                std::cerr << "ProcessEvent() warning: gameFinish for " << game_id
+                          << ", which is not the game being played (" << current_game_id
+                          << ") - leaving the busy flag alone and recording no result" << std::endl;
+                return;
+            }
+        }
         //Record the result to a file. Printing it to stdout leaves an overnight experiment as
         //terminal scrollback, and casual games do not move a rating either, so without this
         //there is nowhere a score actually accumulates.
