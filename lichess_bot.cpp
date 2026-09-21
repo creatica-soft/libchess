@@ -1486,8 +1486,46 @@ void ProcessEvent(const json& event) {
             //are handled by the same path.
             const bool variant_ok = (variant == "standard" || variant == "fromPosition" || variant == bot_variant);
             const bool rated_ok = (!accept_rated_only || rated);
+            //THE RATING BAND APPLIES TO INCOMING CHALLENGES TOO. CREATICA_MIN_ELO/MAX_ELO used to
+            //gate only the opponents this bot picks to challenge, so it challenged inside the band
+            //but played anyone who asked -- which is the opposite of what setting a band means.
+            //
+            //Exemptions: the sibling account, so the two bots can still be paired, and anyone named
+            //by --accept-only=, which is a stronger statement of intent than the band. A challenge
+            //carrying NO rating is accepted rather than refused, so that a renamed or missing field
+            //cannot silently take the bot off the board.
+            //
+            //Re-applied after a revert. It was suspected of causing the double-game failure of
+            //2026-09-21; inspection found no mechanism -- it only adds a conjunct to an && chain,
+            //which cannot accept MORE -- but inspection had already been wrong three times, so it
+            //comes back with the decision log below rather than on the strength of that argument.
+            const int challenger_rating = event["challenge"]["challenger"].value("rating", 0);
+            const bool rating_ok = challenger_rating <= 0
+                                || challenger_id == "creaticachessbot2"
+                                || (!accept_only.empty() && accept_only.count(challenger_id) > 0)
+                                || (challenger_rating > min_elo && challenger_rating < max_elo);
+            //ONE LINE, BUILT THEN WRITTEN ONCE. Several threads write to stdout with no mutex, so a
+            //chain of << from here interleaves with the game thread and curl's own output -- the
+            //2026-09-21 log has response bodies spliced into the middle of other lines, which is
+            //why "the line is not there" could not be trusted as evidence. A single write is not a
+            //lock, but it is one syscall and it does not fragment.
+            //
+            //It records every input to the decision, so a challenge accepted or refused for the
+            //wrong reason can be read off directly instead of inferred. challenge_outstanding is
+            //read raw rather than through challengeStillOutstanding(), which can cancel on lichess.
+            {
+                std::ostringstream d;
+                d << "ProcessEvent() decision: challenge " << challenge_id << " from "
+                  << challenger_id << " rating " << challenger_rating
+                  << " | in_game=" << game_in_progress.load()
+                  << " outstanding=" << challenge_outstanding.load()
+                  << " variant=" << variant_ok << " rated=" << rated_ok
+                  << " rating=" << rating_ok << " speed=" << speedAllowed(speed)
+                  << " allowed=" << challengerAllowed(challenger_id) << "\n";
+                std::cout << d.str() << std::flush;
+            }
             if ((!game_in_progress.load() && !challengeStillOutstanding() && variant_ok) &&
-                rated_ok && speedAllowed(speed) && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
+                rated_ok && rating_ok && speedAllowed(speed) && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -1502,6 +1540,9 @@ void ProcessEvent(const json& event) {
                 else if (!speedAllowed(speed)) reason += "timeControl";
                 //lichess's own decline reason for "I only play rated", so the challenger is told why.
                 else if (!rated_ok) reason += "casual";
+                //lichess has no decline reason for "outside my rating band", so it goes out as
+                //generic; the decision line above already recorded the rating and the band.
+                else if (!rating_ok) reason += "generic";
                 else reason += "generic";
                 if (HttpRequest("POST", decline_url, reason)) {
                     std::cout << "ProcessEvent() debug: challenge declined successfully with " << reason << std::endl;
@@ -1795,8 +1836,11 @@ int main(int argc, char ** argv) {
         "                              line's BIAS but cannot make it informative: a +300cp\n"
         "                              opening is two games decided before either engine thinks.\n"
         "                              Regenerate the cp column with tools_evalbook.py.\n"
-        "  CREATICA_MIN_ELO  %-10s\\ rating band for picking a RANDOM opponent; ignored\n"
-        "  CREATICA_MAX_ELO  %-10s/ when --challenge= names one.\n"
+        "  CREATICA_MIN_ELO  %-10s\\ rating band, exclusive at both ends. Applies BOTH to picking\n"
+        "  CREATICA_MAX_ELO  %-10s/ a random opponent and to accepting incoming challenges.\n"
+        "                              Ignored when --challenge= names an opponent, for anyone named\n"
+        "                              by --accept-only=, and for the sibling bot account. A challenge\n"
+        "                              carrying no rating is accepted.\n"
         "\n"
         "OUTPUT\n"
         "  CREATICA_RESULTS  (results_<username>.csv)\n"
