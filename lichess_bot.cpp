@@ -1434,8 +1434,34 @@ void ProcessEvent(const json& event) {
             //are handled by the same path.
             const bool variant_ok = (variant == "standard" || variant == "fromPosition" || variant == bot_variant);
             const bool rated_ok = (!accept_rated_only || rated);
+            //THE RATING BAND APPLIES TO INCOMING CHALLENGES TOO.
+            //
+            //CREATICA_MIN_ELO/MAX_ELO used to gate only the opponents this bot picks to challenge
+            //(see the bot-list filter above). Incoming challenges skipped the test entirely, so the
+            //bot happily played anyone who asked -- which is the opposite of what setting a band
+            //means, and it quietly biases the rating: every game outside the band still counts.
+            //
+            //Two exemptions, both deliberate. An explicit --accept-only= list is a stronger
+            //statement of intent than the band, so a named challenger is always allowed; and the
+            //sibling account is exempt exactly as it is for outgoing challenges, so the two bots
+            //can still be paired.
+            //
+            //A missing rating is ACCEPTED rather than refused. If lichess ever stops sending the
+            //field, or sends it under another name, refusing by default would silently decline
+            //every challenge and take the bot off the board; accepting keeps it playing and the
+            //log line below makes the situation visible.
+            const int challenger_rating = event["challenge"]["challenger"].value("rating", 0);
+            const bool named_explicitly = !accept_only.empty() && accept_only.count(challenger_id) > 0;
+            const bool rating_known = challenger_rating > 0;
+            const bool rating_ok = !rating_known || named_explicitly ||
+                                   challenger_id == "creaticachessbot2" ||
+                                   (challenger_rating > min_elo && challenger_rating < max_elo);
+            if (!rating_known)
+                std::cout << "ProcessEvent() warning: challenge from " << challenger_id
+                          << " carries no rating; accepting without the " << min_elo << "-" << max_elo
+                          << " band" << std::endl;
             if ((!game_in_progress.load() && !challengeStillOutstanding() && variant_ok) &&
-                rated_ok && speedAllowed(speed) && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
+                rated_ok && rating_ok && speedAllowed(speed) && challengerAllowed(challenger_id) /*&& title != "BOT"*/) {
                 std::string accept_url = "https://lichess.org/api/challenge/" + challenge_id + "/accept";
                 if (HttpRequest("POST", accept_url)) {
                     std::cout << "ProcessEvent() debug: challenge accepted successfully" << std::endl;
@@ -1450,6 +1476,13 @@ void ProcessEvent(const json& event) {
                 else if (!speedAllowed(speed)) reason += "timeControl";
                 //lichess's own decline reason for "I only play rated", so the challenger is told why.
                 else if (!rated_ok) reason += "casual";
+                //lichess has no decline reason for "outside my rating band", so this is generic --
+                //but the log line says which rating was refused and against what band.
+                else if (!rating_ok) {
+                    reason += "generic";
+                    std::cout << "ProcessEvent() debug: declining " << challenger_id << " rated "
+                              << challenger_rating << ", outside " << min_elo << "-" << max_elo << std::endl;
+                }
                 else reason += "generic";
                 if (HttpRequest("POST", decline_url, reason)) {
                     std::cout << "ProcessEvent() debug: challenge declined successfully with " << reason << std::endl;
@@ -1695,8 +1728,11 @@ int main(int argc, char ** argv) {
         "                              line's BIAS but cannot make it informative: a +300cp\n"
         "                              opening is two games decided before either engine thinks.\n"
         "                              Regenerate the cp column with tools_evalbook.py.\n"
-        "  CREATICA_MIN_ELO  %-10s\\ rating band for picking a RANDOM opponent; ignored\n"
-        "  CREATICA_MAX_ELO  %-10s/ when --challenge= names one.\n"
+        "  CREATICA_MIN_ELO  %-10s\\ rating band, exclusive at both ends. Applies BOTH to picking\n"
+        "  CREATICA_MAX_ELO  %-10s/ a random opponent and to accepting incoming challenges.\n"
+        "                              Ignored when --challenge= names an opponent, for anyone named\n"
+        "                              by --accept-only=, and for the sibling bot account. A challenge\n"
+        "                              carrying no rating is accepted, with a warning.\n"
         "\n"
         "OUTPUT\n"
         "  CREATICA_RESULTS  (results_<username>.csv)\n"
