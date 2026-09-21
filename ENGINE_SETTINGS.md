@@ -47,8 +47,8 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. Use 900: see *Which reset threshold*. |
 | `CollectDuringPonder` | check | false | — | Run the collection beside the ponder search instead of inline before every search. Safe because of the mark's write barrier. See *The mark beside the search*. |
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
-| `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0.** Evidence every reply to the root's most-visited move must have before the search may ignore it. Aimed at a refutation that starts with a sacrifice, which PUCT starves after its first few visits. |
-| `VerifyAfter` | spin | 600 | 0–1000 | Per-mille of the search's own time after which `VerifyReplies` starts. Verifying from the first simulation costs the early search. |
+| `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
+| `VerifyAfter` | spin | 600 | 0–1000 | When the floor switches on, as a per-mille fraction of **this move's own time budget**. `600` = after 60% of the move's time; on a 2 s move it starts at 1.2 s and the floor has the last 0.8 s to work in. `0` would verify from the first simulation, which measurably costs the early search. |
 | `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
 | `MinimaxMinEv` | spin | 32 | 1–1000000 | Evidence a grandchild needs before it may set the `MinimaxBackup` correction. The minimum of a set of noisy estimates is biased low, so without a floor one unlucky evaluation condemns a good move; at 32 a position test showed measurable harm, at 2000 and above it did not. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
@@ -1500,11 +1500,13 @@ value gap of about 0.93 with a 1% prior, the exploration term sustains about 6 v
 and about 17 at C = 4, where 500 are needed.
 
 **Two rules were built and measured on the mistakes test set** (139 positions, 8 s each from an empty
-tree, `Hash` 2048, 4 threads, `pisp2`):
+tree, `Hash` 2048, 4 threads, `pisp2`). Each cell is **how many of the 139 positions were solved by that
+time**, so the numbers grow left to right along a row; the last column is the median number of simulations
+a position took.
 
-| solved | within 1 s | 2 s | 4 s | 8 s | median simulations |
+| setting | solved ≤1 s | ≤2 s | ≤4 s | ≤8 s | median sims |
 |---|---|---|---|---|---|
-| neither rule | 45 | 48 | 54 | 61 | 2.63 M |
+| neither rule (the plain engine) | 45 | 48 | 54 | 61 | 2.63 M |
 | `VerifyReplies 500` from the start | 43 | 50 | 58 | 66 | 2.44 M |
 | `VerifyReplies 2000` from the start | 31 | 41 | 54 | 66 | 2.29 M |
 | `VerifyReplies 500`, `VerifyAfter 600` | 49 | 53 | 60 | 66 | 2.44 M |
@@ -1512,6 +1514,44 @@ tree, `Hash` 2048, 4 threads, `pisp2`):
 
 `BalanceShare 900` gained 32 positions and lost 12 against the plain engine, which is the only margin here
 beyond churn. At a game-like 2 s a position it solves 68 against 58, gaining 22 and losing 12.
+
+### Reading `VerifyReplies` and `VerifyAfter`
+
+The two numbers answer different questions: **how much** extra looking, and **when**.
+
+**What "evidence" counts.** Not visits. `N` counts every time a simulation arrives at a node, including
+arrivals that learned nothing — when the tree is full a simulation cannot expand, so it re-backs-up a value
+already counted. `evidence` counts only the simulations that actually reached a fresh evaluation. So
+`VerifyReplies 500` means *500 informed simulations*, not 500 arrivals, and a reply cannot satisfy the floor
+by being bounced off a full tree five hundred times.
+
+**Where the floor is applied.** Exactly one node per simulation. While descending, the root reports which
+child currently has the most visits — the move the engine would play if the search stopped now. One level
+below *that child only*, every one of the opponent's replies must reach the floor before PUCT may ignore it.
+Replies to moves the engine is not about to play are untouched, and no move anywhere is ever skipped: the
+floor only ever *adds* visits.
+
+**Worked example**, from the position that lost a queen in `Gr3fzghd`. The engine is about to play `Kh8`,
+which has 49 legal White replies, one of which is the refutation `Qxf8+`. With `VerifyReplies 500` the cost
+is at most 49 × 500 ≈ **24,500 simulations** — about 3% of that search's 845,430 — and every one of them is
+spent on an answer to the move actually being played.
+
+**Why `VerifyAfter` exists.** Running the floor from the first simulation spends it while the engine is
+still working out which moves are worth anything, and that measurably hurts: 43 positions solved within a
+second against 45 for the plain engine, and 31 at `VerifyReplies 2000`. Starting at 60% leaves the opening
+of the search exactly as it was and spends the tail confirming whichever move won — 49 within a second
+against 45, and better at every later time too. That is why the default pairing is `500` with `600`, and it
+is the only configuration in the table that beats the plain engine in all four columns.
+
+**What the measured cost turned out to be in real games.** Nothing. Across four lichess games at 120+2 the
+median simulations per search was 862,906 with the floor on against 845,346 without — slightly *up*. The
+likely reason is tree reuse: the replies to the leading move usually arrive with evidence already inherited
+from earlier searches, so the floor is already satisfied and never fires.
+
+**What it has not been shown to do.** It has never been demonstrated to change a specific blunder. From an
+empty tree the engine already solves the `Gr3fzghd` position 6 times out of 6 at 2 s with the floor off, so
+that position can only detect harm, not benefit; reproducing the real failure needed the game's 12.9-million
+node tree, which cannot be reconstructed from a move list.
 
 **What the cap costs.** It converts depth into breadth: each simulation expands more, so fewer run. On a
 middlegame position at 12 s, `Hash` 2048:
@@ -2279,3 +2319,38 @@ with 26 of 59 configurations installed, WDL only:
 
 The miss count is the better guide to what to download next than any offline frequency list: it counts what
 the *search* actually wanted, not what the game happened to reach.
+
+### Is the one-ply value better than the search's average?
+
+`node->cp` is the one-ply minimax plus quiescence written when a node is expanded; `Q` is the mean of every
+leaf the subtree has visited. Two blunders showed `cp` far closer to the truth than `Q` — `Gr3fzghd` 24...Kh8
+(`Q -13`, `cp -514`, truth −652) and `UU5b1QSz` 13.Nxd5 (`Q +23`, `cp -175`, truth −232) — which raised the
+question of whether the backup should shrink toward `cp`.
+
+**It should not.** Over 802 played moves from 140 games, with Stockfish as judge:
+
+| \|Q − cp\| | n | median \|Q − truth\| | median \|cp − truth\| | Q wrong by ≥150 cp |
+|---|---|---|---|---|
+| 0–50 | 343 | 16 | 23 | 6% |
+| 50–150 | 243 | 29 | 106 | 9% |
+| 150–300 | 128 | 31 | 215 | 9% |
+| 300–500 | 53 | 46 | 397 | 11% |
+| **500+** | **35** | **612** | 463 | **63%** |
+
+`Q` beats `cp` in every band but the last, and over a separate 300-position sample taken at the root its
+median error was 20.5 cp against 67.5. Averaging earns its keep; blending `cp` into the backup would lose
+more than it gains, almost everywhere.
+
+**But the disagreement is a detector.** Past 500 centipawns of disagreement, `Q`'s median error jumps from
+about 25 cp to 612 and it is badly wrong 63% of the time, against a 6–9% base rate — roughly sevenfold
+enrichment, for one comparison between two numbers already stored on the node. It is a cliff, not a
+gradient: the 300–500 band is still fine.
+
+Two limits worth stating. In the 500+ band `cp` is bad too (median error 463), so when the two disagree
+violently **neither number knows anything** and the right response is more search in that subtree, not
+substituting one value for the other — which argues for using the signal to allocate search, as
+`VerifyReplies` does, rather than to correct a value. And it catches only the catastrophic cases: of the two
+known blunders, `Kh8` sits at 501 and would fire, while `Nxd5` sits at 198 and would not.
+
+Untested as code. The obvious experiment is to gate `VerifyReplies` on the disagreement, which would let the
+floor be raised a long way while being paid for only where the engine is far more likely to be wrong.
