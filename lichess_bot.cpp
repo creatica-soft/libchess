@@ -635,8 +635,23 @@ size_t WriteCallback(void * contents, size_t size, size_t nmemb, void * userp) {
     std::string data((char *)contents, size * nmemb);
     //std::cout << "WriteCallback() debug: received chunk: " << data << std::endl;
     size_t pos = 0;
-    //ndjson - new line delimited json
-    while ((pos = data.find('\n', pos)) != std::string::npos) {
+    //ndjson - new line delimited json.
+    //
+    //SEARCH FROM 0 EVERY TIME. This used to resume the search at the PREVIOUS newline's offset
+    //(find('\n', pos)) while also erasing that prefix from `data`, so after the first line the
+    //offset pointed into the wrong place in a now-shorter string. Two lines arriving in one
+    //callback -- which is the normal case, since lichess emits a chatLine and a gameState together
+    //when a draw is offered -- came out either MERGED or DROPPED:
+    //
+    //  "AAAA\nBB\nCCC\n"  ->  "AAAA", then substr(0,6) = "BB\nCCC", two objects in one string
+    //  "AAAA\nBB\n"       ->  "AAAA", then find from 4 past the end, and "BB" is lost entirely
+    //
+    //The merged case is the JSON parse error seen in the log ("unexpected '{'; expected end of
+    //input" on a chatLine); the dropped case is silent. Either way the gameState in that buffer
+    //never reaches process_line(), so the bot acts on a stale position -- it re-sent a move lichess
+    //already had and spent 26 seconds of its clock retrying it -- and never sees wdraw/bdraw, so an
+    //opponent's draw offer goes unanswered.
+    while ((pos = data.find('\n')) != std::string::npos) {
         std::string line = state->partial_line + data.substr(0, pos); //complete the line with a chunk that is terminated with '\n'
         data.erase(0, pos + 1); //delete this chunk once it is consumed
         state->partial_line.clear(); //empty partial_line
@@ -1301,8 +1316,21 @@ try_again:  if (go(creatica, evaluations)) {
             const auto      started  = std::chrono::steady_clock::now();
             bool delivered = false;
             for (int attempt = 1; ; ++attempt) {
-                delivered = HttpRequest("POST", move_url, "", nullptr, "", true, /*max_retries=*/0);
+                std::string reply;
+                delivered = HttpRequest("POST", move_url, "", &reply, "", true, /*max_retries=*/0);
                 if (delivered) break;
+                //A REJECTION IS NOT A DELIVERY FAILURE. Retrying is for the case where the request
+                //never arrived; when lichess answers that the move is illegal or that it is not our
+                //turn, it arrived and was refused, and every further attempt is spent clock. Seen in
+                //game 7CNMltIv: a stale gameState made the bot re-send a move lichess already had,
+                //and it retried eleven times over 26 seconds before giving up.
+                if (reply.find("Not your turn") != std::string::npos ||
+                    reply.find("cannot move to") != std::string::npos ||
+                    reply.find("game already over") != std::string::npos) {
+                    std::cerr << "ComputeAndPostMove(): lichess refused " << new_move << " -- "
+                              << reply << "; not retrying" << std::endl;
+                    break;
+                }
                 if (!game_in_progress.load() || gameStateStatus.load() >= aborted) {
                     std::cerr << "ComputeAndPostMove(): giving up on " << new_move
                               << " -- the game is over" << std::endl;
