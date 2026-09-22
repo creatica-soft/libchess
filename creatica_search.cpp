@@ -1513,6 +1513,48 @@ void set_root(NNUEContext& ctx) {
     root->evidence.store(1, std::memory_order_relaxed);
   }
 
+  //THE ROOT MUST HAVE CHILDREN, AND ONE RETRY IS ALLOWED TO GET THEM.
+  //
+  //Everywhere else an abandoned expansion is harmless -- expand_node() gives the block back and the
+  //node stays a leaf, which the search simply walks past. At the ROOT it is a forfeit: with no
+  //children select_best_moves() has nothing to rank, the workers spin (27.9 million "simulations" in
+  //2.2 seconds, twelve million a second, because every descent returns at once) and the engine
+  //answers "bestmove (none)". Seen five times in creatica_creaticachessbot.log, each followed by the
+  //bot restarting the engine mid-game, and once in a 321-ply game at ply 76 where the position
+  //plainly had legal moves.
+  //
+  //Which abandon point fires has NOT been established: occupancy was 568 per mille at the time, so
+  //neither the arena nor the child pool looks exhausted, and a small-Hash reproduction over 51 moves
+  //never triggered it. So this does two things rather than one. It discards the tree and expands
+  //again from a clean arena, which turns a lost game into a lost tree; and it logs everything needed
+  //to identify the cause next time, since expansion_abandons was previously visible nowhere.
+  if (root->num_children.load(std::memory_order_relaxed) == 0) {
+    char fen[MAX_FEN_STRING_LEN];
+    const uint64_t ab = expansion_abandons.load(std::memory_order_relaxed);
+    log_file("info string ROOT HAS NO CHILDREN after expansion: fen %s, tree %zu nodes at %d permille, "
+             "expansion abandons so far %llu -- discarding the tree and retrying once\n",
+             board2fen(board, fen), live_tree_nodes(), tree_occupancy(), (unsigned long long)ab);
+    gc_join();
+    cleanup_locked();
+    root = search.arena.alloc();
+    if (root) {
+      //Exactly the sequence the fresh-root path above uses. stamp() is not optional: it sets the
+      //generation and identity the map entry is validated against, so a node published without it
+      //is invisible to lookup() and would be handed out as absent on the very next search.
+      root->hash.store(zh.hash, std::memory_order_relaxed);
+      search.arena.stamp(root, (uint32_t)generation.load(std::memory_order_relaxed));
+      search.tree.insert(zh.hash, root);
+      total_nodes.fetch_add(1, std::memory_order_relaxed);
+      std::unordered_set<uint64_t> pos_history;
+      const double r2 = eval_and_expand(root, board, zh, ctx, pos_history, 0);
+      root->W.store(tanh(r2 / eval_scale), std::memory_order_relaxed);
+      root->N.store(1, std::memory_order_relaxed);
+      root->evidence.store(1, std::memory_order_relaxed);
+    }
+    log_file("info string ROOT RETRY: %d children after discarding the tree\n",
+             root ? root->num_children.load(std::memory_order_relaxed) : -1);
+  }
+
   search.root = root;
 }
 
