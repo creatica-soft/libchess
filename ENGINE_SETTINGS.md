@@ -2509,7 +2509,21 @@ engine's reported magnitude falls as that total grows:
 | 2M–8M | 80 | 454 | 337 | **0.74** |
 
 and by occupancy, 0.82 / 0.87 / 0.81 / **0.69** across 0–200, 200–500, 500–800 and 800–1000 per mille.
-**A bigger tree is a more compressed one.**
+
+**CORRECTION — that trend is confounded, and the controlled test points the other way.** The table above is
+*observational*: positions that accumulate huge trees are not the same positions as those with small ones,
+they are later, simpler and more often endgames. A controlled comparison on identical positions says the
+opposite. Replaying two games at 2 s a move with `ReuseTree` on and off:
+
+| | median simulations | ratio |
+|---|---|---|
+| `ReuseTree` on | 577,128 | **0.74** |
+| `ReuseTree` off | 310,956 | **0.69** |
+
+The fresh search does 46% fewer simulations and is *more* compressed, not less — which is what UCT theory
+predicts, since the average converges toward minimax as samples accumulate. So **more search reduces
+compression**, and the earlier correlation with tree size should be read as position selection rather than
+as an effect of the tree. Treat "a bigger tree is a more compressed one" as withdrawn.
 
 That is the opposite of what UCT promises. The convergence proof assumes a stationary search from **one**
 root; with reuse, the samples in a node's mean come from searches of *different* root positions — from when
@@ -2574,3 +2588,29 @@ the direction is not.
 **The standing finding is unaffected.** Bigger trees are still more compressed — 0.85, 0.83, 0.74 by
 simulations and 0.69 above 800 per mille. What this shows is that the compression cannot be fixed by
 rescaling the counters, at least not in the top few plies while the rest of the tree keeps its weight.
+
+
+## Is this an MCTS problem?
+
+Essentially yes, and it is worth being exact about which part.
+
+**The cause is the backup rule, not tree reuse.** `Q = W/evidence` is a mean over every leaf a subtree has
+visited, and most of those leaves lie on lines nobody will play. That is true of a one-move-old tree as much
+as a ten-million-node one, which is why turning `ReuseTree` off does not remove the compression (0.69 against
+0.74) and why every fix aimed at the *tree* failed — discarding it in the endgame cost 41 Elo, decaying its
+counters took the ratio from 0.74 to 0.50.
+
+**What reuse does is make a wrong average immovable.** It grows the sample count, so in `hKCOETfO` the losing
+move held 2,255,709 visits at `cp −10` against a truth of −618 and a search of 1,537,455 simulations could
+not outvote it. Reuse converts a soft error into an entrenched one; it does not create the error.
+
+**But it is not a permanent property of MCTS.** UCT's estimate converges toward the minimax value as samples
+accumulate, and the controlled comparison above shows that happening. The compression is a *finite-sample*
+effect, and how severe it is at a practical budget depends on how the visits are distributed.
+
+**Which makes it a prior problem wearing a search problem's clothes.** A sharp policy concentrates visits on
+a narrow set of lines, so the mean is dominated by the principal variation and sits close to the minimax
+value. A weak policy spreads visits over many mediocre lines, so the mean is a mixture and compresses. That
+is the same bottleneck recorded throughout this document: creatica's priors are weak, its tree is wide, and
+the value it reports is the average of that width. Compression is a symptom of the policy, not an independent
+defect of the search — which is also why five separate search-level interventions all failed to move it.
