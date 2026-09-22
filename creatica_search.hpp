@@ -107,7 +107,14 @@
 //--- policy head ---------------------------------------------------------------------
 //Where to find the exported weights, overridable with the CREATICA_POLICY env var. The
 //file is produced by:  EXPORT_WEIGHTS=nnue_policy.bin ./nnue_policy_train
-#define POLICY_WEIGHTS_DEFAULT "nnue_policy.bin"
+//nnue_policy_pisp2.bin, not nnue_policy.bin. pisp2 is the best policy measured here -- 39.52 Top-1
+//and 74.94 Top-4 against the 256/128 net's lower figures -- and it is what every recent match and
+//every lichess session has actually run. The old default meant a bare ./creatica, and therefore
+//test_smp, tournament and any unconfigured side of a GUI match, played a weaker engine than the one
+//being developed, so every comparison against "default creatica" was against a handicapped baseline.
+//
+//POLICY_BLEND_SCALE BELOW MUST MOVE WITH THIS. The blend constants are calibrated per net.
+#define POLICY_WEIGHTS_DEFAULT "nnue_policy_pisp2.bin"
 //Buffer bounds for the trunk. policy_net_load() refuses anything larger, so these are a
 //guarantee and not a hope.
 #define POLICY_MAX_IN 2048
@@ -124,7 +131,12 @@
 #define POLICY_BLEND 0.45
 //Restores the blended prior's concentration to the incumbent's ~0.39. Override with
 //CREATICA_BLEND_SCALE.
-#define POLICY_BLEND_SCALE 1.15
+//1.02 for pisp2, not 1.15. This is calibrated PER NET, and 1.15 belongs to the old 256/128 net:
+//bench_blend reports the top move's share of the blended prior at several scales, and pisp2 is
+//sharper, giving 0.4098 at 1.00 and 0.4254 at 1.05, so 1.02 reproduces the concentration 1.15 gave
+//the older net. Changing the net without changing this leaves a sharp net flattened by a scale meant
+//for a blunt one, which is worse than either default alone.
+#define POLICY_BLEND_SCALE 1.02
 
 struct NNUEContext {
     Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
