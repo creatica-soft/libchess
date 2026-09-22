@@ -42,10 +42,10 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `ProbabilityMass` | spin | 1000 | 900–1000 | **Per-mille, not percent.** Keep only the moves whose policy priors sum to this share and drop the tail, gated before the child evaluations. `1000` keeps every move and is an exact no-op. `creatica` only — see below before changing it. |
 | `ReuseTree` | check | **true** | — | Keep the search tree between moves instead of rebuilding it, so the subtree under the move played is inherited already searched. `Ponder` implies this; this does not imply `Ponder`. Default changed to on after measurement — see below. `creatica` only. |
 | `GcThreshold` | spin | 700 | 0–1000 | Per-mille of `Hash` at which the tree is collected. It reclaims only memory — an unreachable node is never traversed — so collecting every move used to pay a large cost for nothing. Since the arena that cost is roughly 100 ms at `Hash` 1024, and the value is now set by the *expansion ceiling* rather than by collection cost: occupancy climbs a p99 of 299 per-mille during one search, so 700 is about the highest value that keeps the tree off the 1000 ceiling. Raise it and roughly one search in ten overshoots; lowering it is now affordable. See *The node arena*. `creatica` only. |
-| `TreeResetBelow` | spin | 0 | 0–1000000000 | **Off at 0.** Before a search, if the tree is at `TreeResetOccupancy` or more and the root inherited fewer than this many informed simulations (its evidence), discard the whole tree instead of collecting it. Aimed at the one case a full tree turns into a blunder: a root the last search barely looked at, on a tree nothing can be freed from. 1000 is the value tested in replays; it has not been measured in games. See *A full tree that cannot be collected*. |
+| `TreeResetBelow` | spin | **1000** | 0–1000000000 | **On by default; 0 disables.** Before a search, if the tree is at `TreeResetOccupancy` or more and the root inherited fewer than this many informed simulations (its evidence), discard the whole tree instead of collecting it. Aimed at the one case a full tree turns into a blunder: a root the last search barely looked at, on a tree nothing can be freed from. Default since September 2026, on a sound mechanism and weeks of live use rather than a demonstrated gain — the only match, 154.5 : 145.5 over 300 games, is inside the noise. See *A full tree that cannot be collected*. |
 | `TreeResetOccupancy` | spin | 950 | 0–1000 | Per-mille of `Hash` at or above which `TreeResetBelow` applies. Below 950 no search in 22 games froze, so resetting there would only throw knowledge away. |
-| `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. Use 900: see *Which reset threshold*. |
-| `CollectDuringPonder` | check | false | — | Run the collection beside the ponder search instead of inline before every search. Safe because of the mark's write barrier. See *The mark beside the search*. |
+| `TreeResetHollow` | spin | **900** | 0–1000 | **On by default; 0 disables.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. See *Which reset threshold* — and note the supporting match is inside the noise. |
+| `CollectDuringPonder` | check | **true** | — | Run the collection beside the ponder search instead of inline before every search. Safe because of the mark's write barrier. Default since September 2026: measured in a lichess game at 0 collections on the move's own clock against 13 costing 5,384 ms, and about 8% more simulations a move. See *The mark beside the search*. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
 | `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
@@ -263,11 +263,11 @@ them with `setoption`, at any time, and see them listed in response to `uci`.
 
 | option | type | default | range | meaning |
 |---|---|---|---|---|
-| `PolicyWeights` | string | `nnue_policy.bin` | — | The exported policy net. Changing it reloads the net; if the load fails the previous net is kept and an `info string` says why, so the engine never runs on a half-loaded net. A reload is refused while a search is running, because the worker threads read the net without a lock. The `info string` names the row count, which is how you check which net is actually in use: **4096 = the narrow table, 24576 = piece-indexed**, and then lists `legality term` and `spatial term: …` when the net has them. See *Policy file formats*. |
+| `PolicyWeights` | string | **`nnue_policy_pisp2.bin`** | — | The exported policy net. Changing it reloads the net; if the load fails the previous net is kept and an `info string` says why, so the engine never runs on a half-loaded net. A reload is refused while a search is running, because the worker threads read the net without a lock. The `info string` names the row count, which is how you check which net is actually in use: **4096 = the narrow table, 24576 = piece-indexed**, and then lists `legality term` and `spatial term: …` when the net has them. See *Policy file formats*. |
 | `PolicyMode` | spin | 1 | 0–2 | 0 = off, 1 = prior, 2 = full. See below. |
 | `PolicyBlend` | spin | 45 | 0–100 | Share of the prior taken from the policy head, in hundredths; the rest comes from the 1-ply child evaluations. 0 reproduces the incumbent prior exactly, 100 is policy-only. Ignored when `PolicyMode` is 2. |
 | `PolicyTemp` | spin | 75 | 0–300 | Temperature the policy logits are read at, in hundredths. Chosen so the resulting prior has the concentration the exploration constants were tuned for. |
-| `BlendScale` | spin | 115 | 0–300 | Overall sharpness of the blended prior, in hundredths. A mixture of two disagreeing signals is flatter than either alone; this restores it. |
+| `BlendScale` | spin | **102** | 0–300 | Overall sharpness of the blended prior, in hundredths. A mixture of two disagreeing signals is flatter than either alone; this restores it. **Calibrated per net** — 1.02 belongs to `pisp2`, 1.05 to `pisp`, 1.15 to the old 256/128 net — so it must move whenever `PolicyWeights` does. |
 | `FpuReduction` | spin | 20 | 0–100 | First-play urgency in hundredths, in the same tanh units as `W`. An unvisited child is assumed to be worth this much less than its parent. Only bites when children are unevaluated — `PolicyMode 2`, or `SeedChildren` off. |
 | `SeedChildren` | check | true | — | Off stops a child being born with `N=1, W=tanh(eval)`. Diagnostic; see the measurements. |
 | `NodeMinimax` | check | true | — | Off makes a node take a static evaluation of itself instead of the 1-ply minimax over its children. Diagnostic. |
@@ -282,7 +282,7 @@ match actually ran with:
 
 ```
 info string settings: Hash 2048, Threads 8, ..., PolicyMode 1, PolicyBlend 0.45,
-PolicyTemp 0.75, BlendScale 1.15, FpuReduction 0.2, SeedChildren true, NodeMinimax true
+PolicyTemp 0.75, BlendScale 1.02, FpuReduction 0.2, SeedChildren true, NodeMinimax true
 ```
 
 There is also a `settings` command, outside the UCI protocol, that prints the same values
@@ -520,7 +520,7 @@ THREADS 4            MULTI_PV 5           HASH 2048
 EXPLORATION_MIN 65   EXPLORATION_MAX 160  EXPLORATION_DEPTH_DECAY 5
 VIRTUAL_LOSS 36      EVAL_SCALE 61        TEMPERATURE 58
 PV_PLIES 16          MAX_DEPTH 100        SYZYGY_PATH "/Users/ap/syzygy"
-POLICY_WEIGHTS_DEFAULT "nnue_policy.bin"  FPU_REDUCTION 0.20
+POLICY_WEIGHTS_DEFAULT "nnue_policy_pisp2.bin"  FPU_REDUCTION 0.20
 POLICY_BLEND 0.45    POLICY_BLEND_SCALE 1.15
 POLICY_MAX_IN 2048   POLICY_MAX_H2 512    (buffer bounds; a larger net is refused at load)
 ```
@@ -1776,7 +1776,7 @@ being tested as this is written; the last is waiting on an idle machine.
 |---|---|---|
 | Do the exploration constants still want 160/65/5? | running now, in the self-play tuner | they were fitted against the old eval-derived prior, whose top-1 was 27% against the blend's 36%; a prior of a different shape plausibly wants a different exploration balance |
 | Is `PolicyBlend 0.45` right *in play*? | running now, sweeping 0.20–0.70 | 0.45 came from offline top-k accuracy, and top-k has stopped predicting Elo; the one match attempt stopped level at 7.5–7.5 after 15 games |
-| Is `BlendScale 1.15` right? | running now, sweeping 0.85–1.45 | it was set analytically to match the old prior's concentration and has never been tested at all |
+| ~~Is `BlendScale 1.15` right?~~ | **answered** | it is calibrated per net, not a single value: 1.15 for the 256/128 net, 1.05 for `pisp`, **1.02 for `pisp2`**, which is now the default. `bench_blend` reports the top move's share at several scales in one pass |
 | Does the ProbabilityMass gate pay? | running now, sweeping 985–1000 | new mechanism: gating before the child evaluations rather than after (see **ProbabilityMass** above). Skips ~35% of evaluations at 990 for ~3% more nodes and a distinctly deeper tree — an untested trade |
 | Is `creatica` equal to its predecessor? | 40+ games on an idle machine | gate before renaming it to `creatica` and pointing the bot and harnesses at it |
 | ~~What actually caused the 60 s engine stall?~~ **ANSWERED** | reproduced in one move; fixed in `1d26185` | **The engine was not stalling, it was crashing.** Lichess reports castling as KING-TAKES-ROOK (`e8a8`, `e1a1`) in every game created from a position — the UCI_Chess960 convention — and the opening book makes every bot-vs-bot game a `fromPosition` game. libchess understands that notation only behind `board.isChess960` (`board.cpp:869`), which a standard FEN never sets (measured false on all 1370 book FENs). `uci2move_idx()` does no legality check, so `e8a8` was applied literally: the king marched onto its own rook, `ff_move()` left an illegal `Board`, and the next search died in `kingMoves()`. Two crash reports both show `set_root() -> eval_and_expand() -> kingMoves()`. Repro: `position fen <black may castle long> moves e8a8` then `go` is a SIGSEGV; `e8c8` is not. Collection time was **not** the cause — the 11.9 s maximum was real but never reached the 60 s watchdog. |
@@ -2631,3 +2631,31 @@ reuse (turning reuse off gives 0.69 against 0.74); and more search reduces it, a
 is set by how widely the visits spread, which is set by the priors. Five separate search-level interventions
 failed to move it, which is the strongest evidence in this document that **the policy is the bottleneck and
 the search is not where the fix lives.**
+
+
+## The defaults changed, September 2026
+
+A bare `./creatica` used to run the 256/128 net at a scale calibrated for it, with both tree resets off and
+the collection inline. That was not the engine being developed — and it is what `test_smp`, `tournament` and
+any unconfigured side of a GUI match actually ran, so every comparison against "default creatica" was
+against a handicapped baseline.
+
+| option | was | now | evidence |
+|---|---|---|---|
+| `PolicyWeights` | `nnue_policy.bin` | `nnue_policy_pisp2.bin` | best net measured: 39.52 Top-1, 74.94 Top-4 |
+| `BlendScale` | 115 | **102** | calibrated for `pisp2`; must move with the net |
+| `CollectDuringPonder` | false | **true** | 0 collections on the move's own clock against 13 costing 5,384 ms; ~8% more simulations |
+| `TreeResetBelow` | 0 | **1000** | mechanism plus live use; the match is inside the noise |
+| `TreeResetHollow` | 0 | **900** | same |
+
+**`BlendScale` and `PolicyWeights` are a pair.** The blend constants are calibrated per net, so changing one
+without the other leaves a sharp net flattened by a scale meant for a blunt one — worse than either old
+default alone.
+
+**Honesty about the two reset values.** 154.5 : 145.5 over 300 games is 51.5%, about +10 Elo against a
+standard error near 12. They are defaults because the mechanism is sound — a frozen tree learns nothing, so
+discarding it costs little, and the rule only fires at `TreeResetOccupancy` or above — and because they have
+run for weeks in live play without trouble. Not because a match showed they help.
+
+**This moves every baseline.** Any future A/B where one side is given "no options" is now a different and
+stronger engine than it was before this change.

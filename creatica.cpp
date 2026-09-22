@@ -508,13 +508,13 @@ public:
         o.spin("GcThreshold", &gc_threshold, 700, 0, 1000);
         // Discard the tree before a search when it is at TreeResetOccupancy per-mille or more and the
         // root inherited fewer than TreeResetBelow informed simulations. 0 = off. See runMCTS().
-        o.spin("TreeResetBelow",     &tree_reset_below,     0,   0, 1000000000);
+        o.spin("TreeResetBelow",     &tree_reset_below,  1000,   0, 1000000000);
         o.spin("TreeResetOccupancy", &tree_reset_occupancy, 950, 0, 1000);
         // Also discard it when the previous search was at least this many per-mille hollow: a frozen tree.
-        o.spin("TreeResetHollow",    &tree_reset_hollow,    0,   0, 1000);
+        o.spin("TreeResetHollow",    &tree_reset_hollow,  900,   0, 1000);
         // Run the collection beside the ponder search instead of inline before every search. Safe
         // because of the mark's write barrier; see mark_barrier() in creatica_search.cpp.
-        o.check("CollectDuringPonder", &collect_during_ponder, false);
+        o.check("CollectDuringPonder", &collect_during_ponder, true);
         // Where to append the root visit distribution after each search, and a tag written on
         // every line so records can be joined back to a game and its result. Empty = off.
         o.string("VisitDumpFile", &visit_dump_path, "");

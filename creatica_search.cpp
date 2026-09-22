@@ -188,14 +188,25 @@ int64_t       gc_threshold = 700;
 //full tree whose root inherited almost nothing. TreeResetBelow is the root's evidence -- informed
 //simulations it inherited -- below which to reset, 0 = off. TreeResetOccupancy is the per-mille of Hash
 //at or above which the rule applies. See the reset in runMCTS() for why and for the measurements.
-int64_t       tree_reset_below = 0;
+//DEFAULT 1000, was 0 (off). Measured by Arkadi at 154.5 : 145.5 over 300 games with TreeResetHollow
+//900 -- 51.5%, roughly +10 Elo against a standard error near 12, so INSIDE THE NOISE. It is a
+//default on the strength of a sound mechanism and weeks of live use, not a demonstrated gain: a
+//frozen tree learns nothing, so discarding it costs little, and the rule only fires at
+//TreeResetOccupancy or above. Do not cite the match as evidence it helps.
+int64_t       tree_reset_below = 1000;
 //Let the collection run while the engine ponders, instead of paying it inline before every search.
 //Safe only because of the write barrier; see mark_barrier(). Off by default.
-bool          collect_during_ponder = false;
+//DEFAULT TRUE, was false. The best-evidenced of the defaults changed here, and the only one that is
+//directly observed rather than inferred from a match: in a lichess game it took the collection off
+//the move's own clock entirely -- 0 collections costing 0 ms against 13 costing 5,384 ms with a
+//worst case of 778 ms -- and searched about 8% more per move. Safe because of the mark's write
+//barrier, and the reset-beside-collection crash it once exposed is fixed and reproduced under ASAN.
+bool          collect_during_ponder = true;
 int64_t       tree_reset_occupancy = 950;
 //TreeResetHollow: also reset when the PREVIOUS search was at least this many per-mille hollow -- the tree
 //was frozen, whatever the new root inherited. 0 = off. See the reset in runMCTS().
-int64_t       tree_reset_hollow = 0;
+//DEFAULT 900, was 0 (off). See TreeResetBelow above for the evidence, which is weak.
+int64_t       tree_reset_hollow = 900;
 //The previous search's hollow simulations, per-mille, written when it finishes. -1 before the first.
 static std::atomic<int> last_search_hollow_permille{-1};
 
