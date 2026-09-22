@@ -1123,6 +1123,19 @@ static bool firstLegalMove(Board& board, char * out) {
 //tablebase 0 means the game is drawn with best play, where an evaluation of 0 only means the engine
 //cannot see a difference. Covers both routes to that line, the local Syzygy probe and the answer
 //fetched from lichess, because both report through report_tb_move().
+//Clear the three fields tablebaseVerdict() keys on, before a search that will overwrite them.
+//go() does not reset the Evaluation, and with FinalInfoLines off an ordinary search may print no
+//info line at all -- so without this the ONE-NODE line from a tablebase answer on an earlier move
+//would still be sitting there, and a later position would be read as a tablebase draw when it is
+//nothing of the kind. Clearing sends the error the safe way: a missing line reads as "not a
+//tablebase answer" rather than as a stale one.
+static void clearTablebaseVerdict() {
+    if (!evaluations[0]) return;
+    evaluations[0]->depth  = 0;
+    evaluations[0]->nodes  = 0;
+    evaluations[0]->tbhits = 0;
+}
+
 static bool tablebaseVerdict(int& cp_out) {
     const Evaluation * e = evaluations[0];
     if (!e || e->depth != 1 || e->nodes != 1 || e->tbhits != 1) return false;
@@ -1199,7 +1212,8 @@ try_pos: if (!position(creatica)) {
         creatica.winc = winc;
         creatica.binc = binc;
         if (our_turn) {
-try_again:  if (go(creatica, evaluations)) {
+try_again:  clearTablebaseVerdict();   //see clearTablebaseVerdict(): go() does not reset these
+            if (go(creatica, evaluations)) {
               std::cerr << "ComputeAndPostMove() error: go(creatica, evaluations) returned non-zero code, restarting..." << std::endl;
               releaseChessEngine(creatica);
               initChessEngine(creatica, engine_path.c_str(), MOVETIME, DEPTH, bot_hash, bot_threads, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);

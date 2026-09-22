@@ -3283,6 +3283,19 @@ void runMCTS(NNUEContext& ctx) {
                      tb_probe.move.c_str(), bestmove.c_str());
             bestmove = tb_probe.move;
             ponder.clear();          //no PV behind a tablebase move
+            //SAY THAT THIS IS A TABLEBASE ANSWER, in the same shape run_go() uses for a LOCAL probe
+            //(report_tb_move): one node, one tbhit, depth 1. Without it an answer from lichess is
+            //indistinguishable from an ordinary search result to anything reading the UCI stream,
+            //because the substitution happens after the search has already printed its own info
+            //lines. lichess_bot's tablebaseVerdict() keys on exactly this triple to tell a certainty
+            //from an estimate, and with WDL-only local tables most SIX-piece roots are answered by
+            //lichess rather than locally -- so without this the draw offer would almost never fire
+            //where it matters. tb_probe.score is 0 for a draw: sendGetRequest() only moves it off
+            //zero for a win or a loss category.
+            print("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 "
+                  "time 0 pv %s\n", tb_probe.score, bestmove.c_str());
+            log_file("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 "
+                     "time 0 pv %s\n", tb_probe.score, bestmove.c_str());
           }
         }
       }
