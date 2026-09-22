@@ -279,6 +279,12 @@ static void load_opening_book(const std::string& path) {
 #define RESULTS_FILE results_path.c_str()
 std::string current_game_id = "";
 std::atomic<bool> game_in_progress {false};
+//Whether we have already offered a draw on the strength of a tablebase verdict in THIS game. One
+//offer, not one a move: the position stays drawn for the rest of the endgame, so repeating it every
+//move would be pestering an opponent who has already said no. Reset when a game starts.
+std::atomic<bool> tb_draw_offered {false};
+
+
 std::atomic<bool> challenge_accepted {false};
 std::atomic<bool> challenge_declined {false};
 //"Am I committed to a game?" has TWO parts and only one was tracked. game_in_progress
@@ -1093,6 +1099,22 @@ static bool firstLegalMove(Board& board, char * out) {
   return false;
 }
 
+//DID THE ENGINE ANSWER FROM A TABLEBASE RATHER THAN FROM A SEARCH?
+//
+//creatica reports a root tablebase probe as a one-node line -- report_tb_move() prints
+//"info depth 1 seldepth 1 multipv 1 score cp <n> nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv <move>"
+//-- which no real search produces, since a search reports hundreds of thousands of nodes. So this
+//triple identifies a CERTAINTY rather than an estimate, and it is worth acting on differently: a
+//tablebase 0 means the game is drawn with best play, where an evaluation of 0 only means the engine
+//cannot see a difference. Covers both routes to that line, the local Syzygy probe and the answer
+//fetched from lichess, because both report through report_tb_move().
+static bool tablebaseVerdict(int& cp_out) {
+    const Evaluation * e = evaluations[0];
+    if (!e || e->depth != 1 || e->nodes != 1 || e->tbhits != 1) return false;
+    cp_out = e->scorecp;
+    return true;
+}
+
 void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, const bool is_white, const std::string& initial_fen, const std::string& moves, const long long wtime, const long long btime, const long long winc, const long long binc) {
     int gss = gameStateStatus.load();
     std::cout << "ComputeAndPostMove() debug: game state - status: " << gameSS[gss] << ", moves: " << moves << std::endl;
@@ -1180,7 +1202,16 @@ try_again:  if (go(creatica, evaluations)) {
               goto try_again;
             } //end of if (go())
             if (draw_offer) {
-                if (evaluations[0]->scorecp < DRAW_CP) {
+                //A tablebase draw is accepted whatever the search score says, because the tablebase
+                //is right and the search is not. The DRAW_CP rule below would usually accept it too
+                //-- a tablebase draw reports 0 -- but only by coincidence of the number, and it
+                //would refuse if the engine had reported the position as better for us.
+                int tb_cp = 0;
+                const bool tb_draw = tablebaseVerdict(tb_cp) && tb_cp == 0;
+                if (tb_draw)
+                  std::cout << "ComputeAndPostMove() debug: accepting the draw -- the tablebase says drawn"
+                            << std::endl;
+                if (tb_draw || evaluations[0]->scorecp < DRAW_CP) {
                   std::string draw_url = "https://lichess.org/api/bot/game/" + game_id + "/draw/yes";
                   if (!HttpRequest("POST", draw_url)) {
                     std::cerr << "ComputeAndPostMove() error: failed to post request to " << draw_url << std::endl;
@@ -1233,6 +1264,20 @@ try_again:  if (go(creatica, evaluations)) {
             }
 
             std::string move_url = "https://lichess.org/api/bot/game/" + game_id + "/move/" + new_move;
+            //OFFER THE DRAW ALONGSIDE THE MOVE. lichess takes offeringDraw on the move endpoint, so
+            //this costs no extra request and cannot race with the move. Once per game -- see
+            //tb_draw_offered. Only on a tablebase 0: an evaluation near zero is an opinion, and
+            //offering a draw on an opinion in a position we might win is giving away half a point.
+            {
+                int tb_cp = 0;
+                bool expected = false;
+                if (tablebaseVerdict(tb_cp) && tb_cp == 0 &&
+                    tb_draw_offered.compare_exchange_strong(expected, true)) {
+                    move_url += "?offeringDraw=true";
+                    std::cout << "ComputeAndPostMove() debug: offering a draw with " << new_move
+                              << " -- the tablebase says drawn" << std::endl;
+                }
+            }
             std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "..." << std::endl;
 
             //KEEP TRYING UNTIL IT LANDS, OR UNTIL THE CLOCK IS GONE.
@@ -1613,6 +1658,7 @@ void ProcessEvent(const json& event) {
           {
             std::lock_guard<std::mutex> lc(playing_mutex);
             game_in_progress.store(true);
+            tb_draw_offered.store(false);   //one tablebase draw offer per game
             clearChallengeOutstanding(); //the game supersedes any outstanding challenge
           }
           game_cv.notify_one();
