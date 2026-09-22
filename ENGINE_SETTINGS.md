@@ -49,6 +49,8 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
 | `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0, and LEAVE IT OFF — it loses games. See *Why `VerifyReplies` backfires*.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
 | `VerifyAfter` | spin | 600 | 0–1000 | When the floor switches on, as a per-mille fraction of **this move's own time budget**. `600` = after 60% of the move's time; on a 2 s move it starts at 1.2 s and the floor has the last 0.8 s to work in. `0` would verify from the first simulation, which measurably costs the early search. |
+| `RootDecayKeep` | spin | 1000 | 1–1000 | **Off at 1000.** Per mille of a node's accumulated *weight* kept when the root moves, applied to the top `RootDecayDepth` plies. Scales `W` and `evidence` by the same factor, so **`Q` is unchanged** and the ranking among the root's children is untouched — only how much new evidence is needed to move a belief. See *Decaying the weight, not the value*. |
+| `RootDecayDepth` | spin | 2 | 0–6 | How many plies below the root `RootDecayKeep` reaches. 0 is the root alone, 2 is about a thousand nodes, 3 about twelve thousand. A whole-tree pass is not affordable — see the note. |
 | `ReuseTreeMinPieces` | spin | 0 | 0–32 | **Off at 0, and LEAVE IT OFF — measured at −41 Elo over 300 games.** Do not reuse the tree once the root has fewer than this many pieces — discard it and search the position fresh. Unlike the other two reset triggers it is **not** gated on `TreeResetOccupancy`, because the tree it targets is *wrong* rather than *full*. Fires once per root, so a ponder search and the real search after it do not reset twice. See *The inherited tree in the endgame*. |
 | `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
 | `MinimaxMinEv` | spin | 32 | 1–1000000 | Evidence a grandchild needs before it may set the `MinimaxBackup` correction. The minimum of a set of noisy estimates is biased low, so without a floor one unlucky evaluation condemns a good move; at 32 a position test showed measurable harm, at 2000 and above it did not. |
@@ -2492,3 +2494,52 @@ piece count the scan looked at. Treat 12 as untested and unpromising rather than
 the tree against 50 fresh at ≤12 pieces — pointed the *wrong way*, as `BalanceShare` and `VerifyReplies` did
 before it. Its n=30 buckets were explicitly reported as not significant, and they were not merely
 inconclusive but actively misleading. A position scan can explain a mechanism; it cannot rank an option.
+
+
+## Decaying the weight, not the value
+
+**The measurement this is built on.** A node's value is `Q = W / evidence`, a mean, and under `ReuseTree`
+`evidence` is a lifetime total that nothing resets. Against Stockfish over 420 real search roots, the
+engine's reported magnitude falls as that total grows:
+
+| root simulations | n | median \|Stockfish\| | median \|engine\| | ratio |
+|---|---|---|---|---|
+| 50k–500k | 13 | 534 | 453 | 0.85 |
+| 500k–2M | 101 | 447 | 373 | 0.83 |
+| 2M–8M | 80 | 454 | 337 | **0.74** |
+
+and by occupancy, 0.82 / 0.87 / 0.81 / **0.69** across 0–200, 200–500, 500–800 and 800–1000 per mille.
+**A bigger tree is a more compressed one.**
+
+That is the opposite of what UCT promises. The convergence proof assumes a stationary search from **one**
+root; with reuse, the samples in a node's mean come from searches of *different* root positions — from when
+it was a deep sideline, from when it was the ponder root, from three moves ago. More samples is then a
+broader and staler mixture, not a converging estimate. In `hKCOETfO` the losing move held 2,255,709 visits
+at `cp -10` against a true −618, with its own one-ply value at −259; a search of 1,537,455 simulations
+cannot outvote that.
+
+**What the option does.** When the root moves, multiply `W` and `evidence` by the same factor on the top few
+plies. Because both are scaled together, `Q` is arithmetically unchanged — the engine believes exactly what
+it believed a moment ago, and the ranking among the root's children is untouched because they are all
+scaled alike. The only thing that changes is **how much new evidence it takes to move that belief**. The
+value is preserved; its inertia is not.
+
+**Why only the top plies.** A whole-tree pass is unaffordable: the note on `NodeArena::gen` records 183 ns
+per slot once something touches each node's cache line, which is over a second on a ten-million-node tree,
+every move. It is also unnecessary — the move is chosen among the root's children, and fresh leaf
+evaluations reach them through backup whatever the deep tree holds.
+
+**What is deliberately not scaled.** `N` and the edge counts, which drive the exploration term. Scaling them
+would change how widely the search looks as well as how fast it learns; only the second is what the
+measurement points at, and one change at a time.
+
+**Why this rather than `ReuseTreeMinPieces`.** That option discarded the tree and measured −41 Elo, because
+the accumulated *depth* is worth a great deal. Decay keeps every node, every edge, every prior and all the
+expansion work — it gives up none of the depth — and targets only the quantity the table above indicts.
+
+Measured cost: none detectable. Median simulations per search 504,022 with `keep=250 depth=2` against
+467,217 with it off, and 41–1,281 nodes scaled per move at depth 2.
+
+**Untested for strength.** Needs a head-to-head, and given that three previous options measured −150, ±0 and
+−41, the prior should be sceptical. Note also that any match at 0.5 s a move understates the effect: the
+compression this targets grows with tree size, and trees at 0.5 s are small.

@@ -63,6 +63,8 @@ extern bool      reuse_tree;
 extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 extern int64_t   tree_reset_below;
+extern int64_t   root_decay_keep;
+extern int64_t   root_decay_depth;
 extern int64_t   reuse_tree_min_pieces;
 extern int64_t   minimax_backup;
 extern int64_t   minimax_min_ev;
@@ -541,6 +543,11 @@ public:
         // Do not reuse the tree once the root has fewer than this many pieces: discard it and
         // search fresh. 0 is off. Not gated on occupancy, and fires once per root so a ponder
         // search and the real search after it do not reset twice. See reuse_tree_min_pieces.
+        // Per mille of a node's accumulated WEIGHT kept when the root moves, applied to the top
+        // RootDecayDepth plies. 1000 is off. Q = W/evidence is unchanged by it -- only how much new
+        // evidence is needed to move it. See root_decay_keep.
+        o.spin("RootDecayKeep",      &root_decay_keep,     1000,   1, 1000);
+        o.spin("RootDecayDepth",     &root_decay_depth,       2,   0,    6);
         o.spin("ReuseTreeMinPieces", &reuse_tree_min_pieces,  0,   0,   32);
         o.spin("MinimaxBackup",      &minimax_backup,       0,   0, 1000);
         // Evidence a grandchild needs before it may set the correction. Guards against a single

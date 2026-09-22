@@ -275,6 +275,39 @@ int64_t       tree_reset_occupancy = 950;
 //in both buckets and neither difference is significant at that sample size, which is why this is an
 //option to be matched rather than a default.
 int64_t       reuse_tree_min_pieces = 0;
+//ROOT DECAY (RootDecayKeep, 1000 = off). Per mille of a node's accumulated WEIGHT kept when the
+//root moves, applied to the top RootDecayDepth plies of the tree.
+//
+//The problem it addresses, measured. A node's value is Q = W/evidence, a MEAN, and under tree reuse
+//`evidence` is a lifetime total that nothing resets. Against Stockfish over 420 real search roots,
+//the engine's reported magnitude falls as that total grows:
+//
+//    root simulations      50k-500k   500k-2M   2M-8M
+//    |engine| / |truth|       0.85      0.83     0.74      (and 0.69 in trees above 800 per mille)
+//
+//That is the opposite of what UCT promises, because the convergence proof assumes a stationary
+//search from ONE root. With reuse the samples in a node's mean come from searches of DIFFERENT root
+//positions -- from when it was a deep sideline, from when it was the ponder root, from three moves
+//ago -- so more samples means a broader and staler mixture rather than a converging estimate. In
+//lichess hKCOETfO the losing move carried 2,255,709 visits at cp -10 against a true -618, with its
+//own one-ply value at -259; a search of 1,537,455 simulations cannot outvote that.
+//
+//WHY SCALING W AND EVIDENCE TOGETHER IS THE RIGHT LEVER. Q = W/evidence is unchanged by it -- the
+//engine believes exactly what it believed a moment ago, and the ranking among the root's children is
+//untouched because every one of them is scaled by the same factor. What changes is only how much new
+//evidence it takes to move that belief. The value is preserved; its inertia is not.
+//
+//WHY ONLY THE TOP FEW PLIES. A whole-tree pass is unaffordable: the note on NodeArena::gen records
+//183 ns per slot once something touches each node's cache line, which is over a second on a
+//ten-million-node tree, every move. The top plies are where it matters anyway -- the move is chosen
+//among the root's children, and a fresh leaf evaluation reaches them through backup whatever the
+//deep tree holds. Depth 2 is about a thousand nodes; the cost is nothing.
+//
+//N and the edge counts are deliberately NOT scaled. They drive the exploration term, and changing
+//them would alter how widely the search looks as well as how fast it learns -- two changes at once,
+//and only the second is what the measurement points at.
+int64_t       root_decay_keep = 1000;
+int64_t       root_decay_depth = 2;
 //The root this trigger last fired on. Without it the reset would fire again for the REAL search
 //after firing for the ponder search on the same position, and pondering in the endgame would be
 //pure waste -- see the note on ReuseTree, which records that pondering REQUIRES reuse. Firing once
@@ -1590,7 +1623,41 @@ void set_root(NNUEContext& ctx) {
     root->evidence.store(1, std::memory_order_relaxed);
   }
 
-  search.root = root;    
+  search.root = root;
+  //ROOT DECAY. Runs here because set_root() is called with no workers running, so these writes need
+  //no synchronisation. Breadth-first to RootDecayDepth, visiting each node once -- transpositions
+  //make this a DAG, and scaling a shared node twice would decay it by the square of the factor.
+  if (root_decay_keep < 1000 && root_decay_keep > 0 && search.root) {
+    const double keep = root_decay_keep * 0.001;
+    std::unordered_set<const MCTSNode *> seen;
+    std::vector<MCTSNode *> level{search.root}, next;
+    seen.insert(search.root);
+    size_t scaled = 0;
+    for (int d = 0; d <= (int)root_decay_depth && !level.empty(); ++d) {
+      for (MCTSNode * n : level) {
+        const uint64_t ev = n->evidence.load(std::memory_order_relaxed);
+        if (ev) {
+          //Both by the same factor, so Q is bit-for-bit the same belief with less weight behind it.
+          //At least 1 unit of evidence is kept: a node scaled to zero would report Q = 0 ("drawn"),
+          //which is a claim, not an absence of one.
+          const uint64_t ev2 = (uint64_t)(ev * keep);
+          n->evidence.store(ev2 < 1 ? 1 : ev2, std::memory_order_relaxed);
+          n->W.store(n->W.load(std::memory_order_relaxed) * keep, std::memory_order_relaxed);
+          ++scaled;
+        }
+        if (d == (int)root_decay_depth) continue;
+        const int nc = n->num_children.load(std::memory_order_relaxed);
+        if (!n->children.load(std::memory_order_acquire)) continue;
+        for (int i = 0; i < nc; ++i) {
+          MCTSNode * c = search.arena.child_at(n, i);
+          if (c && seen.insert(c).second) next.push_back(c);
+        }
+      }
+      level.swap(next); next.clear();
+    }
+    log_file("info string root decay: kept %lld per mille of the weight on %zu nodes to depth %lld\n",
+             (long long)root_decay_keep, scaled, (long long)root_decay_depth);
+  }
 }
 
 //called from expand_node() and make_move()
