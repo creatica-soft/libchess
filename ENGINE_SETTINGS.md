@@ -46,14 +46,6 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `TreeResetOccupancy` | spin | 950 | 0–1000 | Per-mille of `Hash` at or above which `TreeResetBelow` applies. Below 950 no search in 22 games froze, so resetting there would only throw knowledge away. |
 | `TreeResetHollow` | spin | 0 | 0–1000 | **Off at 0.** A second trigger for the same reset: discard the tree when the *previous* search was at least this many per-mille hollow — the tree is frozen, whatever the root inherited. Applies at `TreeResetOccupancy` or more. Use 900: see *Which reset threshold*. |
 | `CollectDuringPonder` | check | false | — | Run the collection beside the ponder search instead of inline before every search. Safe because of the mark's write barrier. See *The mark beside the search*. |
-| `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
-| `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0, and LEAVE IT OFF — it loses games. See *Why `VerifyReplies` backfires*.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
-| `VerifyAfter` | spin | 600 | 0–1000 | When the floor switches on, as a per-mille fraction of **this move's own time budget**. `600` = after 60% of the move's time; on a 2 s move it starts at 1.2 s and the floor has the last 0.8 s to work in. `0` would verify from the first simulation, which measurably costs the early search. |
-| `RootDecayKeep` | spin | 1000 | 1–1000 | **Off at 1000, and LEAVE IT OFF — it makes compression WORSE, 0.74 → 0.50.** Per mille of a node's accumulated *weight* kept when the root moves, applied to the top `RootDecayDepth` plies. Scales `W` and `evidence` by the same factor, so **`Q` is unchanged** and the ranking among the root's children is untouched — only how much new evidence is needed to move a belief. See *Decaying the weight, not the value*. |
-| `RootDecayDepth` | spin | 2 | 0–6 | How many plies below the root `RootDecayKeep` reaches. 0 is the root alone, 2 is about a thousand nodes, 3 about twelve thousand. A whole-tree pass is not affordable — see the note. |
-| `ReuseTreeMinPieces` | spin | 0 | 0–32 | **Off at 0, and LEAVE IT OFF — measured at −41 Elo over 300 games.** Do not reuse the tree once the root has fewer than this many pieces — discard it and search the position fresh. Unlike the other two reset triggers it is **not** gated on `TreeResetOccupancy`, because the tree it targets is *wrong* rather than *full*. Fires once per root, so a ponder search and the real search after it do not reset twice. See *The inherited tree in the endgame*. |
-| `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
-| `MinimaxMinEv` | spin | 32 | 1–1000000 | Evidence a grandchild needs before it may set the `MinimaxBackup` correction. The minimum of a set of noisy estimates is biased low, so without a floor one unlucky evaluation condemns a good move; at 32 a position test showed measurable harm, at 2000 and above it did not. |
 | `VisitDumpFile` | string | `<empty>` | — | Append the root visit distribution after every search to this file. The AlphaZero-style policy training target, collected as a free byproduct of searches that happen anyway. Empty disables it. `creatica` only. |
 | `GameTag` | string | `<empty>` | — | Written on every visit-dump line, so records can be joined back to a game and its result. Set per game by `lichess_bot`. `creatica` only. |
 | `ValidateTree` | check | false | — | Diagnostic. After every collection, check the invariants the collector must preserve and report violations. Costs a full walk of the tree per move; for runs asking whether reuse is sound, not for playing. `creatica` only. |
@@ -2614,3 +2606,28 @@ value. A weak policy spreads visits over many mediocre lines, so the mean is a m
 is the same bottleneck recorded throughout this document: creatica's priors are weak, its tree is wide, and
 the value it reports is the average of that width. Compression is a symptom of the policy, not an independent
 defect of the search — which is also why five separate search-level interventions all failed to move it.
+
+
+## Removed from the engine
+
+Nine options were taken out after measurement, with all their code. They are documented above and in git
+history so the results are not lost, but they are no longer tunable and no longer clutter the option list —
+26 options remain where there were 35.
+
+| removed | measured |
+|---|---|
+| `BalanceShare`, `BalanceDepth` | −150 Elo |
+| `MinimaxBackup`, `MinimaxMinEv` | ±0 — 48.8% over 126 games |
+| `VerifyReplies`, `VerifyAfter` | caused a forced mate to be walked into: 0/12, 4/12, 12/12 blunders as the floor rose |
+| `RootDecayKeep`, `RootDecayDepth` | compression 0.74 → 0.50, worse than doing nothing |
+| `ReuseTreeMinPieces` | −41 Elo |
+
+The compression diagnostic went with them — the second accumulator carrying each backup unsquashed, and its
+per-search log line. It had answered its question: the `tanh` accounts for only 4–6% of the compression.
+
+**What the whole exercise established, and what survives it.** Creatica's value is compressed to roughly
+60–70% of the truth; that is mixture dilution in the mean backup, not the squashing; it is not caused by tree
+reuse (turning reuse off gives 0.69 against 0.74); and more search reduces it, as UCT predicts. Its severity
+is set by how widely the visits spread, which is set by the priors. Five separate search-level interventions
+failed to move it, which is the strongest evidence in this document that **the policy is the bottleneck and
+the search is not where the fix lives.**

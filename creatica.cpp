@@ -63,15 +63,6 @@ extern bool      reuse_tree;
 extern bool      post_move_collect;
 extern int64_t   gc_threshold;
 extern int64_t   tree_reset_below;
-extern int64_t   root_decay_keep;
-extern int64_t   root_decay_depth;
-extern int64_t   reuse_tree_min_pieces;
-extern int64_t   minimax_backup;
-extern int64_t   minimax_min_ev;
-extern int64_t   verify_replies;
-extern int64_t   verify_after;
-extern int64_t   balance_share;
-extern int64_t   balance_depth;
 extern bool      collect_during_ponder;
 extern int64_t   tree_reset_occupancy;
 extern int64_t   tree_reset_hollow;
@@ -384,10 +375,6 @@ void persistent_worker_func(int thread_id) {
       //mcts_search(); ending the loop here made the engine stop searching altogether the
       //moment the tree filled, which with tree reuse happens routinely in a long game.
 
-      //The verification phase: see VerifyReplies. Recomputed every simulation because it depends on the
-      //clock, and it costs one comparison.
-      params.verify = verify_replies > 0 &&
-                      elapsed * 1000.0 >= (double)params.time_alloc * (verify_after * 0.001);
       accumulator_stack_reset(ctx);
       mcts_search(params, ctx);
       //Keep the expansion guard current during the search, not just between searches. Cheap:
@@ -398,11 +385,6 @@ void persistent_worker_func(int thread_id) {
         if (hf > 1000) hf = 1000;
         hash_full.store(hf, std::memory_order_relaxed);
       }
-      //The root's minimax table (MinimaxBackup). Thread 0 only, every 1024 simulations, and only
-      //when the option is on -- see the note at minimax_backup for why it is cached rather than
-      //computed inside the selection.
-      if (minimax_backup > 0 && params.thread_id == 0 && (occupancy_tick & 0x3FF) == 0)
-        refresh_root_minimax();
       int expected = seldepth.load(std::memory_order_relaxed);
       while (params.seldepth > expected && !seldepth.compare_exchange_strong(expected, params.seldepth, std::memory_order_relaxed)) expected = seldepth.load(std::memory_order_relaxed);
       if ((chessEngine.depth && depth.load(std::memory_order_relaxed) >= chessEngine.depth) ||
@@ -411,11 +393,6 @@ void persistent_worker_func(int thread_id) {
       }
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
     }
-    //`params` is a COPY, so the compression diagnostic mcts_search() accumulated into it would be
-    //thrown away here. Hand the two counters back to the slot runMCTS() reads. Nothing else in
-    //ThreadParams is written back: the rest is input, and seldepth is already published atomically.
-    pool_params[thread_id].root_pawns        = params.root_pawns;
-    pool_params[thread_id].root_pawn_backups = params.root_pawn_backups;
     //Decrement under pool_mutex, notify after releasing it. runMCTS() waits on
     //pool_done_cv with the predicate active_workers == 0, and evaluates that predicate while
     //holding the lock; a decrement-and-notify from outside the lock can land in the window
@@ -535,34 +512,6 @@ public:
         o.spin("TreeResetOccupancy", &tree_reset_occupancy, 950, 0, 1000);
         // Also discard it when the previous search was at least this many per-mille hollow: a frozen tree.
         o.spin("TreeResetHollow",    &tree_reset_hollow,    0,   0, 1000);
-        // Before the search may ignore a reply to the move it currently means to play, that reply must
-        // have this much evidence. 0 = off. See select_best_child().
-        // Weight, per mille, of the two-ply minimax correction blended into a ROOT child's value:
-        // Q_eff = (1-lambda)*mean + lambda*(opponent's best reply). 0 is off and reproduces the
-        // plain mean exactly. See the long note at minimax_backup in creatica_search.cpp.
-        // Do not reuse the tree once the root has fewer than this many pieces: discard it and
-        // search fresh. 0 is off. Not gated on occupancy, and fires once per root so a ponder
-        // search and the real search after it do not reset twice. See reuse_tree_min_pieces.
-        // Per mille of a node's accumulated WEIGHT kept when the root moves, applied to the top
-        // RootDecayDepth plies. 1000 is off. Q = W/evidence is unchanged by it -- only how much new
-        // evidence is needed to move it. See root_decay_keep.
-        o.spin("RootDecayKeep",      &root_decay_keep,     1000,   1, 1000);
-        o.spin("RootDecayDepth",     &root_decay_depth,       2,   0,    6);
-        o.spin("ReuseTreeMinPieces", &reuse_tree_min_pieces,  0,   0,   32);
-        o.spin("MinimaxBackup",      &minimax_backup,       0,   0, 1000);
-        // Evidence a grandchild needs before it may set the correction. Guards against a single
-        // noisy evaluation condemning a good move.
-        o.spin("MinimaxMinEv",       &minimax_min_ev,      32,   1, 1000000);
-        o.spin("VerifyReplies",      &verify_replies,       0,   0, 1000000);
-        // Per-mille of the search's time after which that verification starts. 0 verifies from the
-        // first simulation, which costs the early search; see creatica_search.cpp.
-        o.spin("VerifyAfter",        &verify_after,       600,   0, 1000);
-        // Share of a node's visits, per-mille, that one child may hold before the search prefers the
-        // next one. 1000 = off. See select_best_child().
-        o.spin("BalanceShare",       &balance_share,     1000,  100, 1000);
-        // The deepest ply BalanceShare applies to: 0 is the root alone, 1 adds the replies to it.
-        // 1000 caps every depth, which cost a match badly; see select_best_child().
-        o.spin("BalanceDepth",       &balance_depth,     1000,    0, 1000);
         // Run the collection beside the ponder search instead of inline before every search. Safe
         // because of the mark's write barrier; see mark_barrier() in creatica_search.cpp.
         o.check("CollectDuringPonder", &collect_during_ponder, false);
