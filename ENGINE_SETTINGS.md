@@ -49,7 +49,7 @@ binaries. They can be changed at run time with `setoption name <X> value <Y>`.
 | `BalanceShare` | spin | 1000 | 100–1000 | **Off at 1000.** The share of a node's visits, in per-mille, that one child may hold before the search prefers the next child instead. The capped child is chosen again as soon as its share falls back under the cap, so no move is ever dropped. See *Balancing the visits*. |
 | `VerifyReplies` | spin | 0 | 0–1000000 | **Off at 0, and LEAVE IT OFF — it loses games. See *Why `VerifyReplies` backfires*.** A floor, counted in *evidence*, that every reply to the move the engine is currently about to play must reach before PUCT is free to stop looking at it. `500` means "give each of the opponent's answers at least 500 informed simulations". Aimed at a refutation that begins with a sacrifice, which PUCT abandons after a handful of visits. See *Reading `VerifyReplies` and `VerifyAfter`*. |
 | `VerifyAfter` | spin | 600 | 0–1000 | When the floor switches on, as a per-mille fraction of **this move's own time budget**. `600` = after 60% of the move's time; on a 2 s move it starts at 1.2 s and the floor has the last 0.8 s to work in. `0` would verify from the first simulation, which measurably costs the early search. |
-| `RootDecayKeep` | spin | 1000 | 1–1000 | **Off at 1000.** Per mille of a node's accumulated *weight* kept when the root moves, applied to the top `RootDecayDepth` plies. Scales `W` and `evidence` by the same factor, so **`Q` is unchanged** and the ranking among the root's children is untouched — only how much new evidence is needed to move a belief. See *Decaying the weight, not the value*. |
+| `RootDecayKeep` | spin | 1000 | 1–1000 | **Off at 1000, and LEAVE IT OFF — it makes compression WORSE, 0.74 → 0.50.** Per mille of a node's accumulated *weight* kept when the root moves, applied to the top `RootDecayDepth` plies. Scales `W` and `evidence` by the same factor, so **`Q` is unchanged** and the ranking among the root's children is untouched — only how much new evidence is needed to move a belief. See *Decaying the weight, not the value*. |
 | `RootDecayDepth` | spin | 2 | 0–6 | How many plies below the root `RootDecayKeep` reaches. 0 is the root alone, 2 is about a thousand nodes, 3 about twelve thousand. A whole-tree pass is not affordable — see the note. |
 | `ReuseTreeMinPieces` | spin | 0 | 0–32 | **Off at 0, and LEAVE IT OFF — measured at −41 Elo over 300 games.** Do not reuse the tree once the root has fewer than this many pieces — discard it and search the position fresh. Unlike the other two reset triggers it is **not** gated on `TreeResetOccupancy`, because the tree it targets is *wrong* rather than *full*. Fires once per root, so a ponder search and the real search after it do not reset twice. See *The inherited tree in the endgame*. |
 | `MinimaxBackup` | spin | 0 | 0–1000 | **Off at 0.** Weight, per mille, of a two-ply minimax correction blended into a ROOT child's value: `Q_eff = (1-λ)·mean + λ·(the opponent's best reply)`. A **min** over the grandchildren, because they are the opponent's moves. Aimed at the averaging that compresses `Q`. Measured 48.8% over 126 games against 0, i.e. indistinguishable — see *The value is compressed, and the tanh is not why*. |
@@ -2540,6 +2540,37 @@ expansion work — it gives up none of the depth — and targets only the quanti
 Measured cost: none detectable. Median simulations per search 504,022 with `keep=250 depth=2` against
 467,217 with it off, and 41–1,281 nodes scaled per move at depth 2.
 
-**Untested for strength.** Needs a head-to-head, and given that three previous options measured −150, ±0 and
-−41, the prior should be sceptical. Note also that any match at 0.5 s a move understates the effect: the
-compression this targets grows with tree size, and trees at 0.5 s are small.
+### Measured, and it does the opposite of what it was built to do
+
+A self-play match at **2 s a move** — the control this option most deserved, since the compression it targets
+grows with tree size — reached **22 : 21 after 43 games**, about +8 Elo with a 95% interval of −65 to +82.
+Noise, and no disaster.
+
+The mechanism test is the decisive one, and it fails. Two match games were replayed move by move through a
+single engine so the tree accumulated exactly as in play, at the same 2 s, once with decay off and once with
+`keep=250 depth=2`, capturing the root value at every move. Identical positions both runs, 47 of them with
+|Stockfish| ≥ 100 cp:
+
+| | median ratio, engine magnitude ÷ Stockfish |
+|---|---|
+| decay **off** | **0.74** |
+| decay **on** | **0.50** |
+
+Simulations were essentially unchanged (−7.7%), so this is not a throughput effect. **The option makes the
+very quantity it was built to improve substantially worse.**
+
+**Why the reasoning behind it was wrong.** Scaling `W` and `evidence` together preserves `Q` exactly *at the
+instant of scaling*, and I treated that as if it remained true afterwards. It does not. Decaying only the top
+two plies leaves the deep tree at full weight, so a root child ends up holding far less evidence than its own
+subtree does; its `Q` is then dominated by the handful of new samples that arrive, while the exploration term
+still uses the undecayed `N` and so does not widen to compensate. The inconsistency between a decayed top and
+an undecayed bottom is itself a dilution mechanism. That is a hypothesis for the direction, not a proven
+account of the size.
+
+**Caveat on the number.** 45 sharp positions from two games, all in one simulation bucket — the replay's
+trees never reached the 2M–8M range where the original compression was worst. The magnitude is imprecise;
+the direction is not.
+
+**The standing finding is unaffected.** Bigger trees are still more compressed — 0.85, 0.83, 0.74 by
+simulations and 0.69 above 800 per mille. What this shows is that the compression cannot be fixed by
+rescaling the counters, at least not in the top few plies while the rest of the tree keeps its weight.

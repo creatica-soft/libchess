@@ -1,5 +1,9 @@
 // c++ -std=c++20 -Wall -O2 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o mistakes/san2fen mistakes/san2fen.cpp
-// SAN moves on stdin (optionally preceded by a line "FEN <fen>"): prints the final FEN and the UCI move list.
+// SAN moves on stdin; prints "<plies>\t<final FEN>\t<UCI move list>".
+// The STARTING position is argv[1], one quoted argument, defaulting to the standard start.
+// (An earlier version of this comment claimed a "FEN <fen>" line could be given on stdin. It
+// could not -- there is no such parsing here, and a leading FEN line is read as a move and fails.)
+// Set EVERY_PLY in the environment to print a line per ply instead of only the last.
 #include <cstdio>
 #include <cstring>
 #include <string>
