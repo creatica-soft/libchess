@@ -1,5 +1,5 @@
 //For MacOS using clang
-// c++ -std=c++20 -Wall -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica
+// c++ -std=c++20 -Wall -O3 -flto -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-lcurl,-rpath,$HOME/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica
 
 // For linux or Windows using mingw. Not compile-tested: this machine has no GCC and no Windows.
 // GCC may still warn inside the vendored Syzygy code that tbprobe.c #includes; if it does,
@@ -66,6 +66,15 @@ extern int64_t   tree_reset_below;
 extern bool      collect_during_ponder;
 extern int64_t   tree_reset_occupancy;
 extern int64_t   tree_reset_hollow;
+extern std::atomic<bool> hollow_abort;
+extern bool hollow_abort_enabled;
+extern std::atomic<bool> hollow_abort_armed;
+extern std::atomic<uint64_t> uninformed_sims;
+//The root trace diagnostic; see root_trace_snapshot() in creatica_search.cpp. Writes nothing unless
+//RootTraceFile names a path.
+extern std::string root_trace_path;
+void root_trace_snapshot(bool final_line);
+extern std::atomic<uint64_t> search_simulations;
 void gc_join();
 void reap_shutdown();
 extern std::string visit_dump_path;
@@ -97,6 +106,7 @@ extern double timeAllocated; //ms
 extern double exploration_min;
 extern double exploration_max;
 extern double exploration_depth_decay;
+extern double exploration_root;
 extern double virtual_loss;
 extern double eval_scale;
 extern double temperature;
@@ -370,6 +380,7 @@ void persistent_worker_func(int thread_id) {
 
     while (depth.load(std::memory_order_relaxed) < chessEngine.depth &&
       elapsed < (params.time_alloc * 0.001) &&
+      !hollow_abort.load(std::memory_order_relaxed) &&
       !stopFlag.load(std::memory_order_relaxed)) {
       //hash_full is NOT a termination condition. A full tree gates expansion inside
       //mcts_search(); ending the loop here made the engine stop searching altogether the
@@ -381,9 +392,42 @@ void persistent_worker_func(int thread_id) {
       //tree_occupancy() reads two atomics. Thread 0 only, every 4096 simulations, so the cost
       //is negligible and the guard reflects a tree that is still growing.
       if (params.thread_id == 0 && (++occupancy_tick & 0xFFF) == 0) {
+        //Purely diagnostic and off unless RootTraceFile is set; see root_trace_snapshot().
+        if (!root_trace_path.empty()) root_trace_snapshot(false);
         int hf = tree_occupancy();
         if (hf > 1000) hf = 1000;
         hash_full.store(hf, std::memory_order_relaxed);
+        //IS THIS SEARCH LEARNING ANYTHING? A simulation is counted hollow when it reached a leaf the
+        //tree had no room to expand, so it backpropagated a number already in the tree. When almost
+        //every simulation is hollow the tree is frozen and the rest of this move's allocation will
+        //produce nothing; the cure is to retire the tree and search again from an empty one, and it
+        //is worth far more now, mid-move, than at the start of the next move.
+        //
+        //Only thread 0, and only on a tick it is already paying for. The three conditions are: enough
+        //simulations for the rate to mean something, a tree genuinely at the reset occupancy, and
+        //enough of the budget left to rebuild in. runMCTS() does the reset -- a worker must never
+        //free the tree the other workers are walking.
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
+        const uint64_t sims = search_simulations.load(std::memory_order_relaxed);
+        //ONLY A SEARCH WITH A REAL DEADLINE. A ponder search and a `go infinite` search are both given
+        //timeAllocated = 1e9 ms, so the "no later than half way through the budget" test below is
+        //vacuous for them -- elapsed is never within nine orders of magnitude of the limit. Left
+        //unguarded it fired ten times during pondering in live games on 2026-09-24, retiring an
+        //18-million-node tree each time, and pondering is the worst moment for that: on a ponder hit
+        //the real search inherits the ponder search's tree, so the abort destroyed the tree the very
+        //next move was about to use. There is no cost to leaving these searches alone, because a tree
+        //still frozen when the next real search begins is caught by the between-moves TreeResetHollow
+        //check in runMCTS() anyway.
+        const bool has_deadline = !chessEngine.ponder && !chessEngine.infinite;
+        if (hollow_abort_enabled && has_deadline && tree_reset_hollow > 0 &&
+            hollow_abort_armed.load(std::memory_order_relaxed) &&
+            sims >= HOLLOW_ABORT_MIN_SIMS &&
+            hf >= tree_reset_occupancy &&
+            elapsed < (params.time_alloc * 0.001) * HOLLOW_ABORT_MAX_ELAPSED) {
+          const uint64_t hollow = uninformed_sims.load(std::memory_order_relaxed);
+          if ((uint64_t)(1000 * hollow / sims) >= (uint64_t)tree_reset_hollow)
+            hollow_abort.store(true, std::memory_order_relaxed);
+        }
       }
       int expected = seldepth.load(std::memory_order_relaxed);
       while (params.seldepth > expected && !seldepth.compare_exchange_strong(expected, params.seldepth, std::memory_order_relaxed)) expected = seldepth.load(std::memory_order_relaxed);
@@ -443,7 +487,20 @@ public:
         // advertises 65 / 0..100, engine sees 0.65
         o.real("ExplorationMin", &exploration_min, EXPLORATION_MIN / 100.0, 0.0, 1.0, 100);
         // advertises 160 / 0..200, engine sees 1.60
-        o.real("ExplorationMax", &exploration_max, EXPLORATION_MAX / 100.0, 0.0, 2.0, 100);
+        //CEILING RAISED FROM 2.0. The measurement that motivates ExplorationRoot found the constant
+        //needed to keep the correct move selectable at a median of about 1.95 and a 75th percentile of
+        //3.3, so the old ceiling was the median requirement exactly and could not reach the rest. The
+        //DEFAULT is unchanged, so nothing about the deployed engine moves.
+        //CEILING 100, not 10 and originally not 2. Raised twice because the ceiling itself kept being
+        //the thing that blocked the experiment: the root-only frontier was still rising at 50, and the
+        //question of whether PUCT's lock-out is root-only or happens at EVERY ply needs a large constant
+        //applied at every depth, which means ExplorationMax with ExplorationDepthDecay at 0. The DEFAULT
+        //is untouched at 1.60, so nothing about the deployed engine moves.
+        o.real("ExplorationMax", &exploration_max, EXPLORATION_MAX / 100.0, 0.0, 100.0, 100);
+        //The root's own exploration constant; 0 means "use the depth schedule", which is the incumbent.
+        //Ceiling 100, not 10: the measured frontier was still RISING at 10 and 10 was the old ceiling,
+        //so the best value is not yet bracketed. See the sweep in ENGINE_SETTINGS.md.
+        o.real("ExplorationRoot", &exploration_root, 0.0, 0.0, 100.0, 100);
         // advertises 5 / 0..10, engine sees 0.05
         o.real("ExplorationDepthDecay", &exploration_depth_decay,
                EXPLORATION_DEPTH_DECAY / 100.0, 0.0, 0.10, 100);
@@ -476,6 +533,11 @@ public:
         o.real("PolicyTemp",   &policy_temperature, 0.75,               0.0, 3.0, 100);
         o.real("BlendScale",   &policy_blend_scale, POLICY_BLEND_SCALE, 0.0, 3.0, 100);
         o.real("FpuReduction", &fpu_reduction,      FPU_REDUCTION,      0.0, 1.0, 100);
+        // Stop a search that has gone hollow, retire the tree and re-search the rest of the move on
+        // a clean one, instead of waiting for the next move's reset. OFF: see hollow_abort_enabled
+        // in creatica_search.cpp for what happened when it was on, and for the ponder bug that has
+        // to be fixed before it is turned on again.
+        o.check("HollowAbort", &hollow_abort_enabled, false);
         o.check("SeedChildren", &seed_children, true);
         o.check("NodeMinimax",  &node_minimax,  true);
         // Per-mille, not percent: the interesting settings are near the top of the range
@@ -518,7 +580,36 @@ public:
         // Where to append the root visit distribution after each search, and a tag written on
         // every line so records can be joined back to a game and its result. Empty = off.
         o.string("VisitDumpFile", &visit_dump_path, "");
+        //A DIAGNOSTIC. Appends a snapshot of every root child's (N, W, evidence) every 4096 of thread
+        //0's simulations, plus one final line per search, so the evolution of Q can be reconstructed
+        //offline and alternative weightings tested against the recorded mistakes without changing the
+        //search. Empty disables it and nothing is written; it never alters a value the search uses.
+        o.string("RootTraceFile", &root_trace_path, "");
         o.string("GameTag",       &game_tag,        "");
+        //EXACT VERDICTS, PROPAGATED. Off by default: with it off a node's `terminal` holds exactly
+        //the values it always has and the search is bit-for-bit the incumbent's. See the long note
+        //on prove_terminals in creatica_search.hpp for the mechanism and the measurements behind it.
+        o.check("ProveTerminals", &prove_terminals, false);
+        //SOFT MINIMAX BACKUP, in hundredths: 0 is the incumbent search exactly, 100 is a pure
+        //minimax over the tree MCTS has grown, and anything between blends the two as
+        //(1 - w) * mean + w * minimax. See the note on minimax_weight in creatica_search.hpp.
+        o.real("MinimaxWeight", &minimax_weight, 0.0, 0.0, 1.0, 100);
+        //PROGRESSIVE WIDENING ON THE PRIOR'S ORDER. 0 is off and the search is then bit-for-bit the
+        //incumbent's. See the note on topk_min in creatica_search.hpp: every legal move is still
+        //expanded and still carries an edge, and k grows with the node's descents, so a move passed
+        //over early is available later -- which is what ProbabilityMass could not do.
+        o.spin("TopKMin",   &topk_min, 0, 0, 64);
+        o.real("TopKWiden", &topk_widen, 1.0, 0.0, 8.0, 100);
+        //FLATTEN THE PRIOR INSIDE THE TOP K, keeping the total mass and leaving the tail alone. 0 and
+        //1 are off. The prior's ordering below rank 2 is nearly flat already and its first choice is
+        //its least reliable, so this removes a ranking the measurements say is not earning its place
+        //and lets Q choose among the set instead. See flatten_prior().
+        o.spin("FlattenTopK", &flatten_topk, 0, 0, 64);
+        //MinVisitK / MinVisitShare / MinVisitDepth: the visit floor for the leading candidates. 0
+        //children is off and is the incumbent search exactly. See the note in creatica_search.hpp.
+        o.spin("MinVisitK",     &min_visit_k,     0, 0, 64);
+        o.real("MinVisitShare", &min_visit_share, MIN_VISIT_SHARE, 0.0, 0.25, 1000);
+        o.spin("MinVisitDepth", &min_visit_depth, 0, 0, 8);
         o.check("ValidateTree", &validate_tree_enabled, false);
     }
 
@@ -1036,12 +1127,17 @@ private:
         policy_loaded_ = path;
         //Say whether the spatial term is active, and which plane layout it expects. A spatial net
         //that silently ran as a plain one would be invisible in the log otherwise.
-        char sp[160] = "";
+        //The head count belongs here too: a format 9 net read as one with a single shared pair would
+        //score every non-pawn move with the pawn head, and this line is how one checks which net is
+        //actually in use.
+        char sp[224] = "";
         if (policy_net.spatial.loaded)
-            snprintf(sp, sizeof sp, ", spatial term: %d planes, %d channels, dim %d, %d conv layer%s, layout %d",
+            snprintf(sp, sizeof sp, ", spatial term: %d planes, %d channels, dim %d, %d conv layer%s, "
+                                    "layout %d, %d head%s",
                      policy_net.spatial.planes, policy_net.spatial.ch, policy_net.spatial.dim,
                      policy_net.spatial.layers, policy_net.spatial.layers == 1 ? "" : "s",
-                     policy_net.spatial.layout);
+                     policy_net.spatial.layout,
+                     policy_net.spatial.heads, policy_net.spatial.heads == 1 ? " (shared)" : "s (one per piece type)");
         print("info string policy head %s loaded: %d -> %d -> %d -> %d%s%s\n",
               path, policy_net.in, policy_net.h1, policy_net.h2, policy_net.out,
               policy_net.has_wl ? ", legality term" : "", sp);

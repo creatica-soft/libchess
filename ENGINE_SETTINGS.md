@@ -288,6 +288,344 @@ PolicyTemp 0.75, BlendScale 1.02, FpuReduction 0.2, SeedChildren true, NodeMinim
 There is also a `settings` command, outside the UCI protocol, that prints the same values
 in a readable column with both the engine-side number and the UCI integer.
 
+### `ExplorationRoot`: the search commits in its first 3% and cannot reconsider
+
+**The failure is a fixed point, not variance.** Re-running the test set four times per position: 57 of
+141 are solved in **zero** of four repeats, and in 44 of those 57 — 77% — the engine plays the *same
+wrong move every time*, median one distinct wrong move across four repeats. Quoting a solve rate hides
+this; always / never / sometimes is the split that means something.
+
+**It is not tree reuse.** Accumulated visits are a median **1.00x** of the current search's simulations
+across 40,763 live searches, above 1.2x in only 7.9%. Top-move concentration is 89.9% on a fresh tree
+against 93.4% live, so reuse contributes about 3.5 points of it and nothing else.
+
+**It is PUCT closing, correctly, on an ordering formed too early.** Root PUCT is
+`Q + C*P*sqrt(parentN)/(1+N)` with `C = ExplorationMax = 1.6` at depth 0. On the never-solved positions:
+
+| | median |
+|---|---|
+| Q gap the correct move must overcome | +0.0438 |
+| its exploration term U at the end | +0.0277 |
+| **U < gap — it can never be selected again** | **34 of 55 (62%)** |
+| the correct move's share of visits | 0.29% |
+| its evidence at the end | 2,348 of ~767,000 |
+
+And the lock closes almost at once: permanent from the first 10% of the search in **53%** of them and
+from before the halfway point in 76%, **median 2.8%**. The remaining 97% of the search confirms a
+decision already irreversible, which is exactly why more time does not help and why the same wrong move
+returns every run.
+
+The constant needed to keep the correct move selectable is **flat in time** — median 1.88 at the very
+start and 1.99 at the end, 75th percentile 2.5 to 3.7 throughout — so one larger value at the root is
+the right shape rather than a schedule. `ExplorationMax` was capped at **2.0**, the median requirement
+exactly and unable to reach the 75th percentile, so the cap was itself blocking the fix; it is 10.0 now.
+
+**`ExplorationRoot`** sets C at depth 0 independently, **0 meaning "use the depth schedule"**, so the
+default is the incumbent exactly. It replaces the `//if (depth == 0) C = 2.0;` that sat commented out in
+`select_best_child` — and the measurement explains why that value would have looked like it did nothing.
+
+**Measured, 171 positions from an empty tree at 2 s, three repeats per setting** (equal repeats, because
+more repeats mechanically produce fewer of both `always` and `never`):
+
+| `ExplorationRoot` | always | never | sometimes | rate | mean per-position change | paired bootstrap p |
+|---|---|---|---|---|---|---|
+| 0 (today) | 42 | 89 | 40 | 35.7% | — | — |
+| 2.0 | 44 | 104 | 23 | 32.5% | **−3.0 points** | 0.046 *(worse)* |
+| 3.5 | 53 | 91 | 27 | 38.9% | +3.5 | 0.056 |
+| 6.0 | 48 | 85 | 38 | 38.4% | +3.3 | 0.061 |
+| **10.0** | **55** | **78** | 38 | **41.7%** | **+6.3 points** | **0.0065** |
+
+Of the 82 positions never solved at 0, **10 are solved in every repeat at 10.0**; of the 38 always
+solved at 0, 1 becomes never. The trend is monotone — 2.0 worse, 3.5 and 6.0 marginally better, 10.0
+clearly better — which is what makes it more than a post-hoc pick among four settings.
+
+**The arithmetic predicted 2.0 and 2.0 makes things worse.** The trace said the median C needed was
+1.95, but that calculation assumed a *fixed trajectory*: raising C changes the whole visit distribution,
+so the extra visits spent on losing moves come out of the moves that needed them. A constant just large
+enough to unlock on the old trajectory is too small to pay for the trajectory it creates, and it takes
+roughly 3x the predicted value before unlocking outweighs dilution. Any offline reweighting of a fixed
+trace is subject to the same error.
+
+**The frontier, three repeats each, 0 re-run in the same batch as an in-run control:**
+
+| `ExplorationRoot` | always | never | sometimes | rate | vs 0 | bootstrap p | agrees with the prior's top move |
+|---|---|---|---|---|---|---|---|
+| 0 (today) | 40 | 85 | 46 | 35.7% | — | — | 21.0% |
+| 2 | 44 | 104 | 23 | 32.5% | −3.2 | 0.057 | 21.2% |
+| 3.5 | 53 | 91 | 27 | 38.9% | +3.2 | 0.071 | 22.4% |
+| 6 | 48 | 85 | 38 | 38.4% | +2.7 | 0.106 | 22.5% |
+| 10 | 50 | 83 | 38 | 40.4% | +4.7 | 0.041 | 22.0% |
+| 15 | 50 | 80 | 41 | 42.3% | +6.6 | 0.0039 | 23.5% |
+| 20 | 59 | 73 | 39 | 44.6% | +9.0 | 0.0008 | 27.8% |
+| 30 | 60 | 76 | 35 | 45.8% | +10.1 | 0.0003 | 27.3% |
+| **50** | **68** | **70** | 33 | **49.1%** | **+13.5** | **<0.0001** | 31.8% |
+
+**No ceiling in range.** Monotone except the dip at 2, and still rising at 50, which is the current cap.
+`always` goes 40 to 68 and `never` 85 to 70: 28 positions converted from a fixed wrong answer to a fixed
+right one.
+
+**It is not the search degenerating into its policy head**, which is the obvious confound, since a large
+C makes root allocation tend to `argmax(P/(1+N))` and ignore Q. The prior's own top move is acceptable in
+**21.2%** of these positions; at 50 the engine scores 49.1% while agreeing with that move only 31.8% of
+the time, so the extra solves are not the prior's.
+
+**What it costs, measured.** `RootTraceFile` at both settings:
+
+| | top move's share of visits | root moves with ≥1% of the top move's visits | simulations |
+|---|---|---|---|
+| `ExplorationRoot` 0 | 89.9% | **2** | 676,288 |
+| `ExplorationRoot` 50 | 55.5% | **10** | 578,895 |
+
+**Today's search effectively examines two root moves out of a median 34.** At 50 it examines ten, still
+concentrating 55% on one rather than going uniform, and pays **14% of its simulation throughput** — a
+wider root reuses less of the deep principal variation and expands more distinct subtrees.
+
+**THE LIMITATION THAT MATTERS MORE THAN THE p-VALUE.** This test set is built from positions where the
+current visit allocation *failed*. It is therefore the best available instrument for showing that the
+allocation is the problem, and close to the worst for estimating what changing it is worth: the set holds
+no position where creatica already plays well and a wide root would make it play worse, and that is
+exactly where the 14% throughput cost lands. The 40 positions it always solves today are the only
+counterweight, and 50 breaks few of them, but 40 positions are not a sample of normal play. **Expect a
+match to show materially less than +13.5 points' worth, and do not rule out a loss.** The mechanism is
+established; the magnitude is not.
+
+### Where the visits go, and whether a recency-weighted Q would help
+
+`RootTraceFile` is a diagnostic, empty by default and writing nothing unless set: on the tick thread 0
+already pays for, it appends every root child's `(edge visits, N, W, evidence)`, plus one final line per
+search. Between two snapshots, `-(ΔW)/Δevidence` is the mean of exactly the backups that arrived in that
+window, so the evolution of `Q` can be reconstructed and alternative weightings scored **offline on real
+searches**, without changing the search.
+
+**What the visit dump already showed**, over the 170 mistakes matched to a live search:
+
+| | median |
+|---|---|
+| the blunder's share of visits | **84.5%** |
+| the best acceptable move's share | **1.5%** |
+| visit ratio, blunder / acceptable | **41.9x** |
+| the acceptable move's rank by visits | 3rd of 34 legal moves |
+| prior on the blunder | 0.0615 |
+| prior on the best acceptable move | 0.0565 |
+| prior *favoured* the blunder in | **82 of 170 — a coin flip** |
+
+So the 42x visit gap is produced by the search's own value estimates, not inherited from the policy.
+That is an independent reason the three policy experiments were nulls.
+
+**Concentration does not distinguish a blunder**, which was the first hypothesis and is wrong: the top
+move's share of visits is a median 90.3% in positions creatica blundered in against **93.5%** in all
+40,590 other searched positions. Blunder positions are slightly *less* concentrated. (Two data traps
+here: under `ReuseTree` visit counts accumulate across moves while the `simulations` column is
+per-search, so shares must be taken against the visit sum — dividing by `simulations` gives impossible
+figures above 100%.)
+
+**The test of a recency-weighted Q.** All 171 positions re-searched from an empty tree at 2 s with the
+bot's settings, median 767,554 simulations. Every criterion scored the way the engine scores — argmax
+over *all* root moves — and asked whether the move it picks is Stockfish-acceptable:
+
+| criterion | acceptable move picked, of 171 |
+|---|---|
+| **engine today: most edge visits** | 65 — **38.0%** |
+| flat Q, the final `W/evidence` | 69 — 40.4% |
+| recency-decayed Q, λ=0.99 | 71 — 41.5% |
+| recency-decayed Q, λ=0.95 | 73 — 42.7% |
+| **recency-decayed Q, λ=0.90** | 74 — **43.3%** |
+| recency-decayed Q, λ=0.70 | 70 — 40.9% |
+| Q over the last 50% of evidence | 70–74 — 40.9–43.3% |
+| Q over the last 25% of evidence | 71–74 — 41.5–43.3% |
+| Q over the last 10% of evidence | 71 — 41.5% |
+
+Paired against the engine's own criterion at λ=0.90: both acceptable 62, **only recency 12, only the
+engine 3**, neither 94 — 15 discordant pairs, exact two-sided McNemar **p = 0.035**.
+
+**Four things temper that.** λ was chosen from nine candidates on the same 171 positions, so the effect
+size is an upper estimate — though every one of the nine beats the engine's criterion, so the direction
+is not a single lucky point. Reweighting a fixed trace shows only that the information was *present* by
+the end; it cannot show what the search would have done, because Q feeds PUCT and a different Q would
+have sent the visits elsewhere. 94 of 171 are unfixed by any criterion tested. And a position test set
+has moved in the opposite direction to playing strength before.
+
+**How it would be implemented, and why the sliding window is the one to build.** A per-backup
+exponential decay is `W ← W·γ + v`, `evidence ← evidence·γ + 1`, with γ = 1 recovering today's behaviour
+exactly. The measured λ=0.90 per window corresponds to a half-life of about 69,000 evidence, i.e.
+γ ≈ 0.99999. But `W` and `evidence` are atomics updated with `fetch_add` on the hottest path in the
+engine, and a multiplicative decay needs a compare-and-swap loop instead. The sliding window scores the
+same (43.3% at the last 25–50% of evidence) and keeps `fetch_add`: carry a second pair
+`(W_recent, evidence_recent)`, reset periodically, and read Q from it once it has enough evidence.
+Two more atomic adds per backup and a periodic reset.
+
+### The leaf value: `NodeMinimax` is optimistic, and there is no capture quiescence
+
+Three candidate leaf values, measured against the shard's own Stockfish evaluation over 60,000
+held-out positions that are not in check (91.6% of them), with mate scores clamped to ±1000 cp. `W`
+is `tanh(cp/610)`, the unit the search averages, on a scale two wide.
+
+| | mean \|err\| | median | 90th pct | sign ok | ≥200cp | ≥400cp | **confidently wrong side** |
+|---|---|---|---|---|---|---|---|
+| static `evaluate_nnue()` | 154.7 cp / 0.162 W | 60 | 461 | 83.9% | 25.5% | 12.5% | 0.91% |
+| **1-ply minimax (what the engine uses)** | **181.8 cp / 0.212 W** | **109** | 463 | **76.3%** | **31.7%** | 13.4% | **2.13%** |
+| all-captures quiescence | **134.4 cp / 0.135 W** | **49** | **410** | **86.9%** | **21.8%** | **10.4%** | **0.29%** |
+
+"Confidently wrong side" means the truth and the estimate are both at least 150 cp and disagree on who
+is better — the failure that loses games rather than a point of accuracy.
+
+**`NodeMinimax` is worse than not looking at all.** With `node_minimax` true and `PolicyMode 1` — both
+defaults — `eval_and_expand()` does not use the static value: the node's `cp` is
+`max over children of -position_eval(child)`. That is worse than the static evaluation on every
+measure, and 2.3× worse on confidently-wrong-side. The mechanism is maximisation bias, and it shows up
+directly when the signed error is measured from the **side to move's** point of view rather than
+White's, which is where a White-relative average cancels it out:
+
+| mean signed error, side-to-move relative | |
+|---|---|
+| static evaluation | **−42.2 cp** (slightly pessimistic) |
+| 1-ply minimax | **+74.3 cp** (optimistic) |
+| quiescence | **−15.7 cp** (nearly unbiased) |
+
+Taking a maximum over ~30 child estimates that each carry about 150 cp of noise overestimates
+systematically. In MCTS that matters more than it would in alpha-beta, because `Q = W / evidence` is a
+**mean** of leaf values: random error averages away over visits and a bias does not. And the bias
+alternates sign with depth, so every node believes it is doing better than it is — which is the shape
+of a search that walks into a blunder.
+
+**THAT CONCLUSION IS WRONG, AND THE TEST SET SAYS SO.** Absolute accuracy against Stockfish is not
+the quantity that decides a move. What decides a move is whether the estimator prefers a good move to
+the blunder, and that is a *relative* question, on which an optimism shared by every sibling largely
+cancels. Measured directly on all 171 rows of `mistakes/testset.tsv` — real positions where a
+2-second Stockfish says creatica's move lost at least 100 cp — by scoring the child after the played
+move against the child after each acceptable move and asking whether the estimator prefers an
+acceptable move by at least 100 cp:
+
+| estimator applied to each candidate's child | blunders rejected, of 171 | quiescence nodes / position |
+|---|---|---|
+| **1-ply minimax (the current default)** | **54 — 31.6%** | 0 |
+| 2-ply minimax | 30 — 17.5% | 0 |
+| minimax over children quiesced to depth 2 | 26 — 15.2% | 792 |
+| minimax over children quiesced to depth 4 | 25 — 14.6% | 2474 |
+| static `evaluate_nnue()` | 23 — 13.5% | 0 |
+| quiescence depth 2 | 22 — 12.9% | 22 |
+| quiescence depth 4 | 24 — 14.0% | 63 |
+| quiescence depth 6 | 26 — 15.2% | 125 |
+| quiescence depth 8 | 25 — 14.6% | 180 |
+| quiescence depth 10 | 25 — 14.6% | 230 |
+
+At a stricter 200 cp bar the gap widens: the 1-ply minimax rejects 28 and the static value 9.
+
+**`NodeMinimax true` is the best leaf value of the ten tested, by more than a factor of two.** Leaving
+it at its default is right and `NodeMinimax false` would make the engine worse — the opposite of what
+the absolute-accuracy table above predicts.
+
+**One principle explains every row.** An estimator whose last ply is the *blunderer's own move* takes a
+maximum there, so it rescues the blunder with an optimistic reply and hides it. An estimator whose last
+ply is the *opponent's* move reveals the punishment. `-minimax1(child)` ends on the opponent's reply, so
+it is conservative and sees the refutation; `-minimax2(child)` adds the mover's follow-up and the
+optimism returns; quiescence from a child at even depth also ends on the mover's recapture. That is why
+1-ply beats 2-ply, why depth 2 quiescence is *worse* than no quiescence at all, and why the
+odd-and-even alternation shows up in every one of these tables.
+
+**So a capture quiescence at the leaves is not worth building.** It does not reject creatica's real
+mistakes better than the static value it would replace, it makes the existing minimax markedly worse
+when combined with it, and it costs 22% of the node rate at depth 2 rising to 119% at depth 8
+(measured over the 171 test-set positions: 6.7 quiescence nodes per call at depth 2 and 57.3 at depth 8,
+against a PolicyMode 1 expansion of about 150 µs, of which 137 µs is evaluating every child).
+
+**What the residual says.** Even the best leaf estimator flags only 31.6% of these mistakes. For the
+other two thirds no 1-ply or 2-ply value distinguishes the blunder from a good move at all — they need
+real tree search, the search *did* run for thousands of simulations, and it still chose the blunder. So
+for most of creatica's mistakes the lever is neither the evaluation's accuracy nor the leaf's
+resolution: it is how the search spends its visits. `Q = W / evidence` is a mean, and a mean is slow to
+abandon a move that started out looking fine.
+
+**A caution about the two hand-picked examples.** `QlmMRJGE` and `qgaqG0C8` were chosen *because* they
+looked like value errors, and they are not representative: quiescence needs depth 8 to catch the first
+and never fully catches the second, while the aggregate said depth 2 was sufficient. Two examples
+selected for a hypothesis cannot test it.
+
+**Do not confuse this with `MinimaxBackup`**, which was a different proposal — backing minimax values
+up through the tree rather than choosing the leaf's own value — and which failed in a match.
+
+**There is no capture quiescence in creatica.** What `CLAUDE.md` calls "quiescence at leaves" is
+`process_check()`, a check *extension*: `evaluate_nnue()` returns a sentinel in check, so a checked leaf
+is expanded and minimaxed over its replies instead. Captures are never resolved. The quiescence row
+above is a plain stand-pat-plus-all-captures alpha-beta written only to measure the gap; it does 40.4
+nodes per position, so at roughly 4 µs an evaluation it cannot simply be dropped in at every leaf.
+
+**Spot-checked on the two blunders that actually cost games**, which is what makes the aggregate
+believable. The root evaluations were nearly right; it was the child position after the chosen move
+that was misjudged, and quiescence is what catches it — while leaving the correct move untouched:
+
+| | Stockfish | static | quiescence | nodes |
+|---|---|---|---|---|
+| `QlmMRJGE` after the blunder Ng6 | +516 | **+10** | **+496** | 138 |
+| `QlmMRJGE` after the correct Ne6 | +78 | +68 | +68 | 5 |
+| `qgaqG0C8` after the blunder Rc7 | +561 | **+58** | **+203** | 37 |
+| `qgaqG0C8` after the correct Re8 | 0 | +1 | +1 | 19 |
+
+(All White-relative; both games had creatica as Black.) In `QlmMRJGE` quiescence would have moved that
+child from +10 to +496 at its very first expansion, which is enough to reject the move outright.
+
+### The stored PV move was decoded wrongly, and it cost the policy castling entirely
+
+**Every policy figure recorded before 28 September 2026 was measured on a set that silently excluded
+the positions the policy is worst at.** Two independent encoding mismatches, both in the readers:
+
+- **Castling is stored king-to-ROOK.** `lichess_evals_bin_writer.cpp`'s `parse_uci_move()` keeps the
+  PV move as its UCI text reads, and the source data gives `e1h1`, `e1a1`, `e8h8`, `e8a8`. Every legal
+  move list generated here has castling as king-to-`g1`/`c1`. Nothing ever matched.
+- **Promotions are stored `0=Q, 1=N, 2=B, 3=R`** — see that function's `'q'` case, which assigns 0.
+  Every reader had `{none, N, B, Q}`, so a queen promotion looked like *no* promotion and matched
+  nothing, and a rook promotion was silently relabelled a queen. `promo=0` is also the default for a
+  non-promotion, but the board resolves it: a pawn arriving on the last rank promotes, and there 0
+  means queen.
+
+Of 3,296 records in 203,296 whose stored PV1 matched no generated move, **71% were castling and 29%
+promotions, and nothing else at all.** With both decoded, the figure is zero.
+
+**In the trainer this was worse than losing the example.** Under `PIECE_INDEX` the promotion code is
+never read, so promotions were unaffected there — but the castling row `(King, e1, h1)` is not in the
+legal list, so the loss treated PV1 as illegal. For the 56% of records carrying one PV the whole
+position contributed nothing. For the 44% carrying more, PV1 was dropped and the remaining PVs were
+**renormalised**, so the model was actively trained to believe the second-best move is best in every
+position where castling is best. The row `(King, e1, g1)` appeared in the softmax as a legal move and
+never once as the target, so it was only ever pushed down.
+
+**The measured consequence in `nnue_policy_pisp2.bin`**, over the 2,292 test positions where castling
+is Stockfish's own best move:
+
+| | Top-1 | Top-6 |
+|---|---|---|
+| 1-ply child evaluations alone | 22.4% | **92.0%** |
+| policy alone | 0.0% | **0.0%** |
+| blended at `PolicyBlend 45` | 0.0% | **0.1%** |
+
+The policy does not merely rank castling poorly; it never has it in its top six, and because the blend
+is 45% policy it destroys a signal the child evaluations had. Spot-checked by hand with a
+single-position ranking tool: in `r3k2r/ppp1qpb1/2n1bnpp/3pp3/4P3/2PP1NNP/PPB2PP1/R1BQK2R w KQkq - 0 1`
+castling ranks **34th of 37** legal moves, and in
+`r1b1kb1r/pp2pppp/2n2n2/2q5/4P3/2NB4/PPP2PPP/R1BQK2R w KQkq - 0 1` it ranks **37th of 37**.
+
+**So every published number is optimistic.** Validating the deployed net with the fixed decoder, on
+20,000 positions rather than the 19,772 that used to survive:
+
+| `nnue_policy_pisp2.bin` | Top-1 | Top-4 | Top-6 |
+|---|---|---|---|
+| old decoder (what the tables above record) | 39.46 | 74.95 | 84.04 |
+| **fixed decoder** | **39.02** | **74.10** | **83.09** |
+
+`bench_blend` agrees: policy alone 39.25 / 74.17 / 82.89 and blended at 0.45 38.32 / 75.72 / 84.76 over
+200,000 positions, with zero records skipped. **Treat every policy Top-k in this document as measured
+on the easier, truncated set**, and compare new runs only against the fixed-decoder figures.
+
+**The input cannot see castling rights**, and that is deliberately not being changed yet. Two positions
+differing only in castling rights reach the model as byte-identical 1024 NNUE features *and*
+byte-identical planes — verified directly — because the king's square is already marked as a legal
+source in plane 12 and `g1`/`c1` are already marked as legal destinations in plane 13 by the rooks, so
+the castling move's `(from, to)` pair is entirely absorbed by the marginals. The halfmove clock and
+the fullmove number are invisible too; the en passant square shows up as a single extra cell in plane
+13. But the model is only ever asked to score moves that are *in* the legal list, so it is only asked
+about castling where castling is legal and never has to infer availability. Fix the labels first —
+`L1C8pi3_run.sh` — and see whether anything is still missing.
+
 ### Policy file formats
 
 The exported `.bin` records its own layout in a version field, and the engine refuses anything it
@@ -305,10 +643,15 @@ independently: whether the move table is indexed by the moving piece, and whethe
 | 6 | + `Cl` [out,h2] | piece-indexed | 24576 |
 | 7 | 2 + spatial block | `from*64 + to` | 4096 |
 | 8 | 5 + spatial block | piece-indexed | 24576 |
+| 9 | 8 with **one spatial head per moving piece type** | piece-indexed | 24576 |
 
-The engine implements 1, 2, 4, 5, 7 and 8. Versions 3 and 6 use the untied `Cl` table and are
+The engine implements 1, 2, 4, 5, 7, 8 and 9. Versions 3 and 6 use the untied `Cl` table and are
 refused. An engine older than versions 7 and 8 refuses them too, which is deliberate: read as a 2 or
-a 5, a spatial net would run without its spatial term.
+a 5, a spatial net would run without its spatial term. Version 9 is a separate version for the same
+reason: read as an 8, its per-square vectors would be truncated to their first `dim` numbers, which
+is the pawn head, and every knight, bishop, rook, queen and king move would be scored with it. Its
+spatial block also carries a ninth header integer, so its header magic is `SPA2` rather than `SPAT`
+and a misread fails on the magic instead of on arithmetic.
 
 **The piece index** exists because `emb[from*64 + to]` gave a rook moving e1–e4 and a queen moving
 e1–e4 the same row, leaving the model to tell them apart through the 128-dim global position code.
@@ -333,7 +676,7 @@ an independent measurement. Here it is policy-only Top-1 against the trainer's o
 agreed for the old net and was five points out for the new one, which is what exposed the missing
 term.
 
-**The spatial term** (versions 7 and 8) adds `dot(u[from], v[to])` to each move's score, where `u`
+**The spatial term** (versions 7, 8 and 9) adds `dot(u[from], v[to])` to each move's score, where `u`
 and `v` are per-square vectors computed from 8x8 planes by 3x3 convolutions. It is what lets the
 policy see the board as a board: which squares are defended, and by what. The planes, all oriented
 from the side to move's point of view, are: own pieces by type (0–5), enemy pieces (6–11), squares a
@@ -343,8 +686,186 @@ because they only index attacks on occupied squares.
 
 The spatial block after `Wl` is an 8-integer header — magic `SPAT`, planes, channels, dim, layers,
 scale, plane layout, attack planes — followed by `Wc1`, `bc1`, `Wc2`/`bc2` if there are two layers,
-`Wu` and `Wv`. The engine reads only shapes it implements (14 or 26 planes, up to 64 channels, dim up
-to 32, one or two layers) and refuses the rest.
+`Wu` and `Wv`. In format 9 it is a 9-integer header under the magic `SPA2`, the ninth integer being
+the head count. The engine reads only shapes it implements (14 or 26 planes, up to 64 channels, dim
+up to 32, one or two layers, 1 or 6 heads and 6 only on a piece-indexed net) and refuses the rest.
+
+**Per-piece spatial heads** (format 9, the trainer's `SPATIAL_HEADS=6`). With one shared `u`/`v` pair
+the spatial term `dot(u[from], v[to])` is a function of the two squares and of nothing else, and
+under piece indexing it is added to all six per-piece blocks of the move table unchanged. So it
+cannot express the most ordinary fact about a destination square: that it is a good square for a
+knight and a bad one for a queen. Six heads give each moving piece type its own `u` and `v`, chosen
+at scoring time by the piece on the from-square.
+
+**THE MEASUREMENT THAT MOTIVATED THIS WAS WRONG. Read this before repeating the idea.**
+
+The argument was: over 60,000 held-out positions with `pisp2`, the blended prior holds Stockfish's own
+best *move* in its top six 85.7% of the time but holds *some move of that move's piece* 93.8% of the
+time, with the gap reaching 14.7 points for queen moves and 2.0 for pawn moves. That was read as "the
+model picks the right piece and misses the right square", and it is **an artefact of comparing two
+metrics with completely different chance baselines**.
+
+"Some move of the right piece is in the top six" is a far easier question than "the right move is in
+the top six", and it gets easier the more legal moves that piece has. A piece with *k* of *n* legal
+moves lands in a random six-move subset with probability `1 - C(n-k,6)/C(n,6)`, against `6/n` for one
+specific move. Measured on the same 60,000 positions, with the floor subtracted and expressed as the
+share of *available* headroom the model captures — `lift / (100 - floor)`:
+
+| Stockfish's best move is a… | move: got / floor / %headroom | piece: got / floor / %headroom |
+|---|---|---|
+| capture | 98.2 / 27.7 / **98%** | 99.2 / 70.0 / 97% |
+| quiet move | 81.7 / 30.8 / **74%** | 92.0 / 69.9 / 73% |
+| pawn move | 86.3 / 26.3 / 81% | 88.3 / 35.6 / 82% |
+| knight move | 88.4 / 21.9 / 85% | 95.8 / 66.2 / 88% |
+| bishop move | 85.9 / 22.0 / 82% | 94.5 / 69.8 / 82% |
+| rook move | 82.6 / 25.5 / 77% | 95.0 / **82.6** / 71% |
+| queen move | 81.5 / 20.7 / 77% | 96.2 / **89.3** / 64% |
+| king move | 90.7 / 65.8 / 73% | 94.8 / 87.0 / 60% |
+| all positions | 85.7 / 30.0 / **79%** | 93.8 / 69.9 / **79%** |
+
+The two columns capture the **same 79%** of their available headroom. There is no piece-versus-square
+gap. For queens the model is in fact *worse* at the piece question (64% of headroom) than at the move
+question (77%), and the entire 14.7-point "gap" is the 89.3% floor — a queen with many legal moves is
+in any random top six almost by default.
+
+Two overnight runs were spent on that misreading before the floors were computed: `SPATIAL_HEADS=6`
+and `SPATIAL_DIM=32`, both nulls, both exactly what an intervention aimed at a non-existent deficit
+should produce. **Any claim about where the policy is weak must carry the chance baseline for the
+metric it is measured in.** The scratchpad breakdown tool now prints `rndMove6` and `rndPiece6`
+beside every row for this reason.
+
+What the corrected table does say is the thing that was already known and already acted on: **captures
+are essentially solved at 98% of available headroom and quiet moves sit at 74%**. That is the gap the
+by-piece-type attack planes (14–25) were added for, and it is not a new lever pointing at any
+particular reshaping of the spatial term.
+
+The receptive-field explanation was also tested and also does not hold: splitting quiet bishop, rook
+and queen moves by distance travelled gives 70%, 71%, 72%, 73% and 74% of available headroom at
+distances 1 to 5. Flat. One 3x3 convolutions is not the fix.
+
+**Cost.** `Wu` and `Wv` go from `[ch, dim]` to `[ch, 6*dim]`, which at 8 channels and dim 16 is 1,280
+more numbers — 0.04% of the model. The `u` and `v` scratch grows to 48 KB each, held in a
+`thread_local` per search thread. Six heads cost about **+2.8 µs per expanded node** after the
+projection rewrite described below, all of it in `spatial_forward` and none in `spatial_score` — the
+expected shape, since the head count changes the per-square projection, run once per position, and not
+the per-move dot product, which still reads `dim` numbers. Before the rewrite it was +8.3 µs.
+
+### The projection rewrite
+
+`policy_spatial_forward_impl()` ends by projecting the convolution's `[ch][64]` output into the
+per-square vectors `u` and `v`. The obvious way to write that is channel-outer, accumulating straight
+into `s.u` and `s.v` — and that reads and rewrites every one of the `64*heads*dim` output numbers once
+per channel, so eight channels make eight passes over a 48 KB pair of arrays to perform 98,000
+multiply-adds. Measured at dim 16, the projection cost **1.65 µs** a position with one head and
+**9.9 µs** with six: six times the arithmetic at six times the price, from a base that was already
+slow for what it computes.
+
+It is now square-outer: one square's whole `heads*dim` block is built in a local buffer and stored
+once, which does exactly the same arithmetic, summed over channels in exactly the same order, with an
+eighth of the traffic. The relu on `u` folds into that single store, removing a separate sweep over
+`64*heads*dim` and both `memset`s.
+
+```
+spatial_forward, ns per expanded node    before    after
+  8 channels, dim 16, 1 head             7,341.7   6,872.9
+  8 channels, dim 16, 6 heads           15,586.9   9,632.8
+```
+
+The projection itself goes from 1.65 µs to **0.55 µs**, and six heads from 9.9 µs to 3.3 µs.
+
+**It is exact, not merely close.** Summing over channels in the same order makes this a memory-traffic
+change rather than a numerics change, and `check_policy_export` confirms it against logit dumps written
+*before* the rewrite: three nets — `pisp2` (one head), `pisp2h6` (six trained heads) and a
+deliberately-diverged six-head test net — each reproduce their pre-rewrite figures to the last digit
+(max 1.12e-05 / 1.07e-05 / 9e-06, mean 9.98e-07 / 8.97e-07 / 6.7e-07), with no top-move disagreements.
+
+### The width frontier
+
+With the projection no longer dominating, `bench_policy_spatial` takes `SPATIAL_CH`, `SPATIAL_DIM`,
+`SPATIAL_LAYERS` and `SPATIAL_HEADS` from the environment, so the whole frontier can be measured in one
+session. 37 positions of `test_fen_strings`, 40 repeats, idle machine, one head, as ns added per
+expanded node and as a multiple of what `pisp2` costs today:
+
+| channels | dim | layers | conv + projection | per move | total added | vs `pisp2` |
+|---|---|---|---|---|---|---|
+| 8 | 16 | 1 | 6,987 | 82 | 7,272 | **1.00x** (`pisp2`) |
+| 8 | 32 | 1 | 7,416 | 182 | 7,797 | 1.07x |
+| 16 | 16 | 1 | 14,016 | 86 | 14,325 | 1.97x |
+| 16 | 32 | 1 | 14,704 | 181 | 15,094 | 2.08x |
+| 32 | 16 | 1 | 28,319 | 92 | 28,646 | 3.94x |
+| 32 | 32 | 1 | 30,066 | 184 | 30,478 | 4.19x |
+| 8 | 16 | 2 | 8,212 | 82 | 8,473 | 1.17x |
+| 16 | 16 | 2 | 19,525 | 84 | 19,810 | 2.72x |
+| 32 | 32 | 2 | 50,479 | 188 | 50,876 | 7.00x |
+
+**`dim` is nearly free and `ch` is not.** Doubling `dim` costs 7% of the spatial term, about 1% of an
+expansion; doubling `ch` doubles it, because the first convolution's cost is `planes * ch * 9` per
+square and 26 planes make it the dominant term. Doubling `dim` also doubles the per-move dot product,
+82 ns to 182 ns, which is still negligible against the rest.
+
+The order tried was `dim` first, `ch` only if `dim` moved the destination gap — see `L1C8D32_run.sh`.
+
+**Result: `dim` 16 → 32 is a null too, and `ch` should NOT be tried on this reasoning.**
+`nnue_policy_pisp2d32.bin`, trained 27–28 September 2026 on pisp2's recipe with `SPATIAL_DIM=32` and
+one shared head, 8 h 06 min, exports clean (1.01e-05 over 56,373 moves, no top-move disagreements):
+
+| | policy alone: Top-1 | Top-4 | Top-6 | blended at 0.45: Top-1 | Top-4 | Top-6 |
+|---|---|---|---|---|---|---|
+| `pisp2` (dim 16) | 39.58 | 74.72 | 83.73 | 38.81 | 76.50 | 85.73 |
+| `pisp2d32` (dim 32) | **39.66** | **74.93** | **83.81** | **39.00** | **76.60** | **85.98** |
+
+Consistently positive but by 0.1 to 0.25 of a point, which is inside run-to-run variation, for 1.07x
+the spatial term's cost. More to the point, the destination-side gap it was aimed at went 8.1 → 8.0,
+and that gap was a measurement artefact in the first place (see the correction under *Per-piece
+spatial heads*). **Three interventions on the spatial term's destination pathway — per-piece heads,
+double width — have each moved held-out accuracy by less than a quarter of a point.** Paying 2x for
+`ch` 8 → 16 has no evidence behind it and should not be the next thing tried.
+
+If `pisp2d32` were ever deployed it would need `BlendScale 108` rather than 102: at `PolicyBlend 0.45`
+it puts 0.3984 on its top move at scale 1.00 against pisp2's 0.4025.
+
+A `SPATIAL_HEADS=6` build can be fine-tuned from a one-head checkpoint: the loader copies the single
+trained pair into all six heads and says so, and the model then scores every move exactly as that
+checkpoint did, so the six heads can only diverge by learning something. Checkpoints record their
+head count in a `spatial_heads` buffer and a build refuses one that carries more heads than it has.
+
+**MEASURED, AND IT IS A NULL. Do not deploy it.** `nnue_policy_pisp2h6.bin` was trained on
+27 September 2026 with `L1C8pi2H6_run.sh` — `SPATIAL_HEADS=6` and otherwise byte-for-byte pisp2's
+recipe: same architecture, same 28 cached shards, same two epochs, same batch size, same 68,726-step
+schedule ending at `LR_MIN`. 8 h 05 min, no restarts. The engine reproduces the trainer to 1.07e-05
+over 56,373 moves with no top-move disagreements.
+
+Trainer validation on the same 19,772 held-out positions:
+
+| | Top-1 | Top-4 | Top-6 | held-out policy loss |
+|---|---|---|---|---|
+| `pisp2`, one shared head | **39.46** | 74.95 | 84.04 | 2.0695 |
+| `pisp2h6`, six heads | 39.40 | **75.04** | **84.15** | **2.0602** |
+
+`bench_blend` on 60,000 test positions, which is the number that matters because it is how the engine
+uses the net:
+
+| | policy alone: Top-1 | Top-4 | Top-6 | blended at 0.45: Top-1 | Top-4 | Top-6 |
+|---|---|---|---|---|---|---|
+| `pisp2` | **39.58** | 74.72 | 83.73 | 38.81 | 76.50 | 85.73 |
+| `pisp2h6` | 39.44 | **74.92** | **83.86** | **38.94** | **76.72** | **85.93** |
+
+Every difference is two tenths of a point or less, in both directions, which is well inside the
+run-to-run variation the `pisp` → `pisp2` pair already demonstrated (0.4 points of policy Top-1 for
+no measurable Elo over 300 games). Against that, the six heads cost **8.3 µs per expanded node**, or
+about 13% of the node rate. The trade is not close.
+
+**The term it was aimed at did not move** — the raw piece-minus-move gap went from 8.1 to 8.0 points
+overall, queen 14.7 to 14.3, rook 12.4 to 12.5 — but as the correction above explains, that gap was
+never a deficit, so its not moving is not informative about the six heads. The term did learn: it grew
+to 173% of the mean absolute legal logit and the held-out loss improved by 0.009 nats, so the extra
+parameters found something; it simply was not something that reorders the top of the move list. `emb`
+is already indexed by (piece, from, to), so the model already had a per-piece per-destination
+parameter, and a per-piece *position-dependent* one adds nothing measurable on top.
+
+If it were ever deployed it would need `BlendScale 108`, not 102: at `PolicyBlend 0.45` it puts 0.3934
+on its top move at scale 1.00 against pisp2's 0.4025, and 1.05 brings it to 0.4086 against the 0.4087
+pisp2 reaches at 1.02.
 
 **Plane layout** records a trainer bug the weights were trained with, because the engine has to
 reproduce the planes a net saw, not the planes it should have seen. Under piece indexing the trainer
@@ -519,7 +1040,7 @@ In `creatica_search.hpp`. Changing any of these needs a rebuild:
 THREADS 4            MULTI_PV 5           HASH 2048
 EXPLORATION_MIN 65   EXPLORATION_MAX 160  EXPLORATION_DEPTH_DECAY 5
 VIRTUAL_LOSS 36      EVAL_SCALE 61        TEMPERATURE 58
-PV_PLIES 16          MAX_DEPTH 100        SYZYGY_PATH "/Users/ap/syzygy"
+PV_PLIES 16          MAX_DEPTH 100        SYZYGY_PATH "<your syzygy dir>"
 POLICY_WEIGHTS_DEFAULT "nnue_policy_pisp2.bin"  FPU_REDUCTION 0.20
 POLICY_BLEND 0.45    POLICY_BLEND_SCALE 1.15
 POLICY_MAX_IN 2048   POLICY_MAX_H2 512    (buffer bounds; a larger net is refused at load)
@@ -1827,6 +2348,66 @@ from the `#define`s, so it cannot drift from the code the way a table here would
 the configuration is **environment variables**; the command-line flags only cover what changes
 between runs of the same setup.
 
+### How big the opponent pool is: `CREATICA_NB`
+
+`GetAndProcessBots()` asks `/api/bot/online?nb=<n>` for the list it challenges from. **That `nb` is a
+prefix of a fixed ordering, not a sample of it**, which is the whole reason the number matters.
+Measured on 26 September 2026: 396 bots were online, and `?nb=50` returned exactly the first 50 rows
+of the `?nb=1000` list, in the same order, on two fetches seconds apart.
+
+The head of that ordering is lichess's own bot family — `maia1` at 1399, `maia5` at 1437, `maia9` at
+1599, then the odds-giving Leelas from 2000 up to 3340 — and almost none of it lies inside the
+2100–2800 band the bot challenges in. Applying `GetAndProcessBots()`'s own filter to the fetched list:
+
+| `nb` | eligible opponents |
+|---|---|
+| 50 (the old default) | **12** |
+| 1000 | **117** |
+
+So the old value gave the bot 12 candidates out of 117, and *the same 12 every round*, because the
+ordering is stable. Bots visibly playing on `lichess.org/games/bot` were simply past the cut rather
+than absent or ineligible. The default is now 1000, which is more than the population; the API
+returns what it has, the whole list is 336 KB in one request, and it is fetched only between games.
+
+`CREATICA_NB` overrides it, for the same reason `CREATICA_MIN_ELO` and `CREATICA_MAX_ELO` are
+overridable: widening the pool changes *who* creatica has been playing, so its rating will move for
+reasons that have nothing to do with the engine. A run whose purpose is to compare two engine
+versions against a known field should pin `CREATICA_NB=50` to keep the field the earlier games used.
+
+Of the 396 online, 202 were at or below 2100 and 77 at or above 2800, so the rating band itself
+excludes 279 by design — that is not a defect, and the real pool is the remaining 117. All 396 carried
+a blitz rating and none were flagged `tosViolation` or `disabled`, so neither of those filters trims
+anything in practice.
+
+### Saying something when a draw offer is declined: `CREATICA_CHAT_DRAW_DECLINED`
+
+The bot offers a draw **at most once a game, and only when the tablebase says the position is a dead
+draw** — `tablebaseVerdict()` requires the search to have returned depth 1, one node and one
+tablebase hit, so the verdict is a proof rather than an opinion. Opponents essentially never accept.
+Measured over the 297 games in `creatica_creaticachessbot.log`, **58 reached a tablebase-drawn
+position**, so roughly one game in five plays out a draw that both sides could already have agreed.
+
+When the offer is turned down, the bot now posts one line into the game's *player* chat (the two
+players' room, not the public spectator one). The default is
+`solar energy is free in Queensland - burn, baby, burn`; `CREATICA_CHAT_DRAW_DECLINED` replaces it,
+and setting it to the empty string switches it off.
+
+Three things this deliberately gets right:
+
+- **There is no "declined" event in the game stream**, so a decline is read off the bot's own
+  `wdraw`/`bdraw` flag going from set to clear while the game is still running. Had they *accepted*,
+  the status would be terminal and the handler returns before reaching the check. An opponent's move
+  implicitly declines and clears the flag too, which is the same answer for this purpose.
+- **The text is form-encoded** with `curl_easy_escape` rather than pasted into the body. The default
+  contains spaces and commas; unencoded, the message would be truncated or the `room` field corrupted.
+- **One line per game**, tracked by `draw_decline_chatted` and reset alongside `tb_draw_offered` when
+  a game starts. A failed chat POST is logged and dropped with no retry — a chat line is decoration,
+  and a bot that spent clock retrying it would be trading a game for a joke.
+
+It is also read with `env_str_or_empty()` rather than `env_str()`, because `env_str()` treats an empty
+value as *unset* and falls back to the default. That is right for a path, where `""` can only be a
+mistake, and wrong for a setting whose empty value is how you turn it off.
+
 Check a configuration before committing a night to it:
 
 ```sh
@@ -1842,7 +2423,7 @@ have been played — a book FEN is sent as `variant=fromPosition`, which silentl
 ```sh
 LICHESS_USERNAME=creaticachessbot  CREATICA_VISITS=bot1_visits.tsv CREATICA_THREADS=2 \
   CREATICA_HASH=1024 CREATICA_PONDER=1 CREATICA_CLOCK=120 CREATICA_INC=2 \
-  CREATICA_BOOK=/Users/ap/libchess/book.tsv \
+  CREATICA_BOOK=~/libchess/book.tsv \
   ./lichess_bot --challenge=creaticachessbot2 --casual --accept-only=creaticachessbot2
 
 LICHESS_USERNAME=creaticachessbot2 CREATICA_VISITS=bot2_visits.tsv CREATICA_THREADS=2 \
@@ -2154,7 +2735,7 @@ through `engine.cpp`. They set its options **by name**:
 ```cpp
 setEngineSpin(engine, "PolicyBlend", 45);      // 0.45 — see the scaling note above
 setEngineCheck(engine, "PerformanceCores", true);
-setEngineStringOption(engine, "SyzygyPath", "/Users/ap/syzygy");
+setEngineStringOption(engine, "SyzygyPath", "~/syzygy");
 setOptions(engine);                            // sends everything that differs from default
 ```
 
@@ -2346,6 +2927,9 @@ violently **neither number knows anything** and the right response is more searc
 substituting one value for the other — which argues for using the signal to allocate search, as
 `VerifyReplies` does, rather than to correct a value. And it catches only the catastrophic cases: of the two
 known blunders, `Kh8` sits at 501 and would fire, while `Nxd5` sits at 198 and would not.
+
+I think a better alternative to more search strategy is better priors (the policy). At least if the policy can eliminate
+catastrophically bad priors, Q will stay bounded and not explode to blunders.
 
 Untested as code. The obvious experiment is to gate `VerifyReplies` on the disagreement, which would let the
 floor be raised a long way while being paid for only where the engine is far more likely to be wrong.
@@ -2584,6 +3168,12 @@ rescaling the counters, at least not in the top few plies while the rest of the 
 
 ## Is this an MCTS problem?
 
+**Answered, 5 October 2026 — yes, and it is not repairable by reallocating visits.** See *Why no search
+change survived: the allocation law and the test-set artefact* at the end of this document: a
+non-leading move's share of the search is `C*P/(gap*sqrt(D))` and decays as `1/sqrt(D)`, the
+concentration that causes it IS what buys depth on the principal line, and forcing a constant share
+instead made the deep-refutation bucket 3.5x worse. The section below predates that measurement.
+
 Essentially yes, and it is worth being exact about which part.
 
 **The cause is the backup rule, not tree reuse.** `Q = W/evidence` is a mean over every leaf a subtree has
@@ -2659,3 +3249,1005 @@ run for weeks in live play without trouble. Not because a match showed they help
 
 **This moves every baseline.** Any future A/B where one side is given "no options" is now a different and
 stronger engine than it was before this change.
+
+## Where the limit actually is: MCTS, alpha-beta and Stockfish on the same positions, 3–4 October 2026
+
+This is the longest measurement run in this document and it answers the question *Is this an MCTS
+problem?* above with numbers rather than argument. Everything here uses the **same 171-position
+mistakes test set** (`mistakes/testset.tsv`, drawn from the bot's own games) and, where an evaluator is
+involved, **the same two nets creatica embeds** — verified identical: `nn-c288c895ea92.nnue` and
+`nn-37f18f62d772.nnue` are the defaults of both creatica and the installed Stockfish 18.
+
+Scripts and binaries for all of it live in `$EXPERIMENTS/` -- a scratch directory kept OUTSIDE the repo,
+both so a reboot does not clear it the way `/private/tmp` does and so that multi-gigabyte intermediates
+never risk being committed. Set it to wherever you keep yours; every path below is relative to it.
+
+### How the set is scored, and why not as a rate
+
+Four repeats per position, and each position is classed **always solved**, **never solved** or
+**sometimes solved**. The headline number is how many positions move between *never* and *always*,
+because that is the only movement that says something about the mechanism. A change that shuffles
+positions inside the *sometimes* band has not done the same kind of thing at all.
+
+The noise floor for class movement is known, because two independent runs of the *same* unmodified
+search are available: they disagree on **one** position in one direction and **zero** in the other. So
+a change that converts fifteen positions is doing something real; a two-point difference in the
+aggregate rate is not.
+
+### 1. Exploration: the curve never turns, so no constant is the answer
+
+`ExplorationRoot` applies its own constant at depth 0 only. Three repeats per setting, in-batch
+control:
+
+| `ExplorationRoot` | solved |
+|---|---|
+| 0 (default schedule) | 35.7% |
+| 2 | 32.5% |
+| 10 | 40.4% |
+| 20 | 44.6% |
+| 50 | **49.1%** |
+
+It never turns inside the range the option allows, and the cost is real: the top move's visit share
+falls from 89.9% to 55.5%, and simulations from 676,288 to 578,895. **A monotonically rising sweep is a
+diagnostic, not a setting** — it says no single constant is sufficient, because the quantity a
+refutation has to overturn grows with the tree.
+
+Why it cannot be fixed by making the constant adaptive: seven candidate "this node is tactical" signals
+read off the root's own children — best-minus-mean child value, best-minus-second, standard deviation,
+how often the leader changed, how far its value drifted, and two more — were tested for their ability to
+separate the never-solved positions from the always-solved ones. **Every AUC landed between 0.47 and
+0.62, against 0.5 for no information at all.** The search cannot tell which positions it is about to get
+wrong. One number from that run is worth keeping: the best-minus-mean child value has a median of
+0.197, while the best-minus-**visit-weighted**-mean is 0.0026, seventy-five times smaller. By the end of
+a search the moves still being visited all agree with each other, and the move that would disagree has
+stopped being visited.
+
+### 2. `ProveTerminals`: propagating exact verdicts converts nothing
+
+Off by default. A node is *proven* when its outcome is exact — mate, stalemate, a tablebase hit — and
+exactness composes by backward induction: a node with one child lost for the child's mover is won, and a
+node all of whose children are won for their mover is lost. Proofs override PUCT in selection, back up
+as ±1 rather than as evaluations, and outrank every visit count at the root.
+
+It fires at scale: across 684 searches it stamped **2,957,835** tablebase verdicts and proved **296,872**
+nodes won and **93,362** lost. The result:
+
+| | solved | always | never | never → always |
+|---|---|---|---|---|
+| off | 36.1% | 39 | 86 | — |
+| on | 34.4% | 34 | 83 | **0** |
+
+**Zero conversions in either direction.** Two implementation notes that cost real time and are worth
+not repeating. The verdict rides in the unused high bits of `terminal` because `MCTSNode` is pinned at
+64 bytes; an in-check node is stored as the plain `int` −1, which has *every* bit set, so a bare mask
+read both proof bits out of it and declared every check a forced mate — the principal variation
+collapsed from nineteen plies to two. And the first version stamped proofs only in `make_move_policy()`,
+which the blended prior never calls, so the counter read **exactly zero** across 684 searches; the site
+that matters is the tablebase branch in `position_eval()`.
+
+### 3. `MinimaxWeight`: the backup operator, and the first thing that moves a deterministic failure
+
+Off by default (0). Every node carries `mm`, the best value its subtree has been shown to reach, in
+centipawns from its own side to move, recomputed on backup as the maximum over its children of the
+negation of theirs. Selection scores a child on `(1 − w)·mean + w·minimax`.
+
+It cost no memory: `expanding` is one byte at offset 36 and `descents` needs four-byte alignment at 40,
+so bytes 37–39 were padding and a two-byte `int16` fits there. The `static_assert` on 64 bytes still
+passes. The value is recomputed in full rather than kept as a running maximum, because a maximum that
+only rises is a high-water mark — when a child's value falls the parent's must fall with it.
+
+| weight | solved | always | never | median simulations | never → always | always → never |
+|---|---|---|---|---|---|---|
+| 0 (control) | 34.6% | 40 | 90 | 599,283 | — | — |
+| 0.50 | 46.2% | 63 | 74 | 375,669 | **15** | 2 |
+| 0.60 | 47.4% | 66 | 77 | 373,987 | **15** | 3 |
+| **0.75** | **48.7%** | 65 | 71 | 351,387 | **15** | 2 |
+| 1.00 | 44.3% | 61 | 77 | 61,956 | 14 | 4 |
+
+A genuine interior optimum, unlike the exploration sweep — and pure minimax being worse is what the
+reasoning predicted, since the maximum of many noisy estimates is wrong upward.
+
+**The smaller tree is not the explanation.** The blend costs 41% of the simulations, so a
+simulation-matched control was run: weight 0 at 1,170 ms, which reaches 325,270 simulations — *fewer*
+than the blend's 351,387. It scores 33.6% and converts **zero** positions. Halving creatica's search
+changes nothing about which positions it fails on.
+
+The affected positions are mostly weight-specific: 24 distinct positions convert for at least one
+weight and only **four** convert for all of them, so no single global constant collects much more than
+0.75 already does.
+
+### 4. Why that result matters more than its size
+
+The two results above, taken together, say something the engine's design has been assuming the opposite
+of. Propagating **exact** verdicts converted zero positions. Propagating **maxima over ordinary
+estimates** converted fifteen, while changing no evaluation anywhere — same net, same policy, same child
+evaluations, same seeds. So what MCTS lacks here is not access to certainties. It is the **backup
+operator applied to guesses**: `Q` is a mean where alpha-beta's root value is a minimax, and that is
+true of estimates and not only of proofs.
+
+### 5. How good the birth value is, and how deep it would have to be
+
+Full-width negamax over every legal root move, no pruning, no ordering, nothing skipped, same NNUE.
+Depth 1 is exactly what the engine seeds a child with today.
+
+| | top move acceptable | leaf evaluations |
+|---|---|---|
+| depth 1 — today's seed | **21.6%** | ~34 |
+| depth 2 | 30.4% | ~1,000 |
+| depth 3 | 37.4% | ~37,000 |
+
+About eight points a ply, straight. For comparison, creatica's MCTS at 600,000 simulations scores
+34.6% — so **two seconds of MCTS is worth about three plies of brute force**, and an exhaustive depth-3
+search costing a sixth of a second scores higher.
+
+Of the 90 positions MCTS never solves, a depth-3 birth value gets **27** right, against 19 for the
+minimax backup, for a twentieth of the cost. Of the 57 that neither MCTS arm ever solves it gets 12.
+
+### 6. Stockfish on the same positions: it is not the evaluator
+
+This is the control that should have been run first. Same nets, same clock, one thread.
+
+| engine, 2 s a move | solved | mean depth | mean nodes | of the 90 | of the 57 |
+|---|---|---|---|---|---|
+| creatica MCTS, 4 threads | 34.6% | ~3 effective | 600,000 sims | 0 | 0 |
+| a plain alpha-beta probe, 1 thread | 53.8% | 5.6 | 1,379,969 | 38 | 23 |
+| **Stockfish 18, 1 thread** | **94.2%** | **23.9** | **1,739,264** | **82** | **52** |
+| Stockfish 18, 4 threads | 95.9% | 22.2 | 4,532,535 | 85 | 55 |
+
+**The information is in the net.** Any claim that creatica's evaluation is the ceiling on a set of
+positions is unfounded until the reference engine has been run on the identical positions, because it
+shares the net. A plateau measured with a weak searcher is a fact about the searcher.
+
+The one number that explains the table: effective branching factor — nodes to the power of one over
+depth — is **1.83 for Stockfish and 12.54 for the probe**. Per ply Stockfish pays 1.83 times the nodes
+and the probe pays 12.5, and compounded that is the whole difference between depth 6 and depth 24 at the
+same cost.
+
+Stockfish's ten misses are not failures of the set: in every one its two-second move appears in that
+position's own `sf_lines` at rank 2 to 6, and the `acceptable` column is a strict subset of that list.
+Seven are near-misses of 71 to 122 cp. Two are real: at `e9o2RVij` ply 95 it misses a forced mate, and
+at `j3zkChdp` ply 111, at depth 27, it plays a move its own deeper analysis scores at −19960. The
+labels came from a MultiPV 8 run, which orders the top moves far more carefully than a single-PV search
+of the same length, so **94.2% is not a ceiling and not the right yardstick** — the set's own labelling
+conditions are.
+
+### 7. What depth the set actually needs, and what it costs
+
+Asked directly, rather than inferred from Stockfish's reported depth — which is not the same unit as a
+near-full-width depth, because reductions make it selective.
+
+| Stockfish at fixed depth | solved | mean nodes |
+|---|---|---|
+| 4 | 40.9% | 620 |
+| 6 | 40.9% | 1,544 |
+| 8 | 55.6% | 4,158 |
+| 12 | **73.1%** | **25,546** |
+| 14 | 82.5% | 73,351 |
+| 16 | **89.5%** | **200,553** |
+
+**Depth 12 costs 25,546 nodes and depth 16 costs 200,553. Creatica spends 600,000 simulations in the
+same two seconds.** The compute for the depth these positions need is already in the engine three times
+over. It is not the evaluator, not the time control, and not an unreachable depth — it is the number of
+nodes each ply costs.
+
+(Depth 4 and depth 6 scoring identically at 40.9% despite 2.5 times the nodes is the only
+non-monotonic point in the curve and is unexplained.)
+
+### 8. What the ordering and pruning machinery is worth, and where it stops
+
+Measured on the probe so the contribution of each mechanism is separable. The mean position here has
+**32.3 legal moves**, so alpha-beta that searches every move has a floor of √32.3 = **5.68** on its
+branching factor, reachable only with perfect ordering. Stockfish runs at 2.1 — *below* that floor,
+which is only possible by not searching everything to full depth.
+
+| rung | solved | mean depth | branching factor |
+|---|---|---|---|
+| captures-first by victim, no pruning | 49.7% | 5.3 | 11.33 |
+| + killers and history | 51.5% | 5.5 | 10.46 |
+| + null-move pruning | 53.8% | 5.8 | 9.04 |
+| + late move reductions | 54.4% | 7.1 | 5.92 |
+| + both | 53.8% | 7.5 | **5.45** |
+
+Ordering buys about two points and a tenth of the branching factor; **pruning buys five points and
+nearly halves it**. Killers and history are worth noting separately because they are *not* hand-crafted
+chess knowledge — a killer is "this move caused a cutoff here a moment ago" and a history score is "this
+from-to pair has been causing cutoffs", both statistics the search accumulates about itself at runtime,
+costing a table lookup. The learned policy head, by contrast, costs 13.76 µs a node and was worth 1.7
+points when used on the top three plies only.
+
+**This line of work is closed.** Arkadi's ruling: "we are here not to reconstruct Stockfish." The probe
+was built to diagnose and it has; its mechanisms are not a plan for creatica.
+
+### 9. Four defects in the probe, and why they are recorded here
+
+Absolute solve rates from a young search are far less trustworthy than differences between its arms, and
+every number in sections 5 to 8 was produced by code that had at least one of these live at some point.
+
+1. **Proof bits colliding with the in-check encoding** — described in section 2.
+2. **`board.isCheck` read before the position's own moves were generated.** It looks like a field of the
+   position and is not: it is a cache that `king_moves()` writes as a side effect, valid only for the
+   position `kingMoves()` was last called on. Reading it at node entry returns the *parent's* answer.
+   That let null-move pruning fire while the side to move was in check, the opponent captured the king,
+   and the next generator call dereferenced a null pointer. Compute it instead:
+   `getCheckers(board, lsBit(side[stm] & pieceTypes[King-1]))`, verified against the library's own
+   answer over 567,436 nodes with zero disagreements.
+3. **An unbounded check extension.** `if (in_check) ++depth` with no limit; in a forcing sequence the
+   depth never decreases. Worth **+5.8 points** to turn off entirely, and the curve is monotonic in the
+   limit — 0 beats 2 beats 4 beats unbounded.
+4. **In-check leaves scored as a dead draw.** `evaluate_nnue()` returns its `NNUE_CHECK` sentinel in
+   check, and `eval_cp()` mapped the sentinel to 0. Worth **+13.5 points** against the thing that
+   replaced it, because "evade, then evaluate statically" is a horizon effect in the middle of a
+   tactical sequence. Both are wrong; the engine's own `process_check()` has the right answer, a one-ply
+   minimax over the evasions.
+
+Defects 2 and 4 **masked** each other, which is the general warning: a search has no oracle, and one
+component's error routinely hides another's. The first "correct" version measured 22 points *worse* than
+the buggy one. The only trustworthy signals are the ones that cannot be rationalised — a crash, a
+corrupt board, a counter reading exactly zero.
+
+### 10. What a per-move value model would have to achieve, and where the data is
+
+Taking Stockfish's own per-move cp from `sf_lines` as truth and adding independent Gaussian noise to
+every move, then taking the argmax:
+
+| noise σ | top-8 only | plus 24 unlabelled moves |
+|---|---|---|
+| 30 cp | 98.4% | 98.3% |
+| **50 cp** | 93.1% | **91.6%** |
+| **100 cp** | 76.5% | **69.8%** |
+| 200 cp | 57.6% | 41.1% |
+
+**σ ≈ 50 cp buys about 90%, σ ≈ 100 cp about 70%.** NNUE's measured error is a mean absolute 163 cp with
+a 90th percentile of 485, which lands near the 200-cp row — and the one-ply static argmax measures
+21.6%, so reality is at or below that. The requirement is a factor of two to four, not fifty.
+
+Two consequences. The **tail** is what matters, not the average: the argmax over 32 moves is decided by
+the worst-behaved move, so NNUE's median of 64 cp is misleading and its 90th percentile of 485 is the
+number that hurts. And the quantity to optimise is not absolute accuracy at all but the error on **value
+differences within one position**, because a model that is uniformly 80 cp optimistic in a position ranks
+that position perfectly. The noise model above assumes independent errors, which is the pessimistic case;
+real model errors are correlated across the children of one position, so the true requirement is likely
+looser.
+
+Nothing currently trained on this corpus optimises that. NNUE is fitted to absolute evaluations and the
+policy head classifies which move Stockfish would play.
+
+**Where the labels are.** The Stockfish eval shards carry a cp for *every* PV — the format is
+`[16 bits] PV1 cp`, `[4 bits] num_pvs-1`, then per PV `[6] from [6] to [2] promo [16] cp`, with the cp
+omitted only for PV1 — and the writer's own measurement over 200,000 records gives 1 PV 61.7%, 2 PVs
+8.1%, 3 PVs 15.0%, 4 PVs 2.7%, 5 PVs 12.5%. So 38.3% of records carry two or more moves with values.
+But every move they list is one Stockfish rates highly, so they teach how good moves compare and nothing
+about what a bad move looks like.
+
+The **broadcast PGNs** supply exactly that. `lichess_db_broadcast_2020-2025.pgn` is 3.7 GB and 22.76
+million lines, and nine monthly `lichess_db_broadcast_2026-MM.pgn.zst` archives sit beside it. Every
+move carries `[%eval]`, so each one yields the value of the move a human actually played — and in human
+games that is sometimes a mistake.
+
+**Extracted in full on 4 October 2026: 81,909,315 rows from about 1.29 million games, 1.5 GB gzipped**,
+one shard per source file in `$EXPERIMENTS/movevals/`. Validated over every row: zero
+malformed rows, zero malformed moves.
+
+| source | games | annotated moves | rows |
+|---|---|---|---|
+| `lichess_db_broadcast_2020-2025.pgn` | 992,278 | 61,388,019 | 61,330,230 |
+| the nine 2026 monthly archives | ~297,000 | 20,601,933 | 20,579,085 |
+
+| | |
+|---|---|
+| median loss | 10 cp |
+| 90th percentile | 80 cp |
+| 99th percentile | 490 cp |
+
+| loss at least | rows | share |
+|---|---|---|
+| 25 cp | 21,587,955 | 26.4% |
+| 50 cp | 12,871,955 | 15.7% |
+| **100 cp** | **6,633,901** | **8.1%** |
+| **200 cp** | **2,850,745** | **3.5%** |
+| 400 cp | 1,094,481 | 1.3% |
+| 800 cp | 517,915 | 0.6% |
+
+So **6.6 million labelled bad moves with magnitudes**, which is the supervision the tail requires and
+the Stockfish shards cannot supply.
+
+Three things a consumer of this file has to know.
+
+**The mean is meaningless; use the percentiles.** 1,263,960 rows (1.54%) have a mate score on one side
+of the pair and an ordinary evaluation on the other, and since a mate enters the file as ±(20000 − n)
+those rows carry a mean absolute loss of 11,867 cp. They are perfectly valid — a move that throws away
+a forced mate really did give away everything — but they drag the mean over the whole file to 203 cp
+against a median of 10, and a regression on raw `loss` would spend most of its gradient on them. Over
+the 80,645,355 rows with ordinary evaluations on both sides the mean loss is **31.8 cp** and the mean
+absolute **43.3**, with 6,324,321 (7.84%) losing 100 cp or more. Either squash the target the way the
+engine already does with `tanh(cp/610)`, or bucket the mate rows separately.
+
+**The label noise is low but not zero.** 265,274 rows (0.32%) show the move *gaining* more than 100 cp,
+which cannot really happen — a move cannot improve on the best move — so each one is either evaluation
+noise between consecutive positions, since lichess's broadcast analysis runs at variable depth, or a gap
+in the annotations that the before/after pairing did not catch. That 0.32% is a floor on how much of the
+`loss` column is noise rather than signal.
+
+**`src` is a quality filter, not just provenance.** The 2026 archives are annotated at 94% of moves
+against 69% for the five-year file, and they produced **zero** SAN failures in eight of nine months
+against 3,977 games in the older one. So 20.6 million of the rows are from the materially cleaner half.
+
+Extraction cost about twenty minutes for the whole corpus. Three things had to be fixed to get there,
+all recorded in `pgn_movevals.cpp`: the lifted `extractEval` constructed its `std::regex` as a local,
+so it was recompiled once per move — a hundred million times — and making it `static` is what brought
+the big file under ten minutes; the first version buffered all of stdin and then copied it, about 7.4 GB
+of peak memory for a 3.7 GB file on a machine with 8 GiB, so it now streams `std::cin` a line at a time;
+and the output goes to a named file, with a `.gz` path streamed through `gzip`, because `san2move()`
+prints an error line *and an ASCII board* to stdout when a game desyncs and that landed in the middle of
+the data. Dedup is available (`DEDUP=1`, worth about 8% of rows, almost all repeated openings) but was
+deliberately left off for the full run: its hash set needs 3–4 GB, and `MIN_PLY` achieves the same thing
+at no memory cost.
+
+### What the incumbent evaluator scores on that metric
+
+`movevals_nnue_err.cpp` measures NNUE on the quantity itself rather than on a proxy. Each row of the
+dataset gives the true per-move loss, and NNUE can estimate the same thing from two evaluations:
+`est_loss = evaluate_nnue(position) + evaluate_nnue(child)`, the second added rather than subtracted
+because the child's side to move is the opponent. 400,000 rows from the clean 2026 shards, mate rows
+excluded, error reported as estimate minus truth:
+
+| true loss | rows | mean error | mean absolute | sigma | median |
+|---|---|---|---|---|---|
+| all | 400,000 | −56.7 | 81.5 | **279.2** | −15 |
+| under 25 cp | 291,884 | −25.6 | 56.6 | 168.0 | −7 |
+| 25–99 | 72,601 | −51.0 | 62.5 | 85.1 | −37 |
+| **100–199** | 19,925 | **−131.2** | 133.9 | 89.5 | −120 |
+| **200–399** | 10,296 | **−266.3** | 266.5 | 105.3 | −251 |
+| **400+** | 5,294 | **−1161.4** | 1161.4 | 1673.9 | −570 |
+
+The method validates itself on the quiet rows: for moves that lose nothing the estimated loss is about
+−5 cp against a true value near 2, so the two evaluations are properly antisymmetric across a good move.
+
+Then the tail. For moves truly losing 200–399 cp the mean error is **−266**, so the estimated loss is
+about **+14 cp**; for moves losing 400 or more the error is again roughly equal and opposite to the loss
+itself. **NNUE does not mis-size the big mistakes, it does not see them** — its estimate of the loss is
+approximately the negation of the loss, which is what "reports a blunder as a fine move" looks like
+numerically.
+
+That closes the loop on this whole section. The static one-ply argmax scores 21.6% because the one-ply
+value rates the losing move as fine; the lock-out then fixes that judgement inside the first 3% of the
+search; and no exploration constant, backup operator or proof propagation can recover a move whose birth
+value says nothing is wrong. Against the requirement — sigma about 100 cp for 70% of the test set and
+about 50 for 90% — the incumbent sits at **sigma 279 overall, with a conditional error on the tail equal
+to the tail**.
+
+The open question, stated honestly: the losses in that tail are TACTICAL, visible only after a search,
+and how much of that is learnable statically is not known. Stockfish's net is already trained on searched
+evaluations and still shows this blindness at one ply. So a trained comparator is a well-posed experiment
+with a measured baseline, not a solved problem.
+
+### A narrow learned search: the containment curve and the one number that gates it
+
+Arkadi's proposal, on 5 October 2026, after everything above: "MCTS is incapable of amplifying the best
+move out of top-6, which covers 80% and would reduce branching from 12 to 6! alpha-beta with amazing
+branching 2 requires hand-crafted move ordering and pruning. And I'm sure there ways to improve the
+model as well. The knoweledge that is presented into stockfish euristics, can be transferred to a
+policy head."
+
+This section is the arithmetic and the measurements for that. **It also reopens move narrowing**, which
+had been a standing no — `ProbabilityMass` was tested twice and lost both times — so the ban no longer
+applies, but the reason it failed does: a gate DELETES a move from a node permanently, and under tree
+reuse that outlives the move.
+
+#### The prize, and why the sharp column is the only one that matters
+
+Searching k moves a node instead of about 32 takes alpha-beta's perfect-ordering floor from
+sqrt(32) = 5.68 to sqrt(k). At creatica's existing budget of roughly 1.7 million nodes that converts
+straight into depth, and depth converts into accuracy by Stockfish's measured fixed-depth curve.
+
+Measured on 40,000 of the labelled positions, mean 28.2 legal moves: how often is the move a depth-12
+search prefers inside `nnue_policy_pisp2.bin`'s top k?
+
+| k | all positions | **sharp positions** | floor sqrt(k) | depth at 1.7M nodes | expected rate |
+|---|---|---|---|---|---|
+| 1 | 34.8% | 65.1% | 1.00 | — | — |
+| 2 | 51.6% | 79.6% | 1.41 | 41 | 94.2% |
+| 4 | 69.5% | **89.8%** | 2.00 | 20.7 | 92.3% |
+| **6** | 79.3% | **93.8%** | 2.45 | **16.0** | **89.5%** |
+| **8** | 85.7% | **95.8%** | 2.83 | 13.8 | 81.6% |
+| 10 | 90.0% | 97.2% | 3.16 | 12.5 | 75.3% |
+| 16 | 96.5% | 98.9% | 4.00 | 10.3 | 63.4% |
+
+**Only 5,703 of the 40,000 positions (14%) are sharp** -- the best move worth a pawn or more over the
+second. In the other 86% several moves are near-equal and losing "the best" one costs under 100 cp,
+which a search absorbs. Dropping a move only matters in the sharp 14%, and there containment is far
+better than the headline: 93.8% at k=6 against 79.3% overall, because the policy head's misses
+concentrate exactly where the choice does not matter.
+
+The per-node failure rate that follows is P(sharp) x P(miss | sharp) = 0.14 x 0.062 = **0.9% at k=6**,
+so about 87% of 16-ply lines keep every decisive move. At k=8 it is 0.6% a node over 14 plies, about
+92%. **So the design point is k = 6 to 8: depth 14 to 16 at the budget the engine already spends, which
+the measured curve values at 82-89% against the 34.6% it gets now.**
+
+Two caveats. The depth and rate columns assume PERFECT ordering inside the retained set, so they are
+upper bounds -- though Stockfish runs at 1.83 with full width where the full-width floor is 5.68,
+because pruning takes it below the floor, so the floor binds in neither direction. And the compounding
+risk is real: 79.5% containment per node is 0.795^d if the dropped moves are gone for good. The remedy
+is to REDUCE rather than EXCLUDE -- search the first few at full depth and the rest shallower,
+re-searching anything that beats alpha -- which measured 11.33 to 5.92 on the branching factor without
+excluding anything.
+
+#### The spatial term cannot be dropped
+
+`nnue_policy_pi.bin` is format 5 -- piece-indexed with the legality term and no spatial block -- so it
+is the fair comparison rather than an ablation, and the library refuses an ablation anyway:
+`policy_score()` fatals when a spatial net is scored without its buffer, because that "would score
+moves by a different function".
+
+| | sharp containment k=6 | k=8 |
+|---|---|---|
+| `pisp2`, with the spatial term | **93.8%** | 95.8% |
+| `pi`, without it | 87.3% | 91.1% |
+
+Worth 6.5 points where it matters, which doubles the per-node failure rate from 0.9% to 1.8% and over
+16 plies is the difference between 13% and 25% of lines losing a decisive move.
+
+#### The one number that gates the whole design
+
+`polcost2.cpp`. Components on a hot accumulator, 20 legal moves, then the marginal cost measured by
+walking a depth-3 tree with `do_move_dp` and the accumulator pushed and popped as a search does:
+
+| | |
+|---|---|
+| `nnue_features` (read the accumulator) | **0.15 us** |
+| `policy_context` (1024 -> 256 -> 128) | **5.69 us** |
+| `policy_build_planes` (26 x 64) | 0.47 us |
+| `policy_spatial_forward` (conv + projection) | **7.38 us** |
+| `policy_score` over 20 moves | 1.41 us |
+| summed | 15.10 us |
+| bare walk (movegen, do_move, undo) | 0.35 us/node |
+| walk + `evaluate_nnue` every node | 2.66 us/node |
+| walk + the full policy forward every node | 19.91 us/node |
+| **MARGINAL cost of the policy per node** | **19.56 us** |
+| marginal cost of an evaluation, for scale | 2.31 us |
+
+Feature extraction is already free at 0.15 us, so the incremental accumulator is doing its job -- the
+hope that a search would amortise part of the policy cost is dead. The marginal cost in a search is
+**higher** than the 13.76 us standalone figure, because between nodes the caches are cold rather than
+hot on one repeated board. Against a budget of about 1.2 us a node, **the policy is 16 times too
+expensive**, and it costs 8.5 times an evaluation. Two dense matmuls are 87% of it: the trunk at 5.69 us
+and the spatial convolution plus projection at 7.38 us.
+
+**So the blocker is now a single precisely-sized engineering problem: get the policy forward from
+19.6 us to about 1.2 us without losing the spatial term.** Three levers, and they multiply:
+int8 quantization of both matmuls -- NNUE itself runs a 1024-wide transform plus its layers in 1.42 us
+with int8 SIMD, so 4-8x here is what the surrounding code already achieves; a narrower trunk, since
+1024 -> 256 -> 128 is 295k MACs and halving both widths is 4x on that matmul at a cost the containment
+curve can price; and caching the context vector, which depends only on the position's features and not
+on its move list, across the revisits that iterative deepening produces.
+
+That is a different kind of problem from everything else in this section. It is an implementation target
+with a known number rather than a research question.
+
+#### Making the policy forward affordable: what worked, and five things that did not
+
+The design above needs the policy at EVERY node, so the whole question is whether its 19.56 us can
+become about 1.2 us. The answer splits cleanly in two: the trunk is solved by batching and the spatial
+term resisted everything.
+
+**The trunk: solved, by batching, and the margin is large.**
+
+| batch | libtorch addmm | Accelerate `cblas_sgemm` |
+|---|---|---|
+| 1 | 11.95 us | 8.24 us |
+| 8 | 1.55 | 1.11 |
+| **64** | 0.64 | **0.60** |
+| 256 | 0.55 | 0.56 |
+
+Against 5.63 us for the hand-written float version one position at a time. The two libraries converge,
+which says this is the hardware rather than either library being clever: 18.9 million MACs in 38 us is
+about 455 GMAC/s, roughly nine times what hand-written NEON reaches, so Apple's matrix coprocessor is
+doing it. A 1024x256 matmul is exactly the shape it wants.
+
+**libtorch cannot be used per call, and a newer version would not change that.** A single EMPTY op costs
+**1.28 us** of dispatch overhead -- the entire per-node budget before any arithmetic -- and the trunk
+through libtorch is 11.95 us against the hand-written 5.63. The installed 2.12.0 is current; the floor
+is inherent to dynamic dispatch. Sparse tensors are worse again: the plane input is only 8% dense, and
+every sparse formulation tried here lost to dense SIMD (below).
+
+**The spatial term: not solved.** 7.39 us hand-written, 7.10 us a position batched at 64, and the five
+attempts below all lost. Batching cannot help it because every GEMM inside it has K=26 and N=8, far too
+small to amortise anything, so it runs at memory speed however many positions are stacked.
+
+| attempt | result |
+|---|---|
+| scatter over set input bits, float | 6.57 us, **1.12x** -- bit-exact |
+| gather per output square, float | 16.00 us, **0.46x** -- bit-exact (1.9e-06) |
+| gather per output square, int8 | 8.27 us, **0.89x** -- 4.6% of peak magnitude |
+| int8 trunk, one scale per tensor | 6.09 us, **0.92x** -- and 73% error, scale far too coarse |
+| batched GEMM, nine taps through Accelerate | 9.11 us a position at batch 64, worse than `conv2d` |
+
+**Why all of them lost, which is the transferable lesson.** The planes are strictly binary -- the
+maximum byte value is 1 -- and only 135.6 of 1664 cells are set, 8.1%, so the dense convolution performs
+119,808 multiply-accumulates of which 92% are multiplications by zero. Cutting 92% of the multiplies
+made it SLOWER. The library's loop is eight independent float adds streaming over contiguous memory with
+no branch in the innermost statement: near-perfect instruction-level parallelism. Every sparse
+formulation replaces that with a `ctz`-driven loop carrying a serial dependency through the same eight
+accumulators, an unpredictable branch per iteration and a border test per tap, and pays back more than
+it saves. **At this size the arithmetic was never the bottleneck**, and reasoning from operation counts
+predicted the opposite of what happened three times in a row. The existing implementation has clearly
+already been through this: its comments record measured penalties for exactly these alternatives.
+
+**So the only lever that works on the spatial term is doing less arithmetic.** Priced with the library's
+own kernel, one conv layer, mean over the 171 positions:
+
+| planes | channels | MACs | us/position | vs 26x8 |
+|---|---|---|---|---|
+| 10 | 4 | 23,040 | 4.12 | 1.9x |
+| 10 | 8 | 46,080 | 4.88 | 1.6x |
+| **14** | **4** | 32,256 | **3.18** | **2.5x** |
+| 14 | 8 | 64,512 | 5.54 | 1.4x |
+| 20 | 4 | 46,080 | 3.78 | 2.1x |
+| **26** | **8** | 119,808 | **7.80** | current |
+| 26 | 16 | 239,616 | 14.60 | 0.53x |
+
+Sub-linear in the MAC count -- 3.7x less arithmetic buys 2.5x less time -- because the plane unpacking,
+the padded-buffer memset and the projection do not shrink with the channels. **Channels are the stronger
+lever than planes.** And the floor is about 3 us, which is still 2.5x over the whole per-node budget.
+Any of these shapes needs a retrain, and the containment curve above is how to price what it costs.
+
+#### Which settles the algorithm question, in MCTS's favour
+
+The 1.2 us budget belongs to a NARROW ALPHA-BETA at depth 16, where each node's bound depends on the
+last, so the policy is needed 1.7 million times a move, sequentially, and cannot be batched. On that
+design the spatial term alone is 2.5x over budget at its floor.
+
+In MCTS the policy is needed once per EXPANSION, about 75,000 times a move rather than 1.7 million --
+which is why creatica can already afford it at 13 us, some 13% of expansion cost. With the trunk batched
+to 0.60 us the whole forward would be roughly 8 us an expansion, about 0.6 seconds of thread time out of
+eight. And MCTS is the only one of the two algorithms that CAN batch, because virtual loss exists
+precisely so that several threads hold different leaves in flight.
+
+**So the expensive learned model is affordable in a search that batches and amortises it over
+expansions, and unaffordable in one that needs it at every node.** That is an argument for the narrowing
+to top-k happening inside MCTS rather than inside alpha-beta -- which keeps the algorithm Arkadi wanted
+to keep for its genericity, and uses the one structural advantage it has over the alternative.
+
+#### `TopKMin` / `TopKWiden`: progressive widening, and what it measured instead
+
+Off by default, and with `TopKMin` 0 the search is bit-for-bit the incumbent's. `k(N) = TopKMin +
+floor(TopKWiden * log2(1 + N))` over the node's own DESCENTS, applied to the children in the order
+`expand_node()` publishes them, which is descending prior order -- so the narrowing is a bound on the
+selection loop and nothing else.
+
+**It is not `ProbabilityMass`.** That option deleted the tail at expansion, before the child
+evaluations, so a dropped move contributed nothing and under tree reuse the truncation outlived the
+move. Here every legal move is still expanded and still carries an edge. Three places that matters, and
+tree reuse is the least of them: the node's own one-ply minimax value is a `max` over EVERY child, so
+the tail still sets the parent's `cp` immediately; a node widens as it accumulates descents, which
+happens exactly where the search is concentrating; and only then does the width persist across moves.
+The cost is that the tail is still evaluated and still materialised, so the arena fills about five times
+faster than a genuinely narrow search needs -- roughly a ply given away to nodes never visited again.
+
+Calibration, mean width achieved at the root position of the test set: `TopKMin 6 TopKWiden 0` gives
+5.72 of 19.69 available, `6/0.10` gives 6.22, `6/0.25` gives 8.43, `6/0.50` gives 11.48. `TopKWiden 1`
+reaches a mean width of 16.94 and barely narrows at all, because `log2(1+N)` is 20 at the root.
+
+Two repeats an arm, control in the same batch:
+
+| arm | solved | both right | both wrong | median sims | wrong->right | right->wrong |
+|---|---|---|---|---|---|---|
+| control (off) | 120/342 = 35.1% | 44 | 95 | 562,944 | — | — |
+| k6 widen 0 | 122/342 = 35.7% | 50 | 99 | 550,067 | 11 | 10 |
+| k6 widen 0.10 | 115/342 = 33.6% | 50 | 106 | 582,488 | 9 | 9 |
+| k4 widen 0.25 | 127/342 = 37.1% | 53 | 97 | 603,954 | 8 | 7 |
+| k8 widen 0.25 | 119/342 = 34.8% | 49 | 101 | 570,076 | 4 | 4 |
+| k6 widen 0.25 | 118/342 = 34.5% | 52 | 105 | 586,511 | 2 | 7 |
+
+**A symmetrical null** -- 11 against 10, 9 against 9, 8 against 7 -- which is reshuffling, not
+improvement, and quite unlike `MinimaxWeight`'s 15 against 2. The simulation counts barely move either,
+so the narrowing did not buy the depth the branching arithmetic promised.
+
+#### Why it failed: the prior has a trustworthy SET and almost no ordering
+
+Three measurements, all from the engine's own output, explain it.
+
+**The search spends a quarter of its root visits below rank 6, and plays from rank 9 or worse 19% of the
+time.** Root visits by prior rank over 342 searches, reproduced on an independent 684: ranks 1 to 10 take
+25.0, 18.5, 8.3, 9.1, 8.6, 4.3, 2.1, 5.3, 3.0, 3.1 per cent, with 12.7% below rank 10. Not even
+monotone -- rank 8 takes more than ranks 6 and 7 together. Narrowing to six removes a fifth of the moves
+the engine would have chosen.
+
+**The prior's first choice is the LEAST reliable of its leading moves.** Over 1,026 searches, by the
+prior rank of the move actually played:
+
+| rank played | how often | and right |
+|---|---|---|
+| 1 | 25.0% | **28.0%** |
+| 2 | 19.3% | 40.4% |
+| 3 | 9.0% | **58.7%** |
+| 4 | 8.9% | 41.8% |
+| 5 | 8.5% | 20.7% |
+| 11 or worse | 12.1% | 32.3% |
+
+The prior's first choice is played a quarter of the time and is right 28.0% of those; **anything else is
+played 75.0% of the time and is right 37.1%**. So the search is more accurate precisely when it
+overrides the prior, and the deviations a narrow search would remove are where its lift over the prior
+alone -- 34.6% against 26.9% -- comes from. One caveat that is load-bearing: this set is SELECTED for
+positions the engine got wrong, so rank 1 is over-represented among failures by construction. The
+unbiased version of this table would need the broadcast positions, where every move has a depth-12
+value.
+
+**And the prior is nearly flat past rank 2.** From `VisitDumpFile` over the 171 positions, the prior's
+own mass and the visits it actually received:
+
+| prior rank | prior mass | visit share | visits / prior |
+|---|---|---|---|
+| 1 | **40.2%** | 25.5% | **0.63x** |
+| 2 | 13.3% | 18.8% | 1.41x |
+| 3 | 7.9% | 7.8% | 0.98x |
+| 5 | 4.8% | 8.3% | 1.73x |
+| 8 | 2.8% | 5.7% | **2.05x** |
+| 11+ | 13.4% | 12.7% | — |
+
+Consecutive prior-mass ratios: **3.02, 1.68, 1.36, 1.22, 1.25, 1.18, 1.16**. Forty per cent of the mass
+on one move, and after rank 2 each move carries only 16-36% more than the next -- barely an ordering.
+PUCT then spends 0.63x the prior's request on rank 1 and up to 2.05x on rank 8, which the accuracy table
+says is the right direction.
+
+**So the defect is calibration, not width.** Six moves is enough: 93.8% sharp containment at k=6. What
+is wrong is that 40% of the prior's mass sits on a move that is right 28% of the time. `P` multiplies
+the exploration term directly, so a prior whose mass matched the probability of being best would change
+the allocation at every node with no change to the search at all. That is a training objective, and the
+245,000 positions with a depth-12 value for every legal move are exactly the data to fit or measure it
+against.
+
+### The comparator, trained — and why it failed in a way worth knowing
+
+Trained on 4 October 2026 and it is a **negative result with a diagnosed cause**, which is why it is
+written up at length rather than dropped.
+
+The model deliberately mirrored the policy head so that only the objective differed: trunk
+1024 → 256 → 128, the same 24,576 × 128 move embedding indexed `(pt-1)*4096 + from*64 + to` with both
+squares mirrored for Black, 3,441,026 parameters, `score = dot(ctx, emb[move]) * scale + bias`. Target:
+the move's loss in pawns under a Huber loss — not a `tanh` squash, which saturates exactly where the
+signal is. 1,849,055 records from 2026-01…07, tail-weighted so 64% of them lose 100 cp or more;
+validation on 400,000 **uniform** rows from 2026-08…09, a temporal split so no game appears on both
+sides. Three epochs, about fifteen minutes.
+
+On the per-move error it looked like a clear win over NNUE, measured on identical rows:
+
+| true loss | NNUE mean error | comparator | NNUE sigma | comparator sigma |
+|---|---|---|---|---|
+| all | −56.7 | +63.2 | 279.2 | **140.7** |
+| 100–199 | −131.2 | **+0.5** | 89.5 | 80.4 |
+| 200–399 | −266.3 | **−115.3** | 105.3 | 107.1 |
+| 400+ | −1161.4 | **−542.3** | 1673.9 | 443.2 |
+
+Calibrated at 100–199 where NNUE is 131 cp blind, and it flags a 100+ cp mistake as one 76.7% of the
+time at 100–199, 86.9% at 200–399 and 92.4% at 400+.
+
+**And it ranks worse than the static one-ply value it was meant to replace: 8.8% against 21.6%** on the
+171 mistakes positions, with an acceptable move in its top three only 24.6% of the time. Random ranking
+over about thirty moves with one to five acceptable is roughly 5–15%, so this is close to arbitrary.
+
+The diagnostic that explains it, the spread of the predicted loss in centipawns:
+
+| | |
+|---|---|
+| WITHIN a position, averaged over positions | **21.9** |
+| BETWEEN positions, of the per-position mean | **44.5** |
+| mean predicted loss over all moves | 166.3 |
+
+**The model learned the position, not the move.** Its output varies by 22 cp across all the legal moves
+of one position, while the true losses within a position span hundreds — the best move loses nothing and
+a blunder loses 400. Twice as much of its variance is between positions as within them. It learned "how
+dangerous is it here", because that is the only thing the training data varies over.
+
+**The cause, stated so it is not repeated.** With **one labelled move per position there is no
+within-position contrast in the training signal at all.** Sparse labels are trainable for an *absolute*
+value and not for *discrimination*: the model never saw a move nobody would play, so nothing taught it
+that such a move is bad, and fitting the position is the only gradient available. Human games give
+magnitudes on bad moves but no contrast; the Stockfish shards give contrast — 38.3% of records carry two
+or more moves each with a cp — but only among moves Stockfish already rates highly. Neither supplies
+what is needed, which is **contrast that includes bad moves**.
+
+**And a lesson about the metric.** The per-move error table above is measuring the wrong thing. A model
+can score well on it by knowing the position, because the row it is asked about is always a move a human
+actually played. Judge a per-move value model on **ranking all legal moves**, never on regression error
+over played moves — the two pointed in opposite directions here, by a wide margin.
+
+### Fine-tuning the real policy net on the per-move targets: no
+
+The comparator above was a reduced model; this is the deployed net itself, fine-tuned on the depth-12
+per-move labels through its own trainer, so the spatial and legality terms are intact and only the
+target changed. `labels_to_visits.py` converts the labels into the trainer's VISITS_TSV format -- which
+already accepts a per-move DISTRIBUTION, the format creatica's own `VisitDumpFile` writes -- with the
+target weight a softmax over the negated loss at 58 cp, the engine's own prior temperature.
+`pol_train_L1C8pi3` is the build with pisp2's exact architecture (3,459,544 parameters) and
+`L1C8pi2_h1256_h2128_c0_p1_l1_e2_f28.pt` is pisp2's final checkpoint, so the fine-tune starts from the
+deployed weights.
+
+First the BASELINE, which should have been measured before any of this (`policy_rank.cpp`): the policy
+head alone, no search and no blend with the child evaluations, on the 171 mistakes positions --
+**top-1 26.9%, top-3 59.1%, top-6 79.5%.** Better than the static one-ply value's 21.6%, and the right
+move is in its top six four times in five.
+
+| | top-1 | top-3 | top-6 |
+|---|---|---|---|
+| pisp2, deployed | **26.9%** | **59.1%** | **79.5%** |
+| one epoch at the default 2e-3 | 27.5% | 56.7% | 72.5% |
+| 20 epochs at a constant 1e-5, epoch 1 | 28.7% | 54.4% | 73.1% |
+| ... epoch 5 | 26.9% | 58.5% | 75.4% |
+| ... epoch 10 | 28.1% | 59.1% | 75.4% |
+| ... epoch 20 | 28.1% | 58.5% | 76.0% |
+
+On its own target it learned properly -- top-1 against the depth-12 labels rose 33.4% to 34.2% with the
+loss easing 2.675 to 2.596. On the positions that matter it buys a point or two of top-1 and costs
+three to four points of top-6, at every checkpoint, and the shape is the same at 2e-3 for one epoch as
+at 1e-5 for twenty. **So it is the objective, not the schedule.** Sharpening the first choice at the
+expense of the top six is the wrong trade here, because the search needs the right move to be PRESENT.
+
+A note on the schedule, because it is not obvious: the trainer has no learning-rate environment knob,
+but `progress = min(1.0, global_step / TOTAL_STEPS)` is clamped, so `TOTAL_STEPS=1` puts the cosine at
+`LR_MIN` = 1e-5 from the first step and holds it there -- a low constant rate with no recompile. And
+`EXPORT_WEIGHTS` exports the LOADED weights and exits without training, which is worth knowing before
+combining it with a training run.
+
+**What this does and does not test.** The trainer's objective is cross-entropy against a distribution
+and it keeps only the top MAX_PVS = 16 moves, and a softmax over the negated loss gives a bad move a
+weight near zero -- so the magnitude information, the whole reason for building the dataset, is
+discarded by the loss. What was tested is whether depth-12 distributions over all legal moves beat
+eight-PV softmax distributions as a POLICY target, at 245,000 positions against the 300 million the net
+was trained on. Slightly no. Testing the value objective properly needs a loss that uses the
+magnitudes, which means a new head inside that trainer.
+
+One trap worth recording: `uci2move_idx()` returns the PACKED MOVE INDEX — `dst | src<<6`, so 731 for
+d2d4 — and not a status code. Reading a non-zero return as failure, the way a status code would be read,
+rejected all 5.8 million rows on the first run. The engine's own callers ignore the return entirely.
+
+`pgn_movevals.cpp` extracts them. Its parser is lifted verbatim from `pgn_parser.cpp`, the tool that
+built the broadcast bins, so the SAN handling and the eval regex are the proven ones; what changes is
+that it records the position *before* each move, the move itself, and the evaluations on both sides of
+it, where `pgn_parser` records the position *after* the move and its evaluation alone. Every cp is
+flipped into the mover's frame. Rows go to a named file rather than stdout, because `san2move()` prints
+an error line and an ASCII board to stdout when a game desyncs, and in the first test that put 19
+malformed rows in the middle of the data.
+
+## Why no search change survived: the allocation law and the test-set artefact, 5 October 2026
+
+### The whole thing in one paragraph
+
+MCTS decides how much to look at a move from two numbers it does not know well enough: the move's prior
+and how far behind it currently looks. Solve the selection formula and a non-leading move gets about
+`C * P * sqrt(D) / gap` visits and no more -- twenty or thirty in practice, against a million for the
+leader -- while a refutation that lives five plies down needs a subtree of thousands before it shows up at
+all. So the move is dismissed on the strength of a thirty-sample estimate, and the dismissal is
+self-confirming, because the exploration term shrinks as the move accumulates the very visits that would
+have redeemed it. The part that makes this a limit rather than a bug is that its share of the search
+decays as `1/sqrt(D)`: thinking twice as long gives the neglected move 1.41 times more visits out of twice
+the total, so its share FALLS, and more time makes the problem worse rather than better. And the visits
+cannot simply be spread out, because that concentration is exactly what buys depth on the main line --
+when every leading candidate was forced a guaranteed share, the positions needing deep refutations got
+three and a half times worse, since searching everything shallowly is worse than searching the wrong move
+deeply. The inequality in the sampling and the depth of the search are the same property, so MCTS cannot
+allocate depth selectively: it would have to know in advance which moves deserve it, which is the one
+thing it is trying to find out.
+
+### What the symbols mean
+
+Every formula in this section is about **one node and one of its children**, and all of it is read
+straight out of `select_best_child()` in `creatica_search.cpp`. Selection scores each child as `Q + U`
+and takes the largest.
+
+| symbol | is | where it lives |
+|---|---|---|
+| `W` | the sum of all values backed up into this child, from the point of view of the side to move AT the child | `MCTSNode::W` |
+| `evidence` | visits that actually produced information, as distinct from `N`, which counts every arrival — they differ only when a node cannot be expanded | `MCTSNode::evidence` |
+| `Q` | `W / evidence`, the child's mean value. The parent sees its **negation**, because a child states its value from its own side to move | computed |
+| `P` | the move's prior: a float in [0,1], summing to about 1 over the node's children. **Not the policy head's output.** In the default `PolicyMode 1` it is a softmax (`get_prob()`) over a BLEND of the policy head's logit and the child's own NNUE evaluation — `policy_blend * policy_logit / policy_temperature + (1 - policy_blend) * res / temperature`, all scaled by `policy_blend_scale`, so at `PolicyBlend` 0.45 it is 45% head and **55% evaluation**. `res` is the child's evaluation in pawns, already in the parent's frame (the sibling line stores `cp = -res*100`). The head alone is used only in `POLICY_FULL`, which is not the default; `policy_blend = 1.0` is the switch that gets there. The starved moves measured here ran from 0.000074 to 0.133, against a flat `1/num_children` of about 0.03 | `Edge::P`, written at `creatica_search.cpp:1812`, built at 2734 |
+| `n` | how many times **this edge** has been taken. Not the child's visit count: the two differ for any transposition, and enormously under `ReuseTree` | `Edge::n` |
+| `D` | **descents** through the parent — how many times the search has passed through it, which is the sum of its edges' `n`. On the same scale as `n`, which is the point of using it | `MCTSNode::descents` |
+| `C` | the exploration constant, `ExplorationMax` 1.6 at the root and decaying by `ExplorationDepthDecay` 0.05 a ply down to `ExplorationMin` 0.65 | option |
+| `U` | the exploration term itself, `C * P * sqrt(D) / (1 + n)` | computed |
+| `gap` | `Q(leader) − Q(candidate)`, both negated into the parent's frame: how much better the current best child looks. Dimensionless, since `W` accumulates `tanh(eval_pawns / EvalScale)` with `EvalScale` 6.1 — a gap of 0.123 was about 162 cp at the operating points measured here, and the ten cases ran from 17 to 421 cp | computed |
+| `n*` | the equilibrium: the edge count at which `U` has decayed to equal `gap`, after which the move is abandoned | derived |
+| `k`, `share`, `d` | `MinVisitK` (how many leading children get a floor), `MinVisitShare` (the floor, as a fraction of `D`), and plies of depth the floor is applied over | options |
+
+So `n* = C * P * sqrt(D) / gap` comes from setting `C * P * sqrt(D) / (1 + n) = gap` and dropping the 1,
+and the share `n*/D = C * P / (gap * sqrt(D))` is that divided by the parent's total descents. The
+leader's own `U` is dropped throughout: the exact selection condition is
+`U_candidate > (Q_leader + U_leader) − Q_candidate`, and the leader's `U` measured 0.0008 at the median
+against gaps of 0.09 to 0.37, so under 1%, and it changes no verdict in the tables below.
+
+### How this was measured
+
+The day before, a long run of measurements had narrowed the question to *where* creatica fails. This
+section is what happened when five candidate fixes were measured against samples that were **not** built
+from the engine's own mistakes. All five are null or negative, two of them after looking like clear wins,
+and the reason the two disagreed with themselves is the most useful result here.
+
+Everything runs from `$EXPERIMENTS/` (see *How the set is scored* above). Three new harnesses were built and are kept:
+
+- `hard_pool.tsv` — about 7,500 positions that are **sharp** (a depth-12 search prefers the best move by
+  at least 100 cp over the second) **and** where the policy head's own top choice gives away at least
+  100 cp. It conditions on the PRIOR, which is an input to the search rather than its output, so it is
+  not circular for judging a search change.
+- `deepset.txt` / `deep_pool.tsv` — 425 positions whose refutation **creatica's own evaluator cannot see
+  within four plies**, measured by full-width negamax with the engine's NNUE. The sharpest harness of the
+  three, because the selection criterion is a property of the evaluator rather than of the search.
+- `pool_run.py` — scores either against the depth-12 per-move labels in centipawns, graded, with the
+  prior's own error reported beside the engine's.
+
+### 1. The test sets, and why two of them lie
+
+A representative sample of positions is useless for judging a search change. Over 61,753 positions with
+a depth-12 value for every legal move, only **13% are sharp**; in the other 87% the median gap between
+the best two moves is **15 cp** and a mean of 6.1 moves out of 30.8 are within 50 cp of best, so the
+choice does not matter and the evaluator's 165 cp of absolute error largely cancels — a bias shared
+across the moves of one position disappears in the comparison. Any aggregate over unfiltered positions
+is dominated by that 87%.
+
+But `mistakes/testset.tsv` is not the fix, and the contrast is stark. Measured on it, the prior's first
+choice is played 25.0% of the time and is right 28.0% of those, while everything else is played 75.0% and
+is right 37.1% — the prior looks anti-correlated with the truth. Measured on 200 broadcast positions the
+engine never saw, rank 1 is played 41.5% of the time and is right **72.3%** against 52.1% for everything
+else; restricted to the sharp ones, it is played two thirds of the time and is right **100%** while its
+deviations give away 76 cp. The mistakes set is not a sample of sharp positions — it is a sample of sharp
+positions **where the prior was wrong**, because those are the ones that cost games and therefore got
+collected.
+
+One objection and its answer, because the arithmetic matters. "Within 50 cp" looks saturated on neutral
+positions, and NNUE's mean absolute error is about 165 cp, so the engine cannot be accurate to 50 cp.
+But a **random** legal move scores within 50 cp only **23.2%** of the time (mean 6.1 of 30.8 moves
+qualify), and only **8.3%** in sharp positions, against the engine's ~100%. The metric is saturated
+because the engine is good at it, not because the positions are permissive. Mean absolute error against a
+searched evaluation does not bound how well an evaluator RANKS moves inside one position.
+
+### 2. Where the failures are: the depth gradient
+
+On 300 positions from `hard_pool.tsv` the engine gives away more than 100 cp in **11.0%** of them, with a
+**median loss of zero** — it finds the exact best move more than half the time — while the prior's own
+top choice on those same positions is off by a mean of **2,152 cp**. The search converts a catastrophic
+prior into a 153 cp mean loss, a fourteenfold reduction, and **the failure rate does not depend on how
+wrong the prior was**: 11.6%, 8.4% and 13.6% across the 100–199, 200–399 and 400+ buckets. That retires
+the prior as the cause of the losses.
+
+What it does depend on is depth. Full-width negamax with creatica's own NNUE, and the smallest depth at
+which it prefers a move within 50 cp of the depth-12 best:
+
+| needs depth | solved | failed | failure rate |
+|---|---|---|---|
+| 1 | 83 | 3 | 3.5% |
+| 2 | 41 | 2 | 4.7% |
+| 3 | 46 | 4 | 8.0% |
+| 4 | 25 | 3 | 10.7% |
+| more than 4 | 72 | 21 | **22.6%** |
+
+Monotone, a 6.5-fold rise, and two thirds of all failures in the deepest bucket while it holds 31% of
+the positions. One ply is free because every legal child is evaluated at expansion; from three plies the
+move must EARN visits while its Q still looks bad.
+
+### 3. The allocation law
+
+Diagnosing those failures by root trace: the right move gets tens of visits against the leader's million.
+Setting the PUCT exploration term equal to the Q gap and solving for the edge count gives the visits a
+non-leading move ever receives:
+
+    n* = C * P * sqrt(D) / gap
+
+and it predicts the traces across three decades of P. With C = 1.6 and D about 600,000: P = 0.0015 and a
+gap of 0.09 predicts 20.7 visits against 30 observed; P = 0.127 and a gap of 0.123 predicts 1,280 against
+2,244. The *gap* here is the leader's backed-up value minus the candidate's, both negated into the root's
+frame because W and evidence live on the child — a median of about **130 cp** in these cases, ranging
+from 17 to 421. The leader's own exploration term, dropped from the comparison, is 0.0008 at the median
+against gaps of 0.09 to 0.37, so under 1% and it changes no verdict.
+
+A refutation five plies down needs a subtree of thousands. The two numbers never meet, and **no constant
+closes them**:
+
+- **Raise C.** Buying 10,000 visits for a P = 0.0015 move needs C = 774 against the incumbent 1.6. That
+  is uniform search, and raising C measures as a loss here (see *Exploration: the curve never turns*).
+- **Raise P** — a floor, flattening, a better policy head, or reweighting the blend it sits in (see the
+  symbol table: `P` is 45% head and 55% child evaluation by default, not the head alone). Does nothing,
+  because the starved moves are
+  not the low-prior ones: over ten measured cases the right move carried priors from 0.000074 to 0.133,
+  with three at **two to four times** the flat 1/num_children, and was starved identically.
+- **Shrink Q toward the parent at low n**, the textbook Bayesian correction. Solving
+  `n^2 - An - Am = 0` gives `n ~ A + m`: it adds m visits, not m-fold. With m = 50 a 30-visit move
+  reaches 44.
+- **Switch to UCB1.** Its allocation is `~ln(D)/gap^2` against PUCT's `sqrt(D)/gap`. Logarithmic beats
+  square-root downward, so UCB1 explores **less**. The textbook alternative is worse.
+- **Use `evidence` instead of N in the denominator**, as Q does. A no-op here: N and evidence are equal
+  in all twelve starved cases, because they only diverge on hollow nodes and these are simply unvisited.
+  It would also reintroduce the live-lock the note on `MCTSNode::evidence` warns about.
+
+The structural statement is about the SHARE. It is `C * P / (gap * sqrt(D))`, which decays as
+`1/sqrt(D)`: doubling the search multiplies a non-leader's visits by 1.41 while the total grows by 2, so
+its share falls by 29%. **More time makes the inertia worse**, which is why every attempt in this
+document to buy the answer with a bigger tree returned a null.
+
+### 4. MinVisitK / MinVisitShare / MinVisitDepth, and why equalising fails
+
+The one remedy the arithmetic endorses is a share that does not decay: guarantee each of the first k
+children (descending prior order) a floor fraction of the parent's descents, and let PUCT allocate the
+rest. Implemented, default off, see the note in `creatica_search.hpp`. k = **8** because that is where
+the right move's prior rank actually sits — over ten starved cases the ranks were 2, 2, 2, 5, 6, 6, 7, 8,
+18, 27, so top-4 covers 30% and top-8 covers 80%, and it plateaus (top-16 covers no more). Note this is
+NOT the k = 4 the mistakes set's played-rank table suggests; which rank the engine ends up PLAYING is a
+different quantity from where the right move sits.
+
+It works mechanically. On the first deep-failure position the floor gave the prior-rank-2 move its 13,888
+visits, the move discovered it was better, and **PUCT itself then poured 349,586 into it** — the floor
+pays only for the discovery, and the gain is unbounded because a floored move can become the leader. It
+costs about 2.4x the simulations, because searching eight moves broadly expands more nodes.
+
+And it loses, on 300 pool positions, worse the deeper it is applied:
+
+| arm | failures | mean loss | deep-bucket failures | deep-bucket mean loss |
+|---|---|---|---|---|
+| control | 35 (11.7%) | 217 cp | 20/93 | 249 cp |
+| root only | 36 (12.0%) | 218 | 18/93 | 244 |
+| depth <= 1 | 38 (12.7%) | 347 | 22/93 | 660 |
+| depth <= 2 | 48 (16.0%) | 416 | 22/93 | 662 |
+| depth <= 3 | 44 (14.7%) | 415 | 25/93 | **875** |
+| k = 4, depth <= 3 | 40 (13.3%) | 221 | 23/93 | 255 |
+
+It fails hardest in the bucket it was built for: 249 cp to 875, a 3.5x degradation, with fixed-against-
+broken asymmetric the wrong way (7 against 12 at depth 3). Narrowing k from 8 to 4 recovers most of the
+damage, which confirms cost as the cause: the leader's own line keeps `(1 - k*share)^d` of the budget,
+0.76 at the root and 0.44 three plies down.
+
+**The conclusion, and it is the point of the whole section.** The unequal sampling is not a defect
+sitting beside the depth mechanism — it IS the depth mechanism. Concentrating visits on one line is how
+MCTS buys depth there, and the `1/sqrt(D)` share decay is the same fact from the other side. Equalise the
+samples and everything is searched shallowly, and shallow-everywhere loses to deep-on-the-wrong-move.
+So **no reallocation of visits can work**: floors, guaranteed shares, round-robin budgets, a larger C,
+prior floors, flattening. That family is closed.
+
+### 5. The two false positives
+
+Both changes that looked like wins were scored on the mistakes set. Both reverse on unselected positions.
+
+**FlattenTopK** — equal mass across the top k, tail untouched, total preserved. On the mistakes set at
+two repeats: control 119/342 = 34.8%, k4 **141/342 = 41.2%** with 18 never-to-always against 6, k6 40.9%,
+k10 41.8%, at *fewer* simulations. At four repeats, control 36.0% and k4 43.0% with 8 against 2. It was
+predicted in advance from three independent measurements of the prior's miscalibration. And the prior is
+not miscalibrated: on unselected sharp positions its first choice is right 100% of the time. The six
+points were the test set's construction, not a defect being fixed.
+
+**MinimaxWeight 0.75** — `Q_blended = (1-w)*mean + w*minimax`, the one mechanism none of the allocation
+arithmetic touches, since it changes how values COMBINE rather than how visits are spent and costs no
+simulations. On the mistakes set: 48.7% against 34.6%, **19 never-to-always against 2**, with a
+simulation-matched control at 33.6% and zero conversions, and at four repeats 47.5% against 36.0% with
+7 against 1. On the 425-position deep set it **reverses**: failures 23.3% against 26.6%, mean loss
+**628 cp against 767**, paired movement **24 fixed against 38 broken** (two-sided exact p = 0.098 — no
+evidence of benefit, a suggestion of harm).
+
+It also composed almost disjointly with flattening on the mistakes set — each fixing 8 and 7 with an
+overlap of 1, and 17 together — which read as two independent mechanisms reinforcing. Both were the same
+artefact.
+
+### 6. What this means for measurement
+
+Five search interventions — `ProveTerminals` (2.96M tablebase verdicts, 390k nodes proved, **zero**
+conversions), `TopKMin` (symmetrical null, 11 against 10), `FlattenTopK`, `MinVisitK`, `MinimaxWeight` —
+and every one is null or negative once scored on positions not chosen by the engine's own failures.
+
+`mistakes/testset.tsv` manufactures false positives, because a change is being scored on positions
+selected precisely because the baseline fails them: any change that perturbs the search can only move
+them one way, and the positions where it does harm are not in the sample. Two of five changes looked
+like clear wins there. **Measure on unselected positions or do not measure.** The harnesses for that now
+exist, and the deep set is the one to prefer: it is selected on the evaluator's horizon, which the search
+does not control, and it holds about 90 failures in 425 positions rather than 20 in 300, so a third-sized
+effect is resolvable rather than inside the noise.
+
+No search change should be played. By elimination the remaining direction is the value and policy models,
+which was the starting position: *make better value and policy models, which absorb chess knowledge
+indirectly, and leave MCTS alone.* The difference is that it is now a conclusion with five negatives and
+a mechanism behind it. Selective depth — spending the extra visits only where they are deserved — would
+need to know which moves deserve them, and seven root signals for that scored AUC 0.47 to 0.62.
+
+### Diagnostic added
+
+`root_trace_snapshot()` now records the **prior** as a sixth field per child
+(`move:edgeN:N:W:evidence:P`). Without it the exploration term cannot be reconstructed offline at all:
+substituting a flat 1/num_children for P overstates U by orders of magnitude for exactly the starved
+moves the trace exists to study, and that substitution produced a table claiming terms of 1.3 to 1.5
+against gaps of 0.1 to 0.35 — which would mean those moves should be selected constantly, when they had
+thirty visits in six hundred thousand.

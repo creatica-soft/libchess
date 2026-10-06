@@ -1,5 +1,5 @@
 //For MacOS using clang
-// c++ -std=c++20 -Wall -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica
+// c++ -std=c++20 -Wall -O3 -flto -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-lcurl,-rpath,$HOME/libchess creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica
 
 // -O3 -g -fno-omit-frame-pointer - options for profiling
 //
@@ -226,6 +226,49 @@ std::atomic<double> last_gc_ms{0.0};
 //Simulations that reached a leaf the tree had no room to expand. If this is not near zero the
 //search is spending its time re-reading numbers it already had.
 std::atomic<uint64_t> uninformed_sims{0};
+//MID-SEARCH HOLLOW ABORT.
+//
+//TreeResetHollow originally looked only at the PREVIOUS search, so a search that froze had to run to
+//the end of its allocation before anything was done about it, and the reset happened at the start of
+//the next move. The move that discovered the problem was therefore always lost. Measured over the 14
+//lichess games of 2026-09-22: 15 searches ended between 920 and 1000 per-mille hollow, meaning that
+//between 92% and 100% of their simulations re-read a number the tree already held and taught it
+//nothing, and each of those was one move's entire thinking time spent for no gain.
+//
+//The workers now notice it themselves. Thread 0 already wakes every 4096 simulations to refresh
+//hash_full; it checks the running hollow rate at the same time and, if the search has gone hollow,
+//sets this flag. Every worker's loop condition tests it, so they all fall out of the search
+//together; runMCTS() then retires the tree, rebuilds the root and runs the REST of this move's
+//budget on a fresh tree. Exactly one retry per move -- the tree cannot be frozen twice in a row when
+//the second attempt starts empty, and capping it means a pathological position can never spend the
+//whole clock resetting.
+std::atomic<bool> hollow_abort{false};
+//OFF BY DEFAULT, and it must stay that way until a match says otherwise.
+//
+//This was built on 2026-09-24 and, because ./creatica is the binary the lichess bot launches, it went
+//live in rated games the moment it was compiled. It fired 28 times across 22 games, each time throwing
+//away a tree of 18 to 19 million nodes in the middle of a move, and the bot scored 52.3% that day
+//against 85.7% two days earlier. That is not proof the abort caused the drop -- nothing was controlled
+//-- but the direction matches the one thing this engine's measurements agree on: the accumulated tree
+//is what compensates for weak priors, and schemes that discard it have lost strength every time they
+//have been tried. So the default is off and the option exists to make it measurable, not to ship it.
+//
+//A second defect was visible in those same log lines, and it is now FIXED. During a ponder search --
+//and equally under `go infinite` -- timeAllocated is set to 1e9 ms, so HOLLOW_ABORT_MAX_ELAPSED, the
+//"only in the first half of the budget" test, never restrained it. Ten of the 28 aborts were ponder
+//searches, so the tree was retired immediately before the real search that would have inherited it on
+//a ponder hit. The trigger in persistent_worker_func() now requires a search with a real deadline, so
+//neither a ponder search nor an infinite one can abort. That costs nothing: a tree still frozen when
+//the next real search starts is caught by the between-moves TreeResetHollow check in runMCTS().
+bool hollow_abort_enabled = false;
+//Whether the abort may fire at all right now. It is armed for the FIRST attempt of a move and
+//disarmed for the retry, and the reason is arithmetic rather than policy: search_simulations and
+//uninformed_sims are not cleared between the two attempts, so that the move's final summary reports
+//what the whole move cost. The retry therefore starts with the failed attempt's hollow simulations
+//already in the numerator, and on a short move that ratio can still be above TreeResetHollow even
+//though the fresh tree is expanding normally. Left armed, the retry would abort itself within one
+//tick of thread 0 and the move would be searched twice for nothing.
+std::atomic<bool> hollow_abort_armed{false};
 TbProbe tb_probe;
 //EDGE VISITS, at RUNTIME rather than compile time.
 //
@@ -313,6 +356,24 @@ double timeAllocated = 0.0; //ms
 double exploration_min;
 double exploration_max;
 double exploration_depth_decay;
+//THE EXPLORATION CONSTANT AT THE ROOT, INDEPENDENTLY OF THE DEPTH SCHEDULE. 0 disables it and the
+//schedule applies unchanged at every depth, so the engine behaves exactly as the incumbent does.
+//
+//WHY THE ROOT IS A SPECIAL CASE. Measured on the 57 test-set positions creatica never solves in four
+//repeats -- 44 of which play the SAME wrong move every time, so they are a fixed point rather than
+//variance. Root PUCT is Q + C*P*sqrt(parentN)/(1+N), and at the end of the search the correct move's
+//exploration term is a median 0.0277 against a Q gap of 0.0438 that it would have to overcome: in 62%
+//of them it is arithmetically locked out and cannot be selected again however long the search runs.
+//
+//THE LOCK CLOSES EARLY, which is why this belongs at the root rather than in a late widening. It is
+//permanent from the first 10% of the search in 53% of those positions and from before the halfway point
+//in 76%, median 2.8%. The first few per cent of the simulations decide the move.
+//
+//The constant needed to keep the correct move selectable is FLAT IN TIME -- median 1.88 at the very
+//start and 1.99 at the end, 75th percentile between 2.5 and 3.7 throughout -- which is what makes one
+//larger value at the root the right shape rather than a schedule. ExplorationMax used to be capped at
+//2.0, which is the median requirement exactly and cannot reach the 75th percentile; the cap is 10.0 now.
+double exploration_root = 0.0;
 //double probability_mass;
 double virtual_loss;
 double eval_scale;
@@ -335,6 +396,15 @@ std::unordered_map<uint64_t, int> position_history;
 
 //A child's value from the PARENT's point of view, which is what "is this winning" means at the
 //root. Zero visits has no value yet, so it is not winning as far as we know.
+//`mm` on Q's scale. The field is centipawns; Q is tanh(pawns / eval_scale), the same mapping the
+//leaf values use, so the two are directly blendable.
+bool mm_value(const MCTSNode * n, double& out) {
+  const int16_t v = n->mm.load(std::memory_order_relaxed);
+  if (v == MM_NONE) return false;
+  out = tanh((double)v * 0.01 / eval_scale);
+  return true;
+}
+
 static inline double child_q(const MCTSNode * c) {
     const uint64_t n = ev_of(c);
     return n ? -c->W.load(std::memory_order_relaxed) / (double)n : 0.0;
@@ -392,6 +462,7 @@ static void arena_reset_slot(MCTSNode * n) {
   n->expanding.store(0, std::memory_order_relaxed);
   n->terminal.store(0, std::memory_order_relaxed);
   n->cp.store(NO_MATE_SCORE, std::memory_order_relaxed);
+  n->mm.store(MM_NONE, std::memory_order_relaxed);
   n->hash.store(0, std::memory_order_relaxed);
   //LAST, and in this order: the tag retires the slot's identity so no map entry can resolve to
   //it, then the generation marks the slot itself free. Neither may be seen while the rest of the
@@ -490,6 +561,44 @@ void cleanup() {
 //meant to detect that. Instead it collects the set of live node ADDRESSES from the map first
 //and tests membership, which touches nothing.
 bool validate_tree_enabled = false;
+//ProveTerminals. See the long note in creatica_search.hpp for what it does and why.
+bool prove_terminals = false;
+//MinimaxWeight. 0 is the incumbent search exactly; see the note in creatica_search.hpp.
+double minimax_weight = 0.0;
+//TopKMin / TopKWiden; see the note in creatica_search.hpp. 0 is off.
+int64_t topk_min   = 0;
+double  topk_widen = 1.0;
+//FlattenTopK; see the note in creatica_search.hpp. 0 is off.
+int64_t flatten_topk = 0;
+std::atomic<uint64_t> flat_nodes{0};
+//MinVisitK / MinVisitShare / MinVisitDepth; see the note in creatica_search.hpp. 0 is off.
+int64_t min_visit_k     = 0;
+double  min_visit_share = MIN_VISIT_SHARE;
+int64_t min_visit_depth = 0;
+//How often the floor overrode the PUCT argmax, and how many selections it could have applied to. The
+//ratio is the share of the search the floor is actually diverting, which is the thing to watch: the
+//arithmetic predicts at most k * share, and a measured value far below that means the floor is not
+//binding and the option is doing nothing.
+std::atomic<uint64_t> min_visit_forced{0}, min_visit_eligible{0};
+//How many of this node's children selection may consider yet. Counted in DESCENDS through the node,
+//the same quantity the exploration term uses, so the two stay on one scale.
+std::atomic<uint64_t> topk_narrowed{0}, topk_considered{0}, topk_available{0}, topk_selections{0};
+static inline int topk_width(uint32_t descents, int num_children) {
+    if (topk_min <= 0) return num_children;
+    const double grow = topk_widen * std::log2(1.0 + (double)descents);
+    int k = (int)topk_min + (int)std::floor(grow > 0.0 ? grow : 0.0);
+    if (k < 1) k = 1;
+    return k < num_children ? k : num_children;
+}
+//Did the operator move the quantity it targets? `mm_raised` counts the times a node's minimax value
+//was pulled ABOVE the value its own mean would have given, which is the only case in which the
+//blend can change a decision.
+std::atomic<uint64_t> mm_updates{0}, mm_changed_choice{0};
+
+//HOW OFTEN THE INDUCTION ACTUALLY FIRES. A change that cannot be shown to move the quantity it
+//targets is not a null result, it is an untested one -- so the counters come before any verdict.
+std::atomic<uint64_t> proofs_win{0}, proofs_loss{0}, proof_seeds{0}, tb_seeds{0};
+
 
 //--- visit-distribution dump ------------------------------------------------------------------
 //
@@ -608,7 +717,7 @@ int validate_tree(const char * where, bool collected) {
 
     //Repetition is a property of the path, not the position, so it must never be cached on a
     //shared node. If this fires, something is writing terminal 3 to a node again.
-    if (node->terminal.load(std::memory_order_relaxed) == 3)
+    if (terminal_kind(node->terminal.load(std::memory_order_relaxed)) == 3)
       complain("node carries terminal 3 (repetition) which is path-dependent", key, 0);
 
     const int    nc = node->num_children.load(std::memory_order_relaxed);
@@ -1523,17 +1632,50 @@ void set_root(NNUEContext& ctx) {
   //bot restarting the engine mid-game, and once in a 321-ply game at ply 76 where the position
   //plainly had legal moves.
   //
-  //Which abandon point fires has NOT been established: occupancy was 568 per mille at the time, so
-  //neither the arena nor the child pool looks exhausted, and a small-Hash reproduction over 51 moves
-  //never triggered it. So this does two things rather than one. It discards the tree and expands
-  //again from a clean arena, which turns a lost game into a lost tree; and it logs everything needed
-  //to identify the cause next time, since expansion_abandons was previously visible nowhere.
+  //Which abandon point fires has NOT been established. So this does two things rather than one. It
+  //discards the tree and expands again from a clean arena, which turns a lost game into a lost tree;
+  //and it logs everything needed to identify the cause next time, since expansion_abandons was
+  //previously visible nowhere.
+  //
+  //WHAT THE TWO LIVE OCCURRENCES SHOWED (2026-09-22, creaticachessbot). The recovery fired twice and
+  //worked both times -- 14 and 18 children after discarding the tree -- and no "bestmove (none)" has
+  //appeared since. Both were endgames reached after a long middlegame, at 592 and 669 per mille
+  //occupancy, so the ARENA was plainly not exhausted. That leaves the child pool, and the reason the
+  //pool figures are now printed: its free lists are exact-size, so it can refuse a small request
+  //while holding a great deal of free space in the wrong sizes. Fragmentation is a hypothesis that
+  //fits both observations; the next occurrence will say whether it is the right one.
   if (root->num_children.load(std::memory_order_relaxed) == 0) {
     char fen[MAX_FEN_STRING_LEN];
     const uint64_t ab = expansion_abandons.load(std::memory_order_relaxed);
+    //THE CHILD POOL, reported because occupancy alone cannot tell the two exhaustion stories apart.
+    //`used` is how many of the pool's entries the bump pointer has handed out and `cap` how many
+    //exist, so used == cap means the pool is full. `free` is how many entries are sitting in the
+    //exact-size free lists waiting to be reused, and `free at N` how many are in the ONE list a
+    //request for N entries can draw from -- N being the size of the last refused request.
+    //
+    //Read it like this. used < cap: the pool was not the cause, look at the arena. used == cap and
+    //free near zero: genuine exhaustion, the pool is too small for this tree. used == cap with free
+    //large but `free at N` zero: FRAGMENTATION, which is the case this instrumentation exists for.
+    //The free lists are exact-size, so blocks released by ~30-move middlegame nodes cannot serve a
+    //~14-move endgame node, and an endgame reached after a long middlegame can be refused while the
+    //pool holds plenty of unusable space.
+    uint32_t free_at_n = 0;
+    const uint32_t fail_n  = search.arena.pool_fail_n.load(std::memory_order_relaxed);
+    const uint64_t pfree   = search.arena.pool_free_entries(&free_at_n, fail_n);
     log_file("info string ROOT HAS NO CHILDREN after expansion: fen %s, tree %zu nodes at %d permille, "
-             "expansion abandons so far %llu -- discarding the tree and retrying once\n",
-             board2fen(board, fen), live_tree_nodes(), tree_occupancy(), (unsigned long long)ab);
+             "expansion abandons so far %llu; child pool used %llu of %llu entries (%d permille), "
+             "%llu free in the size lists, %llu refusals, last refused %u entries with %u free at that size "
+             "(and %u recorded when it failed); arena %zu of %u slots "
+             "-- discarding the tree and retrying once\n",
+             board2fen(board, fen), live_tree_nodes(), tree_occupancy(), (unsigned long long)ab,
+             (unsigned long long)search.arena.pool_used(),
+             (unsigned long long)search.arena.pool_cap,
+             search.arena.pool_cap ? (int)(1000 * search.arena.pool_used() / search.arena.pool_cap) : 0,
+             (unsigned long long)pfree,
+             (unsigned long long)search.arena.pool_fails.load(std::memory_order_relaxed),
+             fail_n, free_at_n,
+             search.arena.pool_fail_free_n.load(std::memory_order_relaxed),
+             search.arena.live(), search.arena.cap);
     gc_join();
     cleanup_locked();
     root = search.arena.alloc();
@@ -1576,6 +1718,12 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
     //PARTIAL child list -- which would silently delete legal moves from the search.
     if (!child) return nullptr;
     child->cp.store(cp, std::memory_order_relaxed);
+    //SEEDED FROM THE ONE-PLY VALUE the child was born with, clamped into the field. Without a seed
+    //the minimax term would be absent for every freshly expanded child, which is most of the tree,
+    //and the blend would reduce to the mean exactly where it is supposed to act.
+    child->mm.store(cp == NO_MATE_SCORE ? MM_NONE
+                                        : (int16_t)std::clamp(cp, -32767, 32767),
+                    std::memory_order_relaxed);
     child->terminal.store(terminal, std::memory_order_relaxed);
     child->hash.store(hash, std::memory_order_relaxed);
     search.arena.stamp(child, (uint32_t)generation.load(std::memory_order_relaxed));
@@ -1583,7 +1731,7 @@ MCTSNode * make_child(const uint64_t hash, const int cp, const int terminal) {
     //Terminal children are seeded regardless of seed_children: a mate or tablebase result
     //is exact rather than an evaluation, and leaving a forced mate unseeded would measure
     //something other than the look-ahead.
-    if (cp != NO_MATE_SCORE && (seed_children || terminal > 0)) {
+    if (cp != NO_MATE_SCORE && (seed_children || terminal_kind(terminal) > 0)) {
       child->N.store(1, std::memory_order_relaxed);
       child->evidence.store(1, std::memory_order_relaxed);   //the evaluation it was born with
       child->W.store(tanh(cp * 0.01 / eval_scale), std::memory_order_relaxed);
@@ -1644,7 +1792,7 @@ void expand_node(MCTSNode * parent, const std::vector<std::tuple<double, int, in
       //instead, so whichever path visits it next evaluates it on its own terms. The prior for
       //this edge still reflects the draw, which is only a heuristic and costs nothing if it is
       //wrong for another path.
-      const bool path_repetition = (terminal == 3);
+      const bool path_repetition = (terminal_kind(terminal) == 3);
       MCTSNode * child = make_child(child_hash,
                                     path_repetition ? NO_MATE_SCORE : child_cp,
                                     path_repetition ? 0 : terminal);
@@ -1759,6 +1907,65 @@ static int report_cp(MCTSNode * child) {
   return (int)std::lround(100.0 * eval_scale * std::atanh(q));
 }
 
+//=== ROOT TRACE: how each root child's Q evolved during one search =============================
+//
+// A DIAGNOSTIC, NOT A SEARCH CHANGE. It writes nothing unless RootTraceFile names a path, and it
+// changes no value the search uses.
+//
+// Why it exists. The visit dump records each root child's FINAL visit count and prior, which is
+// enough to show that creatica puts a median 84.5% of its visits on the move it blunders with and
+// 1.5% on the move it should have played -- but not enough to test any change to how Q is formed,
+// because Q = W / evidence is a single number at the end. Snapshotting (N, W, evidence) periodically
+// turns that into a time series: between two snapshots, the change in W over the change in evidence
+// is the mean of exactly the backups that arrived in that window. Any reweighting over windows --
+// flat, exponentially decayed, sliding -- can then be recomputed offline on real searches, and
+// scored on whether it would have rejected the 171 recorded mistakes, without touching the search.
+//
+// Thread 0 only, on a tick it is already paying for, so the cost is a few dozen atomic reads every
+// 4096 of its simulations. The root's child array is read the same lock-free way uci_output_thread
+// reads it.
+std::string root_trace_path;   //empty disables it entirely
+static std::atomic<uint64_t> root_trace_seq{0};
+void root_trace_snapshot(bool final_line) {
+  if (root_trace_path.empty() || !search.root) return;
+  const int nc = search.root->num_children.load(std::memory_order_relaxed);
+  Edge * children = search.root->children.load(std::memory_order_relaxed);
+  if (nc <= 0 || !children) return;
+  FILE * f = fopen(root_trace_path.c_str(), "a");
+  if (!f) return;
+  fseek(f, 0, SEEK_END);
+  if (ftell(f) == 0)
+    fprintf(f, "#tag\tfen\tseq\tfinal\tsims\tmove:edgeN:N:W:evidence:P ...\n");
+  char fen[MAX_FEN_STRING_LEN];
+  fprintf(f, "%s\t%s\t%llu\t%d\t%llu\t",
+          game_tag.empty() ? "-" : game_tag.c_str(), board2fen(board, fen),
+          (unsigned long long)root_trace_seq.fetch_add(1, std::memory_order_relaxed),
+          final_line ? 1 : 0,
+          (unsigned long long)search_simulations.load(std::memory_order_relaxed));
+  char uci[6];
+  for (int i = 0; i < nc; ++i) {
+    //An Edge carries no child pointer -- the child's slot lives in the pool and is resolved through
+    //the arena, exactly as select_best_moves() does it.
+    MCTSNode * c = search.arena.child_at(search.root, i);
+    if (!c) continue;
+    idx2uci(children[i].move.load(std::memory_order_relaxed), uci);
+    //Both counts are recorded: the per-EDGE visits, which is what ranking uses, and the child
+    //position's own N and evidence, which is what Q is formed from. Under tree reuse they differ by
+    //a lot, and an offline reconstruction that confused them would measure the wrong thing.
+    //The PRIOR too. Without it the exploration term cannot be reconstructed offline at all: U is
+    //C * P * sqrt(parent descents) / (1 + edge n), and substituting a flat 1/num_children for P
+    //overstates it by orders of magnitude for exactly the starved moves the trace exists to study.
+    fprintf(f, "%s%s:%u:%llu:%.6f:%llu:%.8f", i ? " " : "", uci,
+            children[i].n.load(std::memory_order_relaxed),
+            (unsigned long long)c->N.load(std::memory_order_relaxed),
+            c->W.load(std::memory_order_relaxed),
+            (unsigned long long)ev_of(c),
+            (double)children[i].P.load(std::memory_order_relaxed));
+  }
+  fprintf(f, "\n");
+  fclose(f);
+}
+
 static void dump_visits(const std::vector<std::tuple<uint64_t, int>>& visits, const Edge * children) {
   if (visit_dump_path.empty() || !search.root) return;
   FILE * f = fopen(visit_dump_path.c_str(), "a");
@@ -1860,6 +2067,21 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
     visits.push_back({edge_visits ? (uint64_t)children[i].n.load(std::memory_order_relaxed)
                                   : ev_of(child), i});
   }
+  //A PROOF OUTRANKS EVERY VISIT COUNT. See prove_terminals. The root is ranked by visits, and a
+  //move that has just been proved to win may carry very few of them -- the whole failure this
+  //option addresses is that the visits went elsewhere and could not come back. So the verdict is a
+  //tier above the count: proven wins first, then the undecided moves in visit order, then the moves
+  //proved to lose. Within a tier nothing changes.
+  std::vector<int> tier((size_t)num_children, 0);
+  if (prove_terminals)
+    for (int i = 0; i < num_children; ++i) {
+      MCTSNode * c = search.arena.child_at(search.root, i);
+      if (!c) continue;
+      const int ct = c->terminal.load(std::memory_order_relaxed);
+      //From the ROOT's point of view: a child lost for the side to move there is a win for us.
+      if (proven_loss(ct))     tier[(size_t)i] =  1;
+      else if (proven_win(ct)) tier[(size_t)i] = -1;
+    }
   //Descending by visits, and on a TIE the lower child index wins.
   //
   //This was std::greater() over the whole tuple, which compares lexicographically: equal visit
@@ -1868,14 +2090,47 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
   //expand_node), so the highest index is the LOWEST-prior move. Any tie therefore resolved to
   //the worst move rather than the best -- including the all-zero tie of a root that was never
   //searched, where it picked the move the prior liked least.
-  std::sort(visits.begin(), visits.end(), [](const auto& a, const auto& b) {
+  std::sort(visits.begin(), visits.end(), [&tier](const auto& a, const auto& b) {
+    const int ta = tier[(size_t)std::get<1>(a)], tb = tier[(size_t)std::get<1>(b)];
+    if (ta != tb) return ta > tb;
     if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
     return std::get<1>(a) < std::get<1>(b);
   });
   //Dumped HERE, on the raw search result. The loop below can drop moves (the repetition-avoidance
   //in winning positions), and those edits are a playing decision rather than something the search
   //concluded -- training on them would teach the policy a heuristic instead of an evaluation.
+  //The final state, marked, so the offline reconstruction has the same numbers the engine decided on
+  //rather than the last periodic snapshot, which can be thousands of simulations stale.
+  root_trace_snapshot(true);
   dump_visits(visits, children);
+  if (flatten_topk > 1)
+    log_file("flatten: top %lld given equal mass at %llu expansions\n",
+             (long long)flatten_topk, (unsigned long long)flat_nodes.load(std::memory_order_relaxed));
+  if (topk_min > 0) {
+    const uint64_t cons = topk_considered.load(std::memory_order_relaxed);
+    const uint64_t avail = topk_available.load(std::memory_order_relaxed);
+    const uint64_t narrowed = topk_narrowed.load(std::memory_order_relaxed);
+    const uint64_t sels = topk_selections.load(std::memory_order_relaxed);
+    log_file("topk: min %lld widen %.2f -- %llu selections, %llu narrowed (%.1f%%), "
+             "mean width %.2f of %.2f available\n",
+             (long long)topk_min, topk_widen,
+             (unsigned long long)sels, (unsigned long long)narrowed,
+             sels ? 100.0 * (double)narrowed / (double)sels : 0.0,
+             sels ? (double)cons / (double)sels : 0.0,
+             sels ? (double)avail / (double)sels : 0.0);
+  }
+  if (minimax_weight > 0.0)
+    log_file("minimax: weight %.2f, %llu node values recomputed, %llu selections where the blend "
+             "chose a different child than the mean would have\n", minimax_weight,
+             (unsigned long long)mm_updates.load(std::memory_order_relaxed),
+             (unsigned long long)mm_changed_choice.load(std::memory_order_relaxed));
+  if (prove_terminals)
+    log_file("prove: %llu tablebase verdicts stamped, %llu exact nodes met on a path, "
+             "%llu nodes proved won, %llu proved lost\n",
+             (unsigned long long)tb_seeds.load(std::memory_order_relaxed),
+             (unsigned long long)proof_seeds.load(std::memory_order_relaxed),
+             (unsigned long long)proofs_win.load(std::memory_order_relaxed),
+             (unsigned long long)proofs_loss.load(std::memory_order_relaxed));
 
   //A FLOOR ON WHAT THE FILTER MAY LAND ON. The loop below DELETES the leading move rather than
   //comparing it with an alternative, and its only exits are "not a repetition" or "one of the two
@@ -2038,19 +2293,41 @@ int select_best_moves(std::vector<std::pair<int, std::string>>& pvs) {
 //the floor rose, because Q is a MEAN and forcing evidence onto every reply lets the mediocre ones
 //outvote the refutation). See ENGINE_SETTINGS.md before reintroducing anything of that shape.
 int select_best_child(MCTSNode * parent, const int depth) {
-  int num_children = parent->num_children.load(std::memory_order_acquire);
+  const int all_children = parent->num_children.load(std::memory_order_acquire);
   Edge * children = parent->children.load(std::memory_order_acquire);
+  //PROGRESSIVE WIDENING. The children are in descending prior order, so considering only the first k
+  //is the narrowing -- and because k grows with the descents, nothing is removed, only deferred.
+  int num_children = all_children;
+  if (topk_min > 0) {
+    num_children = topk_width(parent->descents.load(std::memory_order_relaxed), all_children);
+    topk_selections.fetch_add(1, std::memory_order_relaxed);
+    topk_considered.fetch_add((uint64_t)num_children, std::memory_order_relaxed);
+    topk_available.fetch_add((uint64_t)all_children, std::memory_order_relaxed);
+    if (num_children < all_children) topk_narrowed.fetch_add(1, std::memory_order_relaxed);
+  }
   double best_score = -INFINITY;
-  int selected; //it will be initialized in the for loop
+  //INITIALISED. It used to rely on at least one child beating -INFINITY, which held while every
+  //child was scored; the proof filter below can skip children, and a node all of whose moves are
+  //proven losses would have left this uninitialised.
+  int selected = 0;
+  const bool prove = prove_terminals;
+  //The blend, and the instrumentation that says whether it did anything. `mean_selected` is what
+  //the incumbent search would have picked from the same statistics, so counting the disagreements
+  //measures the mechanism directly rather than inferring it from the solve rate.
+  const double mmw = minimax_weight;
+  double best_mean_score = -INFINITY;
+  int    mean_selected   = 0;
   // Dynamic Exploration Constant - linear decay with depth
   // setting exploration_depth_decay to 0 will make exploration constant static = exploration_max
   // Decay: Start at exploration_constant, then for example drop by 0.05 - 0.1 per ply, floor at 0.25 - all tunable
   double C = std::max(exploration_min, exploration_max - (depth * exploration_depth_decay));
   //or square root decay with depth
   //double C = std::max(exploration_min, exploration_max - (sqrt(static_cast<double>(depth)) * exploration_depth_decay));
-  
-  // OPTIONAL: Bonus for Root Node (Depth 0) to ensure wide scanning
-  //if (depth == 0) C = 2.0;
+
+  //The root gets its own constant when ExplorationRoot is set; see the note on exploration_root. This
+  //replaces the commented-out `if (depth == 0) C = 2.0;` that used to sit here, and 0 keeps the
+  //schedule so the default is byte-for-byte the incumbent's behaviour.
+  if (depth == 0 && exploration_root > 0.0) C = exploration_root;
   const uint64_t parentN = parent->N.load(std::memory_order_acquire);
   //The exploration numerator: descents THROUGH this node, which is the sum of its edges' n and
   //therefore on the same scale as the per-edge denominator below.
@@ -2059,9 +2336,42 @@ int select_best_child(MCTSNode * parent, const int depth) {
   const double   parentW = parent->W.load(std::memory_order_relaxed);
   const uint64_t parentE = ev_of(parent);
   const double   parentQ = parentE ? parentW / parentE : 0.0;
-  for (int i = 0; i < num_children; i++) {
+  //THE VISIT FLOOR. See the MinVisitK note in creatica_search.hpp. Computed before the PUCT loop and,
+  //when it binds, replaces the argmax outright -- the floor is a guarantee, not another term to be
+  //out-voted by a million-visit mean, which is the whole point.
+  int forced = -1;
+  if (min_visit_k > 0 && depth <= (int)min_visit_depth && min_visit_share > 0.0) {
+    min_visit_eligible.fetch_add(1, std::memory_order_relaxed);
+    const int kk = std::min((int)min_visit_k, num_children);
+    //Floored, so a node whose descents are below 1/share has no floor yet and starts on pure PUCT.
+    const uint32_t floor_n = (uint32_t)(min_visit_share * (double)parentD);
+    if (floor_n > 0) {
+      uint32_t worst_n = 0;
+      for (int i = 0; i < kk; ++i) {
+        //A proven win for the child is a loss here, so the floor must not spend visits on it either.
+        if (prove && proven_win(search.arena.child_at(parent, i)->terminal.load(std::memory_order_relaxed)))
+          continue;
+        const uint32_t en = children[i].n.load(std::memory_order_relaxed);
+        if (en < floor_n && (forced < 0 || en < worst_n)) { forced = i; worst_n = en; }
+      }
+    }
+    if (forced >= 0) min_visit_forced.fetch_add(1, std::memory_order_relaxed);
+  }
+  for (int i = 0; forced < 0 && i < num_children; i++) {
     double P = children[i].P.load(std::memory_order_relaxed);
     MCTSNode * child = search.arena.child_at(parent, i);
+    //AN EXACT VERDICT OVERRIDES PUCT, which is the point of the option. See prove_terminals.
+    //
+    //A child that is lost for the side to move there is a move that WINS here, so it is taken at
+    //once and no average can out-vote it -- this is the alpha-beta cutoff, with a proof in place of
+    //a heuristic. A child that is won for the side to move there loses here, so it is dropped from
+    //consideration; that is not the move gating ruled out elsewhere, because gating discards a move
+    //on a weak ESTIMATE of its value while this is exact and the position is already decided.
+    if (prove) {
+      const int ct = child->terminal.load(std::memory_order_relaxed);
+      if (proven_loss(ct)) { selected = i; break; }
+      if (proven_win(ct)) continue;
+    }
     uint64_t N = child->N.load(std::memory_order_relaxed);   //attention: drives exploration
     const uint64_t Ne = ev_of(child);                        //evidence: drives Q
     //N(s,a) for this edge, which is NOT the child's visit count. See the note on Edge::n.
@@ -2076,15 +2386,30 @@ int select_best_child(MCTSNode * parent, const int depth) {
     //Q still comes from the POSITION: a node's accumulated value is about the position, and a
     //transposition legitimately shares it. Only the exploration term moves to the edge.
     double Q = Ne ? W / Ne : (parentQ - fpu_reduction);
+    //Q_blended. A child states its value from its OWN side to move, so the parent sees the
+    //negation, exactly as it does for W above.
+    double Qb = Q;
+    if (mmw > 0.0) {
+      double mv = 0.0;
+      if (mm_value(child, mv)) Qb = (1.0 - mmw) * Q + mmw * (-mv);
+    }
     //PUCT formula. Numerator and denominator are both edge counts now. Using the child's lifetime
     //N as the denominator meant a child carrying a million inherited visits had an exploration
     //term so small it could never be re-examined from a new parent, which is how a node frozen
     //while it was the ponder root stayed frozen for the rest of the game.
     //One branch on a flag that never changes during a search, so it predicts perfectly.
-    double score = use_edge ? Q + C * P * sqrt((double)parentD) / (1.0 + en)
-                            : Q + C * P * sqrt((double)parentN) / (1.0 + N);
+    const double U = use_edge ? C * P * sqrt((double)parentD) / (1.0 + en)
+                              : C * P * sqrt((double)parentN) / (1.0 + N);
+    const double score = Qb + U;
     if (score > best_score) { best_score = score; selected = i; }
+    if (mmw > 0.0) {
+      const double mean_score = Q + U;
+      if (mean_score > best_mean_score) { best_mean_score = mean_score; mean_selected = i; }
+    }
   }
+  if (forced >= 0) selected = forced;
+  if (mmw > 0.0 && forced < 0 && selected != mean_selected)
+    mm_changed_choice.fetch_add(1, std::memory_order_relaxed);
   // Apply virtual loss to selected child to avoid contention among threads for the same node
   //children = parent.children.load(std::memory_order_acquire);
   MCTSNode * child = search.arena.child_at(parent, selected);
@@ -2095,6 +2420,19 @@ int select_best_child(MCTSNode * parent, const int depth) {
   children[selected].n.fetch_add(1, std::memory_order_relaxed);
   parent->descents.fetch_add(1, std::memory_order_relaxed);
   return selected;
+}
+
+//Equal mass across the first k, the tail untouched, the total preserved. Called after get_prob(), so
+//the entries are already sorted by descending probability and get<0> holds the probability itself.
+void flatten_prior(std::vector<std::tuple<double, int, int, int, uint64_t>>& move_evals) {
+  if (flatten_topk <= 1) return;
+  const size_t k = std::min((size_t)flatten_topk, move_evals.size());
+  if (k < 2) return;
+  double sum = 0.0;
+  for (size_t i = 0; i < k; ++i) sum += std::get<0>(move_evals[i]);
+  const double each = sum / (double)k;
+  for (size_t i = 0; i < k; ++i) std::get<0>(move_evals[i]) = each;
+  flat_nodes.fetch_add(1, std::memory_order_relaxed);
 }
 
 void get_prob(std::vector<std::tuple<double, int, int, int, uint64_t>>& move_evals) { //, double prob_mass) {
@@ -2203,6 +2541,18 @@ std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& boar
       else if (wdl == 0) res = -MATE_SCORE * 0.001;
       else res = 0.0;
       tbhits.fetch_add(1, std::memory_order_relaxed);
+      //A TABLEBASE VERDICT IS A PROOF. See the matching note in make_move_policy(), and note that
+      //THIS is the site that matters: the engine runs with the blended prior, which evaluates every
+      //child through position_eval(), while make_move_policy() is only used by the policy-only
+      //expansion mode. Stamping only the latter left the counter at exactly zero across 684
+      //searches, which is how the mistake was found.
+      //
+      //Only wdl 4 and 0 are proofs. 1, 2 and 3 are blessed loss, draw and cursed win -- decided on
+      //the board but drawn by the fifty-move rule -- and the engine already scores all three as 0.
+      if (prove_terminals && (wdl == 4 || wdl == 0)) {
+        terminal = (terminal & TERMINAL_KIND_MASK) | (wdl == 4 ? PROVEN_WIN : PROVEN_LOSS);
+        tb_seeds.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   } //end of else (pieceCount <= TB_LARGEST)
   return std::make_pair(res, terminal);
@@ -2277,6 +2627,24 @@ std::pair<int, int> make_move_policy(Board& chess_board, const ZobristHash& boar
         else if (wdl == 0) cp = static_cast<int>(-MATE_SCORE * 0.1);
         else               cp = 0;
         tbhits.fetch_add(1, std::memory_order_relaxed);
+        //A TABLEBASE VERDICT IS A PROOF, and until now the search had no way to say so.
+        //
+        //This is what made ProveTerminals inert. The only exact verdict the engine stamped on a
+        //node was checkmate, so on the mistakes test set the induction had almost nothing to
+        //compose -- instrumented over 21 searches it proved a median of about 60 nodes out of
+        //600,000 simulations, roughly one node in ten thousand, and the solve rate did not move
+        //(36.1% against 33.9%, zero positions converted from never solved to always solved).
+        //Meanwhile the same searches were taking hundreds of thousands of tablebase hits, every
+        //one of them exact and every one of them recorded as nothing more than a large centipawn
+        //number that Q then averaged like any opinion.
+        //
+        //Only wdl 4 and 0 are proofs. 1, 2 and 3 are blessed loss, draw and cursed win -- won or
+        //lost on the board but drawn by the fifty-move rule -- and the engine already scores all
+        //three as 0, which is the honest answer and not something to prove a win from.
+        if (prove_terminals && (wdl == 4 || wdl == 0)) {
+          terminal = (terminal & TERMINAL_KIND_MASK) | (wdl == 4 ? PROVEN_WIN : PROVEN_LOSS);
+          tb_seeds.fetch_add(1, std::memory_order_relaxed);
+        }
       }
       //Counted but never logged here: this site has always failed silently, and the count is what
       //tells you a partial set is being probed for tables it does not have.
@@ -2511,6 +2879,8 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
   // policy path it is the prior, and the node's own value is computed below instead.
   std::sort(move_evals.begin(), move_evals.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b);});
   get_prob(move_evals);
+  //Discard the ordering inside the top k, keeping the total mass; see flatten_prior().
+  if (flatten_topk > 1) flatten_prior(move_evals);
   int scorecp;
   if ((!use_policy || policy_mode == POLICY_PRIOR) && node_minimax) {
     //The 1-ply minimax over the children, computed explicitly rather than read off the
@@ -2557,6 +2927,79 @@ MCTS implementation follows the four core phases:
 
 //called from thread_search()
 //calls compute_move_evals() and expand_node()
+//THE MINIMAX BACKUP. See minimax_weight.
+//
+//A node's minimax value is the best its own side can reach: the maximum over its children of the
+//NEGATION of theirs, since a child's value is stated from the child's side to move. Recomputed in
+//full rather than kept as a running maximum, because a max that only ever rises is a high-water
+//mark -- when a child's value falls, the parent's has to fall with it, and an incremental maximum
+//cannot do that. One pass over the children per node on the simulation's path.
+static void mm_backup(MCTSNode * n) {
+  const int nc = n->num_children.load(std::memory_order_acquire);
+  if (nc <= 0) return;
+  int  best = 0;
+  bool any  = false;
+  for (int i = 0; i < nc; ++i) {
+    MCTSNode * c = search.arena.child_at(n, i);
+    if (!c) continue;
+    const int16_t v = c->mm.load(std::memory_order_relaxed);
+    if (v == MM_NONE) continue;
+    const int cand = -(int)v;
+    if (!any || cand > best) { best = cand; any = true; }
+  }
+  if (!any) return;
+  n->mm.store((int16_t)std::clamp(best, -32767, 32767), std::memory_order_relaxed);
+  mm_updates.fetch_add(1, std::memory_order_relaxed);
+}
+
+//Stamp an exact verdict on a node without disturbing its kind. The kind never changes once the node
+//has been expanded, so a plain load-compose-store is enough; two threads proving the same node
+//compose the same word.
+static void set_proof(MCTSNode * n, int proof) {
+  if (proof == PROVEN_WIN) proofs_win.fetch_add(1, std::memory_order_relaxed);
+  else                     proofs_loss.fetch_add(1, std::memory_order_relaxed);
+  const int t = n->terminal.load(std::memory_order_relaxed);
+  if (proof_bits(t) & proof) return;                      //already carries it
+  //`t & 0xff` is what normalises the legacy -1 of an in-check node into 0xff, so the word it
+  //composes is non-negative and proof_bits() will read it. See terminal_kind().
+  n->terminal.store((t & TERMINAL_KIND_MASK) | proof, std::memory_order_release);
+}
+
+//BACKWARD INDUCTION UP THE PATH THIS SIMULATION TOOK. See prove_terminals.
+//
+//Two rules, and they are the whole of it. A node whose side to move can reach a position that is
+//LOST for the side to move there has a winning move, so it is won. A node is lost only when EVERY
+//move reaches a position won for the opponent -- one child that is drawn, or merely unproven, is
+//enough to leave the question open.
+//
+//The walk stops at the first node it cannot prove, so in a quiet position it does nothing beyond
+//one comparison. The "every child" scan is the only part that costs anything, and it runs only when
+//the child just visited was itself proven won, which is rare.
+static void prove_up(const std::vector<MCTSNode *>& path) {
+  for (size_t i = path.size(); i-- > 1; ) {
+    MCTSNode * parent = path[i - 1];
+    MCTSNode * child  = path[i];
+    const int ct = child->terminal.load(std::memory_order_acquire);
+    //A SEED is an exact verdict that did not come from the induction itself -- today that means
+    //checkmate and nothing else. Counted separately, because if the seeds are zero the induction
+    //has nothing to compose and the whole option is inert for reasons that have nothing to do with
+    //whether propagating proofs is a good idea.
+    if (terminal_kind(ct) == 1 || proof_bits(ct)) proof_seeds.fetch_add(1, std::memory_order_relaxed);
+    if (proven_loss(ct)) { set_proof(parent, PROVEN_WIN); continue; }
+    if (!proven_win(ct)) break;          //nothing exact here, and nothing above can follow
+    const int nc = parent->num_children.load(std::memory_order_acquire);
+    if (nc <= 0) break;
+    bool all_won = true;
+    for (int j = 0; j < nc; ++j) {
+      MCTSNode * c = search.arena.child_at(parent, j);
+      //An unexpanded or missing child is an open question, not a win for the opponent.
+      if (!c || !proven_win(c->terminal.load(std::memory_order_relaxed))) { all_won = false; break; }
+    }
+    if (!all_won) break;
+    set_proof(parent, PROVEN_LOSS);
+  }
+}
+
 void mcts_search(ThreadParams& params, NNUEContext& ctx) {
   //One simulation per call, counted at entry so the early return below is still counted -- it
   //consumed time and must appear in the denominator of nps.
@@ -2564,6 +3007,7 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
   std::vector<MCTSNode *> path;  // Track the path from root to leaf
   path.reserve(chessEngine.depth);
   int terminal = 0;
+  int node_terminal_word = 0;
   params.seldepth = 0;
   MCTSNode * node = search.root;
   //start from the same initial position given by board (at the root node, i.e. at the top of the tree - the up side down tree)
@@ -2584,7 +3028,10 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
     //continue iterating down the tree by getting next node until no more children
     node = search.arena.child_at(node, idx);   //the parent is the node being left; evaluated before the assignment
     //init and take edge's move that leads to the child node
-    terminal = node->terminal.load(std::memory_order_acquire);
+    //The raw word carries the proof bits; `terminal` itself stays the kind, so every test below
+    //reads exactly what it always did. See terminal_kind().
+    node_terminal_word = node->terminal.load(std::memory_order_acquire);
+    terminal = terminal_kind(node_terminal_word);
     if (terminal == 3) break; //repetition
     Move move;
     move.dst = (Square)(move_idx & 63);
@@ -2766,6 +3213,14 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
       result = -1;
     } //for stalemate the result is initiated to 0, so no need for this check    
   }
+  //AN EXACT LEAF BACKS UP AS A CERTAINTY, not as an evaluation. Without this the proof would steer
+  //selection while Q went on averaging the static evaluation of a position whose outcome is already
+  //known, which is the dilution the whole option exists to remove. terminal 1 already did this for
+  //mate; this covers the verdicts the induction established.
+  if (prove_terminals && terminal != 1) {
+    if (proven_loss(node_terminal_word))      result = -1.0;
+    else if (proven_win(node_terminal_word))  result =  1.0;
+  }
   // Backpropagation: update node visits and results regardless of whether we expand the node or not
   for (auto n = path.rbegin(); n != path.rend(); ++n) {
     node = *n;
@@ -2774,8 +3229,14 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
       node->evidence.fetch_add(1, std::memory_order_relaxed);
       node->W.fetch_add(result, std::memory_order_relaxed);
     }
+    //The minimax value is refreshed on the same upward walk, leaf first, so a node is recomputed
+    //only after the child it was reached through already carries this simulation's result.
+    if (minimax_weight > 0.0) mm_backup(node);
     result = -result;
   }
+  //Proofs are established AFTER the values have been backed up, so a node that becomes exact on this
+  //simulation is already carrying the visit that proved it.
+  if (prove_terminals) prove_up(path);
   // Revert virtual loss for the selected path (skip root, as no loss was applied to it) regardless of expansion
   // because virtual loss was applied in select_best_child() which is called in the selection phase
   for (size_t j = 1; j < path.size(); ++j) {  // From first child to leaf
@@ -3072,45 +3533,106 @@ void runMCTS(NNUEContext& ctx) {
     seldepth.store(0, std::memory_order_relaxed);
     auto iter_start = std::chrono::steady_clock::now();
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i) {
-        pool_params[i].thread_id = i;
-        pool_params[i].time_alloc = search_budget;
-        pool_params[i].seldepth = 0;
-    }
-    //The predicate must change while pool_mutex is HELD, or the wake can be lost. A worker in
-    //pool_cv.wait() evaluates its predicate holding the lock and only then atomically releases
-    //and blocks; if these stores land in that window and the notify fires before the worker is
-    //actually blocked, the notification goes nowhere and the worker sleeps through the search.
-    {
-      std::lock_guard<std::mutex> lk(pool_mutex);
-      active_workers.store(num_threads); // Register how many we expect to run
-      pool_generation.fetch_add(1);      // Increment generation ID
-    }
-    pool_cv.notify_all();              // SIGNAL: "Start Engines!"
-        
-    if (chessEngine.optionCheck[IntermittentInfoLines].value && !chessEngine.ponder) {
-      search_done.store(false);
-      std::thread output_thread(uci_output_thread);
+    //THE OUTPUT THREAD LIVES AND DIES INSIDE ONE ATTEMPT, never across the reset between them. It
+    //walks the tree from search.root with no lock at all -- that is what it is for, a cheap reader
+    //of a structure only the workers write -- so it cannot be running while gc(retire_all) frees
+    //every node under it. Starting and joining it per attempt costs one thread creation on the rare
+    //move that aborts and keeps the reset in a window where nothing is reading the tree.
+    const bool live_output = chessEngine.optionCheck[IntermittentInfoLines].value && !chessEngine.ponder;
+    //THE SEARCH, WITH ONE RETRY ON A FROZEN TREE. See hollow_abort for why the abort exists at all.
+    //Attempt 0 runs the whole budget in the normal case and this loop turns once. If the workers
+    //come back early because thread 0 found the search hollow, the tree is retired, the root rebuilt
+    //and attempt 1 runs whatever is left of the budget on an empty tree. There is never an attempt 2:
+    //a tree that starts empty cannot be full, so a second abort would mean something other than a
+    //frozen tree, and an uncapped loop could spend the entire move collecting.
+    double attempt_budget = search_budget;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      hollow_abort.store(false, std::memory_order_relaxed);
+      hollow_abort_armed.store(attempt == 0, std::memory_order_relaxed);
+      for (int i = 0; i < num_threads; ++i) {
+          pool_params[i].thread_id = i;
+          pool_params[i].time_alloc = (uint64_t)attempt_budget;
+          pool_params[i].seldepth = 0;
+      }
+      //The predicate must change while pool_mutex is HELD, or the wake can be lost. A worker in
+      //pool_cv.wait() evaluates its predicate holding the lock and only then atomically releases
+      //and blocks; if these stores land in that window and the notify fires before the worker is
+      //actually blocked, the notification goes nowhere and the worker sleeps through the search.
+      {
+        std::lock_guard<std::mutex> lk(pool_mutex);
+        active_workers.store(num_threads); // Register how many we expect to run
+        pool_generation.fetch_add(1);      // Increment generation ID
+      }
+      pool_cv.notify_all();              // SIGNAL: "Start Engines!"
+
+      std::thread output_thread;
+      if (live_output) {
+        search_done.store(false);
+        output_thread = std::thread(uci_output_thread);
+      }
       // Wait until all workers are done
       while (active_workers.load()) {
         std::unique_lock<std::mutex> lock(pool_mutex);
         pool_done_cv.wait(lock, [] { return active_workers.load() == 0; });
         lock.unlock();
       }
-      // Signal output thread to stop
+      if (live_output) {
+        {
+          std::lock_guard<std::mutex> lk(search_done_mtx);
+          search_done.store(true);
+        }
+        cv_search_done.notify_one();
+        output_thread.join();
+      }
+      //Not an abort: either the search ran its allocation, or `stop` arrived, or this was already
+      //the retry. Either way there is nothing more to do for this move.
+      if (!hollow_abort.load(std::memory_order_relaxed) ||
+          stopFlag.load(std::memory_order_relaxed) || attempt == 1) break;
+
+      //EVERY WORKER HAS EXITED. That is what makes the reset safe here and impossible inside a
+      //worker: gc(retire_all) frees the whole tree, and a thread still walking it would be reading
+      //freed slots. gc_join() covers the other collector -- the background one started after the
+      //last bestmove, which under CollectDuringPonder can still be marking this same tree.
+      const auto reset_start = std::chrono::steady_clock::now();
+      const uint64_t sims_before   = search_simulations.load(std::memory_order_relaxed);
+      const uint64_t hollow_before = uninformed_sims.load(std::memory_order_relaxed);
+      const size_t   nodes_before  = live_tree_nodes();
+      gc_join();
+      gc(search.root, /*retire_all=*/true);
+      search.root = nullptr;
+      set_root(ctx);
+      //Both counters belong to the tree that has just been thrown away. seldepth is the deepest line
+      //reached in it and depth the length of its principal variation, and the retry starts from a
+      //single node; leaving either in place would report the dead tree's numbers for the rest of the
+      //move, and with `go depth N` a stale depth could even stop the retry before it began.
+      seldepth.store(0, std::memory_order_relaxed);
+      depth.store(0, std::memory_order_relaxed);
       {
-        std::lock_guard<std::mutex> lk(search_done_mtx);
-        search_done.store(true);
+        int hf = tree_occupancy();
+        if (hf > 1000) hf = 1000;
+        hash_full.store(hf, std::memory_order_relaxed);
       }
-      cv_search_done.notify_one();
-      output_thread.join();
-    } else {
-      // Just wait for workers
-      while (active_workers.load()) {
-        std::unique_lock<std::mutex> lock(pool_mutex);
-        pool_done_cv.wait(lock, []{ return active_workers.load() == 0; });
-        lock.unlock();
-      }
+      //Charged against this move's budget, exactly as the pre-search collection is: the elapsed time
+      //includes both the wasted attempt and the reset, so the retry gets what is genuinely left and
+      //the move as a whole still finishes inside its allocation.
+      const double used_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - iter_start).count();
+      attempt_budget = search_budget - used_ms;
+      log_file("info string hollow abort: %llu of %llu simulations (%d permille) taught the tree nothing "
+               "at %zu nodes; retired the tree in %.1f ms, now %zu nodes at %d permille; "
+               "re-searching with %.0f ms of this move's %.0f ms left\n",
+               (unsigned long long)hollow_before, (unsigned long long)sims_before,
+               sims_before ? (int)(1000 * hollow_before / sims_before) : 0,
+               nodes_before,
+               std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - reset_start).count(),
+               live_tree_nodes(), tree_occupancy(), attempt_budget, search_budget);
+      //Too little left to rebuild anything worth having, or set_root() could not build a root at all.
+      //Nothing is lost by stopping in either case: the reset has already happened, so the NEXT search
+      //starts on the clean tree rather than the frozen one. The null check is not decoration -- every
+      //worker dereferences search.root on its first line, so starting attempt 1 without one would be
+      //a crash, and on lichess a crash is a forfeited game.
+      if (!search.root || attempt_budget < 1.0) break;
     }
     //Refresh hash_full unconditionally.
     //
