@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wall -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot.cpp -o lichess_bot
+// c++ -std=c++20 -Wall -O3 -flto -I $HOME/libchess -L $HOME/libchess -Wl,-lcurl,-lchess,-rpath,$HOME/libchess lichess_bot.cpp -o lichess_bot
 
 #include <functional>
 #include <iostream>
@@ -27,11 +27,22 @@
 //had been playing rated games with the weaker of the two engines available to it.
 //
 //NOTE: the engine loads its policy net from the RELATIVE path "nnue_policy.bin", so it must
-//be started with /Users/ap/libchess as the working directory. If the net cannot be found it
+//be started with the repository directory as the working directory. If the net cannot be found it
 //does not fail: it prints an info string and falls back to the eval-derived prior, which is
 //sound but is exactly the ~108 Elo this change is meant to gain. Check the engine's startup
 //line says "policy head nnue_policy.bin loaded".
-#define CREATICA_PATH "/Users/ap/libchess/creatica"
+//libchess/creatica under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * creatica_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/libchess/creatica", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define CREATICA_PATH creatica_path_default()
 #define DEPTH 0
 #define MOVETIME 0
 //Back to 2048 after a bad call on my part. MCTSNode did shrink 216 -> 56 bytes, but with
@@ -45,7 +56,18 @@
 //file was still overriding that with the value the measurement rejected, so the bot has been
 //running the worse setting. It also halves the number of NNUE contexts, which is fixed memory.
 #define THREADS 4
-#define SYZYGY_PATH "/Users/ap/syzygy"
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define SYZYGY_PATH syzygy_path_default()
 #define BOT_USERNAME "creaticachessbot"  // Lowercase, as per API IDs
 #define DRAW_CP 30 //accept draw if score cp is less than this value in centipawns
 #define MIN_ELO 2100
@@ -53,7 +75,18 @@
 #define ELO_CREATICA 2300
 #define CLOCK_LIMIT 180 //seconds
 #define CLOCK_INCREMENT 3 //seconds
-#define NUMBER_OF_BOTS 50 //number of online bots to return from the list
+//How many online bots to ask /api/bot/online for. IT IS A PREFIX, NOT A SAMPLE, which is why this
+//has to be larger than the population rather than merely large enough to choose from. Measured on
+//26 September 2026: the endpoint had 396 bots online; ?nb=50 returned exactly the first 50 of the
+//?nb=1000 list, in the same order, on two fetches seconds apart. The head of that ordering is
+//lichess's own bot family -- maia1 at 1399, maia5 at 1437, maia9 at 1599, then the odds-giving
+//Leelas at 2000 to 3340 -- so almost none of it falls inside the 2100-2800 band this bot challenges
+//in. The old value of 50 therefore yielded 12 eligible opponents where the full list yields 117,
+//and the same 12 every round. Bots visibly playing on lichess.org/games/bot were simply past the cut.
+//
+//The whole list is 336 KB in one request and is fetched only between games, so asking for more than
+//exists costs nothing; the API returns what it has.
+#define NUMBER_OF_BOTS 1000
 #define MULTI_PV 1 //number of PVs
 #define PV_PLIES 2 //number of plies in PV
 #define EXPLORATION_MIN 65 // used in formular for exploration constant decay with depth
@@ -99,6 +132,14 @@
 static std::string env_str(const char * name, const char * dflt) {
   const char * v = std::getenv(name);
   return (v && *v) ? std::string(v) : std::string(dflt);
+}
+//As env_str(), except that an EXPLICITLY EMPTY value is honoured rather than treated as unset.
+//env_str()'s behaviour is right for a path or a name, where "" can only be a mistake, and wrong for
+//a setting whose empty value is meaningful -- setting a chat line to nothing is how it is switched
+//off without editing the source.
+static std::string env_str_or_empty(const char * name, const char * dflt) {
+  const char * v = std::getenv(name);
+  return v ? std::string(v) : std::string(dflt);
 }
 static int env_int(const char * name, int dflt) {
   const char * v = std::getenv(name);
@@ -193,6 +234,17 @@ const long        book_max_cp = (long)env_int("CREATICA_BOOK_MAXCP", 100);
 //there is nothing to learn.
 const int         min_elo       = env_int("CREATICA_MIN_ELO", MIN_ELO);
 const int         max_elo       = env_int("CREATICA_MAX_ELO", MAX_ELO);
+//How many bots to ask for; see NUMBER_OF_BOTS. Overridable for the same reason the band is: widening
+//the pool changes WHO creatica has been playing, so a run that is measuring the engine against a
+//known field can pin it to the value the earlier games used rather than inherit a new default.
+const int         nb           = env_int("CREATICA_NB", NUMBER_OF_BOTS);
+//What to say in the player chat when a draw offer is turned down. The offer itself is made at most
+//once a game and only when the tablebase says the position is a dead draw (see tablebaseVerdict),
+//so this cannot become chatter: it is one line, in the games where a proven draw is going to be
+//played out anyway. Empty disables it.
+const std::string chat_draw_declined =
+    env_str_or_empty("CREATICA_CHAT_DRAW_DECLINED",
+            "solar energy is free in Queensland - burn, baby, burn");
 //Per instance, so two bots running side by side do not interleave into one file.
 std::mutex results_mutex;
 const std::string results_path = env_str("CREATICA_RESULTS", ("results_" + bot_username + ".csv").c_str());
@@ -283,6 +335,35 @@ std::atomic<bool> game_in_progress {false};
 //offer, not one a move: the position stays drawn for the rest of the endgame, so repeating it every
 //move would be pestering an opponent who has already said no. Reset when a game starts.
 std::atomic<bool> tb_draw_offered {false};
+//Our own draw offer is outstanding as far as lichess is concerned. There is no "declined" event in
+//the game stream, so a decline is read off our own wdraw/bdraw flag going from set to clear while
+//the game is still running -- if they had ACCEPTED, the status would be terminal and the handler
+//returns before it gets there. A move by the opponent implicitly declines, which clears the flag
+//too, and that is the same answer for this purpose: they did not take it.
+std::atomic<bool> our_draw_offer_live {false};
+std::atomic<bool> draw_decline_chatted {false};
+//Whether we have already claimed the draw on a repetition or the fifty-move rule in THIS game.
+//Same reasoning as tb_draw_offered: the position stays drawable, so repeating the claim every move
+//would be pestering. Reset when a game starts.
+std::atomic<bool> rep_draw_claimed {false};
+
+//THE POSITION WE LAST SUCCESSFULLY MOVED IN, as the game's id plus the number of plies that had
+//been played when we moved.
+//
+//lichess re-sends a whole game state in two situations the bot cannot tell apart from a fresh
+//move. `gameFull` arrives again every time the game stream reconnects, and the stream can repeat a
+//`gameState`. The copy it shows does NOT contain our own last move, so the ply parity says it is
+//our turn, and the bot searched the position again and posted a move lichess had already accepted.
+//lichess answers that with HTTP 400 and {"error":"Not your turn, or game already over"}. Seen in
+//game 7CNMltIv, and again in mFhpKAJb at ply 246 of a drawn king-and-pawn shuffle, where it also
+//burned two seconds of clock on the duplicate search before posting.
+//
+//Recording the pair only for a move that was actually DELIVERED is what makes the guard safe. A
+//post that genuinely failed to arrive leaves the pair untouched, so the retry loop and the next
+//game state are both still free to move in that position.
+std::string last_move_game  = "";
+int         last_move_plies = -1;
+std::mutex  last_move_mtx;
 
 
 std::atomic<bool> challenge_accepted {false};
@@ -494,7 +575,6 @@ std::mutex mutex;
 std::mutex playing_mutex;
 std::mutex challenge_mutex;
 std::condition_variable game_cv, challenge_cv;
-int nb = NUMBER_OF_BOTS;
 using json = nlohmann::json;
 std::mt19937 rng;
 struct Engine creatica;
@@ -514,6 +594,55 @@ struct Bot {
     int prog;
 };
 
+// WAITING FOR AN OPPONENT WHO NEVER MOVES.
+//
+// lichess does not end a game by itself when a player's clock expires. The clock is authoritative
+// but passive: the opponent's client normally notices and calls it, and the Board/Bot API's
+// equivalent is claim-victory. So a bot that plays a move and then only waits for the next
+// gameState can wait for ever. Observed live on 2026-09-26, game S99Bim6x: creatica played e4 at
+// 10:43:43 UTC and 5 min 32 s later the game was still `started` with `moves` equal to just "e4",
+// against a 120+2 clock -- Black had 2 minutes and had been over it for more than three.
+//
+// One game at a time is a hard limit here (see ProcessEvent), so a game in that state does not
+// merely waste a game, it takes the bot off the ladder entirely until someone restarts it.
+//
+// The deadline is the opponent's OWN remaining clock plus a margin, not a fixed timeout, because a
+// slow opponent with time on the clock is playing legitimately and must not be interfered with. A
+// correspondence game gets a correspondingly long deadline for free.
+#define OPP_STALL_MARGIN_MS 15000
+//steady_clock milliseconds after which the opponent is out of time; 0 = not waiting on them.
+std::atomic<long long> opp_move_deadline{0};
+//Plies played when the wait began, which decides the remedy: under 2, lichess still allows the game
+//to be ABORTED (lila's rule is playedTurns < 2), and above that it has to be won or left alone.
+std::atomic<int>  opp_stall_plies{0};
+std::atomic<bool> opp_stalled{false};
+static long long nowSteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+//How long to wait before looking again at a stall lichess would neither award nor let us abort.
+#define OPP_STALL_RETRY_MS 60000
+static void disarmOpponentClock() {
+    opp_move_deadline.store(0, std::memory_order_relaxed);
+}
+//Called when a gameState says it is the opponent's move. `their_ms` is their clock from that same
+//event, so the deadline is measured from when lichess told us, not from when we last acted.
+static void armOpponentClock(long long their_ms, int plies) {
+    //NO CLOCK REPORTED -- an unlimited game, or a field lichess left out. Do not watch it at all: a
+    //deadline of now plus the margin would fire in fifteen seconds on an opponent who has done
+    //nothing wrong, and losing a game we would have won is far worse than waiting in one we cannot.
+    if (their_ms <= 0) { disarmOpponentClock(); return; }
+    opp_stall_plies.store(plies, std::memory_order_relaxed);
+    opp_move_deadline.store(nowSteadyMs() + their_ms + OPP_STALL_MARGIN_MS,
+                            std::memory_order_relaxed);
+}
+//Re-arm after lichess refused both remedies, so the retry is once a minute rather than once a
+//second. Deliberately not armOpponentClock(0, ...), which would decline to watch at all.
+static void retryOpponentClock(int plies) {
+    opp_stall_plies.store(plies, std::memory_order_relaxed);
+    opp_move_deadline.store(nowSteadyMs() + OPP_STALL_RETRY_MS, std::memory_order_relaxed);
+}
+
 // Struct for WriteCallback state (to handle partial lines across calls)
 struct StreamState {
     std::string partial_line;
@@ -523,6 +652,9 @@ struct StreamState {
     //so ANY integer limit >= 1 aborts a perfectly healthy idle stream. Track liveness
     //ourselves instead and let the progress callback decide.
     std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
+    //Only the GAME stream watches the opponent's clock. The event stream shares StreamProgress and
+    //must not be torn down because a game has stalled -- it is what delivers gameFinish.
+    bool watch_opponent = false;
 };
 
 #define STREAM_SILENCE_TIMEOUT_S 60
@@ -538,6 +670,21 @@ static int StreamProgress(void * clientp, curl_off_t, curl_off_t, curl_off_t, cu
         std::cerr << "StreamAndProcess() error: no data for " << quiet
                   << "s (keep-alive is ~6s) - treating the connection as dead" << std::endl;
         return 1;
+    }
+    //The opponent's clock, checked HERE because this runs about once a second whether or not bytes
+    //arrive -- and a stalled opponent sends nothing but lichess's keep-alive newlines, so no
+    //gameState ever comes to check it in. Only the flag is set; the POST that deals with it is made
+    //on the game thread once this transfer has ended, because issuing a request from inside a
+    //progress callback would re-enter the handle curl is presently driving.
+    if (st->watch_opponent) {
+        const long long dl = opp_move_deadline.load(std::memory_order_relaxed);
+        if (dl && nowSteadyMs() >= dl) {
+            disarmOpponentClock();
+            opp_stalled.store(true, std::memory_order_relaxed);
+            std::cerr << "StreamAndProcess() warning: the opponent is past their own clock and has "
+                         "not moved - ending the stream to deal with it" << std::endl;
+            return 1;
+        }
     }
     return 0;
 }
@@ -766,7 +913,11 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
             std::cerr << "HttpRequest() error: retryable error: " << curl_easy_strerror(res) << ": "
                       << errbuf << " HTTP: " << http_code << " -- attempt " << retry_count
                       << " of " << (max_retries + 1) << std::endl;
-            if (retry_count <= max_retries) {
+            if (http_code == 429) {
+                std::cerr << "waiting one full minute before retrying..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(60));  // Rate limiting requires waiting 1 min
+            }
+            else if (retry_count <= max_retries) {
                 std::this_thread::sleep_for(std::chrono::seconds(retry_count));  // Linear delay (1s, 2s, 3s...)
             }
         } else {
@@ -1029,13 +1180,16 @@ void GetAndProcessBots(int nb) {
 }
 
 // Updated StreamAndProcess for incremental processing
-void StreamAndProcess(const std::string& url, std::function<void(const json&)> process_line) {
+//`watch_opponent` is set for a GAME stream only; see the note on opp_move_deadline.
+void StreamAndProcess(const std::string& url, std::function<void(const json&)> process_line,
+                      bool watch_opponent = false) {
     CURL * curl = curl_easy_init();
     if (!curl) return;
     char errbuf[CURL_ERROR_SIZE] = "";
 
     StreamState state;
     state.process_line = process_line;
+    state.watch_opponent = watch_opponent;
     struct curl_slist * headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + token).c_str());
     headers = curl_slist_append(headers, "Accept: application/x-ndjson");
@@ -1114,6 +1268,65 @@ static bool firstLegalMove(Board& board, char * out) {
   return false;
 }
 
+//WHERE THE GAME ACTUALLY STANDS UNDER THE DRAWING RULES.
+//
+//lichess hands the bot a move list and nothing else, so the two rules that end a game without
+//anybody playing a move have to be worked out here by replaying it. Both are counted on the
+//position we are ABOUT to move in:
+//
+//  repetitions     -- how many times this exact position has already occurred in the game. Three
+//                     makes a draw CLAIMABLE; five ends the game by itself.
+//  halfmove_clock  -- plies since the last capture or pawn move. 100 makes a draw claimable (the
+//                     fifty-move rule); 150 ends the game by itself (the seventy-five-move rule).
+//
+//Positions are compared on what the rules say makes them the same -- the two colours' occupancy,
+//the six piece types, the castling rights, the en-passant file and the side to move. The whole
+//game is scanned rather than only the window since the last irreversible move, which gives the
+//same answer: a position from before a capture or a pawn move can never occur again.
+//
+//Not hashed, deliberately. getHash() needs the Zobrist tables and the bot never calls
+//zobristHash(), so a hash here would be built from uninitialised noise.
+struct GameStanding {
+    bool valid       = false;
+    int  repetitions = 1;    //including the position in front of us
+    int  halfmove_clock = 0;
+};
+
+static GameStanding replayStanding(const std::string& initial_fen, const std::string& moves) {
+    GameStanding gs;
+    Board b = Board{};
+    if (fen2board(b, initial_fen == "startpos" ? startPosFen : initial_fen.c_str()) != 0) return gs;
+    auto key = [](const Board& x) {
+        //Field by field. A Board carries three bytes of padding that `Board b{}` does not zero,
+        //so it must never be hashed or compared as raw bytes -- see the note in chess_types.h.
+        char buf[80];
+        size_t n = 0;
+        auto put = [&](uint64_t v) { memcpy(buf + n, &v, sizeof v); n += sizeof v; };
+        put(x.side[0]); put(x.side[1]);
+        for (int i = 0; i < PieceType_NB; ++i) put(x.pieceTypes[i]);
+        put(((uint64_t)x.castlingRights << 16) | ((uint64_t)x.enPassant << 8)
+            | (uint64_t)x.sideToMove);
+        return std::string(buf, n);
+    };
+    std::vector<std::string> seen;
+    seen.push_back(key(b));
+    std::istringstream ms(moves);
+    std::string mv;
+    while (ms >> mv) {
+        Move m;
+        uci2move_idx(mv.c_str(), m);
+        StateInfo st = {};
+        do_move(b, m, st);
+        seen.push_back(key(b));
+    }
+    int reps = 0;
+    for (const std::string& k : seen) if (k == seen.back()) ++reps;
+    gs.valid          = true;
+    gs.repetitions    = reps;
+    gs.halfmove_clock = (int)b.halfmoveClock;
+    return gs;
+}
+
 //DID THE ENGINE ANSWER FROM A TABLEBASE RATHER THAN FROM A SEARCH?
 //
 //creatica reports a root tablebase probe as a one-node line -- report_tb_move() prints
@@ -1136,6 +1349,25 @@ static void clearTablebaseVerdict() {
     evaluations[0]->tbhits = 0;
 }
 
+//One line into a game's PLAYER chat, which is the two players' room rather than the public
+//spectator one. The text is form-encoded rather than pasted in: a message with a space, an ampersand
+//or a comma in it would otherwise be truncated at that character or corrupt the room field.
+//
+//Failure is logged and ignored on purpose. A chat line is decoration; a bot that treated a refused
+//chat POST as an error worth retrying would spend its clock on it.
+static void SendChat(const std::string& game_id, const std::string& text) {
+    if (text.empty()) return;
+    char * esc = curl_easy_escape(nullptr, text.c_str(), 0);
+    if (!esc) return;
+    const std::string body = std::string("room=player&text=") + esc;
+    curl_free(esc);
+    if (HttpRequest("POST", "https://lichess.org/api/bot/game/" + game_id + "/chat",
+                    body, nullptr, "", true, 0))
+        std::cout << "SendChat(): " << game_id << " <- \"" << text << "\"" << std::endl;
+    else
+        std::cerr << "SendChat() warning: could not post to " << game_id << "'s chat" << std::endl;
+}
+
 static bool tablebaseVerdict(int& cp_out) {
     const Evaluation * e = evaluations[0];
     if (!e || e->depth != 1 || e->nodes != 1 || e->tbhits != 1) return false;
@@ -1143,7 +1375,7 @@ static bool tablebaseVerdict(int& cp_out) {
     return true;
 }
 
-void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, const bool is_white, const std::string& initial_fen, const std::string& moves, const long long wtime, const long long btime, const long long winc, const long long binc) {
+void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const bool our_turn, const bool is_white, const std::string& initial_fen, const std::string& moves, const int num_plies, const long long wtime, const long long btime, const long long winc, const long long binc) {
     int gss = gameStateStatus.load();
     std::cout << "ComputeAndPostMove() debug: game state - status: " << gameSS[gss] << ", moves: " << moves << std::endl;
     if (gss != started && gss != created) {
@@ -1151,6 +1383,30 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
       gameStateStatus.store(0);
       return;
     }
+    //HAVE WE ALREADY ANSWERED THIS POSITION? See last_move_plies above. Checked here, before the
+    //ponder is stopped and before the search starts, because a duplicate state arriving while we
+    //ponder should leave the ponder alone -- it really is the opponent's move -- and because the
+    //search it would otherwise start costs two seconds of a rated clock.
+    if (our_turn) {
+        std::lock_guard<std::mutex> lk(last_move_mtx);
+        if (last_move_game == game_id && last_move_plies == num_plies) {
+            std::cout << "ComputeAndPostMove(): we have already moved in " << game_id
+                      << " at ply " << num_plies << "; this game state predates our own move, "
+                      << "so not searching or posting again" << std::endl;
+            return;
+        }
+    }
+    //WHERE THE GAME STANDS UNDER THE DRAWING RULES, worked out before anything is spent on the
+    //move, so that both the draw claim below and the refusal handling at the end can see it.
+    //See GameStanding.
+    const GameStanding standing = our_turn ? replayStanding(initial_fen, moves) : GameStanding();
+    if (our_turn && standing.valid &&
+        (standing.repetitions >= 3 || standing.halfmove_clock >= 100))
+        std::cout << "ComputeAndPostMove(): " << game_id << " is drawable by rule -- this position"
+                  << " has occurred " << standing.repetitions << " time(s) and the halfmove clock"
+                  << " is " << standing.halfmove_clock
+                  << "; claiming the draw with the move, and lichess may have ended the game"
+                  << " already" << std::endl;
     if (gss == started) {
         if (creatica.ponder) {
           creatica.infinite = false;
@@ -1297,14 +1553,61 @@ try_again:  clearTablebaseVerdict();   //see clearTablebaseVerdict(): go() does 
             //this costs no extra request and cannot race with the move. Once per game -- see
             //tb_draw_offered. Only on a tablebase 0: an evaluation near zero is an opinion, and
             //offering a draw on an opinion in a position we might win is giving away half a point.
+            //
+            //THE SECOND REASON TO ASK FOR A DRAW: the game is already drawable by rule.
+            //
+            //This is what game mFhpKAJb was missing. It reached a king-and-pawn position neither
+            //side could make progress in and the bot shuffled for roughly twenty more moves, each
+            //one a two second search, until lichess ended it and refused our next move with
+            //"Not your turn, or game already over". Nothing in the bot was counting repetitions,
+            //so it had no idea the game was finished -- the engine scores a repetition as a draw
+            //inside its own search but still has to return a move, and the bot posted it.
+            //
+            //A draw offer in a position that has occurred three times is a CLAIM rather than a
+            //request: the opponent cannot keep playing a game that either side can repeat at will.
+            //The fifty-move rule is the same shape at a hundred plies without a capture or a pawn
+            //move. So this is not giving half a point away -- it is collecting the half point the
+            //rules already allow, instead of shuffling until lichess steps in.
+            //
+            //It is still gated on the engine's own score, for the case where the repetition was an
+            //accident in a position we are winning. Within half a pawn of zero: wider than the
+            //tablebase gate because this is a rule claim rather than an opinion about the position,
+            //and narrow enough that a won endgame is never offered away.
+            //
+            //CREATICA_CLAIM_REPETITION_DRAW=0 turns it off and restores the old behaviour exactly.
             {
+                bool offer = false;
+                std::string why;
                 int tb_cp = 0;
                 bool expected = false;
                 if (tablebaseVerdict(tb_cp) && tb_cp == 0 &&
                     tb_draw_offered.compare_exchange_strong(expected, true)) {
+                    offer = true;
+                    why = "the tablebase says drawn";
+                }
+                if (!offer && standing.valid &&
+                    env_str_or_empty("CREATICA_CLAIM_REPETITION_DRAW", "1") != "0") {
+                    const int score = evaluations[0] ? evaluations[0]->scorecp : 0;
+                    const bool level = score > -50 && score < 50;
+                    if (level && (standing.repetitions >= 3 || standing.halfmove_clock >= 100)) {
+                        expected = false;
+                        if (rep_draw_claimed.compare_exchange_strong(expected, true)) {
+                            offer = true;
+                            why = standing.repetitions >= 3
+                                ? "this position has occurred "
+                                      + std::to_string(standing.repetitions) + " times"
+                                : "no capture or pawn move for "
+                                      + std::to_string(standing.halfmove_clock) + " plies";
+                        }
+                    }
+                }
+                if (offer) {
                     move_url += "?offeringDraw=true";
+                    //Marked here rather than waiting to see lichess echo the flag back, so the
+                    //decline is still detected if only one gameState arrives before they answer.
+                    our_draw_offer_live.store(true);
                     std::cout << "ComputeAndPostMove() debug: offering a draw with " << new_move
-                              << " -- the tablebase says drawn" << std::endl;
+                              << " -- " << why << std::endl;
                 }
             }
             std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move << "..." << std::endl;
@@ -1329,6 +1632,10 @@ try_again:  clearTablebaseVerdict();   //see clearTablebaseVerdict(): go() does 
             const long long deadline = our_ms > 6000 ? our_ms - 4000 : 2000;  //keep some back
             const auto      started  = std::chrono::steady_clock::now();
             bool delivered = false;
+            //Refused by lichess, as opposed to never having arrived. The two need different
+            //messages: "NEVER delivered to lichess" on a refusal reads as a lost move when in fact
+            //lichess has the position and our copy of it was simply out of date.
+            bool refused = false;
             for (int attempt = 1; ; ++attempt) {
                 std::string reply;
                 delivered = HttpRequest("POST", move_url, "", &reply, "", true, /*max_retries=*/0);
@@ -1341,6 +1648,7 @@ try_again:  clearTablebaseVerdict();   //see clearTablebaseVerdict(): go() does 
                 if (reply.find("Not your turn") != std::string::npos ||
                     reply.find("cannot move to") != std::string::npos ||
                     reply.find("game already over") != std::string::npos) {
+                    refused = true;
                     std::cerr << "ComputeAndPostMove(): lichess refused " << new_move << " -- "
                               << reply << "; not retrying" << std::endl;
                     break;
@@ -1363,9 +1671,31 @@ try_again:  clearTablebaseVerdict();   //see clearTablebaseVerdict(): go() does 
                           << " s used); retrying" << std::endl;
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            if (delivered)
+            if (delivered) {
+                //Only a move lichess accepted is recorded, so a failed post leaves us free to
+                //move again in this position. See last_move_plies.
+                {
+                    std::lock_guard<std::mutex> lk(last_move_mtx);
+                    last_move_game  = game_id;
+                    last_move_plies = num_plies;
+                }
                 std::cout << "ComputeAndPostMove() debug: submitting the move " << new_move
                           << "... done" << std::endl;
+            } else if (refused && standing.valid && standing.repetitions >= 3)
+                //lichess merges two quite different cases into one message, "Not your turn, or
+                //game already over". When the position in front of us had already occurred three
+                //times, it is the second one: the game ended in a draw by repetition while we were
+                //searching, and the move we computed was never playable. Not a lost move, and
+                //nothing to recover -- the game is over.
+                std::cout << "ComputeAndPostMove(): " << new_move << " was refused because "
+                          << game_id << " is already drawn -- this position had occurred "
+                          << standing.repetitions << " times. Nothing was lost; the game is over."
+                          << std::endl;
+            else if (refused)
+                std::cerr << "ComputeAndPostMove(): " << new_move << " was refused rather than "
+                             "lost -- either the game state we acted on was stale and lichess "
+                             "already has this position, or the game ended while we searched; "
+                             "waiting for the next game state" << std::endl;
             else
                 std::cerr << "ComputeAndPostMove() error: move " << new_move
                           << " was NEVER delivered to lichess" << std::endl;
@@ -1451,7 +1781,24 @@ void HandleGame(const std::string& game_id) {
                 bool wdraw = state["state"].value("wdraw", false);
                 bool bdraw = state["state"].value("bdraw", false);
                 bool draw_offer = is_white ? bdraw : wdraw;
-                ComputeAndPostMove(game_id, draw_offer, our_turn, is_white, initial_fen, moves, wtime, btime, winc, binc);
+                //THEY DID NOT TAKE THE DRAW. Our own flag was set and is now clear while the game
+                //is still running, so the offer was declined outright or implicitly by their move.
+                //One line per game at most, and only if there is a line configured.
+                if (is_white ? wdraw : bdraw) our_draw_offer_live.store(true);
+                else if (our_draw_offer_live.exchange(false)) {
+                    std::cout << "HandleGame(): our tablebase draw offer in " << game_id
+                              << " was not accepted" << std::endl;
+                    bool already = false;
+                    if (!chat_draw_declined.empty() &&
+                        draw_decline_chatted.compare_exchange_strong(already, true))
+                        SendChat(game_id, chat_draw_declined);
+                }
+                //Arm the stall watchdog the moment it becomes THEIR move, using the clock lichess
+                //just reported for them, and disarm it as soon as it is ours again. Both sides of
+                //this matter: leaving it armed through our own search would fire on us.
+                if (our_turn) disarmOpponentClock();
+                else armOpponentClock(is_white ? btime : wtime, num_plies);
+                ComputeAndPostMove(game_id, draw_offer, our_turn, is_white, initial_fen, moves, num_plies, wtime, btime, winc, binc);
               } else if (state.contains("type") && state["type"] == "gameState") {
                 gameStateStatus.store(0);
                 for (int i = 0; i < game_states; i++) {
@@ -1488,7 +1835,22 @@ void HandleGame(const std::string& game_id) {
                 bool wdraw = state.value("wdraw", false);
                 bool bdraw = state.value("bdraw", false);
                 bool draw_offer = is_white ? bdraw : wdraw;
-                ComputeAndPostMove(game_id, draw_offer, our_turn, is_white, initial_fen, moves, wtime, btime, winc, binc);
+                //THEY DID NOT TAKE THE DRAW. Our own flag was set and is now clear while the game
+                //is still running, so the offer was declined outright or implicitly by their move.
+                //One line per game at most, and only if there is a line configured.
+                if (is_white ? wdraw : bdraw) our_draw_offer_live.store(true);
+                else if (our_draw_offer_live.exchange(false)) {
+                    std::cout << "HandleGame(): our tablebase draw offer in " << game_id
+                              << " was not accepted" << std::endl;
+                    bool already = false;
+                    if (!chat_draw_declined.empty() &&
+                        draw_decline_chatted.compare_exchange_strong(already, true))
+                        SendChat(game_id, chat_draw_declined);
+                }
+                //Same as in gameFull: arm on their move, disarm on ours.
+                if (our_turn) disarmOpponentClock();
+                else armOpponentClock(is_white ? btime : wtime, num_plies);
+                ComputeAndPostMove(game_id, draw_offer, our_turn, is_white, initial_fen, moves, num_plies, wtime, btime, winc, binc);
             } else if (state.contains("type") && state["type"] == "opponentGone") {
                 //lichess omits claimWinInSeconds entirely when gone is false, and a bare
                 //operator[] on a const json& asserts and abort()s - which killed the bot
@@ -1509,10 +1871,44 @@ void HandleGame(const std::string& game_id) {
                     }
                 }
             }
-        });
+        }, /*watch_opponent=*/true);
         std::cout << "HandleGame() debug: StreamAndProcess() returned. Stopping the engine..." << std::endl;
+        //THE OPPONENT RAN OUT OF THEIR OWN CLOCK AND NEVER MOVED. Done here, on the game thread,
+        //with the stream closed, so the POST cannot re-enter the handle curl was driving.
+        //
+        //CLAIM VICTORY FIRST, ABORT SECOND, and the order is the point. Aborting voids the game, so
+        //doing it first would throw away a win on time that was already ours. Only when lichess
+        //refuses the claim -- which it does unless it agrees the opponent is gone -- is abort the
+        //right answer, and it is available only while the game has fewer than two plies, which is
+        //lila's own rule for an abortable game. That is exactly the case this was written for: we
+        //moved first and they never replied.
+        if (opp_stalled.exchange(false, std::memory_order_relaxed)) {
+            const int plies = opp_stall_plies.load(std::memory_order_relaxed);
+            const std::string base = "https://lichess.org/api/bot/game/" + game_id;
+            std::cerr << "HandleGame() warning: opponent in game " << game_id << " is past their own "
+                      << "clock with " << plies << " ply/plies played and has not moved" << std::endl;
+            if (HttpRequest("POST", base + "/claim-victory", "", nullptr, "", true, -1)) {
+                std::cout << "HandleGame(): claimed victory in " << game_id
+                          << " - the opponent was out of time" << std::endl;
+            } else if (plies < 2 && HttpRequest("POST", base + "/abort", "", nullptr, "", true, -1)) {
+                std::cout << "HandleGame(): lichess would not award the game, so " << game_id
+                          << " was aborted - it had only " << plies << " ply/plies" << std::endl;
+            } else {
+                //Neither worked: they are connected enough that lichess will not hand us the game,
+                //and there are too many moves to abort. Reconnect and keep waiting rather than
+                //resign -- but re-arm with a fresh margin so this does not spin once a second.
+                std::cerr << "HandleGame() error: could neither claim nor abort " << game_id
+                          << "; reconnecting and looking again in "
+                          << (OPP_STALL_RETRY_MS / 1000) << "s" << std::endl;
+                retryOpponentClock(plies);
+            }
+        }
     } //end of while (game_in_progress && (gameStateStatus == "created" || gameStateStatus != "started"))
     gameStateStatus.store(0);
+    //A finished game must not leave the watchdog armed: the next game arms it for itself, and a
+    //stale deadline would fire on that game's first wait for the opponent.
+    disarmOpponentClock();
+    opp_stalled.store(false, std::memory_order_relaxed);
     stop(creatica);
 }
 
@@ -1700,7 +2096,10 @@ void ProcessEvent(const json& event) {
           {
             std::lock_guard<std::mutex> lc(playing_mutex);
             game_in_progress.store(true);
-            tb_draw_offered.store(false);   //one tablebase draw offer per game
+            tb_draw_offered.store(false);     //one tablebase draw offer per game
+            rep_draw_claimed.store(false);    //and one rule claim per game
+            our_draw_offer_live.store(false);
+            draw_decline_chatted.store(false);   //and one chat line per game
             clearChallengeOutstanding(); //the game supersedes any outstanding challenge
           }
           game_cv.notify_one();
@@ -1839,13 +2238,14 @@ int main(int argc, char ** argv) {
       //ENVIRONMENT, not flags, and none of it used to appear here -- so the only way to find
       //out what could be set was to read the source. Defaults shown are the compile-time
       //#defines at the top of this file; change them there, not here, or the two drift apart.
-      char d_threads[16], d_hash[16], d_clock[16], d_inc[16], d_minelo[16], d_maxelo[16];
+      char d_threads[16], d_hash[16], d_clock[16], d_inc[16], d_minelo[16], d_maxelo[16], d_nb[16];
       snprintf(d_threads, sizeof d_threads, "(%d)", THREADS);
       snprintf(d_hash, sizeof d_hash, "(%d)", HASH);
       snprintf(d_clock, sizeof d_clock, "(%d)", CLOCK_LIMIT);
       snprintf(d_inc, sizeof d_inc, "(%d)", CLOCK_INCREMENT);
       snprintf(d_minelo, sizeof d_minelo, "(%d)", MIN_ELO);
       snprintf(d_maxelo, sizeof d_maxelo, "(%d)", MAX_ELO);
+      snprintf(d_nb, sizeof d_nb, "(%d)", NUMBER_OF_BOTS);
       printf(
         "usage: %s [flags]\n"
         "\n"
@@ -1926,9 +2326,18 @@ int main(int argc, char ** argv) {
         "                              Regenerate the cp column with tools_evalbook.py.\n"
         "  CREATICA_MIN_ELO  %-10s\\ rating band, exclusive at both ends. Applies BOTH to picking\n"
         "  CREATICA_MAX_ELO  %-10s/ a random opponent and to accepting incoming challenges.\n"
-        "                              Ignored when --challenge= names an opponent, for anyone named\n"
-        "                              by --accept-only=, and for the sibling bot account. A challenge\n"
         "                              carrying no rating is accepted.\n"
+        "  CREATICA_NB       %-10show many bots to ask /api/bot/online for. It is a PREFIX of a\n"
+        "                              fixed ordering, not a sample of it, so a small value keeps\n"
+        "                              returning the same opponents: measured 26 Sep 2026, 396 bots\n"
+        "                              were online and nb=50 yielded 12 inside the rating band where\n"
+        "                              the whole list yielded 117. Keep it above the population.\n"
+        "  CREATICA_CHAT_DRAW_DECLINED\n"
+        "                              one line into the player chat when a draw offer is turned\n"
+        "                              down. The offer is made at most once a game and only on a\n"
+        "                              tablebase-proven draw, so this is one line in the games where\n"
+        "                              a dead draw gets played out anyway. Empty disables it.\n"
+        "                              (\"%s\")\n"
         "\n"
         "OUTPUT\n"
         "  CREATICA_RESULTS  (results_<username>.csv)\n"
@@ -1941,7 +2350,7 @@ int main(int argc, char ** argv) {
         "                              normal ponder search look like a duplicated bestmove and\n"
         "                              sent a whole debugging session the wrong way.\n",
         argv[0], BOT_USERNAME, CREATICA_PATH, d_threads, d_hash, PONDER ? "(true)" : "(false)",
-        d_clock, d_inc, d_minelo, d_maxelo);
+        d_clock, d_inc, d_minelo, d_maxelo, d_nb, chat_draw_declined.c_str());
       return 0;
     } else {
       fprintf(stderr, "%s: unknown argument '%s' (try --help)\n", argv[0], argv[i]);
@@ -1972,7 +2381,9 @@ int main(int argc, char ** argv) {
   else if (!challenge_target.empty())
     std::cout << "main(): challenging only " << challenge_target
               << (challenge_rated ? " (rated)" : " (casual)") << std::endl;
-  else std::cout << "main(): will challenge a RANDOM online bot" << std::endl;
+  else std::cout << "main(): will challenge a RANDOM online bot, drawn from the first " << nb
+                 << " of /api/bot/online rated " << min_elo << " to " << max_elo
+                 << " at blitz (CREATICA_NB, CREATICA_MIN_ELO, CREATICA_MAX_ELO)" << std::endl;
 
   //--print-challenge builds the challenge exactly as the challenge thread would and prints the
   //POST body, then exits. No token and no network. It answers the one question that a night of
