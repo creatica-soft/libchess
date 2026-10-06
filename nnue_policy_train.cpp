@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I /Users/ap/Downloads/libtorch2/include -I /Users/ap/Downloads/libtorch2/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch2/lib -L /Users/ap/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch2/lib,-rpath,/Users/ap/libchess -o nnue_policy_train nnue_policy_train.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I $HOME/Downloads/libtorch2/include -I $HOME/Downloads/libtorch2/include/torch/csrc/api/include -I $HOME/libchess -L $HOME/Downloads/libtorch2/lib -L $HOME/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,$HOME/Downloads/libtorch2/lib,-rpath,$HOME/libchess -o nnue_policy_train nnue_policy_train.cpp
 //
 // POLICY-ONLY trainer over Stockfish NNUE's own representation.
 //
@@ -203,6 +203,58 @@ const float eval_scale = 600.0f; // conversion scale from cp to cnn target and b
 #define SPATIAL_ATTACK 0
 #endif
 
+// SPATIAL_HEADS -- one u/v pair per MOVING PIECE TYPE, instead of one shared by all six.
+//
+// The spatial term is dot(u[from], v[to]) and it is a function of the two SQUARES and of nothing
+// else. Under PIECE_INDEX the logits are laid out (pt-1)*4096 + from*64 + to, and the term is added
+// to all six per-piece blocks unchanged (see SPATIAL_TILE). So the term structurally CANNOT say
+// that e5 is a good destination for a knight and a bad one for a queen -- the single most common
+// thing one would want to say about a destination square.
+//
+// WHY THIS IS THE NEXT THING TO TRY. Measured on 60,000 held-out positions with the deployed net
+// nnue_policy_pisp2.bin, splitting by what Stockfish's own best move was, and asking two questions
+// of the blended prior the engine actually searches with: is the best MOVE in its top 6, and is any
+// move of the best move's PIECE in its top 6?
+//
+//                     n      best move in top 6     best move's PIECE in top 6
+//   queen move      8629           81.5%                      96.2%
+//   rook move      12553           82.6%                      95.0%
+//   knight move     8583           88.4%                      95.8%
+//   pawn move      12971           86.3%                      88.3%
+//   ALL            60000           85.7%                      93.8%
+//
+// The model already picks the right piece 93.8% of the time and the right destination only 85.7% of
+// the time, and the gap is widest for precisely the pieces with the most destinations to choose
+// between: 14.7 points for the queen, 12.4 for the rook, 2.0 for the pawn. It is a
+// destination-resolution failure, not a piece-selection failure.
+//
+// It is NOT a receptive-field failure, which was the other candidate and was tested first: split
+// the quiet bishop/rook/queen moves by how far the piece travelled and blended top-6 reads 76.9% at
+// distance 1 and 84.5% at distance 6 or more. Accuracy does not fall with distance, so one 3x3
+// convolution not seeing down a whole file is not what is costing the points.
+//
+// WHAT IT COSTS. Wu and Wv go from [CH, DIM] to [CH, 6*DIM]: 1,280 more numbers at CH=8, DIM=16,
+// which is 0.04% of the model. At inference the per-square vectors are built once per position, so
+// the extra work is 64 squares x CH x 5*DIM x 2 = about 82,000 multiply-adds against the ~120,000
+// the first convolution already costs, and the per-MOVE cost is unchanged at DIM multiply-adds.
+//
+// TILED FROM THE SHARED HEADS, NOT RANDOM. A fine-tune from a SPATIAL_HEADS=1 checkpoint copies the
+// one trained pair into all six heads, so the model starts at EXACTLY the incumbent's behaviour and
+// any movement in held-out Top-k is something the per-piece heads learned -- the same discipline as
+// Wv starting at zero and Wl starting at zero.
+//
+// 1 = one shared pair, the behaviour of every net up to nnue_policy_pisp2.bin. 6 = one per piece
+// type. Needs PIECE_INDEX, because the moving piece type is read off the policy index.
+#ifndef SPATIAL_HEADS
+#define SPATIAL_HEADS 1
+#endif
+#if SPATIAL_HEADS != 1 && SPATIAL_HEADS != 6
+#error "SPATIAL_HEADS must be 1 (one shared u/v pair) or 6 (one per moving piece type)"
+#endif
+#if SPATIAL_HEADS > 1 && !(SPATIAL && PIECE_INDEX)
+#error "SPATIAL_HEADS=6 needs SPATIAL and PIECE_INDEX; the moving piece type comes from the policy index"
+#endif
+
 // SPATIAL_FROM_PLANE_FIX -- where plane 12's "a legal move starts here" marks go under PIECE_INDEX.
 //
 // get() writes them at pl[12*64 + (legal_idx >> 6)]. That is the from-square only for a 4096-row
@@ -389,7 +441,7 @@ struct NNUEPolicyImpl : torch::nn::Module {
     torch::Tensor W1, b1, W2, b2, emb;
 #if SPATIAL
     torch::Tensor Wu, Wv;
-    torch::Tensor plane_layout;
+    torch::Tensor plane_layout, spatial_heads;
 #if SPATIAL == 2
     torch::Tensor Wc1, bc1, Wc2, bc2;
 #endif
@@ -428,15 +480,19 @@ struct NNUEPolicyImpl : torch::nn::Module {
         Wc2 = register_parameter("Wc2", u({SPATIAL_CH, SPATIAL_CH, 3, 3}, SPATIAL_CH * 9));
         bc2 = register_parameter("bc2", torch::zeros({SPATIAL_CH}));
 #endif
-        Wu  = register_parameter("Wu", u({SPATIAL_CH, SPATIAL_DIM}, SPATIAL_CH));
-        Wv  = register_parameter("Wv", torch::zeros({SPATIAL_CH, SPATIAL_DIM}));
+        Wu  = register_parameter("Wu", u({SPATIAL_CH, SPATIAL_HEADS * SPATIAL_DIM}, SPATIAL_CH));
+        Wv  = register_parameter("Wv", torch::zeros({SPATIAL_CH, SPATIAL_HEADS * SPATIAL_DIM}));
 #else
-        Wu = register_parameter("Wu", u({SPATIAL_PLANES, SPATIAL_DIM}, SPATIAL_PLANES));
-        Wv = register_parameter("Wv", torch::zeros({SPATIAL_PLANES, SPATIAL_DIM}));
+        Wu = register_parameter("Wu", u({SPATIAL_PLANES, SPATIAL_HEADS * SPATIAL_DIM}, SPATIAL_PLANES));
+        Wv = register_parameter("Wv", torch::zeros({SPATIAL_PLANES, SPATIAL_HEADS * SPATIAL_DIM}));
 #endif
         //The input layout this model is trained on; see SPATIAL_FROM_PLANE_FIX. A buffer rather than
         //a parameter: it is saved in every checkpoint but the optimizer never sees it.
         plane_layout = register_buffer("plane_layout", torch::full({1}, (float)SPATIAL_PLANE_LAYOUT));
+        //How many u/v pairs this checkpoint's Wu and Wv hold; see SPATIAL_HEADS. Recorded for the
+        //same reason plane_layout is: the shape alone would let a one-head checkpoint be loaded into
+        //a six-head build as a six-head one with DIM six times too small, silently.
+        spatial_heads = register_buffer("spatial_heads", torch::full({1}, (float)SPATIAL_HEADS));
 #endif
 #if LEGAL_BIAS
         //ZERO, deliberately. With the term's weights at 0 it contributes exactly nothing and the
@@ -501,9 +557,35 @@ struct NNUEPolicyImpl : torch::nn::Module {
         auto vv = torch::matmul(planes, Wv);                    // [B, 64, d]
         return { uu, vv };
     }
+    // [B, 4096] with one shared head, [B, 6, 4096] with one head per piece type -- in the latter
+    // case indexed the same way the logits are, so it lines up block for block.
     torch::Tensor spatial(torch::Tensor x) {
         auto [uu, vv] = spatial_uv(x);
-        return torch::matmul(uu, vv.transpose(1, 2)).reshape({x.size(0), 64 * 64});
+        const int64_t B = x.size(0);
+#if SPATIAL_HEADS > 1
+        //[B, 64, H*D] -> [B, H, 64, D], so each head's 64x64 product is one batched matmul.
+        auto u6 = uu.view({B, 64, SPATIAL_HEADS, SPATIAL_DIM}).permute({0, 2, 1, 3});
+        auto v6 = vv.view({B, 64, SPATIAL_HEADS, SPATIAL_DIM}).permute({0, 2, 1, 3});
+        return torch::matmul(u6, v6.transpose(2, 3)).reshape({B, SPATIAL_HEADS, 64 * 64});
+#else
+        return torch::matmul(uu, vv.transpose(1, 2)).reshape({B, 64 * 64});
+#endif
+    }
+    // Add the spatial term onto the readout's logits. With one shared head the same 4096 values go
+    // into all six per-piece blocks; with six heads each block gets its own. BROADCAST, NEVER
+    // repeat(): under piece indexing logits is [B, 24576] and at batch 8192 that is already 805 MB
+    // of float32, so materialising a second tensor of the same size took training from 45,000
+    // positions a second to 889 on an 8 GB unified-memory machine.
+    torch::Tensor add_spatial(torch::Tensor logits, torch::Tensor sp) {
+        const int64_t B = logits.size(0);
+#if SPATIAL_HEADS > 1
+        return (logits.view({B, SPATIAL_TILE, 64 * 64}) + sp).view({B, -1});
+#elif SPATIAL_TILE > 1
+        return (logits.view({B, SPATIAL_TILE, 64 * 64}) + sp.unsqueeze(1)).view({B, -1});
+#else
+        (void)B;
+        return logits + sp;
+#endif
     }
 #endif
     // x [B, NNUE_DIMS] -> [B, POLICY_OUT]. No legality: BENCH_FORWARD times the trunk alone,
@@ -513,20 +595,7 @@ struct NNUEPolicyImpl : torch::nn::Module {
 #if SPATIAL
         //Included here too: this path is what BENCH_FORWARD times, and timing the model without a
         //term the real path pays for would report a cost the engine never sees.
-        if (x.size(1) >= NNUE_DIMS + SPATIAL_IN) {
-#if SPATIAL_TILE > 1
-            //BROADCAST, NEVER repeat(). Under piece indexing logits is [B, 24576]; at batch 8192
-            //that is already 805 MB of float32, and repeat() materialises a SECOND tensor of the
-            //same size purely to hold six identical copies of a 4096-wide term. On an 8 GB unified
-            //memory machine that alone took training from 45,000 positions a second to 889.
-            //Viewing logits as [B, 6, 4096] and unsqueezing the term to [B, 1, 4096] adds the same
-            //values with no intermediate at all.
-            logits = (logits.view({logits.size(0), SPATIAL_TILE, 64 * 64})
-                      + spatial(x).unsqueeze(1)).view({logits.size(0), -1});
-#else
-            logits = logits + spatial(x);
-#endif
-        }
+        if (x.size(1) >= NNUE_DIMS + SPATIAL_IN) logits = add_spatial(logits, spatial(x));
 #endif
         return logits;
     }
@@ -562,19 +631,13 @@ struct NNUEPolicyImpl : torch::nn::Module {
         //arriving and the result says nothing about the idea.
         auto sp = spatial(x);
         if (share2) {
-            //Measured on the UNtiled term: tiling repeats the same values six times, so the mean of
-            //their absolute value is identical and the copy would be for nothing.
+            //Measured BEFORE add_spatial(). With one shared head tiling repeats the same values six
+            //times, so the mean of their absolute value is identical and the copy would be for
+            //nothing; with six heads the term is already per piece and there is nothing to tile.
             const double a = logits.abs().mean().item<double>();
             *share2 = a > 0.0 ? sp.abs().mean().item<double>() / a : 0.0;
         }
-        //Added to all six per-piece blocks by broadcasting; see SPATIAL_TILE and the note in
-        //forward() about why this must not be a repeat().
-#if SPATIAL_TILE > 1
-        logits = (logits.view({logits.size(0), SPATIAL_TILE, 64 * 64})
-                  + sp.unsqueeze(1)).view({logits.size(0), -1});
-#else
-        logits = logits + sp;
-#endif
+        logits = add_spatial(logits, sp);
 #else
         if (share2) *share2 = 0.0;
 #endif
@@ -640,10 +703,24 @@ struct NNUEPolicyImpl : torch::nn::Module {
         auto sqf  = torch::remainder(legal.clamp_min(0), 4096.0f);
         auto frmf = torch::floor(sqf / 64.0f);
         auto tof  = sqf - frmf * 64.0f;
-        auto [uu, vv] = spatial_uv(x);                                  // [B, 64, d] each
-        const int64_t B = x.size(0), W = legal.size(1), D = uu.size(2);
+        auto [uu, vv] = spatial_uv(x);                                  // [B, 64, H*d] each
+        const int64_t B = x.size(0), W = legal.size(1), D = SPATIAL_DIM;
+#if SPATIAL_HEADS > 1
+        //Which of the six heads this move uses is the moving piece type, which is the block the
+        //policy index sits in: legal / 4096 is pt-1. Fold it into the gather index rather than
+        //slicing along the feature axis afterwards -- a [B, W, H*D] intermediate would be six times
+        //the memory of the [B, W, D] one this produces, and at batch 8192 that is 300 MB a tensor.
+        auto ptf   = torch::floor(legal.clamp_min(0) / 4096.0f);        // 0..5
+        auto uflat = uu.view({B, 64, SPATIAL_HEADS, D}).reshape({B, 64 * SPATIAL_HEADS, D});
+        auto vflat = vv.view({B, 64, SPATIAL_HEADS, D}).reshape({B, 64 * SPATIAL_HEADS, D});
+        auto ui = (frmf * (float)SPATIAL_HEADS + ptf).to(torch::kLong).unsqueeze(2).expand({B, W, D});
+        auto vi = (tof  * (float)SPATIAL_HEADS + ptf).to(torch::kLong).unsqueeze(2).expand({B, W, D});
+        auto uf = uflat.gather(1, ui);
+        auto vt = vflat.gather(1, vi);
+#else
         auto uf = uu.gather(1, frmf.to(torch::kLong).unsqueeze(2).expand({B, W, D}));
         auto vt = vv.gather(1, tof.to(torch::kLong).unsqueeze(2).expand({B, W, D}));
+#endif
         auto sp = (uf * vt).sum(2);                                     // [B, W]
         if (share2) {
             const double a = (logits.abs() * valid).sum().item<double>();
@@ -1311,7 +1388,26 @@ public:
     //
     // Promotion type is deliberately ignored -- all four promotions share a (from,to)
     // pair. That also sidesteps the writer/reader promotion-code mismatch, since the
-    // promo field is never read here.
+    // promo field is never read here under PIECE_INDEX.
+    //
+    // CASTLING, HOWEVER, WAS NOT DECODED AT ALL, AND IT COST THE POLICY THE MOVE ENTIRELY.
+    //
+    // lichess_evals_bin_writer.cpp stores the PV move exactly as its UCI text reads, and the source
+    // data gives castling king-to-ROOK: e1h1, e1a1, e8h8, e8a8. The legal move list generated here
+    // has castling as king-to-g1/c1. So policy_index() was asked for the row (King, e1, h1), which is
+    // not in the legal list, and the loss then treats that PV entry as illegal.
+    //
+    // What follows is worse than losing the example. For the 56% of records carrying ONE PV, the
+    // whole position contributes nothing. For the 44% carrying more, PV1 is dropped and the remaining
+    // PVs are RENORMALISED -- so the model is actively trained to believe the second-best move is best
+    // in every position where castling is best.
+    //
+    // Measured: of 3,296 records in 203,296 whose stored PV1 matched no generated move, 71% were
+    // castling and 29% promotions, and NOTHING ELSE. With both decoded the figure is zero. The
+    // consequence in the deployed net nnue_policy_pisp2.bin is not subtle -- over the 2,292 test
+    // positions where castling is Stockfish's best move, the policy alone puts it in its top six
+    // 0.0% of the time, against 92.0% for the 1-ply child evaluations it is blended with. Spot-checked
+    // by hand on two of them, castling ranked 34th of 37 legal moves and 37th of 37.
     float pv_idx[MAX_PVS], pv_prob[MAX_PVS];
     for (int i = 0; i < MAX_PVS; ++i) { pv_idx[i] = -1.0f; pv_prob[i] = 0.0f; }
 
@@ -1321,13 +1417,28 @@ public:
     if (num_pvs > 0 && pos.from_sq[0] >= 0) {
       float scores[MAX_PVS];
       for (int i = 0; i < num_pvs; ++i) {
-        int from_sq = is_black ? (pos.from_sq[i] ^ 56) : pos.from_sq[i];
-        int to_sq   = is_black ? (pos.to_sq[i]   ^ 56) : pos.to_sq[i];
-        static const int PROMO_PT[4] = {PieceTypeNone, Knight, Bishop, Queen};
-        //From the UNFLIPPED square: pos.from_sq[i] indexes the real board, while from_sq above has
-        //already been mirrored for Black. Reading the mirrored square would name whatever piece
-        //happens to stand on the reflected square, which for Black is usually an enemy piece.
-        const int mv_pt = board.piecesOnSquares[pos.from_sq[i]] & 7;
+        //THE WRITER'S CODE IS 0=Q, 1=N, 2=B, 3=R -- see parse_uci_move() in
+        //lichess_evals_bin_writer.cpp, whose 'q' case assigns 0. Reading it as {none, N, B, Q} made a
+        //queen promotion look like no promotion and a rook promotion look like a queen. It is dead
+        //code under PIECE_INDEX, where policy_index() ignores promo, but a CONV_POLICY or narrow-table
+        //build reads it and would train the wrong output entry.
+        static const int PROMO_PT[4] = {Queen, Knight, Bishop, Rook};
+        //From the UNFLIPPED square: pos.from_sq[i] indexes the real board, while from_sq below is
+        //mirrored for Black. Reading the mirrored square would name whatever piece happens to stand
+        //on the reflected square, which for Black is usually an enemy piece.
+        int raw_from = pos.from_sq[i], raw_to = pos.to_sq[i];
+        const int mv_pt = board.piecesOnSquares[raw_from] & 7;
+        //Castling, stored king-to-rook, rewritten to the king-to-g/c-file form the generator emits.
+        //Done on the REAL board, before the mirroring, because the piece lookup needs real squares.
+        //The rook must be our own: a king "capturing" an enemy rook beside it is an ordinary move.
+        {
+          const int dp = (int)board.piecesOnSquares[raw_to];
+          if (mv_pt == King && (dp & 7) == Rook &&
+              (((dp >> 3) & 1) == (int)board.sideToMove))
+            raw_to = (raw_from & ~7) + (((raw_to & 7) > (raw_from & 7)) ? 6 : 2);
+        }
+        int from_sq = is_black ? (raw_from ^ 56) : raw_from;
+        int to_sq   = is_black ? (raw_to   ^ 56) : raw_to;
         const int pi = policy_index(mv_pt, from_sq, to_sq, PROMO_PT[pos.promo[i] & 3]);
         pv_idx[i] = (pi >= 0) ? static_cast<float>(pi) : -1.0f;
         //cp is WHITE-relative (see the value target above, which flips it for
@@ -2117,12 +2228,21 @@ int main() {
               np_pre -= model->Cl.numel();
 #endif
 #endif
+              //And a checkpoint trained with ONE shared u/v pair is shorter by the five heads this
+              //build added; it is a legitimate thing to fine-tune from, and the loader below copies
+              //the trained pair into all six heads so the model starts at that checkpoint exactly.
+              int64_t np_1head = np;
+#if SPATIAL && SPATIAL_HEADS > 1
+              np_1head -= (model->Wu.numel() + model->Wv.numel()) * (SPATIAL_HEADS - 1) / SPATIAL_HEADS;
+#endif
               const auto sz  = (int64_t)std::filesystem::file_size(weights_file);
               const auto exp = np * 4;
               const auto exp_pre = np_pre * 4;
+              const auto exp_1h  = np_1head * 4;
               const bool fits     = (sz >= exp     && sz - exp     <= 65536);
               const bool fits_pre = (sz >= exp_pre && sz - exp_pre <= 65536);
-              if (!fits && !fits_pre) {
+              const bool fits_1h  = (sz >= exp_1h  && sz - exp_1h  <= 65536);
+              if (!fits && !fits_pre && !fits_1h) {
                 std::cerr << "FATAL: " << weights_file << " is " << sz << " bytes but this build\n"
                           << "       has " << np << " parameters (" << exp << " bytes of tensors).\n"
                           << "       That checkpoint was trained with a different architecture.\n";
@@ -2143,6 +2263,22 @@ int main() {
                 torch::Tensor t;
                 if (ar.try_read(kv.key(), t)) {
                   torch::NoGradGuard ng;
+#if SPATIAL && SPATIAL_HEADS > 1
+                  //A SPATIAL_HEADS=1 checkpoint's Wu and Wv are [CH, DIM] where this build wants
+                  //[CH, 6*DIM]. Copy the one trained pair into all six heads: the model then scores
+                  //every move exactly as that checkpoint did, and the six heads can only diverge by
+                  //learning something. Anything else is a genuine architecture mismatch and falls
+                  //through to copy_(), which throws.
+                  if ((kv.key() == "Wu" || kv.key() == "Wv") &&
+                      t.dim() == 2 && t.size(0) == kv.value().size(0) &&
+                      t.size(1) * SPATIAL_HEADS == kv.value().size(1)) {
+                    kv.value().copy_(t.repeat({1, SPATIAL_HEADS}));
+                    std::cout << "  '" << kv.key() << "' has one head in this checkpoint; copied into "
+                              << "all " << SPATIAL_HEADS << " heads" << std::endl;
+                    ++got;
+                    continue;
+                  }
+#endif
                   kv.value().copy_(t);
                   ++got;
                 } else {
@@ -2166,6 +2302,19 @@ int main() {
               }
               std::cout << "Spatial plane layout " << saved_layout
                         << (has_layout ? "" : " (inferred: checkpoint predates the plane_layout buffer)")
+                        << std::endl;
+              torch::Tensor ht;
+              const bool has_heads = ar.try_read("spatial_heads", ht, /*is_buffer=*/true);
+              const int saved_heads = has_heads ? (int)std::lround(ht.item<float>()) : 1;
+              if (saved_heads > SPATIAL_HEADS) {
+                std::cerr << "FATAL: " << weights_file << " was trained with " << saved_heads
+                          << " spatial head" << (saved_heads == 1 ? "" : "s")
+                          << ",\n       but this build has " << SPATIAL_HEADS
+                          << ". Rebuild with -DSPATIAL_HEADS=" << saved_heads << " to use it.\n";
+                return 3;
+              }
+              std::cout << "Spatial heads " << SPATIAL_HEADS
+                        << (saved_heads == SPATIAL_HEADS ? "" : " (checkpoint had 1, copied into each)")
                         << std::endl;
 #endif
             }
@@ -2194,7 +2343,13 @@ int main() {
               << " PIECE_INDEX=" << PIECE_INDEX
               << " LEGAL_BIAS=" << LEGAL_BIAS
               << " MAX_PVS=" << MAX_PVS << " MAX_TRAIN_PVS=" << MAX_TRAIN_PVS
-              << " POLICY_TEMP=" << POLICY_TEMP << std::endl;
+              << " POLICY_TEMP=" << POLICY_TEMP
+#if SPATIAL
+              << " SPATIAL=" << SPATIAL << " SPATIAL_CH=" << SPATIAL_CH
+              << " SPATIAL_DIM=" << SPATIAL_DIM << " SPATIAL_LAYERS=" << SPATIAL_LAYERS
+              << " SPATIAL_ATTACK=" << SPATIAL_ATTACK << " SPATIAL_HEADS=" << SPATIAL_HEADS
+#endif
+              << std::endl;
     std::cout << "Total number of parameters: " << param_count << std::endl;
         // PARAMS_ONLY=1 prints the model size and exits, so the architecture can be
         // checked without loading a shard.
@@ -2247,7 +2402,16 @@ int main() {
                      "SPATIAL_ATTACK 0 or 12 only; refusing to write a net it would misread" << std::endl;
         return 4;
 #endif
+        //FORMAT 9: a piece-indexed net whose spatial term has one u/v pair PER MOVING PIECE TYPE.
+        //It is not a format 8 with wider tensors -- an engine that read it as an 8 would take the
+        //first DIM numbers of each square's vector as the whole vector, which is the pawn head, and
+        //score every knight, bishop, rook, queen and king move with it. So it gets its own version,
+        //and its spatial header is nine ints under a different magic rather than eight under "SPAT".
+#if SPATIAL_HEADS > 1
+        const int32_t fmt_spatial = 9;
+#else
         const int32_t fmt_spatial = PIECE_INDEX ? 8 : 7;
+#endif
 #endif
         FILE* f = std::fopen(xp, "wb");
         if (!f) { std::cerr << "EXPORT_WEIGHTS: cannot write " << xp << std::endl; return 4; }
@@ -2270,9 +2434,17 @@ int main() {
         //  magic "SPAT", planes, channels, dim, layers, scale, plane_layout, attack planes
         //scale 1 = planes enter the convolution as 0/1 (SPATIAL_SCALE), 0 = as 0/127ths.
         {
+#if SPATIAL_HEADS > 1
+            //  magic "SPA2", planes, channels, dim, layers, scale, plane_layout, attack, heads
+            const int32_t sh[9] = { 0x32415053 /*"SPA2"*/, SPATIAL_PLANES, SPATIAL_CH, SPATIAL_DIM,
+                                    SPATIAL_LAYERS, SPATIAL_SCALE, SPATIAL_PLANE_LAYOUT, SPATIAL_ATTACK,
+                                    SPATIAL_HEADS };
+            std::fwrite(sh, sizeof(int32_t), 9, f);
+#else
             const int32_t sh[8] = { 0x54415053 /*"SPAT"*/, SPATIAL_PLANES, SPATIAL_CH, SPATIAL_DIM,
                                     SPATIAL_LAYERS, SPATIAL_SCALE, SPATIAL_PLANE_LAYOUT, SPATIAL_ATTACK };
             std::fwrite(sh, sizeof(int32_t), 8, f);
+#endif
             std::vector<std::pair<const char*, torch::Tensor>> st = { {"Wc1", m.Wc1}, {"bc1", m.bc1} };
 #if SPATIAL_LAYERS >= 2
             st.push_back({"Wc2", m.Wc2}); st.push_back({"bc2", m.bc2});
@@ -2287,6 +2459,8 @@ int main() {
                       << ", dim " << SPATIAL_DIM << ", layers " << SPATIAL_LAYERS
                       << ", scale " << SPATIAL_SCALE << ", plane layout " << SPATIAL_PLANE_LAYOUT
                       << (SPATIAL_PLANE_LAYOUT ? " (legal-source marks offset by piece type)" : " (true from-square)")
+                      << ", heads " << SPATIAL_HEADS
+                      << (SPATIAL_HEADS > 1 ? " (one u/v pair per moving piece type)" : " (one pair shared by every piece)")
                       << std::endl;
         }
 #endif
