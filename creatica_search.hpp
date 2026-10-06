@@ -1,4 +1,5 @@
 #include <cstdlib>   //calloc/malloc for the child table
+#include <cstdio>
 #include "nnue/nnue/nnue_accumulator.h"
 
 #ifdef _MSC_VER
@@ -44,7 +45,18 @@
 #define THREADS 4
 #define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH "/Users/ap/syzygy"
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static inline const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define SYZYGY_PATH syzygy_path_default()
 #define HASH 2048 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_MIN 65 // used in formular for exploration constant decay with depth
 #define EXPLORATION_MAX 160 //smaller value favor exploitation, i.e. deeper tree vs wider tree
@@ -104,6 +116,24 @@
 #define GC_EVICT_SOFT 600
 #define GC_EVICT_HARD 850
 
+//--- the mid-search hollow abort -------------------------------------------------------
+//A search whose tree is full learns nothing and has to be stopped and restarted on a fresh tree.
+//These two numbers decide when a running search is judged to be in that state. The threshold
+//itself is the TreeResetHollow UCI option, shared with the between-moves reset, so there is one
+//knob rather than two; these only stop it firing too early or too late to be worth acting on.
+//
+//HOLLOW_ABORT_MIN_SIMS: how many simulations this search must have run before its hollow rate is
+//believed at all. A rate measured over a handful of simulations is noise, and the cost of getting
+//it wrong is a discarded tree. 65,536 is sixteen of thread 0's 4,096-simulation ticks and, at the
+//330,000 simulations a second these games averaged, about 0.2 s -- a fifth of a fast move and a
+//twentieth of a slow one.
+#define HOLLOW_ABORT_MIN_SIMS 65536
+//HOLLOW_ABORT_MAX_ELAPSED: how far into the move's own budget the abort may still fire, as a
+//fraction. Restarting is only worth it if enough time remains to build a tree worth having, and
+//past the half-way point it is better to finish with the statistics already gathered than to throw
+//them away and search half as long from scratch.
+#define HOLLOW_ABORT_MAX_ELAPSED 0.5
+
 //--- policy head ---------------------------------------------------------------------
 //Where to find the exported weights, overridable with the CREATICA_POLICY env var. The
 //file is produced by:  EXPORT_WEIGHTS=nnue_policy.bin ./nnue_policy_train
@@ -124,6 +154,9 @@
 //"assume every unexplored move draws", which is why the incumbent's Q=0 fallback is wrong
 //once children are born unevaluated. Override at runtime with CREATICA_FPU.
 #define FPU_REDUCTION 0.20
+//MinVisitShare's default once MinVisitK turns the floor on. At k = 8 this diverts at most 24% of a
+//node's descents, leaving the leader 76%; see the MinVisitK note below for the arithmetic.
+#define MIN_VISIT_SHARE 0.03
 //Share of the prior taken from the policy head; the remainder comes from the 1-ply child
 //evaluation. 0 reproduces the incumbent exactly, 1 is policy-only. Measured best around
 //0.4-0.5 (see the table in creatica_search.cpp). Override with CREATICA_POLICY_BLEND.
@@ -156,6 +189,15 @@ struct alignas(64) MCTSNode {
     std::atomic<int> num_children{0};
     std::atomic<int> terminal{0}; //0 (not terminal), 1 (mate), 2 (stalemate), 3 (repetition), -1 (check)
     std::atomic<uint8_t> expanding{0};  // expansion gate (test-and-set try-lock): exchange(1, acquire) == 0 acquires it, store(0, release) releases it
+    //THE SUBTREE'S MINIMAX VALUE, in centipawns, from the side to move at this node. See
+    //minimax_weight. MM_NONE means "no value yet".
+    //
+    //Two bytes, and they are the LAST free bytes in the node: `expanding` is one byte at offset 36
+    //and `descents` needs four-byte alignment at 40, so bytes 37 to 39 were padding and this takes
+    //38 and 39. Centipawns in an int16 are ample -- MATE_SCORE is 20000 and NO_MATE_SCORE 21000,
+    //both inside +-32767 -- and the alternative, a double, would have pushed the node to 128 bytes
+    //and halved the tree, which is the mistake pool_off already made once.
+    std::atomic<int16_t> mm{-32768};
     //How many times the search has DESCENDED THROUGH this node, i.e. the sum of its edges' n.
     //It is the numerator of the exploration term, and it has to be edge-consistent with the
     //denominator or the two are on different scales: N below counts every arrival at this
@@ -280,17 +322,59 @@ struct NodeArena {
     std::atomic<uint64_t> pool_bump{0};
     std::vector<uint64_t> pool_free[POOL_MAX_BLOCK + 1];
     std::mutex            pool_mtx;
+    //Why a failed pool_alloc() is recorded at all. When set_root() finds a root with no children it
+    //has to say WHY the expansion was abandoned, and the three abandon points are indistinguishable
+    //from outside. These four counters make the pool's own refusals visible: how many there were,
+    //how big the last refused request was, and -- the one that matters -- whether the pool was
+    //genuinely exhausted or merely FRAGMENTED. The free lists are exact-size, so a block of 30
+    //entries returned by a middlegame node can never serve an endgame node asking for 14. If the
+    //bump pointer has reached pool_cap, a 14-entry request then fails while megabytes sit free in
+    //the wrong-sized lists. pool_free_entries() against pool_used() is exactly that test.
+    std::atomic<uint64_t> pool_fails{0};       //failed pool_alloc() calls since the last pool_reset()
+    std::atomic<uint32_t> pool_fail_n{0};      //block size of the most recent failure
+    std::atomic<uint32_t> pool_fail_free_n{0}; //entries that were free in THAT size's list at the time
+
+    //Records one refusal. Called only on the failure path, so taking the pool mutex here costs the
+    //search nothing: by the time this runs the expansion is already being abandoned.
+    void note_pool_fail(uint32_t n) {
+        pool_fails.fetch_add(1, std::memory_order_relaxed);
+        pool_fail_n.store(n, std::memory_order_relaxed);
+        uint32_t avail = 0;
+        if (n >= 1 && n <= POOL_MAX_BLOCK) {
+            std::lock_guard<std::mutex> lk(pool_mtx);
+            avail = (uint32_t)pool_free[n].size();
+        }
+        pool_fail_free_n.store(avail, std::memory_order_relaxed);
+    }
+
     //Offset of a block of n entries, or UINT64_MAX when the pool is exhausted, which the caller treats
     //exactly like an exhausted arena: the expansion is abandoned and the node stays a leaf.
     uint64_t pool_alloc(uint32_t n) {
-        if (n == 0 || n > POOL_MAX_BLOCK) return UINT64_MAX;
+        if (n == 0 || n > POOL_MAX_BLOCK) { note_pool_fail(n); return UINT64_MAX; }
         {
             std::lock_guard<std::mutex> lk(pool_mtx);
             auto& fl = pool_free[n];
             if (!fl.empty()) { const uint64_t off = fl.back(); fl.pop_back(); return off; }
         }
         const uint64_t off = pool_bump.fetch_add(n, std::memory_order_relaxed);
-        return off + n <= pool_cap ? off : UINT64_MAX;
+        if (off + n <= pool_cap) return off;
+        note_pool_fail(n);
+        return UINT64_MAX;
+    }
+    //Entries handed out by the bump pointer, clamped: pool_bump keeps rising past pool_cap because a
+    //failed fetch_add is never given back, so the raw counter overstates the pool once it is full.
+    uint64_t pool_used() const {
+        const uint64_t b = pool_bump.load(std::memory_order_relaxed);
+        return b < pool_cap ? b : pool_cap;
+    }
+    //Entries sitting in the exact-size free lists, and how many are in the one list a request for n
+    //would draw from. Takes the pool mutex, so this is for diagnostics, never for the search path.
+    uint64_t pool_free_entries(uint32_t * free_at_n = nullptr, uint32_t n = 0) {
+        uint64_t total = 0;
+        std::lock_guard<std::mutex> lk(pool_mtx);
+        for (uint32_t i = 1; i <= POOL_MAX_BLOCK; ++i) total += (uint64_t)i * pool_free[i].size();
+        if (free_at_n) *free_at_n = (n >= 1 && n <= POOL_MAX_BLOCK) ? (uint32_t)pool_free[n].size() : 0;
+        return total;
     }
     void pool_release(uint64_t off, uint32_t n) {
         if (n == 0 || n > POOL_MAX_BLOCK) return;
@@ -299,6 +383,9 @@ struct NodeArena {
     }
     void pool_reset() {
         pool_bump.store(0, std::memory_order_relaxed);
+        pool_fails.store(0, std::memory_order_relaxed);
+        pool_fail_n.store(0, std::memory_order_relaxed);
+        pool_fail_free_n.store(0, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(pool_mtx);
         for (auto& fl : pool_free) fl.clear();
     }
@@ -884,6 +971,190 @@ size_t live_tree_nodes();
 extern std::string visit_dump_path;
 extern std::string game_tag;
 extern bool validate_tree_enabled;
+//EXACT VERDICTS, PROPAGATED. ProveTerminals; off by default, and with it off a node's `terminal`
+//holds exactly the values it always has, so the search is bit-for-bit the incumbent's.
+//
+//WHY. MCTS backs a value up as a MEAN, so a refutation found at one leaf has to out-vote everything
+//already averaged into the move it refutes. Alpha-beta needs one node for the same job: a refutation
+//anywhere cuts the move off at once. That difference is measurable in creatica. On the 171-position
+//set of the bot's own mistakes, 89 positions are never solved in four repeats and 65 of those 89 are
+//answered with the SAME wrong move every time, so the search has a stable fixed point rather than a
+//variance problem; in 62% of them the correct move's PUCT exploration term ends the search smaller
+//than the Q gap it would have to overcome, which means it cannot be selected again however long the
+//search runs. Widening exploration at the root lifts the solve rate from 35.7% to 49.1% but the curve
+//never turns, because the quantity that has to be overturned grows with the tree.
+//
+//A proof is the one number in the tree a mean cannot dilute. Mate, stalemate and a tablebase hit are
+//exact, and exactness composes by backward induction: a node with ONE child that is lost for the
+//child's side to move is won, and a node ALL of whose children are won for their side to move is lost.
+//Propagating that upward turns a single exact leaf into an exact verdict at the root with no visits
+//spent out-voting an average, and it needs no tuning constant.
+//
+//It also targets the positions that need it without being able to name them, which is the property
+//the alternative lacked. Proofs only exist in forcing lines, so in a quiet middlegame nothing is ever
+//proven and the search behaves exactly as it does today. Measured directly: of seven candidate
+//"this node is tactical" signals read off the root's own children -- the spread between the best and
+//the mean child value, the gap between the best two, the standard deviation, how often the leader
+//changed, how far its value drifted -- not one separates the never-solved positions from the
+//always-solved ones, every AUC landing between 0.47 and 0.62 against 0.5 for no information at all.
+//
+//WHERE IT LIVES. MCTSNode is pinned at 64 bytes by a static_assert and has no spare field, so the
+//verdict rides in the unused high bits of `terminal`. The low byte keeps the kind exactly as before
+//-- 0 none, 1 mate, 2 stalemate, 3 repetition, -1 in check -- and must be read through
+//terminal_kind(), which sign-extends so that in-check nodes still read as -1 once a verdict has been
+//stamped on them. Stamping an in-check node matters: checks are where mates live.
+extern bool prove_terminals;
+//SOFT MINIMAX BACKUP. MinimaxWeight; 0 by default, which is the incumbent search exactly.
+//
+//WHY, and what the proof work ruled out. MCTS backs a value up as a MEAN. Alpha-beta's root value
+//is a MINIMAX over the whole tree -- and crucially it is a minimax even when every leaf is a guess,
+//not only when the leaves are certain. ProveTerminals tested the certain half of that difference:
+//it propagated every exact verdict creatica can produce, nearly three million tablebase verdicts
+//stamped across 684 searches and some 390,000 nodes proved won or lost by backward induction, and
+//it converted exactly ZERO never-solved positions into always-solved ones. So exactness is not what
+//Stockfish is beating creatica with on these positions -- at a median of 13 pieces it has no more
+//mates and no more tablebase hits than creatica does. What is left is the operator itself, applied
+//to ordinary estimates.
+//
+//WHAT IT DOES. Every node carries `mm`, the best value its subtree has been shown to reach,
+//recomputed on backup as the maximum over its children of the negation of theirs. Selection then
+//scores a child on a blend, (1 - w) * mean + w * minimax, so w = 0 is today's engine and w = 1 is a
+//pure minimax backup over a tree MCTS is still choosing how to grow. The blend is the point: a pure
+//max over noisy estimates is wildly optimistic, because the maximum of many wrong numbers is wrong
+//upward, while the mean is what buries a single correct refutation under thirty mediocre siblings.
+extern double minimax_weight;
+//PROGRESSIVE WIDENING ON THE PRIOR'S OWN ORDER. TopKMin 0 is off, and with it off the search is
+//bit-for-bit the incumbent's.
+//
+//WHY. The prior's top six contains the move a depth-12 search prefers 93.8% of the time in the
+//positions where the choice matters -- those where the best move is worth a pawn or more over the
+//second, which are 14% of positions and the only ones where losing it costs anything. Searching six
+//moves a node instead of about 32 takes alpha-beta's perfect-ordering floor from sqrt(32) = 5.68 to
+//sqrt(6) = 2.45, and at the 1.7 million nodes creatica already spends that is depth 16 rather than
+//depth 9 -- and Stockfish at fixed depth 16 scores 89.5% on the mistakes set against the 34.6% this
+//engine gets. That gap is what this option exists to go after.
+//
+//WHY IT IS NOT ProbabilityMass, WHICH LOST TWICE. That option DELETED the tail of the move list at
+//expansion, so with a weak prior the moves it threw away were disproportionately the good ones, and
+//under tree reuse one bad decision at a node outlived the move. Here every legal move is still
+//expanded and still carries an edge; selection merely does not CONSIDER the ones past k yet, and k
+//grows with the node's own descent count:
+//
+//    k(N) = TopKMin + floor(TopKWiden * log2(1 + N))
+//
+//so at TopKMin 6 and TopKWiden 1 a node sees 6 moves at its first visit, 9 by seven descents, 12 by
+//63, 16 by a thousand and everything by a million. A move passed over early is available later, which
+//is the property the gate did not have. The children are published in DESCENDING PRIOR ORDER --
+//expand_node() sorts move_evals by prior before publishing -- so this is a bound on the loop and
+//nothing more.
+extern int64_t topk_min;
+extern double  topk_widen;
+//FLATTEN THE PRIOR INSIDE THE TOP K. 0 is off; with it off the prior is untouched.
+//
+//WHY, and it follows from measurement rather than taste. The prior has a trustworthy SET and almost no
+//ordering inside it. Its top six contains the move a depth-12 search prefers 93.8% of the time in the
+//positions where the choice matters -- but 40.2% of its mass sits on rank 1, and after rank 2 each move
+//carries only 16 to 36% more mass than the next, which is barely a ranking at all. Worse, rank 1 is the
+//LEAST reliable of its leading moves: over 1,026 searches the prior's first choice was played 25.0% of
+//the time and was right 28.0% of those, while everything else was played 75.0% of the time and was
+//right 37.1%. PUCT already pushes against this, spending 0.63x the prior's request on rank 1 and 2.05x
+//on rank 8, and the accuracy figures say it is right to.
+//
+//So rather than narrow the set -- which measured a symmetrical null, see TopKMin -- this removes the
+//part of the prior that is not earning its keep: the first k entries are given EQUAL mass, and the tail
+//keeps its own. The total is preserved exactly, so the softmax still sums to one and the exploration
+//term is not globally rescaled; only the ordering inside the top k is discarded, and the search decides
+//among them on Q instead of on a ranking that is 16% steep.
+//
+//The tail is deliberately left alone. It takes 12.7% of root visits, and the engine plays from rank 11
+//or worse 12.1% of the time and is right 32.3% of those -- better than rank 1 -- so flattening must not
+//become a way of quietly suppressing it.
+//
+//DO NOT USE THIS. Every accuracy figure above is an artefact of the test set it was measured on, and the
+//option is kept only so the measurement is reproducible. `mistakes/testset.tsv` is drawn from the bot's
+//own games, so it is a sample of sharp positions WHERE THE PRIOR WAS WRONG -- those are the ones that
+//cost games and therefore got collected. On 200 broadcast positions the engine never saw, the prior's
+//first choice is played 41.5% of the time and is right 72.3% against 52.1% for everything else, and on
+//the sharp ones it is right 100% while its deviations give away 76 cp. The prior is not miscalibrated at
+//all, so there is nothing here to flatten. The six points it gained on the mistakes set (34.8% to 41.2%,
+//18 never-to-always against 6) were that set's construction. See "Why no search change survived" in
+//ENGINE_SETTINGS.md, 5 October 2026.
+extern int64_t flatten_topk;
+
+//=== MinVisitK / MinVisitShare / MinVisitDepth: a visit floor for the leading candidates ==========
+//
+//WHY PUCT CANNOT BE RETUNED INTO SOLVING THIS. Setting U = gap and solving for the edge count gives
+//the visits a non-leading move ever receives:
+//
+//    n* = C * P * sqrt(D) / gap
+//
+//Measured against the engine's own root traces it is right across three decades of P: a move with
+//P = 0.0015 and a gap of 0.09 is predicted 20.7 visits and got 30; one with P = 0.127 and a gap of
+//0.123 is predicted 1,280 and got 2,244. A refutation five plies down needs a subtree of thousands.
+//The two numbers never meet, and no constant closes them:
+//
+//  - raising C to buy 10,000 visits for that first move needs C = 774 against the incumbent 1.6,
+//    which is uniform search, and raising C has measured as a loss here before;
+//  - raising P does nothing, because the starved moves are not the low-prior ones. Over ten measured
+//    cases the right move carried priors from 0.000074 to 0.133 -- three of them at two to four times
+//    the flat 1/num_children -- and was starved identically;
+//  - shrinking Q toward the parent at low n, the textbook Bayesian correction, solves to n ~ A + m:
+//    it adds m visits, not m-fold. With m = 50 a 30-visit move reaches 44;
+//  - UCB1 allocates ~ln(D)/gap^2 against PUCT's sqrt(D)/gap, so it explores LESS, not more.
+//
+//The defect is structural rather than parametric. A non-leader's SHARE of the search is
+//C * P / (gap * sqrt(D)), which decays as 1/sqrt(D): doubling the search multiplies its visits by
+//1.41 while the total grows by 2, so its share falls by 29%. Anything whose share decays cannot be
+//fixed by thinking for longer, which is why every attempt here to buy the answer with a bigger tree
+//returned a null.
+//
+//WHAT THIS DOES. Each of the first MinVisitK children -- they are in descending prior order -- is
+//guaranteed at least MinVisitShare of the parent's descents. When one is below its floor, selection
+//takes the most deficient of them instead of the PUCT argmax; otherwise nothing changes. The share
+//is CONSTANT in D, so for the first time more time helps rather than hurting.
+//
+//It is allocation, not exclusion. No move is removed from any node, so this does not reintroduce the
+//defect ProbabilityMass had, where a gate deleted a move permanently and outlived it under tree
+//reuse. Well-searched losers stay starved, because once above the floor they are back on PUCT.
+//
+//WHY k = 8. The floor can only help a move it covers, and the quantity that matters is the PRIOR rank
+//of the move a depth-12 search prefers, measured on positions chosen without reference to anything
+//the engine played. Over ten starved cases those ranks were 2, 2, 2, 5, 6, 6, 7, 8, 18 and 27, so
+//top-4 covers 30% and top-8 covers 80%, and it plateaus there -- top-16 covers no more than top-8.
+//Note this is NOT the k = 4 that the mistakes set's played-rank table suggests; that table measures
+//which rank the engine ends up playing, which is a different thing from where the right move sits.
+//
+//MinVisitDepth bounds how deep the floor applies, and 0 means the root only. The cost compounds with
+//depth: k * share of each node's descents is diverted, so over d plies the leader's own line keeps
+//(1 - k*share)^d of the budget -- at k = 8 and share = 0.03 that is 0.76 at the root and 0.44 three
+//plies down. The root is where the arithmetic above was measured, so it is the default.
+//
+//0 is off and is the incumbent search exactly.
+extern int64_t min_visit_k;
+extern double  min_visit_share;
+extern int64_t min_visit_depth;
+inline constexpr int16_t MM_NONE = -32768;
+//`mm` as a value on the same scale as Q, or nothing if the subtree has no minimax value yet.
+inline bool mm_value(const MCTSNode * n, double& out);
+inline constexpr int TERMINAL_KIND_MASK = 0xff;
+inline constexpr int PROVEN_WIN  = 1 << 8;   //the side to move at this node wins by force
+inline constexpr int PROVEN_LOSS = 2 << 8;   //the side to move at this node loses by force
+inline constexpr int PROVEN_MASK = PROVEN_WIN | PROVEN_LOSS;
+//READING THE WORD. An in-check node is stored as the plain int -1, which has EVERY bit set, so a
+//bare mask reads both proof bits out of it and declares the position simultaneously won and lost.
+//That is not hypothetical: it was the first thing the option did, and it made the search treat every
+//check as a forced mate, chasing checks and collapsing the principal variation to two plies.
+//
+//So a NEGATIVE word is the legacy encoding -- kind -1, no verdict -- and a non-negative word is the
+//composed one. set_proof() always writes the composed form, turning -1 into 0xff in the low byte,
+//which is why an in-check node can still carry a verdict once it has been stamped.
+inline int terminal_kind(int t) {
+  return t < 0 ? -1 : (int)(int8_t)(t & TERMINAL_KIND_MASK);
+}
+inline int proof_bits(int t) { return t < 0 ? 0 : (t & PROVEN_MASK); }
+//A node is lost for the side to move at it if it is mate, or if the induction has proved it so.
+inline bool proven_loss(int t) { return terminal_kind(t) == 1 || (proof_bits(t) & PROVEN_LOSS); }
+inline bool proven_win(int t)  { return (proof_bits(t) & PROVEN_WIN) != 0; }
 //`collected` says whether a collection has just run; the reachability invariant only
 //holds then, since lazy collection deliberately leaves unreachable nodes in the map.
 int validate_tree(const char * where, bool collected);
