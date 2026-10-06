@@ -1,5 +1,5 @@
 //For MacOS using clang
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-lcurl,-rpath,/Users/ap/libchess creatica-shared-root.cpp uci-shared-root.cpp tbcore.c tbprobe.c -o creatica-shared-root
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-lcurl,-rpath,$HOME/libchess creatica-shared-root.cpp uci-shared-root.cpp tbcore.c tbprobe.c -o creatica-shared-root
 
 // -O3 -g -fno-omit-frame-pointer - options for profiling
 //

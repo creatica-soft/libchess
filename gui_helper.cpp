@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o gui_helper gui_helper.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess -o gui_helper gui_helper.cpp
 //
 // gui_helper - Component A of the chess GUI.
 //

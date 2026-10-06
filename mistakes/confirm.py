@@ -2,6 +2,11 @@
 # decided, and re-score each position with Stockfish MultiPV 8 at <ms>. A move is ACCEPTABLE if Stockfish scores
 # it within 50 cp of its best. Positions where the deeper search no longer shows a >= 100 cp loss are dropped.
 import subprocess, sys
+import os
+#Paths are overridable by environment variable and otherwise resolved under the home directory at run
+#time: this is a public repository, so one machine's absolute paths do not belong in it.
+def _p(var, default):
+    return os.environ.get(var) or os.path.expanduser(default)
 scan, out_path, ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
 rows = [l.rstrip("\n").split("\t") for l in open(scan)][1:]
 cands = []
@@ -11,7 +16,7 @@ for g, ply, side, fen, mv, san, cb, ca, best in rows:
     if ca >= 400 or cb <= -400: continue          # still clearly winning after it, or already clearly lost
     cands.append((g, int(ply), fen, mv, san, cb, ca))
 print(len(cands), "candidates from", len(rows), "moves", flush=True)
-sf = subprocess.Popen(["/Users/ap/stockfish-macos-m1-apple-silicon"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+sf = subprocess.Popen([_p("STOCKFISH", "~/stockfish-macos-m1-apple-silicon")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 def send(s): sf.stdin.write(s + "\n"); sf.stdin.flush()
 def run(fen, extra, multipv):
     send("setoption name MultiPV value %d" % multipv); send("position fen " + fen); send("go movetime %d %s" % (ms, extra))
@@ -26,7 +31,7 @@ def run(fen, extra, multipv):
             lines[int(t[t.index("multipv") + 1])] = (t[t.index("pv") + 1], cp)
     return [lines[k] for k in sorted(lines)]
 send("uci")
-for k, v in (("Threads", 4), ("Hash", 1024), ("SyzygyPath", "/Users/ap/syzygy")): send("setoption name %s value %s" % (k, v))
+for k, v in (("Threads", 4), ("Hash", 1024), ("SyzygyPath", _p("SYZYGY_PATH", "~/syzygy"))): send("setoption name %s value %s" % (k, v))
 send("isready")
 while not sf.stdout.readline().startswith("readyok"): pass
 out = open(out_path, "w")

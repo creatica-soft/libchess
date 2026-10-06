@@ -1,4 +1,4 @@
-//compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess play_games.cpp -o play_games
+//compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess play_games.cpp -o play_games
 #include <string>
 #include <cstdio>
 #include <chrono>

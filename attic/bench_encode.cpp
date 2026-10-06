@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o bench_encode bench_encode.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess -o bench_encode bench_encode.cpp
 // Board -> 576-float model input. This is per-position work the search must pay on top
 // of the forward pass, and it is not in the libtorch timing.
 #include <chrono>

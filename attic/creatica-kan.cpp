@@ -1,12 +1,12 @@
 //using libtorch
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I /Users/ap/Downloads/libtorch2/include -I /Users/ap/Downloads/libtorch2/include/torch/csrc/api/include -L /Users/ap/Downloads/libtorch2/lib -L /Users/ap/libchess -L /Users/ap/pytorch/build/lib -Wl,-lcurl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch2/lib,-rpath,/Users/ap/libchess creatica-kan.cpp uci-kan.cpp tbcore.c tbprobe.c  -o creatica-kan
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I $HOME/Downloads/libtorch2/include -I $HOME/Downloads/libtorch2/include/torch/csrc/api/include -L $HOME/Downloads/libtorch2/lib -L $HOME/libchess -L $HOME/pytorch/build/lib -Wl,-lcurl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,$HOME/Downloads/libtorch2/lib,-rpath,$HOME/libchess creatica-kan.cpp uci-kan.cpp tbcore.c tbprobe.c  -o creatica-kan
 
 //For MacOS using clang and CoreML
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess creatica-kan.cpp uci-kan.cpp tbcore.c tbprobe.c CoreMLEngine.mm -framework CoreML -framework Foundation -fobjc-arc -o creatica-kan
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -L $HOME/libchess -Wl,-lcurl,-lchess,-rpath,$HOME/libchess creatica-kan.cpp uci-kan.cpp tbcore.c tbprobe.c CoreMLEngine.mm -framework CoreML -framework Foundation -fobjc-arc -o creatica-kan
 
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I /Users/ap/Downloads/libtorch2/include -I /Users/ap/Downloads/libtorch2/include/torch/csrc/api/include -L /Users/ap/libchess -L /Users/ap/pytorch/build/lib -Wl,-lcurl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/pytorch/build/lib,-rpath,/Users/ap/libchess,-force_load creatica-cnn.cpp uci-cnn.cpp tbcore.c tbprobe.c /Users/ap/pytorch/build/lib/libpytorch_qnnpack.a -o creatica-cnn
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I $HOME/Downloads/libtorch2/include -I $HOME/Downloads/libtorch2/include/torch/csrc/api/include -L $HOME/libchess -L $HOME/pytorch/build/lib -Wl,-lcurl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,$HOME/pytorch/build/lib,-rpath,$HOME/libchess,-force_load creatica-cnn.cpp uci-cnn.cpp tbcore.c tbprobe.c $HOME/pytorch/build/lib/libpytorch_qnnpack.a -o creatica-cnn
 
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess cnn_network.cpp creatica-cnn.cpp uci-cnn.cpp tbcore.c tbprobe.c -o creatica-cnn
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -L $HOME/libchess -Wl,-lcurl,-lchess,-rpath,$HOME/libchess cnn_network.cpp creatica-cnn.cpp uci-cnn.cpp tbcore.c tbprobe.c -o creatica-cnn
 
 #include "creatica-kan.hpp"
 

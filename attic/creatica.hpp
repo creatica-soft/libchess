@@ -30,7 +30,7 @@
 #define THREADS 8
 #define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH "/Users/ap/syzygy"
+#define SYZYGY_PATH "/path/to/syzygy"
 #define HASH 4096 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_MIN 60 // used in formular for exploration constant decay with depth
 #define EXPLORATION_MAX 150 //smaller value favor exploitation, i.e. deeper tree vs wider tree

@@ -1,5 +1,7 @@
-// c++ -std=c++20 -Wall -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess tbprobe.c test_smp.cpp -o test_smp
+// c++ -std=c++20 -Wall -O3 -flto -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess tbprobe.c test_smp.cpp -o test_smp
 
+#include <cstdio>
+#include <cstdlib>
 #include "nnue/types.h"
 #include "nnue/nnue/nnue_accumulator.h"
 
@@ -31,7 +33,18 @@
 //8/5p2/7p/2p1n2P/1k2N3/1P2P3/2K5/8 b - - 1 62
 #define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH "/Users/ap/syzygy"
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define SYZYGY_PATH syzygy_path_default()
 #define HASH 1024 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define MAX_DEPTH 100
 #define THREADS 8

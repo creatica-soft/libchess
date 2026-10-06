@@ -1,5 +1,7 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o self-play-optimization self-play-optimization.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-lchess,-rpath,$HOME/libchess -L $HOME/libchess -o self-play-optimization self-play-optimization.cpp
 
+#include <cstdio>
+#include <cstdlib>
 #include <errno.h>
 #include <ctype.h>
 #include <string.h>
@@ -20,8 +22,30 @@
 // --- Configuration ---
 //creatica is the engine to tune: it is the one that exposes the policy settings as UCI
 //options. The older creatica-kan this pointed at advertises none of them.
-const char * CREATICA_PATH = "/Users/ap/libchess/creatica";
-const char * SYZYGY_PATH = "/Users/ap/syzygy";
+//libchess/creatica under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * creatica_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/libchess/creatica", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+const char * CREATICA_PATH = creatica_path_default();
+const char * SYZYGY_PATH = syzygy_path_default();
 #define PGN_FILE "tuning_match.pgn"
 //500 ms rather than 2000. A comparison is only as good as its sample size, and at 2000 ms a
 //40-game match takes over three hours. Shorter games shift the optimum of a parameter slightly,

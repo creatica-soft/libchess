@@ -51,8 +51,9 @@ Notes:
 - The library is around 110 MB because both NNUE nets are embedded at compile time with
   `incbin`. The filenames are `#define`s in `nnue/evaluate.h`; switching nets means editing
   that header and rebuilding `chess`.
-- `CMakeLists.txt` hardcodes `-rpath /Users/ap/libchess` and `-O3 -march=native`. Adjust the
-  rpath when building elsewhere.
+- `CMakeLists.txt` sets the rpath to `${CMAKE_CURRENT_SOURCE_DIR}` and compiles with
+  `-O3 -march=native`. The build is in-source, so that is the repo root, which is where
+  `libchess.dylib` lands — no adjustment is needed when building elsewhere.
 - Build **without** extra SIMD macros. `-march=native` alone is measurably faster here than
   forcing `USE_NEON`.
 

@@ -83,10 +83,15 @@ elseif(MSVC)
 else()
     # GCC/Clang on non-Windows
     message(STATUS "Non-MSVC Clang/GCC compiler detected.")
-    set(CMAKE_INSTALL_RPATH "/Users/ap/libchess")
+    # The rpath is the SOURCE DIRECTORY, because the build is in-source: the generated Makefile,
+    # CMakeCache.txt and libchess.dylib all land in the repo root, so this is where the executables
+    # must look for the library at run time. It used to be the absolute path of one machine's
+    # checkout, which both leaked a home directory into a public repository and silently produced
+    # executables that could not find libchess elsewhere.
+    set(CMAKE_INSTALL_RPATH "${CMAKE_CURRENT_SOURCE_DIR}")
     set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
-    target_link_options(chess PRIVATE -Wl,-rpath,/Users/ap/libchess)
+    target_link_options(chess PRIVATE -Wl,-rpath,${CMAKE_CURRENT_SOURCE_DIR})
     
     # -Wall rather than a list of -Wno-*: every source below is clean under it.
     # tbcore.c is deliberately not a target source -- tbprobe.c #includes it, and the

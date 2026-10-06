@@ -7,9 +7,14 @@ At depth 1 the two move LISTS are diffed, which names the illegal move libchess
 generates (or the legal one it misses).
 """
 import subprocess, sys
+import os
+#Paths are overridable by environment variable and otherwise resolved under the home directory at run
+#time: this is a public repository, so one machine's absolute paths do not belong in it.
+def _p(var, default):
+    return os.environ.get(var) or os.path.expanduser(default)
 
-SF = "/Users/ap/stockfish-macos-m1-apple-silicon"
-PERFT = "/Users/ap/libchess/perft"
+SF = _p("STOCKFISH", "~/stockfish-macos-m1-apple-silicon")
+PERFT = _p("PERFT", "~/libchess/perft")
 
 class Stock:
     def __init__(self):

@@ -1,5 +1,5 @@
 //For MacOS using clang
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp
+//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess chess_mcts_smp.cpp uci_smp.cpp tbcore.c tbprobe.c -o chess_mcts_smp
 
 // For linux or Windows using mingw
 // add -mpopcnt for X86_64

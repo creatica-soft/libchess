@@ -1,4 +1,4 @@
-// c++ -std=c++20 -w -O2 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o find_960_bug find_960_bug.cpp
+// c++ -std=c++20 -w -O2 -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess -o find_960_bug find_960_bug.cpp
 //
 // Finds the FIRST move after which reconcile() disagrees, and prints the exact path to it.
 //

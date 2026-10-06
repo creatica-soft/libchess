@@ -46,7 +46,7 @@ EVAL_HI=${EVAL_HI:-500}
 OFFSET=${OFFSET:-0}
 WANT=${1:-20000}
 
-# WHICH ENGINE. gen_targets defaults to /Users/ap/libchess/creatica, and this script used to say
+# WHICH ENGINE. gen_targets defaults to $HOME/libchess/creatica, and this script used to say
 # nothing about it, so a dataset was searched by whatever binary happened to be sitting at that
 # path -- which is rebuilt constantly. The 65k records of 2026-09-08 were produced by an engine
 # that no longer exists, and nothing in the run recorded what it was. Two changes fix that: the

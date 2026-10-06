@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-writable-strings -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o pgn_parser pgn_parser.cpp
+// c++ -std=c++20 -Wno-writable-strings -O3 -flto -Wl,-lchess,-rpath,$HOME/libchess -L $HOME/libchess -o pgn_parser pgn_parser.cpp
 #include <iostream>
 #include <fstream>
 #include <string>

@@ -1,4 +1,4 @@
-//c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -I /Users/ap/libchess -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn9.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
+//c++ -std=c++17 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -I $HOME/Downloads/libtorch/include -I $HOME/Downloads/libtorch/include/torch/csrc/api/include -I $HOME/libchess -L $HOME/Downloads/libtorch/lib -L $HOME/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,$HOME/Downloads/libtorch/lib,-rpath,$HOME/libchess chess_cnn_mcts.cpp uci.cpp chess_cnn9.cpp tbcore.c tbprobe.c -o chess_cnn_mcts
 
 #include "nnue/types.h"
 #include "nnue/position.h"

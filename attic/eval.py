@@ -2,7 +2,7 @@ import sys
 from chess import ffi, lib
 
 if __name__ == "__main__":
-  engineName = ffi.new('char[]', b'/Users/ap/libchess/stockfish-macos-m1-apple-silicon')
+  engineName = ffi.new('char[]', b'$HOME/libchess/stockfish-macos-m1-apple-silicon')
   movetime = 5000 # in ms
   depth = 20 # in plies
   hashSize = 16 # in MB

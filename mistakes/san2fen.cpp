@@ -1,4 +1,6 @@
-// c++ -std=c++20 -Wall -O2 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o mistakes/san2fen mistakes/san2fen.cpp
+// c++ -std=c++20 -Wall -O2 -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,@loader_path/.. -o mistakes/san2fen mistakes/san2fen.cpp
+// The rpath is RELATIVE -- @loader_path/.. is the repository root, one level up from mistakes/, which is
+// where libchess.dylib lands. An absolute rpath bakes one machine's home directory into a tracked binary.
 // SAN moves on stdin; prints "<plies>\t<final FEN>\t<UCI move list>".
 // The STARTING position is argv[1], one quoted argument, defaulting to the standard start.
 // (An earlier version of this comment claimed a "FEN <fen>" line could be given on stdin. It

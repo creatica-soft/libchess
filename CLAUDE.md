@@ -23,7 +23,7 @@ CMake targets: `chess` (the shared library), `test_pos`, `test_nnue`, `test_tb`,
 
 Notes:
 - The library is ~110 MB because both NNUE nets are embedded at compile time via `incbin`. Net filenames are `#define`s in `nnue/evaluate.h` (`EvalFileDefaultNameBig` / `EvalFileDefaultNameSmall`); switching nets means editing that header and rebuilding `chess`.
-- `CMakeLists.txt` hardcodes `-rpath /Users/ap/libchess` and `-O3 -march=native`. Adjust the rpath when building elsewhere.
+- `CMakeLists.txt` sets the rpath to `${CMAKE_CURRENT_SOURCE_DIR}` and compiles with `-O3 -march=native`. Because the build is in-source, the rpath is the repo root, which is where `libchess.dylib` lands — so it needs no adjustment when building elsewhere. It used to be one machine's absolute path, which leaked a home directory into a public repo and produced executables that could not find the library on any other checkout.
 - The build compiles with `-Wall` and **no `-Wno-*` suppressions**, and is warning-free. Keep it that way: fix the warning rather than silencing it, and do not paste `-Wno-*` flags into a new file's build-command comment. `tbcore.c` is deliberately not a target source — `tbprobe.c` `#include`s it, so a separate object would export nothing and only add warnings.
 - Files outside CMake carry their exact compile command in the **first comment line of the file** — that is the convention here. E.g. `creatica.cpp` starts with the `c++ -std=c++20 -Wall ... creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica` line. Use it rather than inventing flags. Each of those lines names the same sources as its CMake target and must be kept in step with `CMakeLists.txt`; the g++/mingw variants carry a note saying they are not compile-tested, because there is no GCC and no Windows here.
 
@@ -42,7 +42,7 @@ There is no test framework. Each `test_*` is a standalone binary that takes a **
 
 `test_pos` is the correctness harness worth running after any change to move generation, `do_move`/`undo_move`, hashing, or the NNUE accumulator. For every legal move in a position it checks: FEN round-trip, `reconcile()` (bitboards vs. mailbox agree), incremental `updateHash()` vs. full `getHash()`, incremental NNUE accumulator vs. a fresh context, and the result against an external Stockfish's own eval. It reports failures on stdout and returns early — read the output; the exit code is not a verdict.
 
-External paths (`STOCKFISH`, `SYZYGY_PATH`, movetime, hash size, thread count) are `#define`s at the top of each test file, not CLI flags. Change the `#define` and rebuild. Current values assume `/Users/ap/stockfish-macos-m1-apple-silicon` and `/Users/ap/syzygy` (5-piece tables).
+External paths (`STOCKFISH`, `SYZYGY_PATH`, movetime, hash size, thread count) are `#define`s at the top of each test file, not CLI flags. Change the `#define` and rebuild. Current values are absolute paths into the author's home directory (`$HOME/stockfish-macos-m1-apple-silicon`, `$HOME/syzygy`) (5-piece tables).
 
 ## Required initialization
 

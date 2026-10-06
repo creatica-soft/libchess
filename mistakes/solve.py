@@ -3,17 +3,22 @@
 # bot's settings, and record which move the engine prefers after every second of search, and the root priors.
 # SOLVED AT t: the preferred move is Stockfish-acceptable from t to the end of the search.
 import subprocess, sys, os, threading, time, re, queue
+import os
+#Paths are overridable by environment variable and otherwise resolved under the home directory at run
+#time: this is a public repository, so one machine's absolute paths do not belong in it.
+def _p(var, default):
+    return os.environ.get(var) or os.path.expanduser(default)
 conf, out_path, engine, ms = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 T = os.path.dirname(os.path.abspath(__file__))
 dump = T + "/solve_dump.tsv"
 if os.path.exists(dump): os.remove(dump)
 rows = [l.rstrip("\n").split("\t") for l in open(conf)][1:]
 p = subprocess.Popen([engine], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                     cwd="/Users/ap/libchess", env=dict(os.environ, CREATICA_LOG=T + "/solve.log"))
+                     cwd=_p("LIBCHESS", "~/libchess"), env=dict(os.environ, CREATICA_LOG=T + "/solve.log"))
 q = queue.Queue()
 threading.Thread(target=lambda: [q.put(l) for l in p.stdout], daemon=True).start()
 def send(s): p.stdin.write(s + "\n"); p.stdin.flush()
-opts = [("Hash", 2048), ("Threads", 4), ("SyzygyPath", "/Users/ap/syzygy"), ("PolicyWeights", "/Users/ap/libchess/nnue_policy_pisp2.bin"),
+opts = [("Hash", 2048), ("Threads", 4), ("SyzygyPath", _p("SYZYGY_PATH", "~/syzygy")), ("PolicyWeights", _p("LIBCHESS", "~/libchess") + "/nnue_policy_pisp2.bin"),
         ("BlendScale", 102), ("TreeResetBelow", 1000), ("TreeResetHollow", 900), ("MultiPV", 1),
         ("IntermittentInfoLines", "true"), ("FinalInfoLines", "true"), ("VisitDumpFile", dump)] + [tuple(kv.split("=", 1)) for kv in os.environ.get("EXTRA", "").split(",") if "=" in kv]
 send("uci")

@@ -1,4 +1,4 @@
-//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o nnue_eval nnue_eval.cpp
+//c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess -o nnue_eval nnue_eval.cpp
 
 #include "nnue/types.h"
 #include "nnue/position.h"
