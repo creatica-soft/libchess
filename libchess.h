@@ -1,5 +1,5 @@
 /// 
-/// c++ -std=c++20 -Wall -shared -O3 -flto -DUSE_PTHREADS -DNDEBUG -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -DUSE_NEON_DOTPROD -Wl,-dylib,-rpath,/Users/ap/libchess -o libchess.dylib board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
+/// c++ -std=c++20 -Wall -shared -O3 -flto -DUSE_PTHREADS -DNDEBUG -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -DUSE_NEON_DOTPROD -Wl,-dylib,-rpath,$HOME/libchess -o libchess.dylib board.cpp engine.cpp fen.cpp pgn.cpp move.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp
 
 /// Call Stockfish::Bitboards::init() once at start -- move generation segfaults without it.
 /// (init_magic_bitboards()/cleanup_magic_bitboards() are gone; board.cpp uses attacks_bb<>.)

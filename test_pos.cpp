@@ -1,8 +1,10 @@
-// c++ -std=c++20 -Wall -O3 -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o test_pos test_pos.cpp
+// c++ -std=c++20 -Wall -O3 -Wl,-lchess,-rpath,$HOME/libchess -L $HOME/libchess -o test_pos test_pos.cpp
 
 //NNUE full eval vs incremental eval test confirms that incremental is faster by one order of magnitude, i.e. about 10 times on average
 //full eval is tens of microseconds per position vs incremental eval is just microseconds per position on M1
 
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <iostream>
 #include <fstream>
@@ -13,12 +15,34 @@
 //#include "tbprobe.h"
 #include "libchess.h"
 
-#define STOCKFISH "/Users/ap/stockfish-macos-m1-apple-silicon"
+//stockfish-macos-m1-apple-silicon under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * stockfish_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/stockfish-macos-m1-apple-silicon", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define STOCKFISH stockfish_path_default()
 #define MOVETIME 2000
 #define DEPTH 0
 #define HASH 256
 #define THREADS 1
-#define SYZYGY_PATH "/Users/ap/syzygy"
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define SYZYGY_PATH syzygy_path_default()
 #define LOGGING false
 #define LIMIT_STRENGTH false
 #define ELO 2600

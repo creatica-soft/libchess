@@ -4,7 +4,7 @@
 #   game  ply  side  fen_before  move_uci  move_san  cp_before  cp_after  sf_best   (cp from the MOVER's point of view)
 import re, subprocess, sys
 pgn, out_path, ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
-SAN2FEN = "/Users/ap/libchess/mistakes/san2fen"
+SAN2FEN = _p("SAN2FEN", "~/libchess/mistakes/san2fen")
 START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 games = []
 for chunk in re.split(r"\n\n(?=\[Event )", open(pgn).read().strip()):
@@ -13,7 +13,7 @@ for chunk in re.split(r"\n\n(?=\[Event )", open(pgn).read().strip()):
     body = re.sub(r"\{[^}]*\}", " ", body)
     sans = [t for t in body.split() if not re.match(r"^(\d+\.+|1/2-1/2|1-0|0-1|\*)$", t)]
     games.append((tags, sans))
-sf = subprocess.Popen(["/Users/ap/stockfish-macos-m1-apple-silicon"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+sf = subprocess.Popen([_p("STOCKFISH", "~/stockfish-macos-m1-apple-silicon")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 def send(s): sf.stdin.write(s + "\n"); sf.stdin.flush()
 def until(prefix):
     last = None
@@ -22,7 +22,7 @@ def until(prefix):
         if l.startswith("info") and " score " in l and " pv " in l: last = l
         if l.startswith(prefix): return l, last
 send("uci"); until("uciok")
-for k, v in (("Threads", 4), ("Hash", 512), ("SyzygyPath", "/Users/ap/syzygy")): send("setoption name %s value %s" % (k, v))
+for k, v in (("Threads", 4), ("Hash", 512), ("SyzygyPath", _p("SYZYGY_PATH", "~/syzygy"))): send("setoption name %s value %s" % (k, v))
 send("isready"); until("readyok")
 cache = {}
 def score(fen):   # cp from the side to move's point of view, and SF's best move
@@ -37,6 +37,11 @@ def score(fen):   # cp from the side to move's point of view, and SF's best move
     cache[fen] = (cp, bm.split()[1] if len(bm.split()) > 1 else "")
     return cache[fen]
 import os
+import os
+#Paths are overridable by environment variable and otherwise resolved under the home directory at run
+#time: this is a public repository, so one machine's absolute paths do not belong in it.
+def _p(var, default):
+    return os.environ.get(var) or os.path.expanduser(default)
 done = set()
 if os.path.exists(out_path):
     done = {l.split("\t")[0] for l in open(out_path)}

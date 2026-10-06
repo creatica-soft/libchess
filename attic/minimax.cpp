@@ -1,4 +1,4 @@
-// compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o minimax minimax.cpp
+// compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -Wl,-lchess,-rpath,$HOME/libchess -L $HOME/libchess -o minimax minimax.cpp
 #include "nnue/types.h"
 #include "nnue/position.h"
 #include "nnue/evaluate.h"
@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 const int INF = 1000000000;
-#define SYZYGY_PATH "/Users/ap/syzygy"
+#define SYZYGY_PATH "/path/to/syzygy"
 #define TT_SIZE 1024 //in MB
 
 struct NNUEContext {

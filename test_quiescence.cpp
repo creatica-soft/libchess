@@ -1,4 +1,6 @@
-// compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o test_quiescence tbcore.c tbprobe.c test_quiescence.cpp
+// compile with c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -Wl,-lchess,-rpath,$HOME/libchess -L $HOME/libchess -o test_quiescence tbcore.c tbprobe.c test_quiescence.cpp
+#include <cstdio>
+#include <cstdlib>
 #include "nnue/types.h"
 #include "nnue/position.h"
 #include "nnue/evaluate.h"
@@ -15,7 +17,18 @@
 #include "tbprobe.h"
 #include "libchess.h"
 
-#define SYZYGY_PATH "/Users/ap/syzygy"
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define SYZYGY_PATH syzygy_path_default()
 //#define PROBABILITY_MASS 100
 #define EVAL_SCALE 62
 #define TEMPERATURE 58

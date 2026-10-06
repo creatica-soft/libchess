@@ -1,4 +1,4 @@
-//c++ -Wno-writable-strings -std=c++20 -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lcurl,-lchess,-rpath,/Users/ap/libchess lichess_bot2.cpp -o lichess_bot2
+//c++ -Wno-writable-strings -std=c++20 -O3 -flto -I $HOME/libchess -L $HOME/libchess -Wl,-lcurl,-lchess,-rpath,$HOME/libchess lichess_bot2.cpp -o lichess_bot2
 
 #include <functional>
 #include <iostream>
@@ -21,12 +21,12 @@
 
 #define INTERMITTENT_INFO_LINES false
 #define FINAL_INFO_LINES false
-#define CREATICA_PATH "/Users/ap/libchess/creatica-shared-root-quiescence"
+#define CREATICA_PATH "/path/to/libchess/creatica-shared-root-quiescence"
 #define DEPTH 0
 #define MOVETIME 0
 #define HASH 2048
 #define THREADS 8
-#define SYZYGY_PATH "/Users/ap/syzygy"
+#define SYZYGY_PATH "/path/to/syzygy"
 #define BOT_USERNAME "creaticachessbot2"  // Lowercase, as per API IDs
 #define DRAW_CP 30 //accept draw if score cp is less than this value in centipawns
 #define MIN_ELO 2200

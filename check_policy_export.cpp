@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O2 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o check_policy_export check_policy_export.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O2 -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess -o check_policy_export check_policy_export.cpp
 //
 // DOES THE ENGINE COMPUTE THE MODEL THAT WAS TRAINED?
 //

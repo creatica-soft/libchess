@@ -8,7 +8,8 @@
 # and each one is silent in the results table -- a crashed engine, an illegal move, a stall and
 # a lost-on-time game all look like an ordinary loss from the score alone.
 
-cd /Users/ap/libchess || exit 1
+#The repository is wherever this script lives, so the path does not have to be written in.
+cd "$(cd "$(dirname "$0")" && pwd)" || exit 1
 SINCE="${1:-$(date -u -v-1d +%Y-%m-%d)}"
 
 echo "=== overnight check, games since ${SINCE} (UTC) ==="

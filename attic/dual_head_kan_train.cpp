@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I /Users/ap/Downloads/libtorch2/include -I /Users/ap/Downloads/libtorch2/include/torch/csrc/api/include -L /Users/ap/Downloads/libtorch2/lib -L /Users/ap/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch2/lib,-rpath,/Users/ap/libchess -o dual_head_kan_train dual_head_kan_train.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -O3 -flto -I $HOME/Downloads/libtorch2/include -I $HOME/Downloads/libtorch2/include/torch/csrc/api/include -L $HOME/Downloads/libtorch2/lib -L $HOME/libchess -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,$HOME/Downloads/libtorch2/lib,-rpath,$HOME/libchess -o dual_head_kan_train dual_head_kan_train.cpp
 
 #include <torch/torch.h>
 #include <vector>

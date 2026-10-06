@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess bin2fen.cpp -o bin2fen
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess bin2fen.cpp -o bin2fen
 //
 // Read the position bins written by pgn_parser.cpp and print one FEN per line, with the
 // Stockfish evaluation that came with it.

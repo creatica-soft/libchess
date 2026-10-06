@@ -10,12 +10,12 @@ if __name__ == "__main__":
   datasetTest = 'end-games-test'
   dataset = datasetTrain # datasetTrain, datasetTest or None
   ds = ffi.new('char[]', dataset.encode()) # it will be appended by thread number and .csv ext
-  engine = ffi.new('char[]', b'/Users/ap/libchess/stockfish-macos-m1-apple-silicon')
+  engine = ffi.new('char[]', b'$HOME/libchess/stockfish-macos-m1-apple-silicon')
   movetime = 5000 # ms - this affects the speed, faster with less time
   depth = 30 # in halfmoves - affects the speed, faster with shallower depth
   hashSize = 64 # in MB
   threadNumber = 1 # chess engine number of threads
-  syzygyPath = ffi.new('char[]', b'/Users/ap/libchess/syzygy/')
+  syzygyPath = ffi.new('char[]', b'$HOME/libchess/syzygy/')
   multiPV = 1 #number of variations provided by chess engine
   writedebug = False
   threads = 8 # end game generation number of threads

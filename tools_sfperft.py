@@ -6,8 +6,13 @@ generated against Stockfish under UCI_Chess960 rather than recalled -- a wrong
 expectation would be indistinguishable from a generator bug. This produces them.
 """
 import subprocess, sys, time
+import os
+#Paths are overridable by environment variable and otherwise resolved under the home directory at run
+#time: this is a public repository, so one machine's absolute paths do not belong in it.
+def _p(var, default):
+    return os.environ.get(var) or os.path.expanduser(default)
 
-SF = "/Users/ap/stockfish-macos-m1-apple-silicon"
+SF = _p("STOCKFISH", "~/stockfish-macos-m1-apple-silicon")
 
 def main():
     fen_file = sys.argv[1]

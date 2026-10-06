@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess gen_targets.cpp -o gen_targets
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -Wno-strncat-size -Wno-vla-cxx-extension -O3 -flto -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess gen_targets.cpp -o gen_targets
 //
 // Search a list of positions with creatica and let it dump the root visit distribution for each
 // one, producing policy-distillation targets.
@@ -30,6 +30,28 @@ static Engine     eng;
 static Evaluation evaluation;
 static Evaluation * evaluations[1] = { &evaluation };
 
+//libchess/creatica under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * creatica_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/libchess/creatica", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
 static const char * env_or(const char * k, const char * d) {
     const char * v = std::getenv(k);
     return (v && *v) ? v : d;
@@ -40,14 +62,14 @@ static long env_l(const char * k, long d) {
 }
 
 int main(int argc, char ** argv) {
-    const char * enginePath = env_or("CREATICA_ENGINE", "/Users/ap/libchess/creatica");
+    const char * enginePath = env_or("CREATICA_ENGINE", creatica_path_default());
     // Defaults to EMPTY, meaning "no dump, report on stdout". An empty environment variable is
     // indistinguishable from an unset one here, so VISIT_DUMP= could not have selected that mode
     // if the default were a filename -- it would silently fall back to writing targets.tsv and
     // print nothing, which is exactly what happened the first time.
     const char * dumpPath   = env_or("VISIT_DUMP",      "");
     const char * tag        = env_or("GAME_TAG",        "positions");
-    const char * syzygy     = env_or("SYZYGY_PATH",     "/Users/ap/syzygy");
+    const char * syzygy     = env_or("SYZYGY_PATH",     syzygy_path_default());
     const long   movetime   = env_l("MOVETIME", 3000);
     const long   threads    = env_l("THREADS",  4);
     const long   hash_mb    = env_l("HASH",     2048);

@@ -1,5 +1,5 @@
-//c++ -O3 -I /opt/anaconda3/include -I /opt/anaconda3/include/torch/csrc/api/include -L /opt/anaconda3/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/opt/anaconda3/lib,-rpath,/Users/ap/libchess -o chess_trans train_chess_trans.cpp chess_trans.cpp
-//c++ -O3 -I /Users/ap/Downloads/libtorch/include -I /Users/ap/Downloads/libtorch/include/torch/csrc/api/include -L /Users/ap/Downloads/libtorch/lib -L /Users/ap/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/Users/ap/Downloads/libtorch/lib,-rpath,/Users/ap/libchess -o chess_trans train_chess_trans.cpp chess_trans.cpp
+//c++ -O3 -I /opt/anaconda3/include -I /opt/anaconda3/include/torch/csrc/api/include -L /opt/anaconda3/lib -L $HOME/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,/opt/anaconda3/lib,-rpath,$HOME/libchess -o chess_trans train_chess_trans.cpp chess_trans.cpp
+//c++ -O3 -I $HOME/Downloads/libtorch/include -I $HOME/Downloads/libtorch/include/torch/csrc/api/include -L $HOME/Downloads/libtorch/lib -L $HOME/libchess -std=c++17 -Wl,-ltorch,-ltorch_cpu,-lc10,-lchess,-rpath,$HOME/Downloads/libtorch/lib,-rpath,$HOME/libchess -o chess_trans train_chess_trans.cpp chess_trans.cpp
 #include "chess_trans.h"
 #include <torch/torch.h>
 #include <torch/script.h>
@@ -539,8 +539,8 @@ int main(int argc, char ** argv) {
     const int bmpr_queue_len_train = 3;
     const int bmpr_queue_len_test = 3;
     const int accumulation_steps = 16; // Accumulate gradients over 16 batches
-    //const std::string pgn_dir = "/Users/ap/Downloads/Lichess Elite Database/";
-    const std::string pgn_dir = "/Users/ap/pgn";
+    //const std::string pgn_dir = "/path/to/Downloads/Lichess Elite Database/";
+    const std::string pgn_dir = "/path/to/pgn";
     const std::vector<std::string> test_files = {"KingBaseLite2019.pgn"};
 
     // Device selection

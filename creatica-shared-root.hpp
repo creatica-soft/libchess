@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "nnue/nnue/nnue_accumulator.h"
 
 #ifdef _MSC_VER
@@ -43,7 +45,18 @@
 #define THREADS 4
 #define MULTI_PV 5
 #define SYZYGY_PATH_DEFAULT "<empty>"
-#define SYZYGY_PATH "/Users/ap/syzygy"
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static inline const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+#define SYZYGY_PATH syzygy_path_default()
 #define HASH 2048 //default, GUI may set it via Hash option (once full, expansion won't happen!)
 #define EXPLORATION_MIN 65 // used in formular for exploration constant decay with depth
 #define EXPLORATION_MAX 160 //smaller value favor exploitation, i.e. deeper tree vs wider tree

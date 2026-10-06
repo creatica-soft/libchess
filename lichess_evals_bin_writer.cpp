@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-writable-strings -O3 -flto -I /Users/ap/libchess  -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess lichess_evals_bin_writer.cpp -o lichess_evals_bin_writer
+// c++ -std=c++20 -Wno-writable-strings -O3 -flto -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess lichess_evals_bin_writer.cpp -o lichess_evals_bin_writer
 //lichess_db_eval.jsonl contains at least 3,003,377 illegal positions out of 288,977,589 
 //such as rnbqk1nr/1pp2ppp/pbnp4/3Pp3/B3P3/2P2N2/PP3PPP/RNBQKBNR b KQkq - 0 1
 //so we need to take care of at least skipping positions with more than 32 pieces and we should check for other things too!

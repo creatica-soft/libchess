@@ -1,5 +1,7 @@
-// compile with c++ -std=c++20 -Wall -O3 -flto -Wl,-lchess,-rpath,/Users/ap/libchess -L /Users/ap/libchess -o tournament tournament.cpp
+// compile with c++ -std=c++20 -Wall -O3 -flto -Wl,-lchess,-rpath,$HOME/libchess -L $HOME/libchess -o tournament tournament.cpp
 
+#include <cstdio>
+#include <cstdlib>
 #include <errno.h>
 #include <ctype.h>
 #include <string.h>
@@ -18,9 +20,31 @@
 // --- Configuration ---
 //A/B test of ONE option. Both sides are the same binary, so any difference in result is
 //attributable to ReuseTree and nothing else -- no difference in net, search, or build.
-const char * ENGINE_1 = "/Users/ap/libchess/creatica";   // ReuseTree ON
-const char * ENGINE_2 = "/Users/ap/libchess/creatica";   // ReuseTree OFF (the incumbent)
-const char * SYZYGY_PATH = "/Users/ap/syzygy";
+//libchess/creatica under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * creatica_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/libchess/creatica", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+//syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
+//path -- this is a public repository. Where the caller reads an environment variable it still wins; this
+//is only the fallback. Resolved once, on the first call, before any thread is started.
+static const char * syzygy_path_default(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        const char * h = std::getenv("HOME");
+        std::snprintf(buf, sizeof buf, "%s/syzygy", (h && *h) ? h : ".");
+    }
+    return buf;
+}
+const char * ENGINE_1 = creatica_path_default();   // ReuseTree ON
+const char * ENGINE_2 = creatica_path_default();   // ReuseTree OFF (the incumbent)
+const char * SYZYGY_PATH = syzygy_path_default();
 #define PGN_FILE "reuse_match.pgn"
 //1000 ms rather than 2000: a comparison is only as good as its sample size, and the ordering of
 //two configurations survives a shorter time control even where the absolute strength does not.

@@ -1,4 +1,4 @@
-// c++ -std=c++20 -w -O3 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess bench_map.cpp -o bench_map
+// c++ -std=c++20 -w -O3 -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess bench_map.cpp -o bench_map
 //
 // Isolates the one operation the collector actually spends its time in, because the self-play
 // A/B could not: two engines playing from the same position diverge into different games, so
