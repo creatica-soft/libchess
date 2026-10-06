@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o bench_blend bench_blend.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess -o bench_blend bench_blend.cpp
 //
 // THE YARDSTICK: how good is the incumbent prior, really?
 //
@@ -28,7 +28,7 @@
 // and 0 under the full one). Only lichess_db_pv_eval_*.bin has from_sq/to_sq/promo.
 // lichess_db_pv_eval_test.bin is the held-out file.
 //
-//   ./bench_prior_acc /Users/ap/lichess_db_pv_eval_test.bin [max_positions] [temperature]
+//   ./bench_prior_acc $HOME/lichess_db_pv_eval_test.bin [max_positions] [temperature]
 //
 // MEASURED BASELINE, 20,000 positions of lichess_db_pv_eval_test.bin, temperature 0.58:
 //   mean branching     28.6 moves/position
@@ -314,7 +314,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: %s <shard.bin> [max_positions] [temperature]\n"
-            "  e.g. %s /Users/ap/lichess_db_eval_1.bin 20000 0.58\n", argv[0], argv[0]);
+            "  e.g. %s ~/lichess_db_eval_1.bin 20000 0.58\n", argv[0], argv[0]);
         return 2;
     }
     const size_t MAXPOS = argc > 2 ? std::strtoul(argv[2], nullptr, 10) : 20000;
@@ -409,12 +409,38 @@ int main(int argc, char ** argv) {
         //evaluation sees one ply ahead by construction; the policy head only sees the
         //current position. A move that is good for reasons visible only after it is played
         //is invisible to the policy and obvious to the evaluation.
-        static const int PROMO2[4] = {PieceTypeNone, Knight, Bishop, Queen};
-        const int pv_src2 = p.from_sq[0], pv_dst2 = p.to_sq[0], pv_pr2 = PROMO2[p.promo[0] & 3];
+        //DECODE THE STORED MOVE THE WAY THE WRITER WROTE IT. Two mismatches used to make this tool
+        //DROP a record instead, and it dropped exactly the records the policy is worst at.
+        //
+        //Castling is stored king-to-ROOK -- e1h1, e1a1, e8h8, e8a8 -- while the generator emits
+        //king-to-g1/c1, so no generated move ever matched. Promotions are stored 0=Q, 1=N, 2=B, 3=R
+        //(see parse_uci_move() in lichess_evals_bin_writer.cpp, whose 'q' case assigns 0), while this
+        //read them as {none, N, B, Q}: a queen promotion looked like no promotion and matched nothing,
+        //and a rook promotion looked like a queen. promo=0 is also the default for a non-promotion, so
+        //the board resolves it -- a pawn arriving on the last rank promotes, and there 0 means queen.
+        //
+        //Measured on 203,296 records: 3,296 failed to match, 71% castling, 29% promotions, nothing
+        //else; with both decoded, zero. That matters because the missing positions are not a random
+        //sample. Over the 2,292 test positions where castling is best, the policy alone puts it in its
+        //top six 0.0% of the time against 92.0% for the child evaluations, so excluding them flattered
+        //every published figure: the deployed net reads 39.02 / 74.10 / 83.09 on the full set against
+        //the 39.46 / 74.95 / 84.04 recorded from the truncated one.
+        static const int PROMO2[4] = {Queen, Knight, Bishop, Rook};
+        int pv_src2 = p.from_sq[0], pv_dst2 = p.to_sq[0];
+        int pv_pr2 = PieceTypeNone;
+        {
+            const int mover = (int)board.piecesOnSquares[pv_src2] & 7;
+            const int last  = (board.sideToMove == ColorWhite) ? 7 : 0;
+            if (mover == Pawn && (pv_dst2 >> 3) == last) pv_pr2 = PROMO2[p.promo[0] & 3];
+            const int dp = (int)board.piecesOnSquares[pv_dst2];
+            //Our OWN rook: a king capturing an enemy rook beside it is an ordinary move.
+            if (mover == King && (dp & 7) == Rook && (((dp >> 3) & 1) == (int)board.sideToMove))
+                pv_dst2 = (pv_src2 & ~7) + (((pv_dst2 & 7) > (pv_src2 & 7)) ? 6 : 2);
+        }
         bool pv_present = false;
         for (const auto& m : moves) {
             if (m.src == pv_src2 && m.dst == pv_dst2 &&
-                (m.promo == pv_pr2 || (p.promo[0] == 0 && m.promo == PieceTypeNone))) {
+                m.promo == pv_pr2) {
                 pv_present = true; break;
             }
         }
@@ -424,7 +450,7 @@ int main(int argc, char ** argv) {
             int grank = 0; double gkey = -1e18;
             for (const auto& m : moves)
                 if (m.src == pv_src2 && m.dst == pv_dst2 &&
-                    (m.promo == pv_pr2 || (p.promo[0] == 0 && m.promo == PieceTypeNone))) gkey = m.pol;
+                    m.promo == pv_pr2) gkey = m.pol;
             for (const auto& m : moves) if (m.pol > gkey) ++grank;
             if (grank == 0) ++gate_top1;
             if (grank <  4) ++gate_top4;
@@ -454,7 +480,7 @@ int main(int argc, char ** argv) {
             double pv_key = -1e18;
             for (const auto& m : moves) {
                 if (m.src == pv_src2 && m.dst == pv_dst2 &&
-                    (m.promo == pv_pr2 || (p.promo[0] == 0 && m.promo == PieceTypeNone)))
+                    m.promo == pv_pr2)
                     pv_key = SCALE * (w * (m.pol / 0.75) + (1.0 - w) * (m.score / 0.58));
             }
             for (const auto& m : moves) {
@@ -501,7 +527,7 @@ int main(int argc, char ** argv) {
                 for (size_t q = 0; q < moves.size(); ++q) {
                     const auto& m = moves[q];
                     if (m.src == pv_src2 && m.dst == pv_dst2 &&
-                        (m.promo == pv_pr2 || (p.promo[0] == 0 && m.promo == PieceTypeNone)))
+                        m.promo == pv_pr2)
                         pv_p = ps[q] / tot2;
                 }
                 std::vector<double> sorted;
