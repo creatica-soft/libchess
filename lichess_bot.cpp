@@ -244,7 +244,7 @@ const int         nb           = env_int("CREATICA_NB", NUMBER_OF_BOTS);
 //played out anyway. Empty disables it.
 const std::string chat_draw_declined =
     env_str_or_empty("CREATICA_CHAT_DRAW_DECLINED",
-            "solar energy is free in Queensland - burn, baby, burn");
+            "solar energy is abundant in Queensland - burn, baby, burn... but don't you want to save time and play more games?");
 //Per instance, so two bots running side by side do not interleave into one file.
 std::mutex results_mutex;
 const std::string results_path = env_str("CREATICA_RESULTS", ("results_" + bot_username + ".csv").c_str());
