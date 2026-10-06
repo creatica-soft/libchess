@@ -1,4 +1,4 @@
-// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -march=native -I /Users/ap/libchess -L /Users/ap/libchess -Wl,-lchess,-rpath,/Users/ap/libchess -o bench_policy_spatial bench_policy_spatial.cpp
+// c++ -std=c++20 -Wno-deprecated -Wno-writable-strings -Wno-deprecated-declarations -O3 -march=native -I $HOME/libchess -L $HOME/libchess -Wl,-lchess,-rpath,$HOME/libchess -o bench_policy_spatial bench_policy_spatial.cpp
 //
 // WHAT DOES THE SPATIAL TERM COST THE ENGINE?
 //
@@ -135,16 +135,28 @@ int main(int argc, char ** argv) {
     char err[512];
     if (!policy_net_load(pnet, wp, err, sizeof err)) { std::fprintf(stderr, "FATAL: %s\n", err); return 2; }
 
-    psp.planes = 26; psp.dim = 16;
+    psp.planes = 26;
+    //DIM is the width of the per-square vectors u and v, and therefore both the projection's output
+    //size and the per-move dot product's length -- the one spatial dimension that costs something on
+    //every move rather than once a position. PolicySpatialScratch is sized for 32.
+    psp.dim = std::getenv("SPATIAL_DIM") ? std::atoi(std::getenv("SPATIAL_DIM")) : 16;
+    if (psp.dim < 1) psp.dim = 1; else if (psp.dim > 32) psp.dim = 32;
     psp.ch = std::getenv("SPATIAL_CH") ? std::atoi(std::getenv("SPATIAL_CH")) : 32;
     if (psp.ch < 1) psp.ch = 1; else if (psp.ch > 64) psp.ch = 64;   // PolicySpatialScratch holds 64
+    //SPATIAL_HEADS=6 measures the per-piece form (format 9). It changes the u/v PROJECTION, which
+    //runs once per position, and not the per-move dot product, which still reads dim numbers -- so
+    //the whole difference should land in spatial_forward and none of it in spatial_score.
+    psp.layers = std::getenv("SPATIAL_LAYERS") ? std::atoi(std::getenv("SPATIAL_LAYERS")) : 2;
+    if (psp.layers < 1) psp.layers = 1; else if (psp.layers > 2) psp.layers = 2;
+    psp.heads = std::getenv("SPATIAL_HEADS") ? std::atoi(std::getenv("SPATIAL_HEADS")) : 1;
+    if (psp.heads != 1 && psp.heads != 6) psp.heads = 1;
     unsigned seed = 12345;
     fill_random(psp.Wc1, (size_t)psp.ch * psp.planes * 9, seed);
     fill_random(psp.bc1, psp.ch, seed);
     fill_random(psp.Wc2, (size_t)psp.ch * psp.ch * 9, seed);
     fill_random(psp.bc2, psp.ch, seed);
-    fill_random(psp.Wu, (size_t)psp.ch * psp.dim, seed);
-    fill_random(psp.Wv, (size_t)psp.ch * psp.dim, seed);
+    fill_random(psp.Wu, (size_t)psp.ch * psp.dim * psp.heads, seed);
+    fill_random(psp.Wv, (size_t)psp.ch * psp.dim * psp.heads, seed);
     psp.loaded = true;
 
     std::vector<Pos> pos;
@@ -202,8 +214,9 @@ int main(int argc, char ** argv) {
                 } break;
         case 6: for (auto& p : pos) {
                     for (size_t i = 0; i < p.oriented.size(); ++i)
-                        sink += policy_spatial_score(psp, pscr, (int)(p.oriented[i] >> 6),
-                                                                (int)(p.oriented[i] & 63));
+                        sink += policy_spatial_score(psp, pscr, p.ptv[i],
+                                                    (int)(p.oriented[i] >> 6),
+                                                    (int)(p.oriented[i] & 63));
                 } break;
         }
         tot[stage] += ns(t0, clk::now());
@@ -227,7 +240,8 @@ int main(int argc, char ** argv) {
                 pos.size(), fenfile, reps, avg_moves);
     std::printf("policy net: %s  (in=%d h1=%d h2=%d out=%d, legality term %s)\n",
                 wp, pnet.in, pnet.h1, pnet.h2, pnet.out, pnet.has_wl ? "on" : "off");
-    std::printf("spatial:    planes=%d ch=%d dim=%d\n\n", psp.planes, psp.ch, psp.dim);
+    std::printf("spatial:    planes=%d ch=%d dim=%d layers=%d heads=%d\n\n",
+                psp.planes, psp.ch, psp.dim, psp.layers, psp.heads);
 
     std::printf("  %-18s %10s\n", "stage", "ns/node");
     std::printf("  %-18s %10.1f   <- the leaf evaluation, for scale\n", name[0], t_eval);

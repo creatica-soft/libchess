@@ -25,8 +25,9 @@
 #include <cstring>
 #include <vector>
 
-// The spatial term's weights and shape, read from a format 7/8 file's spatial block. Defined here,
-// ahead of PolicyNet, because a net carries one; what it computes is described at THE SPATIAL TERM.
+// The spatial term's weights and shape, read from a format 7, 8 or 9 file's spatial block. Defined
+// here, ahead of PolicyNet, because a net carries one; what it computes is described at THE SPATIAL
+// TERM.
 struct PolicySpatial {
   int planes = 0, ch = 0, dim = 0;
   //How many 3x3 convolutions. The second is the expensive one -- its cost grows with the SQUARE of
@@ -41,7 +42,12 @@ struct PolicySpatial {
   //0 = all in plane 12. Reproduced
   //exactly, because a model fed the planes it was not trained on is a different model.
   int layout = 0;
-  std::vector<float> Wc1, bc1, Wc2, bc2, Wu, Wv;   // Wc1[ch][planes][9], Wc2[ch][ch][9], Wu/Wv[ch][dim]
+  //How many u/v pairs the term carries: 1 shared by every piece (formats 7 and 8), or 6, one per
+  //MOVING PIECE TYPE (format 9). With one pair the term cannot say that a square is a good
+  //destination for a knight and a bad one for a queen, because it is a function of the two squares
+  //alone and is added to all six per-piece blocks of the move table unchanged. See THE SPATIAL TERM.
+  int heads = 1;
+  std::vector<float> Wc1, bc1, Wc2, bc2, Wu, Wv;   // Wc1[ch][planes][9], Wc2[ch][ch][9], Wu/Wv[ch][heads*dim]
   bool loaded = false;
 };
 
@@ -55,7 +61,7 @@ struct PolicyNet {
   //Set from the format version, not guessed from `out`: a wrong guess here silently reads the
   //wrong embedding row for every move, which scores at chance without any diagnostic.
   bool piece_indexed = false;
-  //THE SPATIAL TERM. Present in formats 7 and 8; spatial.loaded says whether this net has one.
+  //THE SPATIAL TERM. Present in formats 7, 8 and 9; spatial.loaded says whether this net has one.
   PolicySpatial spatial;
 };
 
@@ -94,16 +100,21 @@ inline bool policy_net_load(PolicyNet& net, const char* path, char* err, size_t 
   //FORMATS 7 AND 8 are 2 and 5 followed by a spatial block -- see policy_load_spatial(). An engine
   //that predates them refuses them, which is the point: a spatial net read as a 2 or a 5 would run
   //without its spatial term and score every move differently from how it was trained.
-  if (hdr[1] < 1 || hdr[1] > 8 || hdr[1] == 3 || hdr[1] == 6) {
+  //FORMAT 9 is format 8 whose spatial term carries one u/v pair PER MOVING PIECE TYPE rather than
+  //one shared pair. It is a separate version rather than a wider format 8 because an engine that
+  //read it as an 8 would take the first `dim` numbers of each square's vector to be the whole
+  //vector -- that is the pawn head -- and score every knight, bishop, rook, queen and king move
+  //with it. Its spatial header is nine ints under the magic "SPA2" instead of eight under "SPAT".
+  if (hdr[1] < 1 || hdr[1] > 9 || hdr[1] == 3 || hdr[1] == 6) {
     snprintf(err, errlen, "%s: policy format version %d is not supported by this engine. "
                           "1/4 = base tensors, 2/5 = with the legality term, 7/8 = with the "
-                          "legality and spatial terms; 3 and 6 use the untied Cl table, which is "
-                          "not implemented",
+                          "legality and spatial terms, 9 = with per-piece spatial heads; 3 and 6 "
+                          "use the untied Cl table, which is not implemented",
              path, hdr[1]);
     std::fclose(f); return false;
   }
-  const bool spatial = (hdr[1] == 7 || hdr[1] == 8);
-  net.piece_indexed = (hdr[1] >= 4 && hdr[1] <= 6) || hdr[1] == 8;
+  const bool spatial = (hdr[1] == 7 || hdr[1] == 8 || hdr[1] == 9);
+  net.piece_indexed = (hdr[1] >= 4 && hdr[1] <= 6) || hdr[1] == 8 || hdr[1] == 9;
   net.has_wl        = (hdr[1] == 2 || hdr[1] == 5 || spatial);
   net.spatial       = PolicySpatial{};
   net.in = hdr[2]; net.h1 = hdr[3]; net.h2 = hdr[4]; net.out = hdr[5]; net.conv = hdr[6];
@@ -133,31 +144,45 @@ inline bool policy_net_load(PolicyNet& net, const char* path, char* err, size_t 
   //Wl comes after emb, so it reads straight on from it.
   if (ok && net.has_wl) ok = rd(net.Wl, (size_t)net.h2 * net.h2);
   if (!ok) { snprintf(err, errlen, "%s: truncated tensor data", path); std::fclose(f); return false; }
-  //The spatial block follows Wl: an 8-int header, then Wc1, bc1, [Wc2, bc2], Wu, Wv.
+  //The spatial block follows Wl: a header, then Wc1, bc1, [Wc2, bc2], Wu, Wv. Formats 7 and 8 write
+  //eight ints under the magic "SPAT"; format 9 writes nine under "SPA2", the ninth being the head
+  //count. The magic differs as well as the length so a misread block fails on the magic rather than
+  //on arithmetic: reading nine ints as eight would take the head count for Wc1's first weight.
   if (spatial) {
-    int32_t sh[8];
-    if (std::fread(sh, sizeof(int32_t), 8, f) != 8 || sh[0] != 0x54415053) {
-      snprintf(err, errlen, "%s: format %d but no spatial block after Wl", path, hdr[1]);
+    const bool wide = (hdr[1] == 9);
+    int32_t sh[9];
+    const size_t nsh = wide ? 9 : 8;
+    const int32_t want_magic = wide ? 0x32415053 /*"SPA2"*/ : 0x54415053 /*"SPAT"*/;
+    if (std::fread(sh, sizeof(int32_t), nsh, f) != nsh || sh[0] != want_magic) {
+      snprintf(err, errlen, "%s: format %d but no %s spatial block after Wl", path, hdr[1],
+               wide ? "SPA2" : "SPAT");
       std::fclose(f); return false;
     }
     PolicySpatial& sp = net.spatial;
     sp.planes = sh[1]; sp.ch = sh[2]; sp.dim = sh[3]; sp.layers = sh[4];
     sp.scale  = sh[5]; sp.layout = sh[6];
     const int attack = sh[7];
+    sp.heads = wide ? sh[8] : 1;
     //Every bound here is a fixed-size buffer in PolicySpatialScratch or a plane layout the builder
     //implements. Refuse rather than overrun or silently build different planes.
+    //heads must be 1 or 6, and 6 only on a piece-indexed net: the head is chosen by the moving
+    //piece type, so on a net whose table is not piece-indexed there is no such thing as the wrong
+    //head to pick and the export should not have claimed six.
     if (!((sp.planes == 14 && attack == 0) || (sp.planes == 26 && attack == 12))
         || sp.ch < 1 || sp.ch > 64 || sp.dim < 1 || sp.dim > 32
         || sp.layers < 1 || sp.layers > 2 || (sp.scale != 0 && sp.scale != 1)
-        || (sp.layout != 0 && sp.layout != 1)) {
+        || (sp.layout != 0 && sp.layout != 1)
+        || (sp.heads != 1 && sp.heads != 6)
+        || (sp.heads != 1 && !net.piece_indexed)) {
       snprintf(err, errlen, "%s: unsupported spatial block (planes %d, attack %d, channels %d, dim %d, "
-                            "layers %d, scale %d, layout %d)", path, sp.planes, attack, sp.ch, sp.dim,
-               sp.layers, sp.scale, sp.layout);
+                            "layers %d, scale %d, layout %d, heads %d)", path, sp.planes, attack, sp.ch,
+               sp.dim, sp.layers, sp.scale, sp.layout, sp.heads);
       std::fclose(f); return false;
     }
     ok = rd(sp.Wc1, (size_t)sp.ch * sp.planes * 9) && rd(sp.bc1, sp.ch);
     if (ok && sp.layers >= 2) ok = rd(sp.Wc2, (size_t)sp.ch * sp.ch * 9) && rd(sp.bc2, sp.ch);
-    if (ok) ok = rd(sp.Wu, (size_t)sp.ch * sp.dim) && rd(sp.Wv, (size_t)sp.ch * sp.dim);
+    if (ok) ok = rd(sp.Wu, (size_t)sp.ch * sp.dim * sp.heads)
+              && rd(sp.Wv, (size_t)sp.ch * sp.dim * sp.heads);
     if (!ok) { snprintf(err, errlen, "%s: truncated spatial block", path); std::fclose(f); return false; }
     sp.loaded = true;
   }
@@ -283,6 +308,17 @@ inline void policy_apply_legal_bias(const PolicyNet& net, float* ctx,
 // 3x3 convolutions. The convolution is what makes it spatial: a square's vector depends on its
 // neighbourhood, so "defended by the pawn one file over" is representable.
 //
+// WITH SIX HEADS (format 9, sp.heads == 6) there is one u/v pair per MOVING PIECE TYPE and the term
+// becomes dot(u[pt][from], v[pt][to]). The reason is that the one-pair form is a function of the two
+// squares and of nothing else, and under piece indexing it is added to all six per-piece blocks of
+// the move table unchanged -- so it cannot say that a square is a good destination for a knight and a
+// bad one for a queen, which is the most ordinary thing there is to say about a destination. Measured
+// on the one-pair net nnue_policy_pisp2.bin over 60,000 held-out positions, the blended prior holds
+// Stockfish's own best move in its top six 85.7% of the time and holds some move of that move's
+// piece 93.8% of the time; the 8.1-point gap is 14.7 points for queen moves and 2.0 for pawn moves,
+// i.e. it grows with how many destinations the piece has. See ENGINE_SETTINGS.md, Per-piece spatial
+// heads, for the full table and for the receptive-field explanation it rules out.
+//
 // The planes, in order, all oriented from the side to move's point of view (mirrored by ^56 for
 // Black) exactly as policy_row() orients its squares:
 //     0-5    own pawn..king
@@ -367,11 +403,18 @@ inline void policy_build_planes(const Board& board, const PolicySpatial& sp,
 
 // Scratch for one forward. One per search thread; about 14 KB, so give it a thread_local rather
 // than putting it on the simulation's stack.
+//The widest heads*dim the loader accepts: dim 32 by 6 heads. Stated once, because the scratch
+//arrays below and the projection's accumulators must agree, and a mismatch would be an overrun.
+#define POLICY_SPATIAL_MAX_HD (32 * 6)
+
 struct PolicySpatialScratch {
   float pad_in[26 * 100];      // zero-padded planes,  [planes][10][10]
   float pad_mid[64 * 100];     // zero-padded conv1 out, [ch][10][10]
-  float u[64 * 32];            // [64][dim]
-  float v[64 * 32];
+  //[64][heads][dim], square-major so one square's whole heads*dim block is contiguous -- which is
+  //what lets the projection below build it in one pass and store it once. Sized for the largest
+  //shape policy_net_load() accepts, so 48 KB each.
+  float u[64 * POLICY_SPATIAL_MAX_HD];
+  float v[64 * POLICY_SPATIAL_MAX_HD];
 };
 
 // planes -> u, v. The loop order is (out channel, in channel, tap, row) with the 8 columns of a row
@@ -463,21 +506,40 @@ inline void policy_spatial_forward_impl(const PolicySpatial& sp, const uint8_t* 
   }
   // u = relu(h2^T @ Wu), v = h2^T @ Wv.  NO RELU ON v -- see the trainer's note: Wv starts at zero,
   // and relu's subgradient at zero is zero, so a relu there would leave v dead for ever.
-  std::memset(s.u, 0, sizeof(float) * 64 * (size_t)D);
-  std::memset(s.v, 0, sizeof(float) * 64 * (size_t)D);
-  for (int c = 0; c < C; ++c) {
-    const float* hc = h2 + (size_t)c * 64;
-    const float* wu = &sp.Wu[(size_t)c * D];
-    const float* wv = &sp.Wv[(size_t)c * D];
-    for (int q = 0; q < 64; ++q) {
-      const float hv = hc[q];
+  //
+  // With six heads Wu is [C][6][dim] and u is [64][6][dim], so a channel's contribution to a square
+  // is one contiguous run of heads*dim numbers rather than dim. That is why the head axis sits next
+  // to dim in both: the inner loop is the one-head loop with a longer trip count, not a nest.
+  //
+  // SQUARE-OUTER, and the loop order is the point rather than a matter of taste. The obvious form is
+  // channel-outer, accumulating straight into s.u and s.v -- and that reads and rewrites every one of
+  // the 64*HD output numbers once per channel, so eight channels make eight passes over a 48 KB pair
+  // of arrays to perform 98,000 multiply-adds. Measured on this machine at dim 16 with six heads, the
+  // projection cost 9.9 microseconds a position that way, against 1.65 for one head -- six times the
+  // arithmetic at six times the price, from a base that was already slow for what it computes.
+  //
+  // Building ONE square's whole HD-wide block in a local buffer and storing it once does exactly the
+  // same arithmetic, summed over c in exactly the same order, with an eighth of the memory traffic.
+  // The relu on u folds into that single store, which also removes a separate sweep over 64*HD and
+  // both memsets. Same order over c is what keeps it bit-for-bit identical to the old form: this is a
+  // traffic change, not a numerics change, and check_policy_export confirms it against dumps written
+  // before the rewrite.
+  const int HD = D * sp.heads;
+  float accu[POLICY_SPATIAL_MAX_HD], accv[POLICY_SPATIAL_MAX_HD];
+  for (int q = 0; q < 64; ++q) {
+    for (int d = 0; d < HD; ++d) { accu[d] = 0.0f; accv[d] = 0.0f; }
+    for (int c = 0; c < C; ++c) {
+      const float hv = h2[(size_t)c * 64 + q];
       if (hv == 0.0f) continue;          // relu leaves about half of h2 at exactly zero
-      float* uq = s.u + (size_t)q * D;
-      float* vq = s.v + (size_t)q * D;
-      for (int d = 0; d < D; ++d) { uq[d] += hv * wu[d]; vq[d] += hv * wv[d]; }
+      const float* wu = &sp.Wu[(size_t)c * HD];
+      const float* wv = &sp.Wv[(size_t)c * HD];
+      for (int d = 0; d < HD; ++d) { accu[d] += hv * wu[d]; accv[d] += hv * wv[d]; }
     }
+    float* uq = s.u + (size_t)q * HD;
+    float* vq = s.v + (size_t)q * HD;
+    // NO RELU ON v; see the note above on why it must stay linear.
+    for (int d = 0; d < HD; ++d) { uq[d] = accu[d] > 0.0f ? accu[d] : 0.0f; vq[d] = accv[d]; }
   }
-  for (int q = 0; q < 64 * D; ++q) if (s.u[q] < 0.0f) s.u[q] = 0.0f;
 }
 
 // THE LAYER COUNT IS A TEMPLATE PARAMETER, not a field read at run time. Branching on sp.layers
@@ -492,12 +554,16 @@ inline void policy_spatial_forward(const PolicySpatial& sp, const uint8_t* pl,
 }
 
 // One move's spatial contribution. `from` and `to` must already be oriented the same way
-// policy_score() orients them, i.e. mirrored by ^56 when Black is to move.
+// policy_score() orients them, i.e. mirrored by ^56 when Black is to move. `pt` is the moving
+// piece's type, Pawn=1 .. King=6, and selects the head on a net that has six; it is ignored on a
+// net with one shared pair, so a one-head net scores exactly as it did before heads existed. The
+// caller has already clamped it into 1..6 -- see policy_score().
 inline float policy_spatial_score(const PolicySpatial& sp, const PolicySpatialScratch& s,
-                                  int from, int to) {
-  const int D = sp.dim;
-  const float* u = s.u + (size_t)from * D;
-  const float* v = s.v + (size_t)to * D;
+                                  int pt, int from, int to) {
+  const int D = sp.dim, HD = D * sp.heads;
+  const size_t head = (sp.heads > 1) ? (size_t)(pt - 1) * D : 0;
+  const float* u = s.u + (size_t)from * HD + head;
+  const float* v = s.v + (size_t)to   * HD + head;
   float acc = 0.0f;
   for (int d = 0; d < D; ++d) acc += u[d] * v[d];
   return acc;
@@ -508,6 +574,14 @@ inline float policy_spatial_score(const PolicySpatial& sp, const PolicySpatialSc
 inline float policy_score(const PolicyNet& net, const float* ctx, int pt, int from, int to, bool flip,
                           const PolicySpatialScratch* sp) {
   if (flip) { from ^= 56; to ^= 56; }
+  //CLAMP RATHER THAN TRUST, and do it BEFORE anything indexes on it. Every caller reads the mailbox
+  //of a generated move's source square, so pt is 1..6 by construction -- but the `& 7` idiom they use
+  //also produces 0 from PieceWhite and PieceBlack and 7 from PieceNone, and pt=0 would make
+  //(pt-1)*4096 a near-maximal unsigned offset while pt=7 lands exactly one row past the end. Both
+  //are silent out-of-bounds reads of a multi-megabyte table, and on a six-head spatial term pt also
+  //picks the head, so the same two values would read past the end of the u/v scratch. The trainer
+  //already refuses these values in policy_index(); this is the same guard on the inference side.
+  if (pt < 1) pt = 1; else if (pt > 6) pt = 6;
   float spatial_term = 0.0f;
   if (net.spatial.loaded) {
     if (!sp) {
@@ -515,19 +589,10 @@ inline float policy_score(const PolicyNet& net, const float* ctx, int pt, int fr
                            "a spatial term; that would score moves by a different function\n");
       std::abort();
     }
-    spatial_term = policy_spatial_score(net.spatial, *sp, from, to);
+    spatial_term = policy_spatial_score(net.spatial, *sp, pt, from, to);
   }
   size_t row = (size_t)(from * 64 + to);
-  if (net.piece_indexed) {
-    //CLAMP RATHER THAN TRUST. Every caller reads the mailbox of a generated move's source square,
-    //so pt is 1..6 by construction -- but the `& 7` idiom they use also produces 0 from PieceWhite
-    //and PieceBlack and 7 from PieceNone, and pt=0 would make (pt-1)*4096 a near-maximal unsigned
-    //offset while pt=7 lands exactly one row past the end. Both are silent out-of-bounds reads of a
-    //multi-megabyte table. The trainer already refuses these values in policy_index(); this is the
-    //same guard on the inference side.
-    if (pt < 1) pt = 1; else if (pt > 6) pt = 6;
-    row += (size_t)(pt - 1) * 64 * 64;
-  }
+  if (net.piece_indexed) row += (size_t)(pt - 1) * 64 * 64;
   const float* e = &net.emb[row * net.h2];
   float s = spatial_term;
   for (int k = 0; k < net.h2; ++k) s += ctx[k] * e[k];
