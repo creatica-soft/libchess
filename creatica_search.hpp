@@ -157,6 +157,7 @@ static inline const char * syzygy_path_default(void) {
 //MinVisitShare's default once MinVisitK turns the floor on. At k = 8 this diverts at most 24% of a
 //node's descents, leaving the leader 76%; see the MinVisitK note below for the arithmetic.
 #define MIN_VISIT_SHARE 0.03
+#define LEAF_DEPTH 0
 //Share of the prior taken from the policy head; the remainder comes from the 1-ply child
 //evaluation. 0 reproduces the incumbent exactly, 1 is policy-only. Measured best around
 //0.4-0.5 (see the table in creatica_search.cpp). Override with CREATICA_POLICY_BLEND.
@@ -1133,6 +1134,18 @@ extern int64_t flatten_topk;
 extern int64_t min_visit_k;
 extern double  min_visit_share;
 extern int64_t min_visit_depth;
+
+//LeafDepth: the depth of the alpha-beta search run at every expanded leaf, in plies. 0 is off and
+//is the incumbent search exactly. See the long note above leaf_moves() in creatica_search.cpp for
+//what this is for -- in short, the failures track the number of plies the engine's own evaluator
+//needs, the visits a non-leading move can ever get are capped at C*P*sqrt(D)/gap, and that cap
+//cannot be loosened because the concentration is also what buys depth. So the plies are bought at
+//the leaf, where a beta cutoff makes them cheap, instead of as MCTS tree.
+//
+//It is not free: a leaf costs its whole alpha-beta subtree rather than one net evaluation, so the
+//simulation count falls by roughly the branching factor to the power of the depth. 1 and 2 are
+//cheap; 4 is where the deep refutations live and where the exchange rate has to be measured.
+extern int64_t leaf_depth;
 inline constexpr int16_t MM_NONE = -32768;
 //`mm` as a value on the same scale as Q, or nothing if the subtree has no minimax value yet.
 inline bool mm_value(const MCTSNode * n, double& out);
