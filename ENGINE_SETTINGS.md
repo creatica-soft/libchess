@@ -2785,6 +2785,13 @@ and skips any option the engine does not have.
 
 ## The value is compressed, and the tanh is not why
 
+**Related but distinct, 8 October 2026:** the `tanh` is not the cause of the *compression* measured here,
+and that finding stands. It is however the cause of a separate problem -- **saturation**. Because it maps
+an unbounded centipawn score into the interval from -1 to 1, above roughly 1200 cp it stops carrying
+information: measured in a live search, a forced mate and a position worth +1188 cp differ by 0.04 in `Q`,
+and a mate in 2 from a mate in 3 by 0.0005. In that region the prior decides the move. See the last
+section of this document.
+
 A node's value is `Q = W / evidence`, and `W` is a running sum of `tanh(pawns / eval_scale)` — a **mean
 over every leaf the subtree has ever visited**. Measured against Stockfish over 682 searches from fourteen
 lichess games, the engine reports about **60–70% of the true magnitude** once a position is unbalanced:
@@ -3173,6 +3180,13 @@ change survived: the allocation law and the test-set artefact* at the end of thi
 non-leading move's share of the search is `C*P/(gap*sqrt(D))` and decays as `1/sqrt(D)`, the
 concentration that causes it IS what buys depth on the principal line, and forcing a constant share
 instead made the deep-refutation bucket 3.5x worse. The section below predates that measurement.
+
+**Answered more fundamentally, 6-8 October 2026 — the algorithm is matched to the wrong domain.** See *Why
+MCTS is the wrong fit: a probabilistic search over a deterministic estimator* at the end of this document.
+MCTS averages because it was built for domains where a position returns a different number each visit; a
+deterministic evaluator returns the same number, and the game defines a maximum rather than a mean, so the
+search spends its compute converting an average into a maximum that alpha-beta has at the first node. The
+measured cost is two to three times. Eight search changes have now been measured and none survived.
 
 Essentially yes, and it is worth being exact about which part.
 
@@ -4011,6 +4025,13 @@ malformed rows in the middle of the data.
 
 ## Why no search change survived: the allocation law and the test-set artefact, 5 October 2026
 
+**Two numbers in this section are unsafe and were corrected on 8 October. Read *Two corrections to how
+this project measures things* in the last section first.** Every uncaptured centipawn mean quoted from the
+deep set here is dominated by mate-labelling artefacts -- the depth-12 labels charge about 19,000 cp for
+playing a slower mate than the labeller found -- and the harness's own run-to-run noise is 32 of 425
+positions, which puts `MinimaxWeight`'s result inside the noise rather than measured. The allocation law
+itself, the depth gradient and the test-set selection bias all stand.
+
 ### The whole thing in one paragraph
 
 MCTS decides how much to look at a move from two numbers it does not know well enough: the move's prior
@@ -4251,3 +4272,322 @@ substituting a flat 1/num_children for P overstates U by orders of magnitude for
 moves the trace exists to study, and that substitution produced a table claiming terms of 1.3 to 1.5
 against gaps of 0.1 to 0.35 — which would mean those moves should be selected constantly, when they had
 thirty visits in six hundred thousand.
+
+## Why MCTS is the wrong fit: a probabilistic search over a deterministic estimator, 6-8 October 2026
+
+### The whole thing in one paragraph
+
+Monte Carlo tree search averages. It was built for domains where visiting a position twice gives you
+two different numbers, so that a mean over many visits converges to something real -- an expected
+outcome. Creatica's leaf evaluation is a deterministic neural network returning a centipawn estimate of
+a minimax value. There is no distribution to average, so what `Q` estimates is not a quantity the game
+defines; the game defines a maximum over the subtree, and a mean is a biased estimator of a maximum.
+UCT does converge to the minimax value in the limit (Kocsis and Szepesvari, 2006) but only by letting
+the visit distribution become degenerate, so the search spends its compute turning an average into a
+maximum -- which alpha-beta has at the first node, for free, and which is where the measured factor of
+two to three in compute comes from. Everything else in this section is that sentence with numbers
+attached: a bounded alpha-beta placed at every leaf costs about 127,000 nodes per leaf and makes the
+engine monotonically worse; the same search used *as the whole engine* matches creatica at roughly a
+third of the CPU; the engine's own root traces show it finding the right move, assigning it the better
+`Q`, and then playing something else because the final choice is made by a cumulative visit counter;
+and two of this project's own measurement instruments turned out to be unsafe for the questions they
+were being asked.
+
+### What the symbols mean
+
+| symbol | what it is | where it lives |
+|---|---|---|
+| `Q` | a node's value as a **mean**: `W / evidence`, negated into the parent's frame | `select_best_child()` |
+| `W` | running sum of `tanh(eval_pawns / EvalScale)` over every simulation through the node | `MCTSNode::W` |
+| `evidence` | how many of those simulations taught the node something (differs from `N` only on hollow nodes) | `MCTSNode::evidence` |
+| `N` | visit count, including hollow visits; drives selection so the search cannot live-lock | `MCTSNode::N` |
+| `edgeN` | the parent's own count of descents down one edge -- **this is what picks the move** | `Edge::n` |
+| `U` | exploration term, `C * P * sqrt(D) / (1 + n)` | `select_best_child()` |
+| `P` | the prior on an edge; at `PolicyMode 1` a softmax over `PolicyBlend * head_logit / PolicyTemp + (1 - PolicyBlend) * child_eval / Temperature`, so 45% policy head and 55% child NNUE eval at the default | `Edge::P` |
+| `C` | exploration constant, decaying with depth between `ExplorationMin` and `ExplorationMax` | `creatica_search.hpp` |
+| `D` | the parent's visit count, the `sqrt` of which scales `U` | -- |
+| `gap` | difference in `Q` between the leading child and another, in the same frame | -- |
+| `mm` | a node's 1-ply minimax value in centipawns, `MM_NONE` when unset | `MCTSNode::mm` |
+| `EvalScale` | 6.1, the pawn scale inside the `tanh`; `cp = 100 * 6.1 * atanh(Q)` | `creatica_search.hpp` |
+| `LeafDepth` | new UCI option: plies of alpha-beta run at every expanded leaf. 0 is off and is the default | `creatica.cpp` |
+
+### How this was measured
+
+The deep set: 425 positions, unselected, chosen because creatica's own NNUE needs more than four plies
+of full-width negamax before it prefers the move a depth-12 search prefers. Scored in centipawns against
+per-move depth-12 labels. Harness `pool_run.py`, data `deep_pool.tsv` and `labels_0.tsv`, all in the
+experiments directory outside this repository. Engine built to a separate binary; `./creatica` in the
+repository root was never rebuilt, because that is the binary the lichess bot launches.
+
+**Read section 5 before trusting any centipawn mean quoted from that harness.** Two of its properties
+were discovered during this work and both invalidate results this project had already drawn.
+
+### 1. The mismatch, stated exactly
+
+In stochastic MCTS -- Go with random rollouts, or a bandit problem -- sampling an action twice gives two
+independent draws, and the sample mean converges to the expected value. The averaging is *estimating a
+random variable that exists*.
+
+Creatica's leaf is `evaluate_nnue()`: deterministic, and returning a centipawn number that is itself a
+point estimate of a minimax value. Two observations follow.
+
+**What is averaged is distinct leaves, not repeated draws.** Each simulation descends to a different
+leaf, so `Q` at an interior node is a visit-weighted mean over the distinct leaf evaluations in its
+subtree. That is a well-defined operation. It is simply not the operation the game calls for: the
+game-theoretic value of that subtree is a minimax over it, and a mean is a biased and inconsistent
+estimator of a maximum.
+
+**`tanh` is the adapter that hides the category error.** `W` accumulates `tanh(eval / EvalScale)`, which
+turns an unbounded centipawn score into something shaped like a probability so that averaging looks
+sensible. `EvalScale` 6.1 is therefore not an arbitrary tuning constant -- it is the conversion that lets
+a minimax estimate enter a machine built for outcome probabilities. And because the adapter must compress
+an unbounded score into the interval from -1 to 1, it saturates: above roughly 1200 centipawns it stops
+carrying information. Measured in a live search, a forced mate and a position worth +1188 cp differ by
+0.04 in `Q`, and a mate in 2 and a mate in 3 by 0.0005. In that region `Q` has nothing left to say and
+the prior decides, which is section 2.
+
+This also explains why the same algorithm works elsewhere. Leela's value head emits a **win
+probability**. Averaging win probabilities over a subtree estimates the expected outcome of the game from
+that point, which genuinely is a random variable over future play, and the mean is its right summary.
+Creatica feeds a minimax-style evaluator into the same machinery. The architecture is not wrong in
+general; it is paired with the wrong kind of number.
+
+The honest counterweight, because it is the one real argument the other way: averaging reduces variance,
+and minimax over noisy evaluations amplifies error -- the minimax pathology of Beal (1980) and Nau (1982).
+So MCTS is genuinely more robust to a bad evaluator. That robustness costs the two-to-three-times factor,
+and it is only worth buying if the evaluator is bad enough to need it. The KAN and CNN experiments
+answered that from the other side: those evaluators are measurably **more** accurate than NNUE against
+depth-30 references and still lose in play, because what the search needed was throughput.
+
+### 2. What the traces show: the search is right and the counter is wrong
+
+Position `4Q3/p7/1p1B1k2/2p2p2/6r1/2P3K1/PP2R3/5R2 w - - 0 44`. White is in check, so there are exactly
+four legal moves. Creatica, two seconds, four threads, 4.29 million simulations. Final root trace:
+
+| move | edge visits | `Q` | cp | `P` |
+|---|---|---|---|---|
+| `e6g6` | **2,631,715** | 0.999517 | 2544 | 0.576 |
+| `d6f4` | 1,525,972 | **0.9999982** | 4247 | 0.112 |
+| `f1f5` | 123,115 | 0.99545 | 1659 | 0.175 |
+
+`d6f4` is mate in 2 and its principal variation in creatica's own output is the mating sequence, move for
+move. So the line is in the tree, and `Q` is right about it -- it is the *highest* `Q` at the root. The
+engine played `e6g6` because the move is chosen by **edge visits**, and `e6g6` has more of them.
+
+Why it has more: once both moves saturate, `Q` separates them by 0.0005, at which point the PUCT score is
+dominated by `U = C * P * sqrt(D) / (1 + n)`, and `e6g6`'s prior is five times larger. The first snapshot
+of the same search, at 16,793 simulations, has `d6f4` holding 13,855 of them -- 82%. The search found the
+mate almost immediately and then four million further simulations *migrated the visits away from it*.
+
+This is not specific to that position. Across 2,936 searches in six independent incumbent-configuration
+arms (`c4_ctrl`, `mm0`, `mm0_short`, `prove_off`, `fl_ctrl`, `tk_ctrl`, `neutral`):
+
+| condition | share of searches |
+|---|---|
+| most-visited root child is not the highest-`Q` child | 11.2% |
+| ... and the higher-`Q` child holds at least 10% of the leader's visits | 8.9% |
+| ... at least 50% | 4.2% |
+
+Those are not low-visit flukes. Examples: `b4b3` played with 381,648 visits at +140 cp while `d7f6` sat at
+236,472 visits and +495 cp; `c3e4` with 456,274 visits at +140 cp against `e3h6` at 174,531 and +308 cp.
+
+**And the search knows.** Comparing the last two trace snapshots of each such search, the higher-`Q` move
+is gaining visits faster in 83.4% of cases -- and in **all 15** of the disagreements worth more than 100 cp.
+In the clearest cases the move the engine goes on to play receives *zero* new simulations while the better
+move takes seventeen thousand. Visit counts are cumulative and never decay, so the move selection reports
+where the search *used to be looking*. Resolving the material cases would take a median of about 84% more
+search time, and they are 1.4% of all searches.
+
+Selecting by `Q` instead is not the fix and was not adopted: a high `Q` on few visits is usually noise,
+which is why every strong MCTS engine selects by visits. The point is narrower and it is about stopping,
+not selecting -- the search has changed its mind and run out of clock, and `search_budget` in
+`creatica_search.cpp` is computed once up front with no stability check anywhere.
+
+### 3. Alpha-beta at the leaf: the exchange rate, measured
+
+`LeafDepth` replaces an expanded leaf's static value with a bounded alpha-beta search from that leaf:
+MVV-LVA plus best-move and killer ordering, iterative deepening, a capture quiescence with check
+extensions, no transposition table and no unsound pruning. It skips nodes in check, whose value already
+comes from a 1-ply minimax, and nodes in tablebase range, where the probe is exact.
+
+Cost, on one deep position:
+
+| `LeafDepth` | simulations in 2 s | nodes per leaf |
+|---|---|---|
+| 0 | 452,559 | -- (one net evaluation) |
+| 1 | 159,346 | 192 |
+| 2 | 32,818 | 1,607 |
+| 3 | 2,784 | 13,650 |
+| 4 | 294 | 127,025 |
+
+That is a branching factor near seven per ply rather than the 1.83 `abprobe.cpp` reaches with the full set
+of orderings and reductions, and adding iterative deepening plus killers did not improve it -- the cost is
+dominated by the capture quiescence with its check extensions, not by the main search.
+
+Result on the deep set, 425 positions, 2000 ms:
+
+| `LeafDepth` | gives away >100 cp | >400 cp |
+|---|---|---|
+| 0 | **20.5%** | **3.1%** |
+| 1 | 23.1% | 3.8% |
+| 2 | 30.4% | 5.2% |
+| 3 | 45.4% | 9.6% |
+
+Monotonically worse at every depth. The plies bought at the leaf are worth less than the simulations they
+displace. This is the sixth search option proposed for creatica and measured as null or negative; with
+`MinVisitK` from 5 October it is the eighth change in this family.
+
+A correctness note on the leaf search, because the obvious test for it does not run. The right check is
+that the same search with every cutoff removed must return the identical value -- alpha-beta only avoids
+visiting nodes whose value cannot matter. That cutoff-free twin does not finish a single position at depth
+1 in two minutes: the cutoffs are what make the quiescence survivable at all, so there is no cheap
+exhaustive reference. What stands in its place is that accuracy rises monotonically with depth (section 4),
+which rules out gross errors but not subtle ones. One real bug was found and fixed along the way: when the
+quiescence ran out of check extensions it returned the window's `alpha`, which made a leaf's value depend
+on the window it happened to be searched with. It now returns the 1-ply static minimax over the evasions,
+which depends on nothing but the position.
+
+### 4. Alpha-beta alone against the whole engine
+
+The same leaf search, used as a complete move chooser with no tree, no time management and one thread,
+over the same 425 positions (tool generated by `genpick.py`, extracting the search verbatim from
+`creatica_search.cpp`):
+
+| depth | exact | >100 cp | mean loss | nodes per position | cutoff share |
+|---|---|---|---|---|---|
+| 1 | 34.1% | 65.9% | 2698 cp | 677 | 65% |
+| 2 | 46.6% | 53.4% | 1519 cp | 4,139 | 55% |
+| 3 | 60.2% | 39.8% | 803 cp | 31,001 | 59% |
+| 4 | 73.6% | 26.1% | 366 cp | 201,617 | 55% |
+| 5 | **80.5%** | **19.3%** | 307 cp | 1,372,112 | 58% |
+
+Against the engine, which used four threads and two seconds -- 8.0 core-seconds -- depth 5 used 2.3
+core-seconds:
+
+| | >100 cp | mean loss capped at 200 cp |
+|---|---|---|
+| MCTS 2 s, 4 threads (two separate runs) | 23.3% / 20.5% | 39 / 35 |
+| alpha-beta depth 5, 1 thread | 19.3% | 33 |
+
+**What this does and does not establish.** It is level, at roughly a third of the CPU, deterministically.
+It does *not* establish that alpha-beta is more accurate: paired against one control it fixes 59 and breaks
+42 (p = 0.111), against the other it fixes 51 and breaks 46 (p = 0.685), and on the capped mean the three
+numbers are within six centipawns of each other. The compute ratio is the robust part; the accuracy
+difference is inside the harness's noise.
+
+Two caveats on reading it as a strength claim. Alpha-beta parallelises badly where MCTS parallelises
+almost linearly -- four threads of Lazy SMP typically yield well under 2.5x in time-to-depth -- so the
+core-second ratio overstates the wall-clock advantage at four threads. And the ordering arms in
+`abprobe.cpp` show where alpha-beta's depth actually comes from: mean depth 5.9 with neither, 6.1 adding
+history, 6.9 adding null-move, 8.0 adding late-move reductions, 8.7 with both, all at about 1.8 million
+nodes. Three plies from search engineering, none of it from a model.
+
+### 5. Two corrections to how this project measures things
+
+**The deep set's labels mis-score mates, and the error is enormous.** `labels_0.tsv` holds depth-12
+per-move values. In a tactically rich position depth 12 cannot resolve which moves mate: one move returns
+`mate 7` and its siblings return `cp 1188`, and by depth 14 all of them are mate. The label then charges
+the engine about 19,000 centipawns for choosing a sibling. Of the 11 positions where the control gave away
+more than 5000 cp, re-scored with Stockfish 18 at depth 20:
+
+- **6** -- creatica played a forced mate itself; the label's "best" was a faster mate. No error at all.
+- **2** -- lost by force whichever move is played; creatica was mated a few plies sooner.
+- **2** -- creatica played a winning move (+664, +287 cp) rather than a mate in 2 or 3. Still winning.
+- **1** -- a genuine blunder, into mate in 2 from a position already at -1227.
+
+The worst case is the four-legal-move position of section 2: Stockfish at depth 22 says **all four moves
+mate** -- mate 5, mate 5, mate 5, mate 7. At depth 12 only one showed mate. Creatica played a mate in 6 and
+was charged 18,805 cp. And the set was *selected* for positions whose answer is deeper than four plies, so
+the selection and the scoring share a blind spot.
+
+**Consequence: never quote the uncapped mean loss from this harness.** Use the mean with losses capped at
+200 or 500 cp. A count of "catastrophes" over 5000 cp measures the labeller, not the engine.
+
+**The harness cannot resolve small differences.** Two runs of the *identical* configuration over the same
+425 positions: 23.3% and 20.5% failures, 628 and 533 cp mean, and they disagree about failure on **32 of
+the 425 positions**. The engine is nondeterministic -- four threads on a wall clock -- so anything smaller
+than about 30 positions in a single run is unresolvable, and a comparison against one control arm inherits
+all of it. The same alpha-beta numbers gave p = 0.111 against one control and p = 0.685 against the other.
+
+For anything expected to move this set by less than ~30 positions: run the control at least twice and
+quote both, or draw more positions (`hard_pool.tsv` holds about 7,500). Note also that comparing two
+*move-selection rules read from the same tree* has a noise floor of exactly zero, which makes it a far
+better instrument than two engine runs.
+
+### 6. What was withdrawn
+
+Recorded because the pattern is consistent and worth recognising next time.
+
+| claim | why it fell |
+|---|---|
+| `FlattenTopK` gains six points | artefact of `mistakes/testset.tsv`, which samples sharp positions *where the prior was wrong* |
+| `MinimaxWeight 0.75` is the surviving direction | reversed on unselected positions; and at 26.6% against controls of 23.3% and 20.5% it is about one noise unit worse -- inconclusive, not measured |
+| alpha-beta halves the catastrophic failures, 6 against 11 | it halves a labelling artefact; alpha-beta maximises centipawns and a mate score is the maximum, so agreeing with the labeller here is mechanical |
+| the refutations are not in the tree | drawn from one position using a known-incomplete `MinimaxWeight` probe; the root traces show the mating line present, with the correct `Q` |
+| MCTS cannot support bounds, so measure the fully-expanded core | `d_core = 1 + min over children`, and MCTS leaves most children unexpanded by construction. The answer follows from the selection rule; there was nothing to measure |
+
+The common shape: a number was taken at face value before checking what produced it. In four of the five
+the contradicting evidence was already on screen -- the capped means disagreed with the uncapped ones
+twice before the labels were checked.
+
+### 7. The evaluator question, closed from the other side
+
+The natural next move after section 4 is to replace the evaluator, and the architecture argument for it is
+tidy: an incremental evaluator cannot be batched and does not need to be, which suits alpha-beta's
+depth-first sequential dependency; an expensive evaluator must be batched, which only MCTS can do by
+collecting leaves across parallel simulations. By that logic creatica today is the mismatched corner --
+a cheap incremental evaluator inside MCTS, getting neither alpha-beta's cutoffs nor any benefit from
+batching -- and the coherent pairing would be a dual-head KAN or CNN giving value and policy from one
+amortised forward pass.
+
+That experiment has already been run in this repository. `creatica-kan-gr.cpp`, `creatica-kan.cpp`,
+`creatica-cnn.cpp` and the CoreML variants all batch their evaluations, at the right granularity: all legal
+children of a node in one forward pass. The recorded outcome is that **NNUE wins in play, and wins because
+it searches deeper in the same budget**, while the KAN and CNN evaluators are measurably more accurate
+against depth-30 references (CNN validation loss 0.05, KAN under 0.07, NNUE considerably higher, at about
+ten epochs each).
+
+So the accurate-but-slower evaluator loses inside MCTS as well as inside alpha-beta, and every axis points
+the same way:
+
+- MCTS + NNUE against alpha-beta + NNUE: alpha-beta, by two to three times in compute for the same quality.
+- MCTS + NNUE against MCTS + KAN/CNN: NNUE, because throughput beat accuracy.
+- Eight search changes inside MCTS: all null or negative.
+
+One note for anyone reading the 165 cp figure for NNUE's mean absolute error: it was measured against a
+*searched* value, and a static evaluator cannot match a search. Much of that gap is the horizon rather than
+error, and no static function of the pieces can recover it. Measuring a static evaluator against a deep
+search overstates its error, which is the same mistake class as the mate labels in section 5.
+
+### 8. Where this leaves creatica
+
+Creatica embeds `nn-c288c895ea92.nnue` and `nn-37f18f62d772.nnue`. Those are Stockfish 18's own two nets --
+the Stockfish 18 binary on this machine reports loading exactly them. So the matched-evaluator,
+equal-hardware comparison of the two search architectures has already been run at scale by other people:
+same weights, same machine, roughly 1100 Elo in alpha-beta's favour. That number conflates architecture
+with fifteen years of search tuning, so it bounds the architectural gap rather than isolating it; the two-
+to-three-times compute ratio in section 4 is the isolated version, measured here.
+
+On an M1 with 8 GB the configuration that exploits an NNUE properly is alpha-beta, and building it well
+produces something strictly weaker than the engine whose evaluator it borrows. The configuration that
+would justify MCTS needs an evaluator emitting outcome probabilities at a rate this hardware cannot
+supply -- which is why Leela needs a GPU, and why the local KAN and CNN attempts lost on throughput.
+
+So the conclusion is not that creatica has a search bug, and not that one more option might work. It is
+that the algorithm is matched to the wrong domain:
+
+> MCTS averages, because it was built for domains where a position returns a different number each visit.
+> Chess with a deterministic evaluator returns the same number, and what the game defines is a maximum
+> rather than a mean. MCTS therefore spends its compute converting an average into a maximum -- which
+> alpha-beta has at the first node, and which costs two to three times. That cost cannot be recovered by
+> changing the backup, the exploration term, the visit allocation, the stopping rule or the leaf
+> evaluation; eight such changes have now been measured. And the evaluator that would justify the
+> averaging is one this hardware cannot afford to run at the rate the search needs.
+
+Diagnostic added, off by default: `LeafDepth` (0 to 8), with its cost reported at the end of each search as
+`info string leaf alpha-beta: depth D, L leaves searched, N nodes (X per leaf), C cutoffs, B refused in
+check`. `ProveTerminals` is also worth a note while the machinery is being described: `PROVEN_WIN` and
+`PROVEN_LOSS` are stamped only from tablebase probes, so a checkmate the search finds in its own tree is
+recorded as a terminal but never seeds a proof. That is why the option converted nothing -- it was switched
+on with almost nothing feeding it. Left as it is, since by this section's argument the thing it would buy
+is mate distance.

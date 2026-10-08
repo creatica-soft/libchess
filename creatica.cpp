@@ -610,6 +610,8 @@ public:
         o.spin("MinVisitK",     &min_visit_k,     0, 0, 64);
         o.real("MinVisitShare", &min_visit_share, MIN_VISIT_SHARE, 0.0, 0.25, 1000);
         o.spin("MinVisitDepth", &min_visit_depth, 0, 0, 8);
+        //LeafDepth: a bounded alpha-beta search at every expanded leaf. 0 is off.
+        o.spin("LeafDepth",     &leaf_depth,      LEAF_DEPTH, 0, 8);
         o.check("ValidateTree", &validate_tree_enabled, false);
     }
 

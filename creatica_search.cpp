@@ -2655,6 +2655,277 @@ std::pair<int, int> make_move_policy(Board& chess_board, const ZobristHash& boar
   return std::make_pair(cp, terminal);
 }
 
+//=========================== LEAF ALPHA-BETA ==================================================
+//
+//WHAT THIS IS FOR. Everything measured on 4-6 October says the failures are not a ranking problem
+//and not a prior problem: the failure rate tracks the number of plies the engine's own evaluator
+//needs before it prefers the right move -- 3.5% at one ply, 22.6% past four -- and the visits a
+//non-leading move ever receives are capped at C*P*sqrt(D)/gap, tens to thousands where the deep
+//refutations need tens of thousands. The allocation cannot be loosened: MinVisitK, which forces a
+//share onto the leading candidates, made the deep bucket 3.5x worse, because the concentration IS
+//the depth mechanism. And the depth cannot be bought from the model, because a value head scores a
+//position and a combination is a property of a sequence.
+//
+//So the remaining move is to resolve the plies where they are cheap. Alpha-beta reaches depth with
+//an effective branching factor near 2 against MCTS's 12.5, and the reason is not narrower move
+//lists but PROOF: a beta cutoff makes every remaining sibling provably irrelevant, which averaging
+//can never do. This puts a bounded alpha-beta search at the leaf, so a leaf knows what is four
+//plies beneath it and the MCTS tree only has to walk one or two plies to see a five-ply refutation.
+//
+//The engine already does a degenerate version of this -- the capture-only extension in
+//process_check() and the 1-ply minimax in node_minimax -- so this is a change of degree.
+//
+//THE PRICE, and it is the whole experiment: a leaf costs its alpha-beta subtree instead of one net
+//evaluation, so simulations drop by that factor. Whether a 4-ply-resolved leaf is worth the ~20-40
+//static leaves it displaces is what the deep set has to answer. LeafDepth 0 is off and is the
+//default.
+//
+//WHAT IT DELIBERATELY DOES NOT HAVE. No transposition table (shared across four threads it would
+//need its own correctness argument, and cutoffs alone are what the branching-factor claim rests
+//on), no null-move and no late-move reductions (each of those is a separate confound, and the
+//measurement is about whether leaf resolution helps at all), and no repetition or fifty-move
+//detection inside the leaf search -- within four plies a repetition needs the path history this
+//function does not carry, and the surrounding engine already scores those at the node.
+int64_t leaf_depth = LEAF_DEPTH;
+std::atomic<uint64_t> leaf_ab_calls{0}, leaf_ab_nodes{0}, leaf_ab_cutoffs{0}, leaf_ab_blind{0};
+
+//Legal moves for the leaf search, the same staged generation the rest of the engine uses.
+//
+//captures_only is the quiescence horizon and is IGNORED IN CHECK: standing pat in check is wrong,
+//and evaluate_nnue() cannot be called on a checked position at all, so the evasions are always
+//generated in full. One kingMoves() call therefore reports both the move list and the check.
+static int leaf_moves(Board& b, Move * out, bool captures_only, bool& in_check) {
+  auto [king_moves, pinned, pinning, checkers, kingSquare] = kingMoves(b);
+  in_check = (checkers != 0);
+  if (in_check) captures_only = false;
+  const uint64_t them = b.side[b.sideToMove == ColorWhite ? ColorBlack : ColorWhite];
+  int n = 0;
+  Move move;
+  move.src = kingSquare;
+  move.promoType = PieceTypeNone;
+  while (king_moves) {
+    move.dst = popLSB(king_moves);
+    if (!captures_only || ((1ULL << move.dst) & them)) out[n++] = move;
+  }
+  if (bitCount(checkers) <= 1) {
+    auto [check_mask, ep_mask] = checkers ? checkMask(b, kingSquare, checkers)
+                                          : std::make_pair(0xffffffffffffffffULL, 0ULL);
+    for (PieceType pt = Queen; pt >= Pawn; --pt) {
+      uint64_t occupations = b.side[b.sideToMove] & b.pieceTypes[pt - 1];
+      while (occupations) {
+        move.src = popLSB(occupations);
+        uint64_t moves = piece_moves(b, pt, move.src, kingSquare, pinned, pinning, check_mask, ep_mask);
+        while (moves) {
+          move.dst = popLSB(moves);
+          PieceType startPiece = PieceTypeNone, endPiece = PieceTypeNone;
+          if (promoMove(b, move)) { startPiece = Knight; endPiece = Queen; }
+          //A promotion changes the material on the board as much as a capture does, so it stays in
+          //the capture-only list whether or not it takes anything. En passant does not land on an
+          //occupied square and so is missed by this test; that is the usual compromise for a
+          //capture horizon and it loses nothing a quiet evaluation would have caught.
+          const bool noisy = (((1ULL << move.dst) & them) != 0) || startPiece != PieceTypeNone;
+          for (move.promoType = startPiece; move.promoType <= endPiece; ++move.promoType)
+            if (!captures_only || noisy) out[n++] = move;
+          move.promoType = PieceTypeNone;
+        }
+      }
+    }
+  }
+  return n;
+}
+
+//ORDERING IS THE WHOLE COST. Alpha-beta visits about the square root of the full tree only when the
+//best move is searched FIRST at every node; with a bad order the cutoffs do not happen and it
+//degenerates towards full width. Measured on one deep position, MVV-LVA alone gave 84,337 nodes for
+//a 4-ply leaf -- a branching factor near 8 per ply, against the 1.83 abprobe.cpp measures with the
+//full set of orderings. None of what is added here prunes anything, so none of it can change the
+//value the leaf search returns; it only changes how long that value takes.
+#define LEAF_MAX_PLY 64
+struct LeafOrderCtx {
+  //Best move found at each ply, written as the search goes and read by the next iteration of the
+  //deepening -- the job a transposition table would do, without the table. Per call, on the stack
+  //of the thread that is searching, so four threads need no agreement about it.
+  Move best[LEAF_MAX_PLY];
+  bool has_best[LEAF_MAX_PLY];
+  //Two killers per ply: quiet moves that caused a cutoff elsewhere at the same distance from the
+  //leaf. They cost two slots and catch the common case of one refutation answering many moves.
+  Move killer[LEAF_MAX_PLY][2];
+  bool has_killer[LEAF_MAX_PLY][2];
+  LeafOrderCtx() {
+    for (int i = 0; i < LEAF_MAX_PLY; ++i) {
+      has_best[i] = false; has_killer[i][0] = false; has_killer[i][1] = false;
+    }
+  }
+};
+
+static inline bool leaf_same(const Move& a, const Move& b) {
+  return a.src == b.src && a.dst == b.dst && a.promoType == b.promoType;
+}
+
+static const int LEAF_PIECE_VALUE[7] = {0, 100, 320, 330, 500, 900, 0}; //index by PieceType
+
+static void leaf_order(Board& b, Move * mv, int n, const LeafOrderCtx& lc, int ply) {
+  int score[256];
+  const bool have_ply = ply < LEAF_MAX_PLY;
+  for (int i = 0; i < n; ++i) {
+    const int victim = b.piecesOnSquares[mv[i].dst] == PieceNone
+                       ? 0 : LEAF_PIECE_VALUE[b.piecesOnSquares[mv[i].dst] & 7];
+    const int mover  = LEAF_PIECE_VALUE[b.piecesOnSquares[mv[i].src] & 7];
+    int s = victim * 16 - mover
+          + (mv[i].promoType != PieceTypeNone ? LEAF_PIECE_VALUE[mv[i].promoType] * 16 : 0);
+    if (have_ply) {
+      //Ahead of every capture, because it is the move the previous, shallower iteration actually
+      //chose here and so is the best single guess available.
+      if (lc.has_best[ply] && leaf_same(mv[i], lc.best[ply])) s += 1 << 20;
+      else if (lc.has_killer[ply][0] && leaf_same(mv[i], lc.killer[ply][0])) s += 1 << 14;
+      else if (lc.has_killer[ply][1] && leaf_same(mv[i], lc.killer[ply][1])) s += 1 << 13;
+    }
+    score[i] = s;
+  }
+  //Insertion sort: n is about 35 and this runs at every node of the leaf search, so the constant
+  //matters more than the order of growth.
+  for (int i = 1; i < n; ++i) {
+    const Move m = mv[i]; const int s = score[i];
+    int j = i - 1;
+    while (j >= 0 && score[j] < s) { mv[j + 1] = mv[j]; score[j + 1] = score[j]; --j; }
+    mv[j + 1] = m; score[j + 1] = s;
+  }
+}
+
+//A quiet move that cut: remember it for the next node at this ply.
+static inline void leaf_store_killer(LeafOrderCtx& lc, const Move& m, int ply, bool quiet) {
+  if (!quiet || ply >= LEAF_MAX_PLY) return;
+  if (lc.has_killer[ply][0] && leaf_same(m, lc.killer[ply][0])) return;
+  lc.killer[ply][1] = lc.killer[ply][0]; lc.has_killer[ply][1] = lc.has_killer[ply][0];
+  lc.killer[ply][0] = m;                 lc.has_killer[ply][0] = true;
+}
+
+#define LEAF_QS_CHECK_EXT 3   //check extensions allowed inside the capture search
+
+//The capture horizon. Fail-soft, centipawns, from b.sideToMove's perspective.
+static int leaf_qs(Board& b, NNUEContext& ctx, int alpha, int beta, int ext, int ply, LeafOrderCtx& lc) {
+  leaf_ab_nodes.fetch_add(1, std::memory_order_relaxed);
+  Move mv[256];
+  bool in_check = false;
+  const int n = leaf_moves(b, mv, true, in_check);
+  if (n == 0) {
+    //No evasion in check is mate. No capture out of check is simply a quiet position, which is
+    //what the stand-pat score is for.
+    if (in_check) return -MATE_SCORE + ply;
+    return static_cast<int>(evaluate_nnue(b, ctx) * 100.0);
+  }
+  int best;
+  if (in_check) {
+    //OUT OF CHECK EXTENSIONS, and the net cannot score a checked position at all. The first version
+    //returned the window's alpha here, which was wrong in a way worth recording: it made this leaf's
+    //value depend on the window it happened to be searched with, so the leaf search was not a
+    //function of the position. That also makes it unverifiable -- a cutoff-free negamax searches with
+    //a full window and would disagree by construction -- which is how the problem was found.
+    //
+    //The answer instead is the 1-ply static minimax over the evasions, which is exactly what the
+    //rest of the engine does in check (node_minimax, and process_check() before it), and depends on
+    //nothing but the position.
+    if (ext <= 0) {
+      leaf_ab_blind.fetch_add(1, std::memory_order_relaxed);
+      int mm = 0;
+      bool any = false;
+      for (int i = 0; i < n; ++i) {
+        StateInfo st;
+        auto [dp, dts] = accumulator_stack_push(ctx);
+        do_move_dp(b, mv[i], st, dp, dts);
+        bool child_check = false;
+        Move tmp[256];
+        const int cn = leaf_moves(b, tmp, false, child_check);
+        int v;
+        //No reply to the evasion: the evasion mates them, or stalemates them.
+        if (cn == 0)          v = child_check ? MATE_SCORE - ply : 0;
+        //An evasion that gives check back cannot be scored by the net either, and there is no ply
+        //left to spend resolving it. Scored as 0, which is a guess -- it is the one remaining
+        //inexactness in the leaf search, and leaf_ab_blind counts how often it is reached.
+        else if (child_check) v = 0;
+        else                  v = -static_cast<int>(evaluate_nnue(b, ctx) * 100.0);
+        undo_move(b, mv[i], st);
+        accumulator_stack_pop(ctx);
+        if (!any || v > mm) { mm = v; any = true; }
+      }
+      return mm;
+    }
+    best = -MATE_SCORE * 2;   //no stand-pat in check
+    --ext;
+  } else {
+    best = static_cast<int>(evaluate_nnue(b, ctx) * 100.0);
+    if (best >= beta) { leaf_ab_cutoffs.fetch_add(1, std::memory_order_relaxed); return best; }
+    if (best > alpha) alpha = best;
+  }
+  leaf_order(b, mv, n, lc, ply);
+  for (int i = 0; i < n; ++i) {
+    StateInfo st;
+    auto [dp, dts] = accumulator_stack_push(ctx);
+    do_move_dp(b, mv[i], st, dp, dts);
+    const int sc = -leaf_qs(b, ctx, -beta, -alpha, ext, ply + 1, lc);
+    undo_move(b, mv[i], st);
+    accumulator_stack_pop(ctx);
+    if (sc > best) best = sc;
+    if (best > alpha) alpha = best;
+    if (alpha >= beta) { leaf_ab_cutoffs.fetch_add(1, std::memory_order_relaxed); break; }
+  }
+  return best;
+}
+
+//Plain fail-soft negamax with alpha-beta. Centipawns, from b.sideToMove's perspective.
+static int leaf_ab(Board& b, NNUEContext& ctx, int depth, int alpha, int beta, int ply, int ply_cap,
+                   LeafOrderCtx& lc) {
+  leaf_ab_nodes.fetch_add(1, std::memory_order_relaxed);
+  Move mv[256];
+  bool in_check = false;
+  const int n = leaf_moves(b, mv, false, in_check);
+  if (n == 0) return in_check ? -MATE_SCORE + ply : 0;   //mate, or stalemate
+  //The check extension, bounded by ply_cap so a long forcing sequence cannot make the leaf search
+  //unbounded. It also keeps evaluate_nnue() away from a checked position here: a checked node is
+  //never at depth 0 after this line, so it never reaches the horizon below.
+  if (in_check && ply < ply_cap) ++depth;
+  if (depth <= 0) return leaf_qs(b, ctx, alpha, beta, LEAF_QS_CHECK_EXT, ply, lc);
+  leaf_order(b, mv, n, lc, ply);
+  int best = -MATE_SCORE * 2;
+  for (int i = 0; i < n; ++i) {
+    StateInfo st;
+    const bool quiet = b.piecesOnSquares[mv[i].dst] == PieceNone
+                       && mv[i].promoType == PieceTypeNone;
+    auto [dp, dts] = accumulator_stack_push(ctx);
+    do_move_dp(b, mv[i], st, dp, dts);
+    const int sc = -leaf_ab(b, ctx, depth - 1, -beta, -alpha, ply + 1, ply_cap, lc);
+    undo_move(b, mv[i], st);
+    accumulator_stack_pop(ctx);
+    if (sc > best) best = sc;
+    if (best > alpha) {
+      alpha = best;
+      if (ply < LEAF_MAX_PLY) { lc.best[ply] = mv[i]; lc.has_best[ply] = true; }
+    }
+    if (alpha >= beta) {
+      leaf_ab_cutoffs.fetch_add(1, std::memory_order_relaxed);
+      leaf_store_killer(lc, mv[i], ply, quiet);
+      break;
+    }
+  }
+  return best;
+}
+
+//ITERATIVE DEEPENING inside the leaf. Each shallower pass is cheap and leaves behind the best move
+//at every ply, which the next pass searches first -- so the deep pass gets its cutoffs on the first
+//move at most nodes instead of after half of them. The total is dominated by the last iteration,
+//which is why re-searching from depth 1 every time is not the waste it looks like.
+static int leaf_search(Board& b, NNUEContext& ctx, int depth) {
+  LeafOrderCtx lc;
+  //Depth 0 is the quiescence alone -- the capture horizon with no full-width ply above it. The
+  //engine never asks for it (LeafDepth 0 is off and takes the old path entirely), but a caller
+  //measuring the leaf search on its own needs it to mean something rather than 0.
+  if (depth <= 0) return leaf_qs(b, ctx, -MATE_SCORE * 2, MATE_SCORE * 2, LEAF_QS_CHECK_EXT, 0, lc);
+  int sc = 0;
+  for (int d = 1; d <= depth; ++d)
+    sc = leaf_ab(b, ctx, d, -MATE_SCORE * 2, MATE_SCORE * 2, 0, depth * 3, lc);
+  return sc;
+}
+
 //generate moves and calls make_move() for each move, which calls position_eval(), which calls isCheckMateStaleMate() and if check, calls process_check(), which calls this function again forming recursion for checks; otherwise, position_eval() calls evaluate_nnue(), which cannot be called in check
 //computes and sorts move evaluations and calls expand_node()
 //called from mcts_search(), set_root() and process_check()
@@ -2904,6 +3175,28 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
       const int t   = std::get<3>(ev);
       if (t == 1 || (t == 0 && ccp != NO_MATE_SCORE)) scorecp = std::max(scorecp, -ccp);
     }
+  }
+  //LEAF ALPHA-BETA replaces this leaf's value with a bounded search from it. See the block above
+  //leaf_moves() for why, and for what it costs.
+  //
+  //Not in check: a checked node's value already comes from the 1-ply minimax over its evasions
+  //(evaluate_nnue() cannot be called on it), and leaf_ab() would only repeat that work one ply
+  //later. Not in tablebase range either: the leaf search does not probe, so under TB_LARGEST it
+  //would replace an exact verdict with an estimate -- position_eval()'s probe is strictly better
+  //there, and keeping those positions on the old path also keeps endgames out of the comparison.
+  if (leaf_depth > 0 && !checkers &&
+      bitCount(chess_board.side[ColorWhite] | chess_board.side[ColorBlack]) > TB_LARGEST) {
+    leaf_ab_calls.fetch_add(1, std::memory_order_relaxed);
+    int ab = leaf_search(chess_board, ctx, static_cast<int>(leaf_depth));
+    //Kept from the static path: a mate or a tablebase verdict found while making the children is
+    //exact, and we are never obliged to play into it, so max() is the right combination. The
+    //tablebase case is the one that matters -- leaf_ab() cannot find it on its own.
+    for (const auto& ev : move_evals) {
+      const int ccp = std::get<2>(ev);
+      const int t   = std::get<3>(ev);
+      if (t == 1 || (t == 0 && ccp != NO_MATE_SCORE)) ab = std::max(ab, -ccp);
+    }
+    scorecp = std::clamp(ab, -MATE_SCORE, MATE_SCORE);
   }
   node->cp.store(scorecp, std::memory_order_relaxed); //look-ahead update
   expand_node(node, move_evals);
@@ -3676,6 +3969,20 @@ void runMCTS(NNUEContext& ctx) {
                position_history.size(), max_rep, flipped,
                (unsigned long long)hollow, sims ? 100.0 * hollow / sims : 0.0,
                (unsigned long long)tb_probe_misses.load(std::memory_order_relaxed));
+      //The leaf alpha-beta's own cost, which is the number the experiment turns on: nodes per leaf
+      //is the exchange rate against the simulations it displaces, and the cutoff share says whether
+      //the ordering is good enough for the search to be paying 2-per-ply rather than 35-per-ply.
+      const uint64_t lcalls = leaf_ab_calls.load(std::memory_order_relaxed);
+      if (lcalls) {
+        const uint64_t lnodes = leaf_ab_nodes.load(std::memory_order_relaxed);
+        log_file("info string leaf alpha-beta: depth %lld, %llu leaves searched, %llu nodes "
+                 "(%.1f per leaf), %llu cutoffs (%.1f%% of nodes), %llu refused in check\n",
+                 (long long)leaf_depth, (unsigned long long)lcalls,
+                 (unsigned long long)lnodes, (double)lnodes / (double)lcalls,
+                 (unsigned long long)leaf_ab_cutoffs.load(std::memory_order_relaxed),
+                 lnodes ? 100.0 * leaf_ab_cutoffs.load(std::memory_order_relaxed) / lnodes : 0.0,
+                 (unsigned long long)leaf_ab_blind.load(std::memory_order_relaxed));
+      }
     }
     if (chessEngine.optionCheck[FinalInfoLines].value) {    
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
