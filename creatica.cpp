@@ -40,6 +40,7 @@
 #include "nnue/bitboard.h"
 #include "creatica_search.hpp"
 #include "policy_net.h"
+#include "err_head.h"
 #include "uci_engine.h"
 #include <sys/stat.h>
 #include <unistd.h>
@@ -50,6 +51,13 @@
 
 //--- state owned by creatica_search.cpp ------------------------------------------
 extern PolicyNet policy_net;
+extern ErrHead   err_head;
+//Declared here rather than in creatica_search.hpp because that header does not know what an
+//ErrHead is; the flag lives in the search's translation unit with it.
+extern bool      err_head_enabled;
+//To refuse a head trained against a feature transformer of a different width -- see
+//load_err_head(). nnue.cpp exports it; creatica.cpp had no reason to declare it before.
+int nnue_feature_dims();
 extern bool      policy_enabled;
 extern int       policy_mode;
 extern double    policy_temperature;
@@ -612,6 +620,16 @@ public:
         o.spin("MinVisitDepth", &min_visit_depth, 0, 0, 8);
         //LeafDepth: a bounded alpha-beta search at every expanded leaf. 0 is off.
         o.spin("LeafDepth",     &leaf_depth,      LEAF_DEPTH, 0, 8);
+        //THE SELECTIVE LEAF SEARCH: the same bounded alpha-beta, but at the CHILDREN a model says
+        //the static evaluation is about to be most wrong about, instead of at every leaf. 0 plies
+        //is off, and it is also off whenever ErrWeights names no loadable head. See the note above
+        //err_leaf_depth in creatica_search.hpp.
+        o.string("ErrWeights",  &err_weights_, ERR_WEIGHTS_DEFAULT, [this] { on_err_weights(); });
+        o.spin("ErrLeafDepth",  &err_leaf_depth,  ERR_LEAF_DEPTH, 0, 8);
+        //In centipawns of PREDICTED error. 371 is the head's own 90th percentile over 3.6M
+        //held-out moves, so it reproduces the one-child-in-ten budget the offline numbers were
+        //measured at; lower spends more plies on more children.
+        o.spin("ErrThreshold",  &err_threshold,   ERR_THRESHOLD, 0, 2000);
         o.check("ValidateTree", &validate_tree_enabled, false);
     }
 
@@ -651,6 +669,7 @@ public:
 
         load_policy_net(policy_weights_.c_str(), /*startup=*/true);
         apply_policy_mode();
+        load_err_head(err_weights_.c_str(), /*startup=*/true);
 
         curl_global_init(CURL_GLOBAL_DEFAULT);
         init_thread_pool((int)chessEngine.optionSpin[Threads].value);
@@ -853,7 +872,10 @@ public:
             return true;
         }
         if (line == "eval") {
-            print("%s\n", nnue_eval(board).c_str());
+            //The check state is computed here rather than read off the Board: this is a UCI command
+            //arriving at an arbitrary moment, so nothing guarantees when kingMoves() last ran.
+            const BoardState bs = isCheckMateStaleMate(board);
+            print("%s\n", nnue_eval(board, bs.check).c_str());
             return true;
         }
         if (line == "settings") {
@@ -868,6 +890,8 @@ private:
     std::string    last_settings_;   //what log_settings() wrote last, so it only speaks on a change
     std::string    syzygy_path_;
     std::string    policy_weights_;
+    std::string    err_weights_;
+    std::string    err_loaded_;
     std::string    policy_loaded_;      // what policy_net actually holds
     int64_t        policy_mode_opt_ = 1;
     bool           performance_cores_opt_ = false;
@@ -1151,6 +1175,65 @@ private:
 
     // Reloading swaps vectors that the worker threads read without a lock, so it cannot
     // happen underneath a live search. Refusing is safe; racing is a crash mid-game.
+    // A failed load leaves the search unchanged. The error head is an addition, not a
+    // substitute: without it the children keep their static values, which is what the engine has
+    // always done, so reporting and carrying on is the right failure -- flagging children with a
+    // random net is not.
+    bool load_err_head(const char * path, bool startup) {
+        ErrHead fresh;
+        char err[512] = "";
+        if (!path || !*path) {
+            err_head_enabled = false;
+            err_loaded_.clear();
+            if (!startup) print("info string ErrWeights cleared; the selective leaf search is off\n");
+            return false;
+        }
+        if (!err_head_load(fresh, path, err, sizeof err)) {
+            const char * msg = startup
+                ? "info string selective leaf search disabled (%s)\n"
+                : "info string ErrWeights: %s -- keeping the selective leaf search off\n";
+            print(msg, err);
+            log_file(msg, err);
+            if (!startup) err_weights_ = err_loaded_;   // the option must name what is loaded
+            return false;
+        }
+        // The head reads the FEATURE TRANSFORMER's output, so a net trained against a different
+        // transformer width would index past the end of the feature buffer. Refuse it here rather
+        // than in err_head_load(), which knows nothing about this build's NNUE.
+        if (fresh.in != nnue_feature_dims() || fresh.in > POLICY_MAX_IN) {
+            print("info string ErrWeights: %s wants %d features, this build's transformer gives %d "
+                  "(limit %d) -- the selective leaf search stays off\n",
+                  path, fresh.in, nnue_feature_dims(), POLICY_MAX_IN);
+            if (!startup) err_weights_ = err_loaded_;
+            return false;
+        }
+        if (fresh.h2 > POLICY_MAX_H2) {
+            print("info string ErrWeights: %s has h2 %d, over the %d the scratch buffer holds -- "
+                  "the selective leaf search stays off\n", path, fresh.h2, POLICY_MAX_H2);
+            if (!startup) err_weights_ = err_loaded_;
+            return false;
+        }
+        err_head = std::move(fresh);
+        err_head_enabled = true;
+        err_loaded_ = path;
+        print("info string error head %s loaded: %d -> %d -> %d -> %d\n",
+              path, err_head.in, err_head.h1, err_head.h2, err_head.out);
+        log_file("info string error head %s loaded: %d -> %d -> %d -> %d\n",
+                 path, err_head.in, err_head.h1, err_head.h2, err_head.out);
+        return true;
+    }
+
+    void on_err_weights() {
+        if (err_weights_ == err_loaded_) return;
+        if (searchFlag.load()) {
+            print("info string ErrWeights: cannot reload while searching; keeping %s\n",
+                  err_loaded_.empty() ? "<none>" : err_loaded_.c_str());
+            err_weights_ = err_loaded_;
+            return;
+        }
+        load_err_head(err_weights_.c_str(), /*startup=*/false);
+    }
+
     void on_policy_weights() {
         if (policy_weights_ == policy_loaded_) return;
         if (searchFlag.load()) {

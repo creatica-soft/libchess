@@ -33,19 +33,8 @@ static const char * syzygy_path_default(void) {
 #define EVAL_SCALE 6.0
 #define TEMPERATURE 60
 
-struct NNUEContext {
-    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
-    Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
-};
-//void init_nnue(const char * nnue_file_big = EvalFileDefaultNameBig, const char * nnue_file_small = EvalFileDefaultNameSmall);
-void init_nnue();
-void cleanup_nnue();
-void init_nnue_context(NNUEContext& ctx);
-void free_nnue_context(NNUEContext& ctx);
-double evaluate_nnue(const Board& board, NNUEContext& ctx);
-std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
-void accumulator_stack_pop(NNUEContext& ctx);
-void accumulator_stack_reset(NNUEContext& ctx);
+//NNUEContext and the nnue wrapper functions come from libchess.h; this file used to carry its own
+//copy. compute_move_evals() below is local to this harness and stays.
 void compute_move_evals(Board& chess_board, ZobristHash& board_hash, NNUEContext& ctx, NNUEContext& ctx2, std::vector<std::tuple<double, int, int, unsigned long long>>& move_evals);
 double temperature = TEMPERATURE * 0.01;
 //double probability_mass = PROBABILITY_MASS * 0.01;
@@ -93,20 +82,20 @@ double process_check(Board& temp_board, ZobristHash& board_hash, NNUEContext& ct
 double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& ctx, NNUEContext& ctx2) {
   double res;
 	const int pieceCount = bitCount(chess_board.side[ColorWhite] | chess_board.side[ColorBlack]);
-	isCheckMateStaleMate(chess_board);
+	const BoardState bs = isCheckMateStaleMate(chess_board);
 	if (pieceCount > TB_LARGEST || chess_board.castlingRights) {
     //evaluate_nnue() returns result in pawns (not centipawns!)
     //we made the move above, so the eval res is from the perspective of opponent color or board_fen.sideToMove
     //and must be negated to preserve the perspective of board_fen.sideToMove
-    if (chess_board.isMate) res = -MATE_SCORE * 0.01; //chess_board.sideToMove loses
-    else if (chess_board.isStaleMate) {
+    if (bs.mate) res = -MATE_SCORE * 0.01; //chess_board.sideToMove loses
+    else if (bs.stalemate) {
       res = 0.0;
-    } else if (chess_board.isCheck) {
+    } else if (bs.check) {
       res = process_check(chess_board, board_hash, ctx, ctx2);
     } else {
-      res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
+      res = evaluate_nnue(chess_board, ctx, bs.check); //returns pawns, not centipawns
       accumulator_stack_reset(ctx2);
-      double res2 = evaluate_nnue(chess_board, ctx2);
+      double res2 = evaluate_nnue(chess_board, ctx2, bs.check);
       if (std::abs(res - res2) > 0.1) printf("inc eval res %f, full eval res %f", res, res2);
     }
   } else { //pieceCount <= TB_LARGEST, etc
@@ -115,15 +104,15 @@ double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& c
       0, 0, ep == SquareNone ? 0 : ep, (chess_board.sideToMove ^ 1) == ColorBlack ? 1 : 0);
     if (wdl == TB_RESULT_FAILED) {
       fprintf(stderr, "error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, err %s\n", TB_LARGEST, pieceCount, ep, chess_board.halfmoveClock, (chess_board.sideToMove ^ 1) == ColorBlack ? 1 : 0, chess_board.side[ColorWhite], chess_board.side[ColorBlack], chess_board.pieceTypes[King - 1], chess_board.pieceTypes[Queen - 1], chess_board.pieceTypes[Rook - 1], chess_board.pieceTypes[Bishop - 1], chess_board.pieceTypes[Knight - 1], chess_board.pieceTypes[Pawn - 1], strerror(errno));
-      if (chess_board.isMate) res = -MATE_SCORE * 0.01;
-      else if (chess_board.isStaleMate) {
+      if (bs.mate) res = -MATE_SCORE * 0.01;
+      else if (bs.stalemate) {
         res = 0.0; 
-      } else if (chess_board.isCheck) {
+      } else if (bs.check) {
         res = process_check(chess_board, board_hash, ctx, ctx2);
       } else {
-        res = evaluate_nnue(chess_board, ctx);
+        res = evaluate_nnue(chess_board, ctx, bs.check);
         accumulator_stack_reset(ctx2);
-        double res2 = evaluate_nnue(chess_board, ctx2);
+        double res2 = evaluate_nnue(chess_board, ctx2, bs.check);
         if (std::abs(res - res2) > 0.1) printf("inc eval res %f, full eval res2 %f", res, res2);
       }
     } else { //tb_probe_wdl() succeeded
@@ -229,8 +218,8 @@ int main(int argc, char ** argv) {
   
   position_eval(board, zh, ctx, ctx2);
   
-	isCheckMateStaleMate(board);
-  if (!board.isMate && !board.isStaleMate) {
+	const BoardState rb = isCheckMateStaleMate(board);
+  if (!rb.mate && !rb.stalemate) {
     std::vector<std::tuple<double, int, int, unsigned long long>> move_evals; //res, move_idx, scorecp, hash
     compute_move_evals(board, zh, ctx, ctx2, move_evals);
     std::cout << "Outcome " << -std::get<2>(move_evals[0]) << " for " << color[board.sideToMove] << std::endl;
@@ -240,7 +229,7 @@ int main(int argc, char ** argv) {
       idx2uci(std::get<1>(move_evals[i]), uci_move);
       std::cout << uci_move << " (" << std::get<0>(move_evals[i]) * 100 << "%)" << ", cp " << -std::get<2>(move_evals[i]) << std::endl;
     }
-  } else if (board.isMate) 
+  } else if (rb.mate) 
     printf("%s is mated\n", color[board.sideToMove]);
   else printf("stalemate, %s has no moves\n", color[board.sideToMove]);
   free_nnue_context(ctx);

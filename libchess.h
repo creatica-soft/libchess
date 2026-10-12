@@ -631,17 +631,19 @@ struct StateInfo {
     //File castlingRook[Color_NB][2] = {{FileNone, FileNone}, {FileNone, FileNone}};
     uint8_t castlingRights;
     uint64_t castlingRooks;
-    bool isCheck = false;
-    uint8_t num_moves = 0;
-    //isMate/isStaleMate were NOT saved here, so undo_move() left the board wearing the
-    //flags of whatever position was last examined. Any code that calls
-    //isCheckMateStaleMate() on a child mid-search - which is how per-child terminal
-    //detection has to work - then corrupted its caller's view of the parent.
-    //APPENDED, not inserted: putting them before num_moves shifted that field from
-    //offset 33 to 35 while sizeof stayed 40, so any binary built against the older
-    //header would have read num_moves from the wrong byte when calling this dylib.
-    bool isMate = false;
-    bool isStaleMate = false;
+    //isCheck, num_moves, isMate and isStaleMate were saved and restored here so that undo_move()
+    //could put the Board's cached flags back. All four are GONE, on 2026-10-12, together with the
+    //Board members themselves: isCheckMateStaleMate() returns a BoardState, so the Board carries no
+    //derived state and there is nothing to preserve across a move.
+    //
+    //The note that lived here recorded the second of the three bugs this design caused: isMate and
+    //isStaleMate were originally NOT saved, so undo_move() left the board wearing the flags of
+    //whatever position was last examined, and any code calling isCheckMateStaleMate() on a child
+    //mid-search corrupted its caller's view of the parent. It was fixed by APPENDING them rather
+    //than inserting, because inserting would have shifted num_moves from offset 33 to 35 while
+    //sizeof stayed 40 -- so a binary built against the older header would have read it from the
+    //wrong byte when calling this dylib. That hazard is the reason to prefer returning a value
+    //over growing a struct, and it is why these are removed rather than rearranged.
     // Pointers to previous state allow for repetition detection
     //StateInfo* previous; //currently not used
 };
@@ -825,7 +827,96 @@ CHESS_API std::pair<uint64_t, uint64_t> checkMask(const Board& board, Square kin
 CHESS_API uint64_t getCheckers(const Board& board, const Square kingSq);
 CHESS_API std::pair<uint64_t, uint64_t> pinFinder(const Board& board, const Square kingSq);
 CHESS_API uint64_t piece_moves(Board& board, const PieceType pt, const Square sq, const Square kingSq, const uint64_t pinned, uint64_t pinning, const uint64_t check_mask, const uint64_t ep_mask);
-CHESS_API void isCheckMateStaleMate(Board& board);
+//WHAT THE BOARD'S CACHED FLAGS USED TO CARRY, returned instead of stored.
+//
+//`Board::isCheck`/`isMate`/`isStaleMate`/`num_moves` are valid only IMMEDIATELY after kingMoves()
+//or isCheckMateStaleMate() on that exact position -- do_move() preserves them so undo_move() can
+//restore them, but never recomputes them, so after a move they describe the PARENT. Nothing in the
+//type system said so, and the same bug has now been found three separate times: the flags leaking
+//across positions in fen2board (see fen.cpp), isMate/isStaleMate not being saved in StateInfo (see
+//the note there), and a stale isCheck making evaluate_nnue() return its in-check sentinel for a
+//quiet position -- which cost a 4.3x slowdown and ten points of accuracy in an alpha-beta probe
+//before anyone noticed.
+//
+//So the values are returned. The caller holds them for exactly as long as they are true.
+struct BoardState {
+    bool check     = false;   //the side to move is in check. SEE THE NOTE on mate, below.
+    bool mate      = false;
+    bool stalemate = false;
+    int  num_moves = 0;       //legal moves for the side to move, promotions counted as four
+};
+
+//NOTE, PRESERVED AND NOT ENDORSED: when the position is mate this reports check == false, which is
+//what the cached flags did (board.cpp set isMate and cleared isCheck together). A mate IS a check,
+//so that is wrong on its face; it is kept byte-for-byte here because changing it would alter every
+//caller's behaviour at the same time as the refactor that removed the fields, and the two need
+//measuring apart.
+CHESS_API BoardState isCheckMateStaleMate(Board& board);
+
+//How many legal moves a generated bitboard represents for `pt`. A pawn landing on the promotion
+//rank is FOUR moves, not one, and expanding them is the caller's job -- so a caller that counts
+//with a bare bitCount() undercounts exactly where it matters. This is the rule piece_moves() used
+//to apply to board.num_moves on the caller's behalf.
+CHESS_API int moveCount(const Board& board, PieceType pt, uint64_t moves);
+
+//=== THE NNUE WRAPPER API =========================================================================
+//
+//nnue/nnue.cpp is the thin wrapper the rest of the project uses, and until now it was declared
+//NOWHERE PUBLIC: creatica_search.hpp, test_pos.cpp, test_nnue.cpp and test_smp.cpp each carried
+//their own private copy of NNUEContext and these nine functions. Four copies that had to be kept
+//in step by hand, and they had already drifted -- test_smp's NNUEContext default-initialised its
+//pointers while the others left them indeterminate.
+//
+//That is not a tidiness problem. A declaration local to a translation unit makes the COMPILER
+//agree with the caller and leaves the LINKER to discover the disagreement, or not: adding the
+//in_check parameter to evaluate_nnue() produced exactly one error until all four copies were
+//found, and a missed one would have linked against a mangled name that no longer existed, or
+//matched a different overload. Declared once, a signature change breaks every caller at compile
+//time, which is the only moment at which it is cheap.
+//
+//The Stockfish types appear only as pointers and references, so forward declarations are enough and
+//libchess.h does not have to pull in the vendored accumulator headers. nnue/evaluate.h forward
+//declares the same two in the same way; the struct/class tags match the definitions in
+//nnue/types.h and nnue/nnue/nnue_accumulator.h, so a translation unit that includes both is fine.
+namespace Stockfish {
+struct DirtyPiece;
+struct DirtyThreats;
+namespace Eval::NNUE {
+struct AccumulatorCaches;
+class  AccumulatorStack;
+}
+}
+
+//One per search thread. Owned by init_nnue_context()/free_nnue_context().
+struct NNUEContext {
+    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack = nullptr;
+    Stockfish::Eval::NNUE::AccumulatorCaches * caches = nullptr;
+};
+
+CHESS_API void init_nnue();          //loads the embedded nets; call once at program start
+CHESS_API void cleanup_nnue();
+CHESS_API void init_nnue_context(NNUEContext& ctx);
+CHESS_API void free_nnue_context(NNUEContext& ctx);
+
+//Returns PAWNS, from the side to move's perspective. `in_check` is passed in rather than read off
+//the Board -- see the note on BoardState above for why that field could not be trusted. When it is
+//true the net is not consulted and NNUE_CHECK is returned.
+CHESS_API double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check);
+
+//Accumulator discipline: push -> do_move_dp -> ... -> undo_move -> pop, one context per thread.
+//reset() is required before evaluating a position unrelated to the last one.
+CHESS_API std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
+CHESS_API void accumulator_stack_pop(NNUEContext& ctx);
+CHESS_API void accumulator_stack_reset(NNUEContext& ctx);
+
+//The human-readable evaluation trace, i.e. what the UCI "eval" command prints.
+CHESS_API std::string nnue_eval(Board& board, bool in_check);
+
+//The feature transformer's post-activation output -- the representation a policy head trains on.
+//Maintained incrementally by the accumulator stack, so it is already computed at a search node.
+CHESS_API int nnue_features(const Board& board, NNUEContext& ctx, unsigned char * out);
+CHESS_API int nnue_feature_dims();
+//==================================================================================================
 //CHESS_API int get_see(const Board& board, const Move move, const PieceType capturedType); //move has been made
 //CHESS_API int get_see(const Board& board, Move move); //overload for above when the move has not been made
 CHESS_API int uci2move_idx(const char * uci_move, Move& move);

@@ -79,16 +79,21 @@ enum Piece : uint8_t {
 };
 
 struct Board {
-    //these booleans are not strictly needed except maybe isChess960
-    bool isCheck = false;
-    bool isStaleMate = false;
-    bool isMate = false;
+    //isCheck / isStaleMate / isMate were REMOVED on 2026-10-12, along with num_moves below. They
+    //were caches, valid only immediately after kingMoves() or isCheckMateStaleMate() on this exact
+    //position: do_move() preserved them so undo_move() could restore them, but never recomputed
+    //them, so after a move they described the PARENT. Nothing in the type system said so and the
+    //same bug was found three times -- the flags leaking across positions in fen2board, isMate and
+    //isStaleMate missing from StateInfo, and a stale isCheck making evaluate_nnue() return its
+    //in-check sentinel for a quiet position (a 4.3x slowdown and ten points of accuracy in an
+    //alpha-beta probe). isCheckMateStaleMate() now RETURNS a BoardState; see libchess.h.
     bool isChess960 = false;
     Color sideToMove = ColorWhite;
     File enPassant = FileNone; //a FILE index, not a square; FileNone == 8 means "no en passant"
     uint8_t halfmoveClock = 0;
-    uint8_t num_moves = 0; //not necessary but good for 8-byte alignment on 64-bit systems
-    //8 bytes up to here
+    //4 bytes up to here. The eight bytes the four removed fields occupied are absorbed by the
+    //padding before castlingRooks, so piecesOnSquares stays at offset 24 and sizeof(Board) stays
+    //152 -- both of which the vendored NNUE tree depends on.
     int moveNumber = 1;
     uint8_t castlingRights = 0xf;
     //3 bytes of padding follow; they are NOT zeroed even by `Board b{}`.
@@ -141,16 +146,12 @@ static_assert(sizeof(Board::piecesOnSquares) == 64, "PERMANENT: nnue_accumulator
 #if defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL   //the numbers below are the 64-bit layout
 static_assert(sizeof(Board) == 152, "PERMANENT: Board layout changed");
 static_assert(alignof(Board) == 8, "Board alignment changed");
-static_assert(offsetof(Board, isCheck) == 0, "Board layout changed");
-static_assert(offsetof(Board, isStaleMate) == 1, "Board layout changed");
-static_assert(offsetof(Board, isMate) == 2, "Board layout changed");
-static_assert(offsetof(Board, isChess960) == 3, "Board layout changed");
-static_assert(offsetof(Board, sideToMove) == 4, "Board layout changed");
-static_assert(offsetof(Board, enPassant) == 5, "Board layout changed");
-static_assert(offsetof(Board, halfmoveClock) == 6, "Board layout changed");
-static_assert(offsetof(Board, num_moves) == 7, "Board layout changed");
-static_assert(offsetof(Board, moveNumber) == 8, "Board layout changed");
-static_assert(offsetof(Board, castlingRights) == 12, "Board layout changed");
+static_assert(offsetof(Board, isChess960) == 0, "Board layout changed");
+static_assert(offsetof(Board, sideToMove) == 1, "Board layout changed");
+static_assert(offsetof(Board, enPassant) == 2, "Board layout changed");
+static_assert(offsetof(Board, halfmoveClock) == 3, "Board layout changed");
+static_assert(offsetof(Board, moveNumber) == 4, "Board layout changed");
+static_assert(offsetof(Board, castlingRights) == 8, "Board layout changed");
 static_assert(offsetof(Board, castlingRooks) == 16, "Board layout changed");
 static_assert(offsetof(Board, piecesOnSquares) == 24, "PERMANENT: Board layout changed");
 static_assert(offsetof(Board, side) == 88, "Board layout changed");

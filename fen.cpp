@@ -136,14 +136,12 @@ int fen2board(Board& board, const char * fenstr) {
     //((unsigned int *)board.castlingRook)[0] = 0x08080808;
     board.castlingRooks = 0;
     board.castlingRights = 0;
-    //These were never reset, so every cached flag leaked from the PREVIOUS position:
-    //one Chess960 game left isChess960 true for the life of the process, and a stale
-    //isCheck made nnue.cpp return the NNUE_CHECK sentinel for a position not in check.
+    //isChess960 is still a real field and still has to be reset: it was never reset at all, so one
+    //Chess960 game left it true for the life of the process. The four DERIVED flags that used to be
+    //reset beside it -- isCheck, isMate, isStaleMate, num_moves -- are gone from Board, so there is
+    //nothing left here to leak from the previous position. That leak was the first of the three
+    //bugs they caused.
     board.isChess960 = false;
-    board.isCheck = false;
-    board.isMate = false;
-    board.isStaleMate = false;
-    board.num_moves = 0;
 
     if (castling_ptr[0] != '-') {
         const char wf[] = "ABCDEFGH";

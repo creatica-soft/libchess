@@ -76,20 +76,13 @@ double virtual_loss;
 double eval_scale;
 double temperature;
 
-struct NNUEContext {
-    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack = nullptr;
-    Stockfish::Eval::NNUE::AccumulatorCaches * caches = nullptr;    
-};
-void init_nnue();
-void cleanup_nnue();
-void init_nnue_context(NNUEContext& ctx);
-void free_nnue_context(NNUEContext& ctx);
-double evaluate_nnue(const Board& chess_board, NNUEContext& ctx);
-std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
-void accumulator_stack_pop(NNUEContext& ctx);
-void accumulator_stack_reset(NNUEContext& ctx);
+//NNUEContext and the nnue wrapper functions come from libchess.h; this file used to carry its own
+//copy, and that copy had already DRIFTED -- it default-initialised both pointers to nullptr while
+//the other three left them indeterminate. Four hand-maintained copies of one API.
 void compute_move_evals(Board& chess_board, const ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, std::vector<std::tuple<double, int, int, uint64_t>>& move_evals);
-double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history);
+//`out` receives what the Board's cached flags used to carry. It is an out-parameter rather than a
+//second return value only to keep the call sites that ignore it unchanged.
+double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, BoardState * out = nullptr);
 
 Board board;
 ZobristHash zh;
@@ -429,26 +422,27 @@ double process_check(Board& temp_board, ZobristHash& board_hash, NNUEContext& ct
 //called from do_move()
 //calls evaluate_nnue() or process_check() or tb_probe_wdl()
 //returns position evaluation in pawns from board_fen->sideToMove perspective
-double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history) {
+double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, BoardState * out) {
   double res;
 	const int pieceCount = bitCount(chess_board.side[ColorWhite] | chess_board.side[ColorBlack]);
-	isCheckMateStaleMate(chess_board);
+	const BoardState bs = isCheckMateStaleMate(chess_board);
+	if (out) *out = bs;
 	if (pieceCount > TB_LARGEST || chess_board.castlingRights) {
 		//debug
 		//char fen[MAX_FEN_STRING_LEN];
 		//board2fen(chess_board, fen);
-    if (chess_board.isMate) {
+    if (bs.mate) {
       res = -MATE_SCORE * 0.01; //chess_board.sideToMove loses
       //print("position_eval() debug: mate detected, returning %f, fen %s\n", res, fen);
     }
-    else if (chess_board.isStaleMate) {
+    else if (bs.stalemate) {
       //print("position_eval() debug: stalemate detected, returning 0, fen %s\n", fen);
       res = 0.0;
-    } else if (chess_board.isCheck) {
+    } else if (bs.check) {
       res = process_check(chess_board, board_hash, ctx, pos_history);
       //print("position_eval() debug: check detected, processing and returning %f, fen %s\n", res, fen);
     } else {
-      res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
+      res = evaluate_nnue(chess_board, ctx, bs.check); //returns pawns, not centipawns
     }
   } else { //pieceCount <= TB_LARGEST, etc
     unsigned int ep = legalEnPassantMove(chess_board);     
@@ -457,13 +451,13 @@ double position_eval(Board& chess_board, ZobristHash& board_hash, NNUEContext& c
       char fen[MAX_FEN_STRING_LEN];
       print("error: unable to probe tablebase; position invalid, illegal or not in tablebase, TB_LARGEST %d, occupations %u, ep %u, halfmoveClock %u, whiteToMove %u, whites %llu, blacks %llu, kings %llu, queens %llu, rooks %llu, bishops %llu, knights %llu, pawns %llu, fen %s, err %s\n", TB_LARGEST, pieceCount, ep, chess_board.halfmoveClock, chess_board.sideToMove == ColorWhite ? 1 : 0, chess_board.side[ColorWhite], chess_board.side[ColorBlack], chess_board.pieceTypes[King - 1], chess_board.pieceTypes[Queen - 1], chess_board.pieceTypes[Rook - 1], chess_board.pieceTypes[Bishop - 1], chess_board.pieceTypes[Knight - 1], chess_board.pieceTypes[Pawn - 1], board2fen(chess_board, fen), strerror(errno));
   		//isCheckMateStaleMate(chess_board);
-      if (chess_board.isMate) res = -MATE_SCORE * 0.01;
-      else if (chess_board.isStaleMate) {
+      if (bs.mate) res = -MATE_SCORE * 0.01;
+      else if (bs.stalemate) {
         res = 0.0; 
-      } else if (chess_board.isCheck) {
+      } else if (bs.check) {
         res = process_check(chess_board, board_hash, ctx, pos_history);
       } else {
-        res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
+        res = evaluate_nnue(chess_board, ctx, bs.check); //returns pawns, not centipawns
       }
     } else { //tb_probe_wdl() succeeded
       //0 - loss, 4 - win, 1..3 - draw
@@ -612,7 +606,8 @@ void mcts_search(ThreadParams * params, NNUEContext& ctx) {
         //the node has been already evaluated except if it is root node
         //here we call position_eval() to reset the accumulator_stack, so subsequent evaluate_nnue() calls are incremental, hence faster
         accumulator_stack_reset(ctx);
-        result = position_eval(sim_board, sim_zh, ctx, pos_history); //calls isCheckMateStaleMate(sim_board)
+        BoardState sim_bs;
+        result = position_eval(sim_board, sim_zh, ctx, pos_history, &sim_bs);
         if (node == search.root) {
           scorecp = static_cast<int>(result * 100);
           result = tanh(result / eval_scale);
@@ -620,7 +615,7 @@ void mcts_search(ThreadParams * params, NNUEContext& ctx) {
           node->N.store(1, std::memory_order_relaxed);
           node->W.store(result, std::memory_order_relaxed);
         }
-        if (!sim_board.isMate && !sim_board.isStaleMate) {
+        if (!sim_bs.mate && !sim_bs.stalemate) {
         	std::vector<std::tuple<double, int, int, uint64_t>> move_evals; //res, move_idx, cp, hash (res is converted to probabilities in get_prob(), hence we need to preserve it in cp)
           compute_move_evals(sim_board, sim_zh, ctx, pos_history, move_evals);
           //updating node's cp with improve evaluation 
@@ -636,7 +631,7 @@ void mcts_search(ThreadParams * params, NNUEContext& ctx) {
           //we could try to iteratively play moves that are different in evals from scorecp by at least 1 pawn
           expand_node(node, move_evals, pos_history);
         } else {
-          if (sim_board.isMate) {
+          if (sim_bs.mate) {
             scorecp = -MATE_SCORE;
             result = -1;
           }
@@ -770,8 +765,8 @@ void runMCTS() {
   std::vector<std::pair<int, std::string>> pvs;
   int multiPV = 1;
 
-	isCheckMateStaleMate(board);
-  if (board.num_moves > 1) {
+	const BoardState root_bs = isCheckMateStaleMate(board);
+  if (root_bs.num_moves > 1) {
     tbhits.store(0, std::memory_order_relaxed);
     std::vector<ThreadParams> thread_params(chessEngine.optionSpin[Threads].value);
     for (int i = 0; i < chessEngine.optionSpin[Threads].value; ++i) {
@@ -814,7 +809,7 @@ void runMCTS() {
       if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
       hash_full.store(hashfull, std::memory_order_relaxed);
     }
-  } else if (board.num_moves == 1) {
+  } else if (root_bs.num_moves == 1) {
       auto iter_start = std::chrono::steady_clock::now();
       int move_idx = 0;
       Move move;
@@ -860,16 +855,16 @@ void runMCTS() {
       accumulator_stack_reset(ctx);
       StateInfo state = {};
       do_move(board, move, state);
-  		isCheckMateStaleMate(board);
+  		const BoardState after_bs = isCheckMateStaleMate(board);
       double res;
-      if (board.isMate) res = MATE_SCORE * 0.01;
-      else if (board.isStaleMate) res = 0.0;
-      else if (board.isCheck) {
+      if (after_bs.mate) res = MATE_SCORE * 0.01;
+      else if (after_bs.stalemate) res = 0.0;
+      else if (after_bs.check) {
         std::unordered_set<uint64_t>pos_history;
         ZobristHash tmp_zh = zh;
         res = -process_check(board, tmp_zh, ctx, pos_history);
       } else {
-        res = -evaluate_nnue(board, ctx);
+        res = -evaluate_nnue(board, ctx, after_bs.check);
       }
       undo_move(board, move, state);
       free_nnue_context(ctx);
@@ -886,11 +881,11 @@ void runMCTS() {
       }
   } //end of if (move_number == 1)
   else {
-      if (board.isMate) {
+      if (root_bs.mate) {
           print("info depth 0 score mate 0\n");
           print("bestmove (none)\n");
       }
-      else if (board.isStaleMate) {
+      else if (root_bs.stalemate) {
           print("info depth 0 score cp 0\n");
           print("bestmove (none)\n");
       }
@@ -1074,7 +1069,7 @@ int main(int argc, char **argv) {
       move_idx = uci2move_idx(uciMove, move);
       printf("searching for move %s (from %s to %s (promo %c), idx %d) in root's children...\n", uciMove, square[move.src], square[move.dst], uciPromoLetter[move.promoType], move_idx);
     }
-    if (board.num_moves <= 1) {
+    if (isCheckMateStaleMate(board).num_moves <= 1) {
       cleanup();
       cleanup_nnue();
       return 0;
