@@ -145,6 +145,10 @@ static inline const char * syzygy_path_default(void) {
 //
 //POLICY_BLEND_SCALE BELOW MUST MOVE WITH THIS. The blend constants are calibrated per net.
 #define POLICY_WEIGHTS_DEFAULT "nnue_policy_pisp2.bin"
+//Empty, not a filename: the selective leaf search is an experiment, so a build that was never
+//asked for it must not print a missing-file line on every startup. Naming a head here only makes
+//it loadable; ErrLeafDepth still has to be raised above 0 for anything to change.
+#define ERR_WEIGHTS_DEFAULT ""
 //Buffer bounds for the trunk. policy_net_load() refuses anything larger, so these are a
 //guarantee and not a hope.
 #define POLICY_MAX_IN 2048
@@ -158,6 +162,13 @@ static inline const char * syzygy_path_default(void) {
 //node's descents, leaving the leader 76%; see the MinVisitK note below for the arithmetic.
 #define MIN_VISIT_SHARE 0.03
 #define LEAF_DEPTH 0
+//ErrLeafDepth / ErrThreshold: the SELECTIVE leaf search. 0 plies is off and is the incumbent
+//search exactly. See the note above err_head_enabled in creatica_search.cpp.
+#define ERR_LEAF_DEPTH 0
+//The predicted error, in centipawns, at which a child stops being trusted statically. 371 is the
+//90th percentile of the head's own predictions over 3.6M held-out moves, i.e. the threshold that
+//reproduces the 10% resolution budget every offline number here was measured at.
+#define ERR_THRESHOLD 371
 //Share of the prior taken from the policy head; the remainder comes from the 1-ply child
 //evaluation. 0 reproduces the incumbent exactly, 1 is policy-only. Measured best around
 //0.4-0.5 (see the table in creatica_search.cpp). Override with CREATICA_POLICY_BLEND.
@@ -172,10 +183,8 @@ static inline const char * syzygy_path_default(void) {
 //for a blunt one, which is worse than either default alone.
 #define POLICY_BLEND_SCALE 1.02
 
-struct NNUEContext {
-    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
-    Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
-};
+//NNUEContext and the nnue wrapper functions are declared ONCE, in libchess.h. This file used to
+//carry its own copy, as did test_pos.cpp, test_nnue.cpp and test_smp.cpp -- see the note there.
 struct ThreadParams {
     int thread_id;
     uint64_t time_alloc;
@@ -1146,6 +1155,37 @@ extern int64_t min_visit_depth;
 //simulation count falls by roughly the branching factor to the power of the depth. 1 and 2 are
 //cheap; 4 is where the deep refutations live and where the exchange rate has to be measured.
 extern int64_t leaf_depth;
+
+//THE SELECTIVE LEAF SEARCH. Where LeafDepth replaces THIS node's value with a bounded alpha-beta
+//from it, this replaces the static evaluation of SOME OF ITS CHILDREN -- the ones a model says the
+//static evaluator is about to be most wrong about.
+//
+//Why per-child and not per-node. In the deployed blended-prior mode every child is evaluated
+//statically anyway, and the blend's second term is built from those values; the ordering of a
+//node's children by that term picks the labels' best move 27.2% of the time. Resolving EVERY
+//child with a 1-ply alpha-beta takes that to 52.5% and cuts the mean cost of the mistake from
+//1.92 pawns to 0.21 -- and as LeafDepth 1 the same search PLAYED WORSE, because it costs
+//452,559 simulations down to 159,346. Accuracy doubled and strength fell, so the question was
+//never whether the plies help; it is the price.
+//
+//What the head buys. Resolution's benefit is not spread evenly: by decile of the true static
+//error it runs from +14.9 cp (resolution HURTS the moves static already gets right) to -488.6 cp
+//in the worst tenth. Spending the plies only where the error is predicted to be large recovers
+//32.3% / 1.33 pawns for a tenth of the calls -- about a quarter of full resolution's accuracy
+//gain at a sixth of its cost. The exchange rate is roughly 5x better. That is the entire case for
+//this option, and it is NOT evidence that the sign flips: eight of the eight search changes tried
+//before it were null or negative once measured on unselected positions, and only a match at the
+//deployment time control can say whether this is the ninth.
+//
+//ErrWeights names the flat error head (moveerr_export.cpp writes it). Without it the option is
+//inert: a missing or malformed file leaves err_head_enabled false and the search unchanged,
+//rather than flagging children with a random net.
+extern int64_t err_leaf_depth;
+extern int64_t err_threshold;
+//err_head itself is NOT declared here: this header does not include err_head.h, for the same
+//reason it does not include policy_net.h -- the net types belong to the two translation units
+//that load and apply them. creatica.cpp declares it next to its extern for policy_net.
+extern bool    err_head_enabled;
 inline constexpr int16_t MM_NONE = -32768;
 //`mm` as a value on the same scale as Q, or nothing if the subtree has no minimax value yet.
 inline bool mm_value(const MCTSNode * n, double& out);
@@ -1191,15 +1231,8 @@ void print(const char * message, ...);
 bool sendGetRequest(const std::string& url, int& scorecp, std::string& uci_move);
 double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, int iter);
 std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& board_hash, NNUEContext& ctx, const std::unordered_set<uint64_t>& pos_history, int iter);
-std::pair<double, int> make_move(Board& chess_board, const ZobristHash& board_hash, const Move& move, NNUEContext& ctx, uint64_t& child_hash, const std::unordered_set<uint64_t>& pos_history, int iter);
-//void init_nnue(const char * nnue_file_big, const char * nnue_file_small);
-void init_nnue();
-void cleanup_nnue();
-void init_nnue_context(NNUEContext& ctx);
-void free_nnue_context(NNUEContext& ctx);
-double evaluate_nnue(const Board& chess_board, NNUEContext& ctx);
-//void accumulator_stack_push(NNUEContext& ctx, Stockfish::DirtyPiece& dp);
-std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
-void accumulator_stack_pop(NNUEContext& ctx);
-void accumulator_stack_reset(NNUEContext& ctx);
-std::string nnue_eval(Board& board);
+//`child_leaf_depth` is 0 on the incumbent path. See the selective leaf search note above.
+std::pair<double, int> make_move(Board& chess_board, const ZobristHash& board_hash, Move& move, NNUEContext& ctx, uint64_t& child_hash, const std::unordered_set<uint64_t>& pos_history, int iter, int child_leaf_depth = 0);
+//init_nnue, cleanup_nnue, init_nnue_context, free_nnue_context, evaluate_nnue,
+//accumulator_stack_push/pop/reset, nnue_eval, nnue_features and nnue_feature_dims all come from
+//libchess.h now. Re-declaring them here is what let a signature change compile and fail at link.

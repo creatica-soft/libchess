@@ -439,19 +439,26 @@ std::pair<uint64_t, uint64_t> checkMask(const Board& board, Square kingSq, uint6
     return std::make_pair(mask, ep_mask);
 }
 
+//See the declaration in libchess.h. Kept beside piece_moves() because it has to agree with the
+//`moves` bitboard that function returns, and with the promotion rule applied below.
+int moveCount(const Board& board, PieceType pt, uint64_t moves) {
+  int n = bitCount(moves);
+  if (pt == Pawn) n += 3 * bitCount(moves & base_rank_bb[OPP_COLOR(board.sideToMove)]);
+  return n;
+}
+
 uint64_t piece_moves(Board& board, const PieceType pt, const Square sq, const Square kingSq, const uint64_t pinned, const uint64_t pinning, const uint64_t check_mask, const uint64_t ep_mask) {
 	uint64_t moves = getMoves(board, sq, pt);
 	//if (pinned & SQ_BIT(sq)) moves &= LineThrough[kingSq][sq];
 	if (pinned & SQ_BIT(sq)) moves &= Stockfish::LineBB[kingSq][sq];
   if (pt == Pawn) moves &= (check_mask | ep_mask);
   else moves &= check_mask;
-  //A pawn landing on the promotion rank is FOUR legal moves (N, B, R, Q); expanding them is the
-  //caller's job (test_pos.cpp:154, expand() in test_smp.cpp / creatica-shared-root.cpp), so the
-  //extra three have to be added here. Without this a position whose only legal move is a
-  //promotion reports num_moves == 1 and the "forced move" branch auto-plays an unsearched
-  //promotion instead of running MCTS over the four choices.
-  if (pt == Pawn) board.num_moves += 3 * bitCount(moves & base_rank_bb[OPP_COLOR(board.sideToMove)]);
-  board.num_moves += bitCount(moves);
+  //This used to accumulate the move count onto board.num_moves -- a counter shared between
+  //kingMoves(), every call of this function, and isCheckMateStaleMate(), which also leaked out as
+  //an output other code read. Callers that want a count call moveCount() on the returned bitboard;
+  //it applies the promotion rule, which a bare bitCount() gets wrong exactly where it matters (a
+  //position whose only legal move is a promotion counts as four, not one, or the "forced move"
+  //branch auto-plays an unsearched promotion instead of choosing between the pieces).
   return moves;
 }
 
@@ -801,22 +808,18 @@ std::pair<uint64_t, uint64_t> king_moves(Board& board, Square kingSq, uint64_t a
   //board.sideToMove = OPP_COLOR(board.sideToMove);
   //end of debug
   
-  board.isMate = false; board.isStaleMate = false;
   //uint64_t moves = KingMoves[kingSq] & ~(board.side[board.sideToMove] | attackedSquares);
   uint64_t moves = Stockfish::PseudoAttacks[King][kingSq] & ~(board.side[board.sideToMove] | attackedSquares);
   uint64_t checkers = getCheckers(board, kingSq);
+  //`checkers` IS the check state and is returned, so nothing is written to the Board here. A caller
+  //that wants "am I in check" tests checkers != 0; one that wants a move count uses bitCount() on
+  //the king moves (a king cannot promote) plus moveCount() per piece.
   if (checkers) {
-  	board.isCheck = true;
-    if (bitCount(checkers) > 1) {
-    	board.num_moves = bitCount(moves);
-      return std::make_pair(moves, checkers);
-    }
+    if (bitCount(checkers) > 1) return std::make_pair(moves, checkers);
   } else {
-  	board.isCheck = false;
   	uint64_t castling_moves = castlingMoves(board, kingSq, attackedSquares);
   	moves |= castling_moves;
   }
-	board.num_moves = bitCount(moves);
   return std::make_pair(moves, checkers);
 }
 
@@ -829,8 +832,15 @@ std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, Square> kingMoves(Board& boar
   return std::make_tuple(moves, pinned, pinning, checkers, kingSq);
 }
 
-void isCheckMateStaleMate(Board& board) {
+BoardState isCheckMateStaleMate(Board& board) {
 	auto [moves, pinned, pinning, checkers, kingSq] = kingMoves(board);
+  //COUNTED LOCALLY, not read back off board.num_moves. The count used to arrive through that field:
+  //kingMoves() set it to the king's move count and every piece_moves() call below added to it, so
+  //the field was an accumulator shared between three functions and also an output other code read.
+  //Here it is a local, and the Board is not used to pass it anywhere.
+  BoardState st;
+  st.check = (checkers != 0);
+  int n = bitCount(moves);                    //the king cannot promote, so no moveCount() needed
   if (bitCount(checkers) <= 1) {
     auto [check_mask, ep_mask] = checkers ? checkMask(board, kingSq, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL);
   	//legal other moves
@@ -838,7 +848,7 @@ void isCheckMateStaleMate(Board& board) {
     	uint64_t occupations = board.side[board.sideToMove] & board.pieceTypes[pt - 1];
     	while (occupations) {
     		Square sq = popLSB(occupations);
-    	  piece_moves(board, pt, sq, kingSq, pinned, pinning, check_mask, ep_mask);
+    	  n += moveCount(board, pt, piece_moves(board, pt, sq, kingSq, pinned, pinning, check_mask, ep_mask));
     	}
     }
     /*occupations = board.side[board.sideToMove] & board.pieceTypes[Rook - 1];
@@ -862,13 +872,17 @@ void isCheckMateStaleMate(Board& board) {
   	  piece_moves(board, Knight, sq, kingSq, pinned, pinning, check_mask, ep_mask);
   	}*/
   }
- 	if (!board.num_moves) {
-		if (board.isCheck) {
-			board.isMate = true;
-			board.isCheck = false;
+ 	st.num_moves = n;
+	if (!n) {
+		if (st.check) {
+			st.mate = true;
+			//PRESERVED, NOT ENDORSED: a mate is a check, but the cached flags cleared isCheck here
+			//and callers were written against that. See the note in libchess.h.
+			st.check = false;
 		}
-		else board.isStaleMate = true;
+		else st.stalemate = true;
 	}
+	return st;
 }
 
 //fast-forward a valid uci move on a given board without StateInfo
@@ -1004,8 +1018,6 @@ PieceType do_move(Board& board, Move& move, StateInfo& state) {
 	board.pieceTypes[mpType - 1] ^= bitSq;
 	board.piecesOnSquares[move.src] = PieceNone;
 
-  //preserve num_moves
-  state.num_moves = board.num_moves;
 
   //preserve castling
   state.castlingRooks = board.castlingRooks;
@@ -1108,9 +1120,6 @@ PieceType do_move(Board& board, Move& move, StateInfo& state) {
 	//preserve halfmove clock for undo_move()
 	state.halfmoveClock = board.halfmoveClock;
 	//preserve check info
-	state.isCheck = board.isCheck;
-	state.isMate = board.isMate;
-	state.isStaleMate = board.isStaleMate;
 
 	//branchless halfmoveClock update
 	bool resetClock = (mpType == Pawn) | (state.capturedType != PieceTypeNone);
@@ -1205,8 +1214,6 @@ PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::Dirt
   dts.prevKsq = static_cast<Stockfish::Square>(kingSquare(board, board.sideToMove));
   dts.threatenedSqs = dts.threateningSqs = 0;
 
-  //preserve num_moves
-  state.num_moves = board.num_moves;
   //preserve castling
   state.castlingRooks = board.castlingRooks;
   state.castlingRights = board.castlingRights;
@@ -1371,9 +1378,6 @@ PieceType do_move_dp(Board& board, Move& move, StateInfo& state, Stockfish::Dirt
 	//preserve halfmove clock for undo_move()
 	state.halfmoveClock = board.halfmoveClock;
 	//preserve check info
-	state.isCheck = board.isCheck;
-	state.isMate = board.isMate;
-	state.isStaleMate = board.isStaleMate;
   
   //branchless halfmoveClock update
 	bool resetClock = (mpType == Pawn) | (state.capturedType != PieceTypeNone);
@@ -1409,8 +1413,6 @@ void undo_move(Board& board, const Move& move, const StateInfo& state) {
 	PieceType mpType = PC_TYPE(board.piecesOnSquares[move.dst]);
 	const uint64_t dstBit = SQ_BIT(move.dst);
 	
-	//restore num_moves
-	board.num_moves = state.num_moves;
 	
 	//restore castling
   board.castlingRooks = state.castlingRooks;
@@ -1423,9 +1425,6 @@ void undo_move(Board& board, const Move& move, const StateInfo& state) {
 	board.halfmoveClock = state.halfmoveClock;
 	
 	//restore check info
-	board.isCheck = state.isCheck;
-	board.isMate = state.isMate;
-	board.isStaleMate = state.isStaleMate;
 
 	//decrement move number if it was black's move
 	if (board.sideToMove == ColorBlack) --board.moveNumber;

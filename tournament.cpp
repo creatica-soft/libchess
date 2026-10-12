@@ -155,8 +155,10 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
   bool repetition = false;
   char fen[MAX_FEN_STRING_LEN] = "";
 
-  isCheckMateStaleMate(board);
-  while (!board.isMate && !board.isStaleMate && board.halfmoveClock < 100 && !repetition) {
+  //Re-assigned at the bottom of the loop body, so the condition always tests the position the loop
+  //is actually about to play from rather than whatever was last examined.
+  BoardState bs = isCheckMateStaleMate(board);
+  while (!bs.mate && !bs.stalemate && board.halfmoveClock < 100 && !repetition) {
     if (board.sideToMove == ColorWhite) {
       strncpy(white.position, board2fen(board, fen), MAX_FEN_STRING_LEN);
       if (!position(white)) {
@@ -213,12 +215,12 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
     writeDebug(board);
     updateHash(zh, board, move, captured, z);
     if (++position_history[zh.hash] >= 3) { repetition = true; break; }
-    isCheckMateStaleMate(board);
+    bs = isCheckMateStaleMate(board);
   }
 
   // Result
   double result = 0.5;
-  if (board.isMate) {
+  if (bs.mate) {
     if (board.sideToMove == ColorWhite) {
       result = 0.0; //white lost, black win
       if (game_id % 2) //engine_1 is white
@@ -230,7 +232,7 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
         score_engine_1 += 1;
       else score_engine_2 += 1; //engine_1 is black
     }
-  } else if (board.isStaleMate || repetition || board.halfmoveClock >= 100) {
+  } else if (bs.stalemate || repetition || board.halfmoveClock >= 100) {
       result = 0.5;
       score_engine_1 += 0.5;
       score_engine_2 += 0.5;
@@ -243,11 +245,11 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
   char res[8] = "*"; //"*" is the PGN tag for an unfinished/unknown result - this was
                      //uninitialised, so any game ending outside the branches below wrote
                      //stack garbage into the [Result] tag.
-  if (board.isMate) {
+  if (bs.mate) {
     if (board.sideToMove == ColorWhite) strcpy(res, "0-1");
     else strcpy(res, "1-0"); 
   } 
-  else if (board.isStaleMate || board.halfmoveClock == 100 || (__builtin_popcountl(board.side[ColorWhite] | board.side[ColorBlack]) <= 5 && evaluations[0]->scorecp == 0) || repetition) strcpy(res, "1/2-1/2");
+  else if (bs.stalemate || board.halfmoveClock == 100 || (__builtin_popcountl(board.side[ColorWhite] | board.side[ColorBlack]) <= 5 && evaluations[0]->scorecp == 0) || repetition) strcpy(res, "1/2-1/2");
   auto now = std::chrono::system_clock::now();
   std::string date = std::format("{:%Y.%m.%d}", now);
   //Which configuration played which colour, recorded per game.

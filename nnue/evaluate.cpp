@@ -254,9 +254,11 @@ Value Eval::to_cp(Value v, const Board& board) {
     return ss.str();
 }*/
 
-std::string Eval::trace(Board& board, const Eval::NNUE::Networks& networks) {
+//MODIFIED FROM UPSTREAM: `in_check` is a parameter rather than a read of board.isCheck, which was a
+//cache that did not reliably describe this position. Same change as evaluate_nnue() in nnue.cpp.
+std::string Eval::trace(Board& board, const Eval::NNUE::Networks& networks, bool in_check) {
 
-    if (board.isCheck)
+    if (in_check)
         return "Final evaluation: none (in check)";
 
     auto accumulators = std::make_unique<Eval::NNUE::AccumulatorStack>();

@@ -53,23 +53,14 @@ static const char * syzygy_path_default(void) {
 #define REF_ABS_TOL 0.10
 #define REF_REL_TOL 0.05
 
-struct NNUEContext {
-    Stockfish::Eval::NNUE::AccumulatorStack * accumulator_stack;
-    Stockfish::Eval::NNUE::AccumulatorCaches * caches;    
-};
+//NNUEContext and the nnue wrapper functions come from libchess.h. This file used to declare its own
+//copy; so did creatica_search.hpp, test_nnue.cpp and test_smp.cpp. Four copies to keep in step by
+//hand, which is what made adding evaluate_nnue()'s in_check parameter a link-time problem instead
+//of a compile-time one.
 struct Evaluation evaluation = {};
 struct Evaluation * evaluations[1] = { nullptr };
 struct Engine stockfish;
 
-void init_nnue();
-void cleanup_nnue();
-void init_nnue_context(NNUEContext& ctx);
-void free_nnue_context(NNUEContext& ctx);
-double evaluate_nnue(const Board& chess_board, NNUEContext& ctx);
-std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
-void accumulator_stack_pop(NNUEContext& ctx);
-void accumulator_stack_reset(NNUEContext& ctx);
-std::string nnue_eval(const Board& board);
 NNUEContext ctx, ctx2;
 Board board;
 ZobristHash zh = {};
@@ -91,15 +82,15 @@ int test(std::string fenString) {
   if (reconcile(board)) return 1;
 	getHash(zh, board, z);
 	//printf("hash %llx\n", zh.hash);
-	isCheckMateStaleMate(board);
+	const BoardState bs0 = isCheckMateStaleMate(board);
   //reset unconditionally: the move loop below pushes onto ctx whether or not the ROOT
   //was in check, so gating the reset on the else-branch left a stale stack behind
   accumulator_stack_reset(ctx);
-  if (board.isMate) printf("%s is mated\n", color[board.sideToMove]);
-  else if (board.isStaleMate) printf("stalemate, %s has no moves\n", color[board.sideToMove]);
-  else if (board.isCheck) printf("%s is checked\n", color[board.sideToMove]);
+  if (bs0.mate) printf("%s is mated\n", color[board.sideToMove]);
+  else if (bs0.stalemate) printf("stalemate, %s has no moves\n", color[board.sideToMove]);
+  else if (bs0.check) printf("%s is checked\n", color[board.sideToMove]);
   else {
-    double eval = evaluate_nnue(board, ctx);
+    double eval = evaluate_nnue(board, ctx, bs0.check);
     printf("pos %s castlilngRights %hhx eval %f pawns\n", fenString.c_str(), board.castlingRights, eval);
   } 
   
@@ -130,11 +121,11 @@ int test(std::string fenString) {
       fprintf(stderr, "FAIL hash: updateHash %llx != getHash %llx\n", tmp_hash.hash, h.hash);
       return 1;
     }
-    isCheckMateStaleMate(board);
-    if (!board.isCheck && !board.isMate && !board.isStaleMate) {
-      double eval1 = evaluate_nnue(board, ctx);
+    const BoardState bs1 = isCheckMateStaleMate(board);
+    if (!bs1.check && !bs1.mate && !bs1.stalemate) {
+      double eval1 = evaluate_nnue(board, ctx, bs1.check);
       accumulator_stack_reset(ctx2);
-      double eval2 = evaluate_nnue(board, ctx2);
+      double eval2 = evaluate_nnue(board, ctx2, bs1.check);
       char fen[MAX_FEN_STRING_LEN];
       strncpy(stockfish.position, board2fen(board, fen), MAX_FEN_STRING_LEN);
       float eval3 = 0;
@@ -191,11 +182,11 @@ int test(std::string fenString) {
               fprintf(stderr, "FAIL hash: updateHash %llx != getHash %llx\n", tmp_hash.hash, h.hash);
               return 1;
             }
-            isCheckMateStaleMate(board);
-            if (!board.isCheck && !board.isMate && !board.isStaleMate) {
-              double eval1 = evaluate_nnue(board, ctx);
+            const BoardState bs2 = isCheckMateStaleMate(board);
+            if (!bs2.check && !bs2.mate && !bs2.stalemate) {
+              double eval1 = evaluate_nnue(board, ctx, bs2.check);
               accumulator_stack_reset(ctx2);
-              double eval2 = evaluate_nnue(board, ctx2);
+              double eval2 = evaluate_nnue(board, ctx2, bs2.check);
               char fen[MAX_FEN_STRING_LEN];
               strncpy(stockfish.position, board2fen(board, fen), MAX_FEN_STRING_LEN);
               float eval3 = 0;

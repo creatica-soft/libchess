@@ -14,6 +14,7 @@
 
 #include "creatica_search.hpp"
 #include "policy_net.h"
+#include "err_head.h"
 #include <memory>     // std::unique_ptr for the spatial term's re-entry fallback
 
 //The policy head replaces the engine's incumbent prior. creatica-shared-root builds its
@@ -47,6 +48,17 @@ enum PolicyMode { POLICY_OFF = 0, POLICY_PRIOR = 1, POLICY_FULL = 2 };
 PolicyNet     policy_net;
 int           policy_mode    = POLICY_OFF;
 bool          policy_enabled = false;
+//THE PER-MOVE ERROR HEAD. Predicts, for each child of a node, how far the static NNUE evaluation
+//of that child is about to be from what a real search of it would say -- an absolute magnitude in
+//pawns, not a judgement of the move. The search uses it to decide which children to resolve with
+//a bounded alpha-beta instead of trusting their static value; see err_leaf_depth in
+//creatica_search.hpp for what that buys and what it is NOT evidence of.
+//
+//It shares the policy head's architecture on purpose: it reads the SAME feature vector, the
+//accumulator stack's post-activation output, which is already computed at a search node. So its
+//trunk costs what the policy's trunk costs and nothing is added per move beyond one dot product.
+ErrHead       err_head;
+bool          err_head_enabled = false;
 //get_prob() divides by `temperature`, which was tuned for evaluations in pawns. The head's
 //outputs are CE-trained logits on an unrelated scale, and at the engine's 0.58 they carry
 //0.486 of the mass on the top move against the incumbent's 0.402 -- sharper than anything
@@ -2503,15 +2515,17 @@ std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& boar
   int terminal;
   //char fen[MAX_FEN_STRING_LEN];
   //printf("position_eval() debug: iter %d, fen %s\n", iter, board2fen(chess_board, fen));
-	isCheckMateStaleMate(chess_board);
-  if (chess_board.isMate) {
+  //The state is RETURNED now rather than left on the Board. It was only ever valid between this
+  //call and the next move, and nothing said so -- see the note on BoardState in libchess.h.
+	const BoardState bs = isCheckMateStaleMate(chess_board);
+  if (bs.mate) {
     res = -MATE_SCORE * 0.01 + iter; //chess_board.sideToMove loses
     return std::make_pair(res, 1);
   }
-  else if (chess_board.isStaleMate) {
+  else if (bs.stalemate) {
     res = 0.0;
     return std::make_pair(res, 2);
-  } else if (chess_board.isCheck) {
+  } else if (bs.check) {
     terminal = -1;
   } else terminal = 0;
 	const int pieceCount = bitCount(chess_board.side[ColorWhite] | chess_board.side[ColorBlack]);
@@ -2520,7 +2534,9 @@ std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& boar
     //  res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
 	  //else if (terminal == -1) res = process_check(chess_board, board_hash, ctx, pos_history, iter);
 	  if (terminal == -1) res = process_check(chess_board, board_hash, ctx, pos_history, iter);
-    else res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
+    //`terminal == -1` is the check state, so it is what gets passed rather than a literal: if this
+    //call is ever moved out of the else branch the sentinel still fires instead of a silent number.
+    else res = evaluate_nnue(chess_board, ctx, terminal == -1); //returns pawns, not centipawns
   } else { //pieceCount <= TB_LARGEST, etc
     unsigned int ep = legalEnPassantMove(chess_board);
     const unsigned int wdl = tb_probe_wdl(chess_board.side[ColorWhite], chess_board.side[ColorBlack], chess_board.pieceTypes[King - 1], chess_board.pieceTypes[Queen - 1], chess_board.pieceTypes[Rook - 1], chess_board.pieceTypes[Bishop - 1], chess_board.pieceTypes[Knight - 1], chess_board.pieceTypes[Pawn - 1], 0, 0, ep == SquareNone ? 0 : ep, chess_board.sideToMove == ColorWhite ? 1 : 0);
@@ -2534,7 +2550,7 @@ std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& boar
       //  res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
   	  //else if (terminal == -1) res = process_check(chess_board, board_hash, ctx, pos_history, iter);
   	  if (terminal == -1) res = process_check(chess_board, board_hash, ctx, pos_history, iter);
-      else res = evaluate_nnue(chess_board, ctx); //evaluate_nnue() returns result in pawns (not centipawns!)
+      else res = evaluate_nnue(chess_board, ctx, terminal == -1); //returns pawns, not centipawns
     } else { //tb_probe_wdl() succeeded
       //0 - loss, 4 - win, 1..3 - draw
       if (wdl == 4) res = MATE_SCORE * 0.001;
@@ -2558,11 +2574,22 @@ std::pair<double, int> position_eval(Board& chess_board, const ZobristHash& boar
   return std::make_pair(res, terminal);
 }
 
+//Defined below, next to leaf_moves(). Declared here because make_move() resolves a flagged child
+//with it and is defined first.
+static int leaf_search(Board& b, NNUEContext& ctx, int depth);
+//How many children the selective leaf search resolved, for the stats line. Separate from
+//leaf_ab_calls, which counts LeafDepth's node-level searches: the two options can be on at once
+//and one counter could not say which did the work.
+extern std::atomic<uint64_t> err_leaf_calls;
+extern std::atomic<uint64_t> err_leaf_flagged;
+
 //called from compute_move_evals()
 //makes a move and calls position_eval(), undo the move
 //checks for repetition
 //returns a pair of eval result in pawns from the perspective of chess_board.sideToMove and terminal state enum
-std::pair<double, int> make_move(Board& chess_board, const ZobristHash& board_hash, Move& move, NNUEContext& ctx, uint64_t& child_hash, const std::unordered_set<uint64_t>& pos_history, int iter) {
+//`child_leaf_depth` > 0 replaces this child's STATIC value with a bounded alpha-beta from it. The
+//caller passes it only for the children the error head flagged; 0 is the incumbent path exactly.
+std::pair<double, int> make_move(Board& chess_board, const ZobristHash& board_hash, Move& move, NNUEContext& ctx, uint64_t& child_hash, const std::unordered_set<uint64_t>& pos_history, int iter, int child_leaf_depth) {
   ZobristHash tmp_hash = board_hash;
   StateInfo state = {}; //keep track of num_moves and isCheck but not isMate or isStaleMate
   auto [dp, dts] = accumulator_stack_push(ctx); //for incremental NNUE evaluation, which is one order faster than full evaluation; both dp and dts are references!
@@ -2577,7 +2604,27 @@ std::pair<double, int> make_move(Board& chess_board, const ZobristHash& board_ha
     return std::make_pair(0.0, 3); //repetition
   }
   auto [res, terminal] = position_eval(chess_board, tmp_hash, ctx, pos_history, iter);
-  //if position_eval() returns terminal state setting chess_board.isMate or .isStaleMate, then undo_move() will not restore these fields until kingMoves() is called
+  //THE SELECTIVE LEAF SEARCH, on a flagged child only.
+  //
+  //The guards are LeafDepth's, for the same reasons: leaf_search() cannot run on a position in
+  //check (evaluate_nnue() refuses one, and the evasions are what position_eval() already minimaxed
+  //over), and inside tablebase range position_eval()'s probe is an exact verdict that an estimate
+  //must not displace. The terminal test is the one that is specific to here: a mate, a stalemate,
+  //a repetition or a proven tablebase result is not an estimate with an error to predict, and
+  //overwriting one would throw away a proof to replace it with a search. PROVEN_MASK is tested as
+  //well as the kind: a proven win or loss can arrive with a kind of 0, so masking only the kind
+  //would resolve exactly the children whose value is already certain.
+  //`terminal` is -1 for a checked child, so the kind test already excludes one; the cache read that
+  //used to be here was redundant AND unreliable.
+  if (child_leaf_depth > 0 && (terminal & (TERMINAL_KIND_MASK | PROVEN_MASK)) == 0 &&
+      bitCount(chess_board.side[ColorWhite] | chess_board.side[ColorBlack]) > TB_LARGEST) {
+    err_leaf_calls.fetch_add(1, std::memory_order_relaxed);
+    //In the CHILD's frame, which is the frame position_eval() returned `res` in; the caller
+    //negates both the same way.
+    res = leaf_search(chess_board, ctx, child_leaf_depth) * 0.01;
+  }
+  //position_eval() no longer leaves anything on the Board: it returns a BoardState, so there is
+  //nothing for undo_move() to have to restore and nothing stale for the caller to read.
   undo_move(chess_board, move, state);
   accumulator_stack_pop(ctx);
   return std::make_pair(-res, terminal);
@@ -2606,16 +2653,16 @@ std::pair<int, int> make_move_policy(Board& chess_board, const ZobristHash& boar
     undo_move(chess_board, move, state);
     return std::make_pair(0, 3); //repetition
   }
-  isCheckMateStaleMate(chess_board);
+  const BoardState bs = isCheckMateStaleMate(chess_board);
   int cp = NO_MATE_SCORE, terminal = 0;
-  if (chess_board.isMate) {
+  if (bs.mate) {
     cp = static_cast<int>(-MATE_SCORE + iter * 100); //the child's side to move is mated
     terminal = 1;
-  } else if (chess_board.isStaleMate) {
+  } else if (bs.stalemate) {
     cp = 0;
     terminal = 2;
   } else {
-    if (chess_board.isCheck) terminal = -1;
+    if (bs.check) terminal = -1;
     //Tablebase positions are exact and cost one probe, so they are still worth taking here
     //rather than deferring to the child's own first visit.
     const int pieceCount = bitCount(chess_board.side[ColorWhite] | chess_board.side[ColorBlack]);
@@ -2688,6 +2735,13 @@ std::pair<int, int> make_move_policy(Board& chess_board, const ZobristHash& boar
 //function does not carry, and the surrounding engine already scores those at the node.
 int64_t leaf_depth = LEAF_DEPTH;
 std::atomic<uint64_t> leaf_ab_calls{0}, leaf_ab_nodes{0}, leaf_ab_cutoffs{0}, leaf_ab_blind{0};
+//The selective leaf search's own counters: searches actually run, and children flagged. The two
+//differ because a flagged child that is terminal, in check or inside tablebase range is not
+//resolved, and the gap between them is how one sees whether the threshold is doing what the
+//offline measurement assumed.
+int64_t err_leaf_depth = ERR_LEAF_DEPTH;
+int64_t err_threshold  = ERR_THRESHOLD;
+std::atomic<uint64_t> err_leaf_calls{0}, err_leaf_flagged{0};
 
 //Legal moves for the leaf search, the same staged generation the rest of the engine uses.
 //
@@ -2812,7 +2866,7 @@ static int leaf_qs(Board& b, NNUEContext& ctx, int alpha, int beta, int ext, int
     //No evasion in check is mate. No capture out of check is simply a quiet position, which is
     //what the stand-pat score is for.
     if (in_check) return -MATE_SCORE + ply;
-    return static_cast<int>(evaluate_nnue(b, ctx) * 100.0);
+    return static_cast<int>(evaluate_nnue(b, ctx, in_check) * 100.0);
   }
   int best;
   if (in_check) {
@@ -2843,7 +2897,7 @@ static int leaf_qs(Board& b, NNUEContext& ctx, int alpha, int beta, int ext, int
         //left to spend resolving it. Scored as 0, which is a guess -- it is the one remaining
         //inexactness in the leaf search, and leaf_ab_blind counts how often it is reached.
         else if (child_check) v = 0;
-        else                  v = -static_cast<int>(evaluate_nnue(b, ctx) * 100.0);
+        else                  v = -static_cast<int>(evaluate_nnue(b, ctx, child_check) * 100.0);
         undo_move(b, mv[i], st);
         accumulator_stack_pop(ctx);
         if (!any || v > mm) { mm = v; any = true; }
@@ -2853,7 +2907,7 @@ static int leaf_qs(Board& b, NNUEContext& ctx, int alpha, int beta, int ext, int
     best = -MATE_SCORE * 2;   //no stand-pat in check
     --ext;
   } else {
-    best = static_cast<int>(evaluate_nnue(b, ctx) * 100.0);
+    best = static_cast<int>(evaluate_nnue(b, ctx, in_check) * 100.0);
     if (best >= beta) { leaf_ab_cutoffs.fetch_add(1, std::memory_order_relaxed); return best; }
     if (best > alpha) alpha = best;
   }
@@ -2942,17 +2996,34 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
   const bool use_policy = policy_enabled && !checkers;
   float pctx[POLICY_MAX_H2];
   bool  flip = false;
+  //THE SELECTIVE LEAF SEARCH's trunk output for this node, read by every err_score() below.
+  //
+  //Only on the path that evaluates children statically. In POLICY_FULL there are no static child
+  //values, so there is no error to predict and nothing to replace -- the children's values come
+  //from their own expansions later. And not in check: a checked node's children are its evasions,
+  //whose values already come from process_check()'s minimax rather than from a static evaluation.
+  const bool use_err = err_head_enabled && err_leaf_depth > 0 && !checkers &&
+                       !(policy_enabled && policy_mode == POLICY_FULL);
+  float ectx[POLICY_MAX_H2];
+  bool  eflip = false;
   //The spatial forward's output for this position, set once the legal move list is known (see THE
   //SPATIAL TERM below) and read by every policy_score() call in this function. Declared here so
   //evaluate() captures it; it is null whenever the net has no spatial term.
   const PolicySpatialScratch* sp_buf = nullptr;
-  if (use_policy) {
+  if (use_policy || use_err) {
     unsigned char feat[POLICY_MAX_IN];
     //Free at a search node: the accumulator this reads is the one do_move_dp() has been
-    //maintaining incrementally down the path.
+    //maintaining incrementally down the path. ONE extraction serves both heads -- they were
+    //trained on the same vector, which is the whole reason the error head is affordable.
     nnue_features(chess_board, ctx, feat);
-    policy_context(policy_net, feat, pctx);
-    flip = (chess_board.sideToMove == ColorBlack);
+    if (use_policy) {
+      policy_context(policy_net, feat, pctx);
+      flip = (chess_board.sideToMove == ColorBlack);
+    }
+    if (use_err) {
+      err_context(err_head, feat, ectx);
+      eflip = (chess_board.sideToMove == ColorBlack);
+    }
   }
 
   //Cancels get_prob()'s own division so the head's logits reach the softmax at the scale
@@ -2999,7 +3070,21 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
       move_evals.push_back({policy_score(policy_net, pctx, pre_pt, m.src, pre_dst, flip, sp_buf) * pscale,
                             move_idx, cp, terminal, child_hash});
     } else {
-      auto [res, terminal] = make_move(chess_board, board_hash, m, ctx, child_hash, pos_history, iter);
+      //WHICH CHILDREN GET THE PLIES. A fixed centipawn threshold on the predicted error, not a
+      //per-node top-k: the offline measurement that this option exists to reproduce flagged the
+      //worst tenth of moves by a GLOBAL threshold, so a node full of quiet moves resolves none of
+      //them and a node full of sharp ones resolves most. A per-node share would spend the same
+      //budget everywhere, which is exactly the allocation the deciles say is wrong.
+      //
+      //It also means no move list has to be collected first, so this adds nothing to the
+      //expansion's structure -- one dot product per move against the trunk output above.
+      int child_depth = 0;
+      if (use_err &&
+          err_score(err_head, ectx, m.src, pre_dst, eflip) * 100.0f >= (float)err_threshold) {
+        err_leaf_flagged.fetch_add(1, std::memory_order_relaxed);
+        child_depth = static_cast<int>(err_leaf_depth);
+      }
+      auto [res, terminal] = make_move(chess_board, board_hash, m, ctx, child_hash, pos_history, iter, child_depth);
       //get_prob() divides by `temperature`, so push temperature * (the logit we want).
       const double prior = use_policy
           ? temperature * policy_blend_scale
@@ -3134,7 +3219,11 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
   if (collect_first)
     for (Move& m : legal) evaluate(m);
 
-  if (chess_board.num_moves == 0) {
+  //move_evals holds one entry per move this function emitted, with promotions already expanded into
+  //their four pieces -- so it IS the legal move count, and a local one. It used to read
+  //board.num_moves, which piece_moves() had been accumulating as a side effect during the
+  //generation loop above: a count arriving through the Board from three different functions.
+  if (move_evals.empty()) {
     if (checkers) {
       node->cp.store(-MATE_SCORE, std::memory_order_relaxed);
       node->terminal.store(1, std::memory_order_relaxed); //mate
@@ -3165,7 +3254,7 @@ double eval_and_expand(MCTSNode * node, Board& chess_board, const ZobristHash& b
     scorecp = -std::get<2>(move_evals[0]);
     for (const auto& ev : move_evals) scorecp = std::max(scorecp, -std::get<2>(ev));
   } else {
-    scorecp = static_cast<int>(evaluate_nnue(chess_board, ctx) * 100.0);
+    scorecp = static_cast<int>(evaluate_nnue(chess_board, ctx, checkers != 0) * 100.0);
     // Mates and tablebase results found while making the children are exact, and a forced
     // mate or a tablebase win one move away is worth at least the static score -- we are
     // never obliged to play it, so max() is the right combination. Without this the policy
@@ -3428,7 +3517,9 @@ void mcts_search(ThreadParams& params, NNUEContext& ctx) {
                      (unsigned long long)(k + 1));
         }
       } else {
-        evaluate_nnue(sim_board, ctx); //the leaf node is evaluated but we call it to make subsequent evals faster
+        //`terminal == -1` is the in-check case and is handled in the branch above, so this is the
+        //quiet one. Passed rather than hard-coded false for the same reason as above.
+        evaluate_nnue(sim_board, ctx, terminal == -1); //re-evaluated to keep later evals incremental
       }
       result = eval_and_expand(node, sim_board, sim_zh, ctx, pos_history, 0);
       result = tanh(result / eval_scale);
@@ -3617,8 +3708,11 @@ void runMCTS(NNUEContext& ctx) {
   std::vector<std::pair<int, std::string>> pvs;
   int multiPV = 1;
 
-	isCheckMateStaleMate(board); //it calculates board.num_moves as well as part of all legal moves generation
-  if (board.num_moves > 1) { //run MCTS using multiple threads
+  //The root's state, held for the whole function. It used to be read back off the Board several
+  //hundred lines apart from this call, with a do_move() in between at the num_moves == 1 branch --
+  //which is exactly the window in which the cached flags stop describing the position.
+	const BoardState root_bs = isCheckMateStaleMate(board); //also counts all legal moves
+  if (root_bs.num_moves > 1) { //run MCTS using multiple threads
     tbhits.store(0, std::memory_order_relaxed);
     tb_probe_misses.store(0, std::memory_order_relaxed);
     //Stop and join any collection still running from the last move. This is the "go" edge of
@@ -3983,6 +4077,19 @@ void runMCTS(NNUEContext& ctx) {
                  lnodes ? 100.0 * leaf_ab_cutoffs.load(std::memory_order_relaxed) / lnodes : 0.0,
                  (unsigned long long)leaf_ab_blind.load(std::memory_order_relaxed));
       }
+      //The selective leaf search, reported separately: the two options can run at once, and the
+      //flagged-versus-resolved gap is how one checks that the threshold is selecting the share the
+      //offline measurement assumed (a tenth of children, at ErrThreshold 371).
+      const uint64_t eflag = err_leaf_flagged.load(std::memory_order_relaxed);
+      if (eflag) {
+        const uint64_t ecalls = err_leaf_calls.load(std::memory_order_relaxed);
+        log_file("info string selective leaf search: depth %lld, threshold %lld cp, %llu children "
+                 "flagged, %llu resolved (%.1f%% of flagged; the rest were terminal, in check or "
+                 "in tablebase range)\n",
+                 (long long)err_leaf_depth, (long long)err_threshold,
+                 (unsigned long long)eflag, (unsigned long long)ecalls,
+                 100.0 * (double)ecalls / (double)eflag);
+      }
     }
     if (chessEngine.optionCheck[FinalInfoLines].value) {    
       elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
@@ -3995,7 +4102,7 @@ void runMCTS(NNUEContext& ctx) {
       if (hashfull > 1000) hashfull = 1000;  // Cap at 1000 per UCI spec
       hash_full.store(hashfull, std::memory_order_relaxed);
     }
-  } else if (board.num_moves == 1) { //skip MCTS and just make the move
+  } else if (root_bs.num_moves == 1) { //skip MCTS and just make the move
       auto iter_start = std::chrono::steady_clock::now();      
       int move_idx = 0;
       Move move;
@@ -4046,15 +4153,17 @@ void runMCTS(NNUEContext& ctx) {
       //key, carrying another position's move list. Same idiom as lines 595 and 629.
       ZobristHash tmp_zh = zh;
       updateHash(tmp_zh, board, move, do_move(board, move, state), z);
-  		isCheckMateStaleMate(board);
+      //The state AFTER the forced move -- a different position from root_bs, which is why reading
+      //the Board here used to work only by accident of ordering.
+  		const BoardState after_bs = isCheckMateStaleMate(board);
       double res;
-      if (board.isMate) res = MATE_SCORE * 0.01;
-      else if (board.isStaleMate) res = 0.0;
-      else if (board.isCheck) {
+      if (after_bs.mate) res = MATE_SCORE * 0.01;
+      else if (after_bs.stalemate) res = 0.0;
+      else if (after_bs.check) {
         std::unordered_set<uint64_t>pos_history;
         res = -process_check(board, tmp_zh, ctx, pos_history, 0);
       } else {
-        res = -evaluate_nnue(board, ctx);
+        res = -evaluate_nnue(board, ctx, after_bs.check);
       }
       undo_move(board, move, state);
       
@@ -4068,15 +4177,15 @@ void runMCTS(NNUEContext& ctx) {
         seldepth.store(1, std::memory_order_relaxed);
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - iter_start).count();
       }
-  } //board.num_moves == 1
+  } //root_bs.num_moves == 1
   else {
-      if (board.isMate) {
+      if (root_bs.mate) {
           log_file("info depth 0 score mate 0\n");
           log_file("bestmove (none)\n");
           print("info depth 0 score mate 0\n");
           print("bestmove (none)\n");
       }
-      else if (board.isStaleMate) {
+      else if (root_bs.stalemate) {
           log_file("info depth 0 score cp 0\n");
           log_file("bestmove (none)\n");
           print("info depth 0 score cp 0\n");

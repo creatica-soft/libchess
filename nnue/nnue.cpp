@@ -43,7 +43,7 @@ CHESS_API void init_nnue(const char * nnue_file_big = EvalFileDefaultNameBig, co
 CHESS_API void cleanup_nnue();
 CHESS_API void init_nnue_context(NNUEContext& ctx);
 CHESS_API void free_nnue_context(NNUEContext& ctx);
-CHESS_API double evaluate_nnue(Board& board, NNUEContext& ctx);
+CHESS_API double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check);
 
 static Stockfish::Eval::NNUE::Networks * networks = nullptr;
 
@@ -79,8 +79,16 @@ void free_nnue_context(NNUEContext& ctx) {
     ctx.accumulator_stack = nullptr;
     ctx.caches = nullptr;
 }
-double evaluate_nnue(const Board& board, NNUEContext& ctx) {
-    if (board.isCheck) return 0.00001; //special value for checks
+//`in_check` is passed IN, not read off the Board. It used to test board.isCheck, a cache that only
+//kingMoves() writes -- so it fired on positions that were not in check and stayed false for ones
+//that were. The caller always has the truth already: kingMoves() returns `checkers`, and
+//isCheckMateStaleMate() returns a BoardState. See the note on BoardState in libchess.h.
+//
+//The sentinel is kept rather than made a precondition, so that a caller which passes the wrong
+//thing gets NNUE_CHECK -- a value every existing caller already tests for -- instead of a plausible
+//evaluation of a position whose king is under attack.
+double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check) {
+    if (in_check) return 0.00001; //special value for checks
     Stockfish::Value v;
     v = Stockfish::Eval::evaluate(*networks, board, *ctx.accumulator_stack, *ctx.caches, 0);
     //comment out next line to keep it from the perspective of the side to move
@@ -115,6 +123,7 @@ void accumulator_stack_pop(NNUEContext& ctx) {
 void accumulator_stack_reset(NNUEContext& ctx) {
   ctx.accumulator_stack->reset();
 }
-std::string nnue_eval(Board& board) {
-    return Stockfish::Eval::trace(board, *networks);
+//`in_check` for the same reason as evaluate_nnue(): the caller knows, the Board's cache does not.
+std::string nnue_eval(Board& board, bool in_check) {
+    return Stockfish::Eval::trace(board, *networks, in_check);
 }

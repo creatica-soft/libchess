@@ -3339,6 +3339,10 @@ collapsed from nineteen plies to two. And the first version stamped proofs only 
 which the blended prior never calls, so the counter read **exactly zero** across 684 searches; the site
 that matters is the tablebase branch in `position_eval()`.
 
+Note that this null is **not** explained by seed starvation. A later paragraph in *MCTS is matched to the
+wrong domain* once claimed that a checkmate found in the tree never seeds a proof; it does -- see the
+correction there. The mechanism fired at scale and converted nothing anyway, which is the result.
+
 ### 3. `MinimaxWeight`: the backup operator, and the first thing that moves a deterministic failure
 
 Off by default (0). Every node carries `mm`, the best value its subtree has been shown to reach, in
@@ -4586,8 +4590,28 @@ that the algorithm is matched to the wrong domain:
 
 Diagnostic added, off by default: `LeafDepth` (0 to 8), with its cost reported at the end of each search as
 `info string leaf alpha-beta: depth D, L leaves searched, N nodes (X per leaf), C cutoffs, B refused in
-check`. `ProveTerminals` is also worth a note while the machinery is being described: `PROVEN_WIN` and
-`PROVEN_LOSS` are stamped only from tablebase probes, so a checkmate the search finds in its own tree is
-recorded as a terminal but never seeds a proof. That is why the option converted nothing -- it was switched
-on with almost nothing feeding it. Left as it is, since by this section's argument the thing it would buy
-is mate distance.
+check`.
+
+`ProveTerminals` is worth a note while the machinery is being described, and an earlier version of this
+paragraph got it wrong. It claimed that `PROVEN_WIN` and `PROVEN_LOSS` are stamped only from tablebase
+probes, so a checkmate the search finds in its own tree never seeds a proof, and that this is why the
+option converted nothing. **That is false.** `proven_loss()` reads
+
+```cpp
+inline bool proven_loss(int t) { return terminal_kind(t) == 1 || (proof_bits(t) & PROVEN_LOSS); }
+```
+
+and `terminal_kind(t) == 1` is checkmate, which `prove_up()` acts on directly (`if (proven_loss(ct)) {
+set_proof(parent, PROVEN_WIN); continue; }`) and `proof_seeds` counts. A mate found in the tree does seed
+the induction. The clause was added in `8fa263d` (6 Oct); the sentence denying it was written in `131a6fa`
+two days later.
+
+The correction matters because it removes an explanation that was doing real work. `ProveTerminals` did
+**not** convert nothing for want of seeds: it stamped 2.96M tablebase verdicts and proved 390k nodes, and
+still produced zero conversions. So proof propagation -- the one mechanism in this engine whose benefit is
+PERMANENT rather than paid per expansion, and therefore the natural candidate for importing what makes
+alpha-beta two to three times cheaper -- has already been measured firing at scale and converting nothing.
+The one caveat left is scope, not mechanism: those proofs are overwhelmingly tablebase endgames, where the
+engine already plays well and there is no headroom to convert. Whether a proof lattice widened from one bit
+to a centipawn interval, which would fire in middlegames instead, converts anything is untested -- but it is
+an open question, not an implication of this measurement. Left as it is.
