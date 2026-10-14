@@ -2411,9 +2411,14 @@ public:
         //for the cost of a table lookup, and the alternative is an NNUE guess about a position
         //whose value is known.
         o.spin("SyzygyInSearch", &o_tbsearch, 1, 0, 1);
-        //The online 7-piece set. Off by default: it reaches the network, which belongs to the
-        //operator to decide, and a local tournament does not want it.
-        o.check("OnlineTablebase", &o_online, false);
+        //The online 7-piece set, ON by default -- which is parity, not a preference.
+        //creatica_mcts has no option for this at all: it probes lichess unconditionally whenever
+        //the local tables cannot answer. Shipping it off here would make the two engines behave
+        //differently in exactly the endgames a head-to-head is decided by, so the default has to
+        //match. It costs nothing on the clock (the request and the search overlap, and the answer
+        //is read only after the search has finished), so there is no case for paying for it in
+        //time either. Turn it off for a network-isolated run.
+        o.check("OnlineTablebase", &o_online, true);
         //THE POLICY NET, AND WHY IT DEFAULTS TO OFF.
         //
         //The prober loads this net unconditionally and orders the first POLICY_PLIES plies with
@@ -2857,7 +2862,7 @@ private:
     int64_t o_qprune = 2, o_qmcount = 2, o_qfutbase = 169, o_qsee = -38;
     int64_t o_conthist = 0, o_lmrshape = 0, o_lmrbase = 0, o_shapemul = 850;
     int64_t o_tbsearch = 1;
-    bool o_online = false;
+    bool o_online = true;
     uint64_t online_id_ = 0;
     int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 1;
     std::string syzygy_path_;
