@@ -414,6 +414,89 @@ static int q_mcount   = 2;     //moveCount > this is skipped
 static int q_futbase  = 169;   //cp added to the stand-pat before comparing with alpha
 static int q_see      = -38;   //a capture with SEE below this is not searched at all
 static thread_local long long qp_tested = 0, qp_mcount = 0, qp_fut = 0, qp_see = 0;
+
+//=== CONTINUATION HISTORY AND A SHAPED REDUCTION ===
+//WHY THIS IS WHAT IS LEFT. The flat reduction has an interior optimum: on Arasan, LMRPLUS 0/1/2/3
+//scores 68/70/72/67, so +2 is worth about a node doubling and +3 falls off a 5-position cliff.
+//Stockfish reduces 3.4 to 4.5 plies on average, which a flat rule cannot reach -- and the reason is
+//that its average is not a uniform large reduction. It is this:
+//
+//    statScore = 2*mainHistory + contHist[0] + contHist[1]
+//    r -= statScore * 850 / 8192          (r in 1024ths of a ply)
+//
+//statScore spans roughly +-74000 there, so that ONE line moves the reduction by several plies: a
+//quiet move with a good track record is barely reduced, a bad one is reduced enormously. A constant
+//has to pick one value for both populations, which is exactly what the cliff at +3 looks like.
+//
+//WHAT A CONTINUATION HISTORY IS. Not "was this move good" but "was this move good AFTER THAT MOVE".
+//Keyed on the pair (previous move's piece and destination, this move's piece and destination), so it
+//learns replies rather than moves. creatica has one butterfly table on [side][from][to] and nothing
+//pairwise, which is why no history-shaped rule could be ported before this.
+//
+//TWO LEVELS, not Stockfish's six. Levels 1 and 2 carry its heaviest weights (1133 and 683 of 1024)
+//and the plies they need are already tracked -- ss_mv_pc/ss_mv_to exist for correction history.
+//Capture history, pawn history and low-ply history are separate items and are NOT here.
+static int conthist  = 0;    //0 off, 1 populate and use in ordering, 2 also shape the reduction
+static int lmrshape  = 0;    //0 the flat integer rule, 1 the 1024ths rule with statScore shaping
+static int lmrbase   = 0;    //0 keep the measured flat base, 1 Stockfish's log(depth)*log(moveno)
+static int shape_div = 8192; //r -= statScore * shape_mul / shape_div
+static int shape_mul = 850;
+static const int CONT_LIMIT = 30000;        //Stockfish's PieceToHistory cap, unchanged
+//[level][previous piece][previous to][this piece][this to]. Level 0 is the move INTO this node,
+//level 1 the move two plies back. Index 12 is the "no move" row, as in correction history.
+static thread_local int16_t cont_hist[2][13][64][13][64];
+static thread_local long long shape_n = 0, shape_sum = 0, shape_absum = 0;
+
+//Stockfish's StatsEntry operator<<, with the continuation cap: step toward the bonus with a pull
+//back proportional to how far the entry already is, so a repeated bonus saturates instead of
+//running away.
+static inline void cont_add(int16_t& e, int bonus) {
+    const int b = std::clamp(bonus, -CONT_LIMIT, CONT_LIMIT);
+    const int v = e;
+    e = (int16_t)(v + b - v * std::abs(b) / CONT_LIMIT);
+}
+
+//The piece index this engine uses for history keys: colour * 6 + type - 1, so 0..11, with 12 free
+//for "no move".
+static inline int hist_pc(int stm, uint8_t src) {
+    return stm * 6 + (int)PC_TYPE((Piece)board.piecesOnSquares[src]) - 1;
+}
+
+static inline int16_t * cont_slot(int level, int ply, int pc, int to) {
+    const int back = level + 1;
+    const int ppc = (ply >= back) ? (int)ss_mv_pc[ply - back] : 12;
+    const int pto = (ply >= back) ? (int)ss_mv_to[ply - back] : 0;
+    return &cont_hist[level][ppc][pto][pc][to];
+}
+
+//THE SCALE PROBLEM, and how it is handled. Stockfish caps mainHistory at 7183 and continuation at
+//30000, and weights the main term by 2. creatica's butterfly history is a different animal: it
+//grows by depth*depth with a wholesale halving at 2^20, so its numbers are two orders of magnitude
+//larger and mean something else. Rather than change the ordering -- which is measured, and at 83%
+//first-move cutoffs is not the problem -- the main term is shifted into a comparable range
+//(2^20 >> 7 is 8192, against Stockfish's 7183) and used only for the shaping.
+//TAKES THE PIECE INDEX, NOT THE SQUARE, because the only place that needs it is AFTER the move has
+//been made -- the reduction depends on whether the move gives check, so it cannot be decided
+//earlier -- and by then m.src is empty and hist_pc() would read whatever is there. ss_mv_pc[ply]
+//was recorded before the move for exactly this kind of use. Quiet moves only, so there is no
+//promotion to disagree about.
+static inline int stat_score(int ply, int pc, uint8_t to, uint8_t from, int stm) {
+    if (pc < 0 || pc > 11) return 0;
+    return 2 * (history[stm][from][to] >> 7)
+         + (int)*cont_slot(0, ply, pc, to)
+         + (int)*cont_slot(1, ply, pc, to);
+}
+
+//Stockfish's bonus and the per-level weights, applied to the move that caused the cutoff and, with
+//the opposite sign, to the quiet moves at the same node that did not.
+static inline void cont_update(int ply, const Mv& m, int stm, int bonus) {
+    //Called with the board RESTORED, so the piece is back on m.src and hist_pc() is correct here.
+    const int pc = hist_pc(stm, m.src);
+    if (pc < 0 || pc > 11) return;
+    const int b = bonus * 896 / 1024;
+    cont_add(*cont_slot(0, ply, pc, m.dst), b * 1133 / 1024 + 88);
+    cont_add(*cont_slot(1, ply, pc, m.dst), b *  683 / 1024);
+}
 static int see_quad     = 12;   //cp per lmrDepth^2, quiet rule
 static int see_cap_base = 80;   //cp per depth, capture rule
 static thread_local long long seep_q_tested = 0, seep_q_pruned = 0;
@@ -1522,6 +1605,11 @@ static int search(int depth, int alpha, int beta, int ply) {
 
     int best = -MATE_CP - 1;
     Mv best_mv = mv[0];
+    //THE QUIET MOVES ACTUALLY SEARCHED at this node. On a cutoff the move that caused it is
+    //rewarded and these are penalised, which is what makes the table mean "this reply works after
+    //that move" rather than merely "this move appears often". Pruned moves are NOT in here: they
+    //were never tried, so they are evidence of nothing.
+    Mv q_tried[64]; int n_q_tried = 0;
     const bool tainted_on_entry = rep_tainted;
     rep_tainted = false;
     int move_index = 0;
@@ -1643,9 +1731,36 @@ static int search(int depth, int alpha, int beta, int ply) {
             if ((lmrsel & 1) &&  nullwin &&  after_cap)          r += 1;
             if ((lmrsel & 2) && !nullwin && !after_cap && r > 0) r -= 1;
         }
+        if (quiet && n_q_tried < 64) q_tried[n_q_tried++] = m;
         //A reduction may not take the child below the horizon: at cd - r <= 0 the child is a
         //quiescence search whatever the reduction, so a larger r past that point buys nothing and
         //only makes the arm harder to read.
+        //THE SHAPED REDUCTION, in 1024ths of a ply so the statScore term has somewhere to go. The
+        //flat integer path above is left exactly as it was and is what runs when LMRSHAPE is off,
+        //which is what keeps every earlier measurement reproducible.
+        if (lmrshape && r > 0) {
+            int r1024;
+            if (lmrbase) {
+                //Stockfish's base: reductions[i] = 21.46 * ln(i), scaled by depth AND move number,
+                //plus its 1182 offset. Growing with both is the point -- a flat rule reduces the
+                //fourth move at depth 20 the same as at depth 4.
+                const double ld = std::log((double)std::max(1, depth));
+                const double lm = std::log((double)std::max(1, move_index));
+                r1024 = (int)(21.46 * ld * 21.46 * lm) + 1182;
+            } else {
+                r1024 = r * 1024;
+            }
+            //The whole point of the exercise: a move with a good track record after the move that
+            //led here is barely reduced; a bad one is reduced far more than any constant would dare.
+            const int ss_sc = (ply < MAX_PLY)
+                            ? stat_score(ply, (int)ss_mv_pc[ply], m.dst, m.src,
+                                         board.sideToMove ^ 1)
+                            : 0;
+            r1024 -= ss_sc * shape_mul / std::max(1, shape_div);
+            ++shape_n; shape_sum += r1024; shape_absum += std::abs(ss_sc);
+            r = r1024 / 1024;
+            if (r < 0) r = 0;
+        }
         if (r > cd_guard) r = cd_guard;
         //An extended move is never also reduced: the two tests disagree about the same move and the
         //extension is the one that looked at the position rather than at the move's index.
@@ -1796,6 +1911,18 @@ static int search(int depth, int alpha, int beta, int ply) {
                 }
                 history_bump(board.sideToMove, m, depth);
                 ++history_cutoffs;
+                //CONTINUATION HISTORY, written. The move that cut off is rewarded and every quiet
+                //move tried at this node that did NOT cut off is penalised -- both halves matter,
+                //because a table that only ever goes up cannot tell a good reply from a common one.
+                //Stockfish's bonus and malus, unchanged except for the depth cap being in plies.
+                if (conthist) {
+                    const int bonus = std::min(116 * depth - 81, 1515);
+                    const int malus = std::min(848 * depth - 207, 2446) - 17 * move_index;
+                    cont_update(ply, m, board.sideToMove, bonus);
+                    for (int qi = 0; qi < n_q_tried; ++qi)
+                        if (!same(q_tried[qi], m))
+                            cont_update(ply, q_tried[qi], board.sideToMove, -malus);
+                }
             }
             break;
         }
@@ -2097,6 +2224,21 @@ public:
         o.spin("QMoveCount",  &o_qmcount,    2,  1, 16);
         o.spin("QFutBase",    &o_qfutbase, 169,  0, 600);
         o.spin("QSEE",        &o_qsee,     -38, -600, 0);
+        //CONTINUATION HISTORY AND THE SHAPED REDUCTION. Both default OFF, and the reason is a
+        //property of the MEASUREMENT rather than of the mechanism: the prober clears its tables for
+        //every test position, because each one has to be an independent search, so statScore never
+        //reaches working magnitude there. Measured on one position at increasing search size:
+        //    depth 6: mean |statScore|   449      depth 9:  5,528
+        //    depth 8:              2,396      depth 10:  6,614
+        //still climbing steeply, against the ~74,000 Stockfish's own tables span. At 5,528 the
+        //shaping range is +-0.56 plies where Stockfish gets +-3, so the test set cannot show what
+        //this does. IN A GAME it is a different quantity entirely, because the tables persist from
+        //move to move -- which is why they are cleared here only on "ucinewgame", never between
+        //moves. Turn these on for a match, not on the strength of a test-set number.
+        o.spin("ContHist",    &o_conthist,   0,  0, 1);
+        o.spin("LMRShape",    &o_lmrshape,   0,  0, 1);
+        o.spin("LMRBase",     &o_lmrbase,    0,  0, 1);
+        o.spin("ShapeMul",    &o_shapemul, 850,  0, 20000);
         o.spin("LMRPlus",     &o_lmrplus,    0, -2, 3);
         o.spin("SingularExt", &o_singext,   50,  0, 400);
         o.spin("CorrHist",    &o_corrhist,   0,  0, 2);
@@ -2184,6 +2326,11 @@ public:
         game_hashes.clear();
         std::memset(corr_tab, 0, sizeof corr_tab);
         std::memset(corr_cont, 0, sizeof corr_cont);
+        //CLEARED HERE AND NOWHERE ELSE. The prober wipes these per test position; an engine must
+        //not wipe them per move, because what a continuation history is FOR is carrying "this reply
+        //works after that move" from one move of the game to the next. That difference is the
+        //whole reason the mechanism is worth measuring in games and cannot be measured on the set.
+        std::memset(cont_hist, 0, sizeof cont_hist);
     }
 
     void set_position(const std::string& fen, const std::vector<std::string>& moves) override {
@@ -2418,6 +2565,10 @@ private:
         //unconditionally, so policy_plies must be 0 unless a net is actually in memory.
         if (o_polplies > 0 && !policy_loaded_) load_policy();
         policy_plies = policy_loaded_ ? (int)o_polplies : 0;
+        conthist     = (int)o_conthist;
+        lmrshape     = (int)o_lmrshape;
+        lmrbase      = (int)o_lmrbase;
+        shape_mul    = (int)o_shapemul;
         qprune       = (int)o_qprune;
         q_mcount     = (int)o_qmcount;
         q_futbase    = (int)o_qfutbase;
@@ -2447,6 +2598,7 @@ private:
     int64_t o_qdepth = 6, o_asp = 25, o_seeord = 1;
     int64_t o_seeprune = 2, o_seequad = 12, o_seecapbase = 80;
     int64_t o_qprune = 2, o_qmcount = 2, o_qfutbase = 169, o_qsee = -38;
+    int64_t o_conthist = 0, o_lmrshape = 0, o_lmrbase = 0, o_shapemul = 850;
     int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 1;
     std::string syzygy_path_;
     std::string policy_net_path_ = "nnue_policy_pisp2.bin";
