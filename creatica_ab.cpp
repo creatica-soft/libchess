@@ -786,8 +786,17 @@ static std::vector<uint64_t> game_hashes;
 static inline bool repeated(int ply) {
     for (int i = ply - 2; i >= 0; i -= 2) if (path_hash[i] == zh.hash) return true;
     //Walk the game backwards in steps of two: only positions with the same side to move can
-    //repeat this one. `ply` parity decides where in the game history that stride starts.
-    for (int i = (int)game_hashes.size() - 1 - (ply & 1); i >= 0; i -= 2)
+    //repeat this one, so the stride is two and the STARTING INDEX is what carries the parity.
+    //
+    //GETTING THAT INDEX WRONG MAKES THE WHOLE CHECK DEAD, SILENTLY, and the first version did.
+    //game_hashes holds p0..p(m-1) after the root p(m) has been popped, so p(m-1) is the position
+    //one move BEFORE the root and has the opposite side to move. At even ply the side to move
+    //matches the root's, so the first candidate is p(m-2) -- size-2 -- not size-1. The original
+    //`size - 1 - (ply & 1)` had both parities inverted, and because the Zobrist hash includes the
+    //side to move, a wrong-parity comparison can essentially never match. Measured on
+    //"position startpos moves g1f3 g8f6 f3g1 f6g8", where the start position genuinely recurs:
+    //0 game-history hits before, 9 after.
+    for (int i = (int)game_hashes.size() - 2 + (ply & 1); i >= 0; i -= 2)
         if (game_hashes[(size_t)i] == zh.hash) return true;
     return false;
 }
@@ -2065,10 +2074,21 @@ static int search(int depth, int alpha, int beta, int ply) {
     return best;
 }
 
+//THE PROMOTION LETTER COMES FROM libchess, NOT FROM A LOCAL TABLE.
+//
+//This used to carry its own `" nbrq"`, indexed by PieceType -- and PieceType runs Knight=2,
+//Bishop=3, Rook=4, Queen=5, while that literal's letters sit at 1..4. So every promotion named the
+//WRONG PIECE, and a queen promotion -- the overwhelmingly common case -- read index 5, which is the
+//string's NUL terminator, and appended nothing. The engine therefore emitted "e7e8" for a queen
+//promotion: not a mis-scored move, an ILLEGAL one. It won a tournament game and the GUI rejected
+//the move that finished it.
+//
+//uciPromoLetter is indexed by PieceType directly and has '\0' in every non-promotion slot, so the
+//range test is still wanted but the lookup can no longer disagree with the enum.
 static std::string uci_of(const Mv& m) {
-    static const char * pl = " nbrq";
     std::string s = std::string(square[m.src]) + square[m.dst];
-    if (m.promo >= Knight && m.promo <= Queen) s += pl[m.promo];
+    if (m.promo >= Knight && m.promo <= Queen && uciPromoLetter[m.promo])
+        s += uciPromoLetter[m.promo];
     return s;
 }
 
@@ -2402,7 +2422,19 @@ public:
         o.spin("LMRPlus",     &o_lmrplus,    0, -2, 3);
         o.spin("SingularExt", &o_singext,   50,  0, 400);
         o.spin("CorrHist",    &o_corrhist,   0,  0, 2);
-        o.spin("RepCheck",    &o_repcheck,   1,  0, 2);
+        //REPCHECK 2, NOT 1, AND THIS IS A CHANGE FROM WHAT WAS MEASURED. A repetition is a
+        //property of the PATH, not of the position -- creatica_mcts says so at length, having
+        //found that stamping a path-local draw onto a shared node made every later visit from any
+        //path see a dead draw with its whole subtree cut off. The alpha-beta equivalent is storing
+        //a repetition-derived score in the transposition table, where it will be believed on a
+        //path that has no repetition at all. Mode 2 is what suppresses those stores; mode 1 tracks
+        //the taint and then ignores it.
+        //
+        //Every measurement in the logs was taken at 1, because the test-set harness searches one
+        //position with no game history, so the hazard barely arises there. In a game it arises
+        //constantly, and a wrong draw score believed out of the table is exactly the kind of
+        //silent error this project keeps paying for.
+        o.spin("RepCheck",    &o_repcheck,   2,  0, 2);
         //Syzygy. Without it, endgames are played by a search that does not know the result, which
         //in a head-to-head against creatica_mcts -- which has both local tables and online probes
         //-- measures the missing tables rather than the search.
@@ -2864,7 +2896,7 @@ private:
     int64_t o_tbsearch = 1;
     bool o_online = true;
     uint64_t online_id_ = 0;
-    int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 1;
+    int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 2;
     std::string syzygy_path_;
     std::string policy_net_path_ = "nnue_policy_pisp2.bin";
     bool policy_loaded_ = false;
