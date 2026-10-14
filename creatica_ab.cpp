@@ -395,6 +395,25 @@ static thread_local long long corr_all_n = 0, corr_all_raw = 0, corr_all_cor = 0
 //recaptured, king recaptures went unvetted, and an unsound early break -- so this rule could not
 //have been written before today without pruning on wrong numbers. That is what the fix was for.
 static int seeprune     = 0;    //0 off, 1 quiets, 2 quiets and captures
+//=== QUIESCENCE PRUNING (Stockfish qsearch Step 6) -- HALF THE TREE, UNTOUCHED UNTIL NOW ===
+//WHY THIS IS THE BIGGEST REMAINING ITEM. Quiescence is 49.6% of all nodes, and the measured
+//per-iteration leaf constant is 168 against Stockfish's 90 -- a 1.87x factor sitting in half the
+//tree. Every pruning rule tried so far has been in the main search, which is the other half.
+//
+//Stockfish prunes quiescence four ways, all gated on not already being lost, and all EXEMPTING
+//checks, recaptures (the move lands where the previous one did) and promotions -- the three cases
+//where a static material count is least trustworthy:
+//  1. moveCount > 2 -- after the first two tries, stop. This is the one with real reach: it caps
+//     the WIDTH of every quiescence node at 2 regardless of how many captures exist.
+//  2. futility: stand-pat + 169 + what the capture wins <= alpha, and raise bestValue to it.
+//  3. SEE below (alpha - futilityBase), i.e. this capture cannot climb to alpha even after trades.
+//  4. and for every move, capture or not: SEE < -38, a capture that simply loses material.
+//Margins converted out of Stockfish's 2.08-per-centipawn units: 351 -> 169, -80 -> -38.
+static int qprune     = 0;     //0 off, 1 the moveCount cap and the SEE filter, 2 also futility
+static int q_mcount   = 2;     //moveCount > this is skipped
+static int q_futbase  = 169;   //cp added to the stand-pat before comparing with alpha
+static int q_see      = -38;   //a capture with SEE below this is not searched at all
+static thread_local long long qp_tested = 0, qp_mcount = 0, qp_fut = 0, qp_see = 0;
 static int see_quad     = 12;   //cp per lmrDepth^2, quiet rule
 static int see_cap_base = 80;   //cp per depth, capture rule
 static thread_local long long seep_q_tested = 0, seep_q_pruned = 0;
@@ -1106,6 +1125,10 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
     //the same binary at a fixed depth disagreed by 19 nodes on one position. A null move is stored
     //instead, which no generated move matches, so the hint is simply absent.
     Mv qbest{0, 0, 0};
+    //MOVES ACTUALLY SEARCHED at this node, which is what the cap counts. Not the loop index: a move
+    //that delta pruning or the SEE filter threw away never cost a node and must not use up the
+    //allowance of two.
+    int q_count = 0;
     for (int i = 0; i < n; ++i) {
         const Mv& m = mv[i];
         //DELTA PRUNING. If the stand-pat score plus everything this capture can possibly win still
@@ -1125,10 +1148,46 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
             if (m.promo >= Knight && m.promo <= Queen) gain += PIECE_CP[m.promo] - PIECE_CP[Pawn];
             if (stand + gain + delta_margin <= alpha) { ++delta_pruned; continue; }
         }
+        //QUIESCENCE PRUNING, Stockfish's Step 6, decided before the move is made. `best` standing
+        //at -MATE_CP means we are in check with nothing yet proved, and pruning there could miss
+        //the only escape; that is Stockfish's !is_loss(bestValue) gate.
+        if (qprune && !in_check && best > -MATE_IN_MAX) {
+            ++qp_tested;
+            const bool is_promo   = (m.promo >= Knight && m.promo <= Queen);
+            //A RECAPTURE IS NEVER PRUNED. The previous move landed on this square, so the exchange
+            //is still open and its value is not yet known -- prev_cap_sq is the same array the
+            //recapture extension uses, and search() has already set it for this ply.
+            const bool recapture  = (ply < MAX_PLY && prev_cap_sq[ply] == m.dst);
+            if (!is_promo && !recapture) {
+                if (q_count > q_mcount) { ++qp_mcount; continue; }
+                if (qprune >= 2) {
+                    const int fv = stand + q_futbase + victim_value(m);
+                    if (fv <= alpha) {
+                        ++qp_fut;
+                        if (fv > best) best = fv;      //it is a bound on this move, so it raises best
+                        continue;
+                    }
+                    if (get_see(board, to_move(m)) < alpha - stand - q_futbase) {
+                        ++qp_fut;
+                        const int cap = std::min(alpha, stand + q_futbase);
+                        if (cap > best) best = cap;
+                        continue;
+                    }
+                }
+            }
+            //Applies to EVERY move including recaptures and promotions: a capture that loses
+            //material outright is not worth a node even here.
+            if (get_see(board, to_move(m)) < q_see) { ++qp_see; continue; }
+        }
+        ++q_count;
         Move mm = {}; mm.src = (Square)m.src; mm.dst = (Square)m.dst; mm.promoType = (PieceType)m.promo;
         StateInfo st = {};
         auto [dp, dts] = accumulator_stack_push(ctx);
         const ZobristHash saved = zh;
+        //THE CHILD'S RECAPTURE TEST needs to know where this capture landed. search() maintains
+        //this for its own children; quiescence has to as well, or every quiescence node below the
+        //first would exempt the wrong square.
+        if (ply + 1 < MAX_PLY) prev_cap_sq[ply + 1] = (uint8_t)m.dst;
         //The captured type comes from do_move_dp, and the board is post-move when updateHash runs --
         //the convention the engine itself uses, verified by hashcheck.
         updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
@@ -2030,6 +2089,14 @@ public:
         o.spin("SEEPrune",    &o_seeprune,   2,  0, 2);
         o.spin("SEEQuad",     &o_seequad,   12,  0, 200);
         o.spin("SEECapBase",  &o_seecapbase, 80,  0, 400);
+        //QUIESCENCE PRUNING, default 2. On its own it is worth NOTHING -- 68 of 197, exactly the
+        //control -- because delta pruning at a zero margin already does most of the same work.
+        //Stacked with SEEPrune it is worth +3, and the pair is +10 against the control on Arasan,
+        //where FOUR TIMES the node budget is worth +7.
+        o.spin("QPrune",      &o_qprune,     2,  0, 2);
+        o.spin("QMoveCount",  &o_qmcount,    2,  1, 16);
+        o.spin("QFutBase",    &o_qfutbase, 169,  0, 600);
+        o.spin("QSEE",        &o_qsee,     -38, -600, 0);
         o.spin("LMRPlus",     &o_lmrplus,    0, -2, 3);
         o.spin("SingularExt", &o_singext,   50,  0, 400);
         o.spin("CorrHist",    &o_corrhist,   0,  0, 2);
@@ -2038,6 +2105,48 @@ public:
         //in a head-to-head against creatica_mcts -- which has both local tables and online probes
         //-- measures the missing tables rather than the search.
         o.string("SyzygyPath", &syzygy_path_, "", [this] { on_syzygy_path(); });
+        //THE POLICY NET, AND WHY IT DEFAULTS TO OFF.
+        //
+        //The prober loads this net unconditionally and orders the first POLICY_PLIES plies with
+        //it, so every measurement in the logs was taken WITH it active. It had to be exposed here
+        //or the engine would not be the search those numbers describe -- and worse, the first
+        //version of this engine left policy_plies at 3 while never loading the net, so
+        //order_by_policy() ran against an uninitialised net: undefined behaviour, and a search
+        //2x the size of the prober's on the same position at the same depth.
+        //
+        //DEFAULTS TO 3, which is what the prober used. The first version defaulted it to 0, on
+        //the grounds that policy ordering measured null (+0.02 plies) and costs about 13.76 us per
+        //ordered node. That cost argument is not decidable from what has been measured, and the
+        //effect is strongly POSITION-DEPENDENT. Same binary, fixed depth:
+        //    middlegame, depth 9:   PolicyPlies=3   729,316 nodes  |  =0  1,118,773 nodes
+        //    start position, d 10:  PolicyPlies=3   751,637 nodes  |  =0    742,991 nodes
+        //A 35% saving in one and nothing in the other, at identical nps either way -- the per-node
+        //cost does not show up, because only the first three plies are ordered and those are a
+        //vanishing fraction of the tree. Two positions settle nothing; the set measurement is owed.
+        //
+        //It defaults to 3 for a reason that does not depend on that: every number in the logs was
+        //taken with this on, so 3 is the configuration the measurements describe, and an engine
+        //running something else is not the engine they are about.
+        o.spin("PolicyPlies", &o_polplies, 3, 0, 8);
+        o.string("PolicyNet", &policy_net_path_, "nnue_policy_pisp2.bin",
+                 [this] { load_policy(); });
+    }
+
+    //Loaded on demand, and a FAILURE IS NOT FATAL. The prober aborts when the net is missing,
+    //which is right for an instrument and wrong for an engine: a GUI that gets no answer cannot
+    //tell a missing file from a crash. Policy ordering is simply turned off instead, and said so.
+    void load_policy() {
+        if (policy_loaded_ || policy_net_path_.empty()) return;
+        char err[256];
+        if (!policy_net_load(pnet, policy_net_path_.c_str(), err, sizeof err)) {
+            std::printf("info string policy net not loaded (%s); policy ordering off\n", err);
+            std::fflush(stdout);
+            o_polplies = 0;
+            return;
+        }
+        policy_loaded_ = true;
+        std::printf("info string policy net loaded from %s\n", policy_net_path_.c_str());
+        std::fflush(stdout);
     }
 
     //tb_init() is not re-entrant here, the same guard creatica.cpp uses.
@@ -2305,6 +2414,14 @@ private:
         seeprune     = (int)o_seeprune;
         see_quad     = (int)o_seequad;
         see_cap_base = (int)o_seecapbase;
+        //ORDERING CANNOT BE ASKED FOR WITHOUT THE NET. order_by_policy() reads pnet
+        //unconditionally, so policy_plies must be 0 unless a net is actually in memory.
+        if (o_polplies > 0 && !policy_loaded_) load_policy();
+        policy_plies = policy_loaded_ ? (int)o_polplies : 0;
+        qprune       = (int)o_qprune;
+        q_mcount     = (int)o_qmcount;
+        q_futbase    = (int)o_qfutbase;
+        q_see        = (int)o_qsee;
         lmrplus      = (int)o_lmrplus;
         sing_margin  = (int)o_singext;
         corrhist     = (int)o_corrhist;
@@ -2313,7 +2430,15 @@ private:
         //The pieces of the reference config that are not exposed: they were measured and there is
         //no reason to let a GUI turn them off.
         tt_on = 1; qtt_on = 1; pvs_on = 1; prune = 3; ext_limit = -1;
-        delta_margin = 0; sing_depth = 2; sing_plies = 3; ttse = 1;
+        delta_margin = 0; sing_depth = 2; sing_plies = 3;
+        //ttse STAYS OFF, and setting it to 1 here was a bug caught by checking the engine against
+        //the prober: same position, same depth, same score of 381, but 1,426,648 nodes against
+        //729,316 and a different move. ttse makes quiescence write its static evaluation into the
+        //table, which is only useful when evmode reads it back -- and evmode is 0, because every
+        //arm built on the cached eval measured negative or unresolved. On its own it just creates
+        //eval-only entries that displace real ones. The reference config has ttse=0; an engine
+        //running a configuration that was never measured is not the engine the numbers describe.
+        ttse = 0; evmode = 0;
     }
 
     std::thread driver_;
@@ -2321,8 +2446,12 @@ private:
     int64_t o_hash = 64, o_threads = 1;
     int64_t o_qdepth = 6, o_asp = 25, o_seeord = 1;
     int64_t o_seeprune = 2, o_seequad = 12, o_seecapbase = 80;
+    int64_t o_qprune = 2, o_qmcount = 2, o_qfutbase = 169, o_qsee = -38;
     int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 1;
     std::string syzygy_path_;
+    std::string policy_net_path_ = "nnue_policy_pisp2.bin";
+    bool policy_loaded_ = false;
+    int64_t o_polplies = 3;
     bool tb_ready_ = false;
 };
 
