@@ -535,6 +535,48 @@ uint64_t attackers_to(const Board& board, const Square sq, const uint64_t occupi
 }
 
 
+//PIECES OF `side` THAT MAY NOT MOVE because they are the only thing between their own king and an
+//enemy slider. Computed against the swap's current `occupied` rather than the board's, so a piece
+//that was pinned at the start but whose pinner has already been captured in the exchange is free
+//again, and a piece that BECOMES pinned as the sequence opens a line is caught.
+//
+//The snipers are found with an empty-board attack from the king square, so a slider is considered
+//whatever stands between it and the king; between_bb() then counts the blockers, and exactly one
+//means that blocker is pinned.
+//`dst` is the square the whole exchange happens on, and it is the one exception: a pinned piece may
+//legally move ALONG its pin ray, and the only capturable square on that ray is the PINNER's own, every
+//other on-ray square being empty by definition of the pin. So a sniper standing on dst does not pin
+//anything for this exchange -- capturing there removes it. Without this the test position
+//"4k3/8/4p3/3r4/2P5/3R4/8/3K4 w" scored cxd5 at 400 instead of 500, because white's Rd3 looked pinned
+//to Kd1 by the very rook it was about to recapture. Stockfish gates this more coarsely, skipping the
+//pin test entirely once a pinner has left its original square (position.cpp: `pinners(~stm) &
+//occupied`); the geometry here is exact and no more expensive.
+static uint64_t see_pinned(const Board& board, const Color side, const uint64_t occupied,
+                           const Square dst) {
+  const uint64_t kingBB = board.side[side] & board.pieceTypes[King - 1] & occupied;
+  if (!kingBB) return 0;                       //no king on the board: nothing can be pinned to it
+  const Stockfish::Square ksq = static_cast<Stockfish::Square>(lsBit(kingBB));
+  const uint64_t enemy = board.side[OPP_COLOR(side)] & occupied;
+  uint64_t snipers =
+      (Stockfish::attacks_bb<Stockfish::ROOK>(ksq, 0) & enemy
+       & (board.pieceTypes[Rook - 1] | board.pieceTypes[Queen - 1]))
+    | (Stockfish::attacks_bb<Stockfish::BISHOP>(ksq, 0) & enemy
+       & (board.pieceTypes[Bishop - 1] | board.pieceTypes[Queen - 1]));
+  uint64_t pinned = 0;
+  while (snipers) {
+    const Stockfish::Square sq = static_cast<Stockfish::Square>(lsBit(snipers));
+    snipers &= snipers - 1;
+    if ((Square)sq == dst) continue;            //the pinner is what the exchange is capturing
+    //between_bb(s1, s2) EXCLUDES s1 but INCLUDES s2 (nnue/bitboard.h:170). So the sniper's own
+    //square is already out and the KING's square is in -- masking the sniper, as the first version
+    //did, was a no-op, and leaving the king in made every pinned piece look like two blockers, so
+    //nothing was ever marked pinned. Mask the king.
+    const uint64_t between = Stockfish::between_bb(sq, ksq) & occupied & ~SQ_BIT((Square)ksq);
+    if (between && !(between & (between - 1))) pinned |= between;   //exactly one blocker
+  }
+  return pinned;
+}
+
 //Static Exchange Evaluation (SEE)
 //move has been made!
 //returns the result from board.sideToMove perspective
@@ -601,7 +643,30 @@ uint64_t attackers_to(const Board& board, const Square sq, const uint64_t occupi
 //same as above except the move has not been made
 //the correction logic of evaluate_nnue() result is
 // if (score = get_see() < 0) res = evaluate_nnue() += score;
-/*int get_see(const Board& board, Move move) {
+//REVIVED 2026-10-12. The note that stood here was wrong twice over, and both halves are worth
+//recording because the wrong inference is the tempting one.
+//
+//It said a king among the least-valuable attackers is harmless "because the move generator only
+//emits LEGAL king captures, so the square is genuinely undefended". The move generator vouches
+//only for the move passed IN. Every recapture after that is synthesised inside the loop below from
+//attackers_to(), with no legality test of any kind, so a king recapture at depth >= 1 was never
+//vetted by anything and the loop really does "capture the king" for pieceValueCP[King] == 10000.
+//
+//But the VALUE survives it, for a reason the note did not identify: the minimax unroll at the end
+//has the king's owner DECLINE the recapture, since -10000 is worse than any alternative, and
+//declining is exactly what an illegal recapture means. Measured on "8/8/2k5/3p4/4P3/8/8/3RK3 w"
+//(Kxd5 illegal because Rd1 still covers d5), get_see returns the correct 100. The king guard below
+//is therefore about keeping the intermediate values a material count -- so the early-exit pruning
+//can work and a caller reading them is not misled -- not about fixing the result.
+//
+//The note's other claim was that a PINNED defender leaves "the sign right and only the magnitude
+//wrong". It does not. attackers_to() knows nothing about pins, so a pinned piece recaptures in the
+//swap when it cannot legally move at all. On "5k2/8/5n2/3p4/4P3/8/8/4KR2 w", where Nf6 is pinned to
+//its king by Rf1, exd5 wins a clean pawn and get_see returned 0 -- a free pawn scored as an even
+//trade, which misorders it and would have any see <= 0 rule prune it. That is the defect worth
+//fixing, and Stockfish fixes it the same way (position.cpp, see_ge: "Don't allow pinned pieces to
+//attack as long as there are pinners on their original square").
+int get_see(const Board& board, Move move) {
   int score[32]; // Stack to track the exchange sequence
   int depth = 0;  
   
@@ -636,7 +701,14 @@ uint64_t attackers_to(const Board& board, const Square sq, const uint64_t occupi
     // Find all pieces attacking the dst square.
     // The mask `& occupied` ensures we only consider pieces currently on the board.
     uint64_t attackers = attackers_to(board, move.dst, occupied) & board.side[side] & occupied;
-    
+
+    //A PINNED PIECE CANNOT RECAPTURE. attackers_to() is a pure attack test and knows nothing about
+    //pins, so without this a piece that may not legally move takes part in the exchange -- see the
+    //note above the function for the position where that scored a free pawn as an even trade. The
+    //king itself is never excluded here; it is handled separately below.
+    const uint64_t pinnedBB = see_pinned(board, side, occupied, move.dst);
+    attackers &= ~(pinnedBB & ~board.pieceTypes[King - 1]);
+
     if (!attackers) break;
     
     // Get the LVA (Least Valuable Attacker: Pawn, then Knight, then Bishop...)
@@ -644,19 +716,45 @@ uint64_t attackers_to(const Board& board, const Square sq, const uint64_t occupi
     for (PieceType pt = Pawn; pt <= King; ++pt) { 
       const uint64_t pt_attackers = attackers & board.pieceTypes[pt - 1]; 
       if (pt_attackers) {
+        //THE KING MAY ONLY RECAPTURE INTO AN UNDEFENDED SQUARE. It is last in this loop, so it is
+        //chosen only when nothing cheaper is left; if the opponent still has an attacker then the
+        //capture is into check and is not a move at all, so the exchange ends here instead of
+        //continuing into a 10000-point king capture. The minimax unroll reached the same answer by
+        //having the king's owner decline, but only after putting pieceValueCP[King] on the stack,
+        //which defeats the early exit below and misleads anything reading the intermediate values.
+        if (pt == King) {
+          const uint64_t opp = attackers_to(board, move.dst, occupied)
+                             & board.side[OPP_COLOR(side)] & occupied
+                             & ~(see_pinned(board, OPP_COLOR(side), occupied, move.dst)
+                                 & ~board.pieceTypes[King - 1]);
+          if (opp) { lva_type = PieceTypeNone; break; }
+        }
         lva_type = pt;
         occupied ^= SQ_BIT(lsBit(pt_attackers)); // Remove the LVA from the occupied bitboard
         break; 
       }
     }
+    if (lva_type == PieceTypeNone) break;       //only an illegal king recapture was available
     
     depth++;
     // The score at this depth is the value of the piece sitting on the square 
     // minus the score the opponent could achieve up to the previous depth.
     score[depth] = pieceValueCP[pieceOnDst] - score[depth - 1];    
     
-    // Alpha-beta style pruning: if the side to move can stop the capture sequence and be ahead, they will.
-    if (std::max(-score[depth - 1], score[depth]) < 0) break;
+    // THE EARLY BREAK THAT USED TO BE HERE WAS UNSOUND, and it cost 100 cp on
+    // "4k3/8/4p3/3r4/2P5/3R4/8/3K4 w", where cxd5 scored 400 instead of 500:
+    //
+    //     if (std::max(-score[depth - 1], score[depth]) < 0) break;
+    //
+    // score[depth] is computed as though nothing recaptures again, so it OVERSTATES what the side to
+    // move gains by continuing. Breaking on it leaves the unroll comparing that optimistic
+    // continuation against declining, and it can pick the wrong branch: there, black's recapture
+    // looked 100 better than declining, and is only equal once white's own recapture is counted --
+    // which is exactly what the break had discarded.
+    //
+    // Removing it makes the value exact. The cost is bounded and small: the loop ends as soon as a
+    // side has no attacker of the square left, two to four iterations in practice, and `score` is
+    // sized 32 for the worst case.
     
     side = OPP_COLOR(side);
     pieceOnDst = lva_type; // The piece that just captured now sits on the destination square
@@ -669,7 +767,7 @@ uint64_t attackers_to(const Board& board, const Square sq, const uint64_t occupi
   }
   
   return score[0];
-}*/
+}
 
 //The "Reverse" Attack Logic to quickly calculate the checkers
 /*uint64_t getCheckers(const Board& board, const Square kingSq) {
