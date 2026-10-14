@@ -25,6 +25,12 @@ add_executable(creatica_mcts creatica_search_mcts.cpp creatica_mcts.cpp uci_fron
 # The alpha-beta engine. Syzygy is probed at the ROOT only; see creatica_ab.cpp's header for the
 # full list of what it does not have.
 add_executable(creatica_ab creatica_ab.cpp uci_frontend.cpp tbprobe.c)
+# Component A of the chess GUI. A CMake target because it was NOT one: the binary went stale on
+# 2025-09-15 and nothing rebuilt it, so when the Board struct lost its cache fields the stale
+# executable kept the old layout inlined while linking the new library. Every field offset past
+# the removed ones was wrong, and the tournament died on an lsBit(0) assertion with a perfectly
+# legal opening position. A copy that is not built is a copy that rots unnoticed.
+add_executable(gui_helper gui_helper.cpp)
 add_executable(test_pos test_pos.cpp)
 # The regression guard for get_see(); see the note at the top of test_see.cpp.
 add_executable(test_see test_see.cpp)
@@ -114,6 +120,7 @@ else()
     target_compile_options(creatica PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(creatica_mcts PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(creatica_ab PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(gui_helper PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_see PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_nnue PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_tb PRIVATE -Wall -O3 -march=native -DNDEBUG)
@@ -141,6 +148,7 @@ target_link_libraries(creatica PRIVATE chess curl)
 target_link_libraries(creatica_mcts PRIVATE chess curl)
 # curl for the online 7-piece tablebase probe (OnlineTablebase, off by default).
 target_link_libraries(creatica_ab PRIVATE chess curl)
+target_link_libraries(gui_helper PRIVATE chess)
 target_link_libraries(test_pos PRIVATE chess)
 target_link_libraries(test_see PRIVATE chess)
 target_link_libraries(perft PRIVATE chess)

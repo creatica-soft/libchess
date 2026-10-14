@@ -341,9 +341,18 @@ static std::string to_uci(const Move& m) {
 // isCheckMateStaleMate() computes the same thing, but it CLEARS board.isCheck when it
 // sets isMate, and the API contract wants both the status and the check flag, so the
 // move list is used directly instead.
-static const char * status_of(const Board& board, const std::vector<Move>& moves) {
-    if (moves.empty()) return board.isCheck ? "mate" : "stalemate";
-    return board.isCheck ? "check" : "ok";
+//
+// board.isCheck IS GONE. It was a cache that went stale the moment a move was made --
+// do_move() preserved it so undo_move() could restore it, but never recomputed it, so after
+// a move it described the PARENT position. Every caller now computes the value instead, and
+// kingMoves() returns `checkers` in its tuple, which is the authority. This is why `board`
+// is no longer const here: kingMoves() takes a non-const reference.
+static const char * status_of(Board& board, const std::vector<Move>& moves) {
+    const auto [kingMoveBB, pinned, pinning, checkers, kingSq] = kingMoves(board);
+    (void)kingMoveBB; (void)pinned; (void)pinning; (void)kingSq;
+    const bool chk = checkers != 0;
+    if (moves.empty()) return chk ? "mate" : "stalemate";
+    return chk ? "check" : "ok";
 }
 
 // ---------------------------------------------------------------------- commands
@@ -367,7 +376,9 @@ static void cmd_legal(const std::string& fen) {
     // ASSUMPTION: "check" means "the side to move is in check", so it is true for mate
     // as well as for a plain check.
     out += "\",\"check\":";
-    out += (board.isCheck || !strcmp(status, "mate")) ? "true" : "false";
+    //DERIVED FROM `status`, which already distinguishes check from mate, rather than asking
+    //kingMoves() again: status_of() has just computed exactly this.
+    out += (!strcmp(status, "check") || !strcmp(status, "mate")) ? "true" : "false";
     out += ",\"status\":\"";
     out += status;
     out += "\"}";
@@ -436,7 +447,7 @@ static void cmd_move(const std::string& uci, const std::string& fen) {
     const char * status = status_of(board, replies);
     // move2san() stops before the check and mate markers; standard SAN carries them.
     if (!strcmp(status, "mate")) san += "#";
-    else if (board.isCheck) san += "+";
+    else if (!strcmp(status, "check")) san += "+";
 
     char fenBuf[MAX_FEN_STRING_LEN] = "";
     board2fen(board, fenBuf);
@@ -448,7 +459,9 @@ static void cmd_move(const std::string& uci, const std::string& fen) {
     out += "\",\"turn\":\"";
     out += (board.sideToMove == ColorWhite ? "w" : "b");
     out += "\",\"check\":";
-    out += (board.isCheck || !strcmp(status, "mate")) ? "true" : "false";
+    //DERIVED FROM `status`, which already distinguishes check from mate, rather than asking
+    //kingMoves() again: status_of() has just computed exactly this.
+    out += (!strcmp(status, "check") || !strcmp(status, "mate")) ? "true" : "false";
     out += ",\"status\":\"";
     out += status;
     out += "\"}";
