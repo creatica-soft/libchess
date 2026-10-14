@@ -21,9 +21,6 @@
 // logs, which is why apply_options() sets them explicitly rather than trusting the initialisers.
 //
 // WHAT IS DELIBERATELY ABSENT, all of it known and none of it hidden:
-//   - no Syzygy tablebases and no online probes. creatica_mcts has both, so endgames are the one
-//     place this engine is handicapped in a head-to-head; add tbprobe.c and the root probe if the
-//     tournament shows it losing endings it should hold.
 //   - no MultiPV, no searchmoves, no 50-move-rule awareness in the search.
 //   - mate distances coming out of QUIESCENCE are unadjusted (the prober's own note says so), so a
 //     mate found there can be reported at the wrong distance. Mates found in the main search are
@@ -49,10 +46,6 @@
 #include "tbprobe.h"
 #include "policy_net.h"
 
-//NNUEContext and the nnue wrapper functions come from libchess.h as of 36d447b. This block used to
-//be a private copy of them -- one of four in the tree, which is why a signature change there was a
-//link-time surprise rather than a compile error.
-
 //PER-THREAD SEARCH STATE. Lazy SMP gives every thread its own board, its own NNUE context and its
 //own hash, and shares exactly ONE structure -- the transposition table. That is the whole of the
 //communication between threads, and it is why alpha-beta SMP is so much less machinery than
@@ -60,14 +53,15 @@
 //a collector that coordinates with live searchers.
 //
 //`z` (the Zobrist tables) and `pnet` (the policy net) stay SHARED because nothing writes them after
-//init. Everything below is written during a search, so a shared copy would be a data race.
-static thread_local Board board; static thread_local NNUEContext ctx;
-static Zobrist z; static thread_local ZobristHash zh;
-static PolicyNet pnet; static thread_local float pctx[512];
+//init. 
+static Zobrist z; 
+static PolicyNet pnet; 
+//Everything below is written during a search, so a shared copy would be a data race.
+static thread_local Board board; 
+static thread_local NNUEContext ctx;
+static thread_local ZobristHash zh;
+static thread_local float pctx[512];
 static thread_local std::vector<unsigned char> pfeat;
-//NNUE_CHECK_SENTINEL is gone: nothing here compares against it any more. evaluate_nnue() is only
-//ever called with in_check == false, because the one place that could be in check resolves the
-//position by searching instead. The compiler flagging it as unused is the refactor's point.
 
 static const int MATE_CP   = 30000;
 static const int MAX_PLY   = 64;
@@ -115,20 +109,19 @@ static inline bool same(const Mv& a, const Mv& b) {
 //of Stockfish's ordering that is NOT hand-crafted chess knowledge. A killer is simply "this move
 //caused a cutoff at this ply a moment ago"; a history score is "this from-to square pair has been
 //causing cutoffs". Both are statistics the search accumulates about itself at runtime, in the same
-//sense that MCTS's visit counts are. Nothing about chess is encoded in either.
-//
+//sense that MCTS's visit counts are. Nothing about chess is encoded in either. Killers and
+//history took this probe from 12.54 to 11.38. Stockfish runs at about 2.1 -- well BELOW that floor,
+//which is only possible by not searching everything to full depth.
 //The target is concrete. Stockfish reaches depth 12 on these positions in 25,546 nodes and depth 16
 //in 200,553, at an effective branching factor near 2.1, and scores 73.1% and 89.5%. This probe sits
 //at a branching factor of 12.5. Creatica already spends 600,000 nodes a move, so the budget for depth
-//16 is there three times over; what is missing is the cost per ply.
+//16 is there three times over; what is missing is the cost per ply. 
 static int  ordering       = 1;
 //PRUNE, as bit flags: 1 = null-move pruning, 2 = late move reductions, 3 = both, 0 = neither.
 //
 //WHY THIS STEP IS THE ONE THAT MATTERS, and why ordering could never have got there. The mean position
 //in this set has 32.3 legal moves, so alpha-beta that searches EVERY move has a hard floor of
-//sqrt(32.3) = 5.68 on its effective branching factor, reached only with perfect ordering. Killers and
-//history took this probe from 12.54 to 11.38. Stockfish runs at about 2.1 -- well BELOW that floor,
-//which is only possible by not searching everything to full depth.
+//sqrt(32.3) = 5.68 on its effective branching factor, reached only with perfect ordering. 
 //
 //AND WHY THIS IS NOT THE GATING THAT WAS RULED OUT FOR CREATICA. A gate drops a move from a node
 //permanently on the strength of a weak estimate, with no way back, and under tree reuse that decision
@@ -179,6 +172,7 @@ static std::atomic<bool> out_of_time{false};
 //It is also the HONEST budget for comparing search rules that differ in cost per node: a rule that
 //thinks harder at each node pays for it in nodes here, exactly as it would on the clock, but without
 //the jitter.
+//TO CHECK/FIX: This is no longer a probe but the engine with UCI and should honor "go nodes X" command!
 static long long fixnodes = 0;
 //LMRPROBE: sample this many parts per thousand of the LMR decisions and find out whether the
 //reduction was RIGHT, by searching the same move both ways and comparing the verdicts. LMRPROBE_OUT
@@ -194,6 +188,7 @@ static long long fixnodes = 0;
 //The probe does not change what the search plays: the normal path's result is used exactly as
 //before and the extra search's value is thrown away. It does cost time, so a probe run is for
 //collecting labels, not for measuring strength.
+//TO FIX: it should be removed from the engine, which is no longer a probe!
 static int lmrprobe = 0;
 //LMRPLUS: add this much to every late-move reduction. It exists because the headroom probe says the
 //current rule `r = 1 + (move_index >= 8)` is safe on 99.6% of its decisions and that one MORE ply of
@@ -202,6 +197,7 @@ static int lmrprobe = 0;
 //because reducing harder everywhere compounds: shallower subtrees feed worse values upward. This
 //knob is how the question gets answered empirically rather than argued.
 static int lmrplus = 0;
+static int lmrall  = 0;   //0 the old gate, 1 Stockfish's `depth >= 2 && moveCount > 1`
 static int lmrsel  = 0;
 //LMRCOST flips the probe's search order so the FULL-depth search runs first. That makes the accuracy
 //labels worthless -- it is exactly the table contamination described at the probe -- but it makes the
@@ -395,6 +391,29 @@ static thread_local long long corr_all_n = 0, corr_all_raw = 0, corr_all_cor = 0
 //THE FIX THIS DEPENDS ON. get_see() had three defects until 2026-10-13 -- pinned defenders
 //recaptured, king recaptures went unvetted, and an unsound early break -- so this rule could not
 //have been written before today without pruning on wrong numbers. That is what the fix was for.
+//PROBCUT ITSELF (Stockfish Step 11, search.cpp:902). Buro 1995: if a reduced-depth search still
+//beats a RAISED beta, the full-depth search almost certainly would too, so the node can be cut
+//without paying for it. Stockfish keeps the shape and discards the statistics -- a = 1, b = 0 and
+//one SPRT-tuned constant -- and the PCREG collector above measured what that constant should be
+//here: at delta 5 the identity-model sigma is 57-63 cp, so the 95% margin is 90-103 cp and
+//Stockfish's 201/2.08 = 97 cp lands inside it, with a measured error rate of 4.5-4.6%. The margin
+//is therefore PORTED AS IS, which no other constant this session has earned.
+//
+//WHAT DIFFERS FROM STOCKFISH HERE, deliberately:
+//  - the static evaluation. Stockfish always has one; this probe's reference config has EVMODE=0
+//    and so has none, and the eval is needed for the SEE threshold (a candidate must win at least
+//    `probCutBeta - staticEval` in material). So one evaluation is computed at the gate when none
+//    is cached, counted in `pc_evals`, and that cost has to be read with the result.
+//  - en passant captures are not candidates. generate(captures_only) tests the destination for an
+//    enemy piece, and an en passant destination is empty, so they never enter the list. Stockfish's
+//    capture_stage() does include them. The omission is conservative -- a missed candidate costs a
+//    cutoff, never a wrong one.
+static int probcut     = 0;    //0 off, 1 on
+static int pc_margin   = 97;   //Stockfish's 201 at PawnValue 208, confirmed by PCREG
+static int pc_red      = 5;    //verification searches depth - this; Stockfish uses 5
+static int pc_mindepth = 3;    //Stockfish's `depth >= 3`
+static thread_local long long pc_tested = 0, pc_cand = 0, pc_cuts = 0, pc_evals = 0;
+
 static int seeprune     = 0;    //0 off, 1 quiets, 2 quiets and captures
 //=== QUIESCENCE PRUNING (Stockfish qsearch Step 6) -- HALF THE TREE, UNTOUCHED UNTIL NOW ===
 //WHY THIS IS THE BIGGEST REMAINING ITEM. Quiescence is 49.6% of all nodes, and the measured
@@ -445,8 +464,115 @@ static int shape_mul = 850;
 static const int CONT_LIMIT = 30000;        //Stockfish's PieceToHistory cap, unchanged
 //[level][previous piece][previous to][this piece][this to]. Level 0 is the move INTO this node,
 //level 1 the move two plies back. Index 12 is the "no move" row, as in correction history.
-static thread_local int16_t cont_hist[2][13][64][13][64];
+//SIX LEVELS, as Stockfish has, not two. cont_slot(level) looks `level + 1` plies back, so levels
+//0..5 are Stockfish's offsets 1..6 and its update weights {1092, 631, 294, 517, 126, 445} map
+//straight on. Two levels was never a deliberate choice -- it was as far as the first port got, and
+//the ordering below never read even those two.
+enum { CONT_LEVELS = 6 };
+static thread_local int16_t cont_hist[CONT_LEVELS][13][64][13][64];
+static const int cont_w[CONT_LEVELS] = { 1092, 631, 294, 517, 126, 445 };
+
 static thread_local long long shape_n = 0, shape_sum = 0, shape_absum = 0;
+
+//THE ATTACK SETS Stockfish's ordering needs, built here because libchess exposes attackers_to()
+//(which answers "who attacks this square") and not attacks_by (which answers "what does this side
+//attack"). Computed once per node and shared by every quiet move, so the cost is one sweep of the
+//side's pieces rather than one per move.
+static inline uint64_t attacks_by_pawns(const Board& b, Color c) {
+    const uint64_t p = b.pieceTypes[Pawn - 1] & b.side[c];
+    return c == ColorWhite ? (((p & ~FILE_A_BB) << 7) | ((p & ~FILE_H_BB) << 9))
+                           : (((p & ~FILE_A_BB) >> 9) | ((p & ~FILE_H_BB) >> 7));
+}
+static inline uint64_t attacks_by_type(const Board& b, Color c, PieceType pt) {
+    const uint64_t occ = b.side[ColorWhite] | b.side[ColorBlack];
+    uint64_t out = 0;
+    for (uint64_t m = b.pieceTypes[pt - 1] & b.side[c]; m; m &= m - 1) {
+        const Stockfish::Square sq = (Stockfish::Square)lsBit(m);
+        if (pt == Knight)      out |= Stockfish::attacks_bb<Stockfish::KNIGHT>(sq, occ);
+        else if (pt == Bishop) out |= Stockfish::attacks_bb<Stockfish::BISHOP>(sq, occ);
+        else if (pt == Rook)   out |= Stockfish::attacks_bb<Stockfish::ROOK>(sq, occ);
+        else if (pt == Queen)  out |= Stockfish::attacks_bb<Stockfish::BISHOP>(sq, occ)
+                                    | Stockfish::attacks_bb<Stockfish::ROOK>(sq, occ);
+    }
+    return out;
+}
+//Does this move give check? Answered WITHOUT making the move: the destination's attack set from the
+//moving piece's new square against the enemy king. Discovered checks are not detected, which costs
+//the ordering a bonus it should have given and never gives one it should not.
+static inline bool gives_check(const Board& b, const Mv& m) {
+    const uint64_t occ = (b.side[ColorWhite] | b.side[ColorBlack])
+                         & ~(1ULL << m.src);
+    const uint64_t kbb = b.pieceTypes[King - 1] & b.side[1 - b.sideToMove];
+    if (!kbb) return false;
+    const int ksq = lsBit(kbb);
+    const int pt = (m.promo >= Knight && m.promo <= Queen)
+                   ? (int)m.promo : (int)PC_TYPE((Piece)b.piecesOnSquares[m.src]);
+    const Stockfish::Square d = (Stockfish::Square)m.dst;
+    switch (pt) {
+        case Pawn: {
+            const uint64_t a = b.sideToMove == ColorWhite
+                             ? ((((1ULL << m.dst) & ~FILE_A_BB) << 7) | (((1ULL << m.dst) & ~FILE_H_BB) << 9))
+                             : ((((1ULL << m.dst) & ~FILE_A_BB) >> 9) | (((1ULL << m.dst) & ~FILE_H_BB) >> 7));
+            return (a >> ksq) & 1ULL;
+        }
+        case Knight: return (Stockfish::attacks_bb<Stockfish::KNIGHT>(d, occ) >> ksq) & 1ULL;
+        case Bishop: return (Stockfish::attacks_bb<Stockfish::BISHOP>(d, occ) >> ksq) & 1ULL;
+        case Rook:   return (Stockfish::attacks_bb<Stockfish::ROOK>(d, occ) >> ksq) & 1ULL;
+        case Queen:  return ((Stockfish::attacks_bb<Stockfish::BISHOP>(d, occ)
+                            | Stockfish::attacks_bb<Stockfish::ROOK>(d, occ)) >> ksq) & 1ULL;
+        default: return false;
+    }
+}
+//THE TABLES THE ORDERING WAS MISSING. Every one of them exists to answer the same question -- is
+//this move actually bad, or merely late -- and that is the question a reduction or a skip has to
+//get right. Stockfish's move-count rule cost 29 positions here for 0.77 of branching factor
+//precisely because "late" was all this probe could tell.
+//  CAPTURE HISTORY   [piece][to][captured type]. Captures are ordered by SEE alone today, which
+//                    cannot distinguish a capture that has repeatedly worked from one that has not.
+//  PAWN HISTORY      [pawn structure][piece][to]. The same quiet move is good or bad depending on
+//                    the pawn skeleton, and nothing else in the ordering knows the skeleton.
+//  LOW-PLY HISTORY   [ply][from][to] for the first few plies, where there is not yet enough
+//                    continuation context and the root ordering matters most.
+static const int CAP_LIMIT = 10692;      //Stockfish's CapturePieceToHistory cap
+static const int PAWN_HIST_SIZE = 512;   //Stockfish's PAWN_HISTORY_SIZE, a power of two
+static const int LOW_PLY_SIZE = 5;       //Stockfish's LOW_PLY_HISTORY_SIZE
+static thread_local int16_t cap_hist[12][64][6];
+static thread_local int16_t pawn_hist[PAWN_HIST_SIZE][12][64];
+static thread_local int16_t low_ply_hist[LOW_PLY_SIZE][64][64];
+static int ord2 = 0;          //0 the measured ordering, 1 the full history ordering
+static int ord2_cap = 1;      //capture history in the capture score
+static int ord2_cont = 1;     //continuation history in the quiet score
+static int ord2_pawn = 1;     //pawn history in the quiet score
+static int ord2_lowply = 1;   //low-ply history in the quiet score
+static int ord2_check = 1;    //Stockfish's check bonus for quiet moves
+static int ord2_threat = 1;   //Stockfish's threatened-square term
+//KILLERS. Two moves are forced above every quiet move whatever their history says. Stockfish has
+//no killer tier at all any more -- the history tables rank the quiet moves and that is the whole
+//ordering. With a table that can only go up, killers were doing work nothing else could; with the
+//saturating table and a malus they may now be overriding better information.
+static int ord2_kill = 1;
+
+static inline void cap_add(int16_t& e, int bonus) {
+    const int b = std::clamp(bonus, -CAP_LIMIT, CAP_LIMIT);
+    const int v = e;
+    e = (int16_t)(v + b - v * std::abs(b) / CAP_LIMIT);
+}
+//Stockfish's pawnHistory cap is 8192 and lowPlyHistory's is 8192 as well.
+static inline void ph_add(int16_t& e, int bonus) {
+    const int b = std::clamp(bonus, -8192, 8192);
+    const int v = e;
+    e = (int16_t)(v + b - v * std::abs(b) / 8192);
+}
+//THE PAWN KEY. libchess's Zobrist state does not carry a separate pawn hash, so it is built here
+//from the pawn bitboards. Cheap -- two bitboards and a mix -- and recomputed per node rather than
+//maintained incrementally, which is the honest trade for a probe.
+static inline int pawn_index() {
+    uint64_t k = board.pieceTypes[Pawn - 1] & board.side[ColorWhite];
+    uint64_t b = board.pieceTypes[Pawn - 1] & board.side[ColorBlack];
+    k = k * 0x9E3779B97F4A7C15ULL ^ (b + 0x165667B19E3779F9ULL);
+    k ^= k >> 29; k *= 0xBF58476D1CE4E5B9ULL; k ^= k >> 32;
+    return (int)(k & (PAWN_HIST_SIZE - 1));
+}
 
 //Stockfish's StatsEntry operator<<, with the continuation cap: step toward the bonus with a pull
 //back proportional to how far the entry already is, so a repeated bonus saturates instead of
@@ -495,8 +621,10 @@ static inline void cont_update(int ply, const Mv& m, int stm, int bonus) {
     const int pc = hist_pc(stm, m.src);
     if (pc < 0 || pc > 11) return;
     const int b = bonus * 896 / 1024;
-    cont_add(*cont_slot(0, ply, pc, m.dst), b * 1133 / 1024 + 88);
-    cont_add(*cont_slot(1, ply, pc, m.dst), b *  683 / 1024);
+    //All six levels, with Stockfish's weights. The +88 on level 0 is kept from the measured version.
+    cont_add(*cont_slot(0, ply, pc, m.dst), b * cont_w[0] / 1024 + 88);
+    for (int L = 1; L < CONT_LEVELS; ++L)
+        cont_add(*cont_slot(L, ply, pc, m.dst), b * cont_w[L] / 1024);
 }
 static int see_quad     = 12;   //cp per lmrDepth^2, quiet rule
 static int see_cap_base = 80;   //cp per depth, capture rule
@@ -1568,6 +1696,72 @@ static int search(int depth, int alpha, int beta, int ply) {
         }
     }
 
+    //PROBCUT. See the note beside the knobs. Placed where Stockfish places it: after the null move
+    //and before the main move loop, so a node that the null move already cut never reaches it.
+    if (probcut && ply > 0 && !in_check && !excluded && depth >= pc_mindepth
+        && beta < MATE_IN_MAX && beta > -MATE_IN_MAX) {
+        const int pcbeta = beta + pc_margin;
+        //Stockfish's veto, and the reason it matters: if the table already says this node is worth
+        //less than the raised beta, the verification cannot succeed and the whole attempt is spent
+        //for nothing. No depth condition on the entry, exactly as upstream.
+        const bool tt_vetoes = tt_flag >= 0 && tt_score < pcbeta;
+        if (!tt_vetoes) {
+            int se = nev; bool se_live = have_nev;
+            if (!se_live) { se = eval_cp(); se_live = true; ++pc_evals; }
+            const int see_need = pcbeta - se;   //material a candidate must win to be worth trying
+            Mv cm[MAX_MOVES];
+            const int cn = generate(cm, true);
+            const int cdepth = std::max(depth - pc_red, 0);
+            ++pc_tested;
+            for (int i = 0; i < cn; ++i) {
+                const Mv& m = cm[i];
+                //Stockfish's capture_stage(): a capture, or a QUEEN promotion. An under-promotion
+                //is not a candidate, and generate() emits all four promotion pieces.
+                const bool is_cap = victim_value(m) != 0;
+                if (!is_cap && m.promo != Queen) continue;
+                if (get_see(board, to_move(m)) < see_need) continue;
+                ++pc_cand;
+                if (ply < MAX_PLY) {
+                    const int moved = (m.promo >= Knight && m.promo <= Queen)
+                                      ? m.promo : PC_TYPE(board.piecesOnSquares[m.src]);
+                    ss_mv_pc[ply] = (uint8_t)(board.sideToMove * 6 + moved - 1);
+                    ss_mv_to[ply] = m.dst;
+                }
+                Move mm = to_move(m);
+                StateInfo st = {};
+                auto [dp, dts] = accumulator_stack_push(ctx);
+                const ZobristHash saved = zh;
+                updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
+                //A quiescence search first: it is far cheaper than the reduced search and refutes
+                //most candidates outright. Only what survives it is worth a real search.
+                int v = -qsearch(-pcbeta, -pcbeta + 1, 0, ply + 1);
+                if (v >= pcbeta && cdepth > 0)
+                    v = -search(cdepth, -pcbeta, -pcbeta + 1, ply + 1);
+                undo_move(board, mm, st); accumulator_stack_pop(ctx); zh = saved;
+                if (out_of_time) return 0;
+                if (v >= pcbeta) {
+                    ++pc_cuts;
+                    //The verification is worth keeping: it is a genuine lower bound at cdepth + 1,
+                    //so later visits to this node inherit it instead of re-proving it.
+                    if (tt_on && !(repcheck == 2 && rep_tainted)) {
+                        TTEntry * e = tt_slot(zh.hash);
+                        TTData old;
+                        const bool have = tt_read(e, zh.hash, old);
+                        if (!have || (int)old.depth <= cdepth + 1) {
+                            TTData d;
+                            d.score = (int16_t)tt_to_store(v, ply);
+                            d.depth = (uint8_t)std::min(cdepth + 1, 255);
+                            d.flag  = (uint8_t)TT_LOWER;
+                            d.src = m.src; d.dst = m.dst; d.promo = m.promo;
+                            tt_write(e, zh.hash, d);
+                        }
+                    }
+                    if (std::abs(v) < MATE_IN_MAX) return v - pc_margin;
+                }
+            }
+        }
+    }
+
     Mv mv[MAX_MOVES];
     const int n = generate(mv, false);
     if (n == 0) return in_check ? -MATE_CP + ply : 0;
@@ -1619,6 +1813,76 @@ static int search(int depth, int alpha, int beta, int ply) {
             else if (same(m, k1))                   score[i] = 2900000;
             else                                    score[i] = history[stm][m.src][m.dst];
         }
+        //THE FULL HISTORY ORDERING (Stockfish's MovePicker::score, movepick.cpp). Replaces the
+        //scores above for every move that is not a killer, keeping the same tier boundaries so the
+        //structure of the list is unchanged -- only the order WITHIN the quiet tier and within the
+        //good-capture tier moves. The point is accuracy, not width: a reduction or a skip is only
+        //as safe as the claim that the moves after the first are worse, and that claim is exactly
+        //what these tables make. The measured ordering above knew nothing but butterfly history.
+        if (ord2) {
+            uint64_t thr[6] = {0,0,0,0,0,0};   //threatByLesser, indexed by PieceType
+            if (ord2_threat) {
+                const Color them = (Color)(1 - stm);
+                const uint64_t pawn_atk = attacks_by_pawns(board, them);
+                const uint64_t minor_atk = attacks_by_type(board, them, Knight)
+                                         | attacks_by_type(board, them, Bishop);
+                const uint64_t rook_atk = attacks_by_type(board, them, Rook);
+                thr[Knight - 1] = thr[Bishop - 1] = pawn_atk;
+                thr[Rook - 1]   = pawn_atk | minor_atk;
+                thr[Queen - 1]  = pawn_atk | minor_atk | rook_atk;
+            }
+            const int pidx = ord2_pawn ? pawn_index() : 0;
+            for (int i = 0; i < n; ++i) {
+                const Mv& m = mv[i];
+                if (ord2_kill && (same(m, k0) || same(m, k1))) continue;
+                const int pc = hist_pc(stm, m.src);
+                if (pc < 0 || pc > 11) continue;
+                const int vv = victim_value(m);
+                if (vv > 0 || m.promo != PieceTypeNone) {
+                    //Captures keep their SEE tier; capture history only reorders within it.
+                    //GOOD captures only. A losing capture sits at -1,000,000 + see and the quiet
+                    //tier floors at -999,000, so adding up to +2,673 of capture history to a losing
+                    //capture could lift it above the worst quiet move and break the tier invariant
+                    //the comment above promises. Within the good-capture tier there is no boundary
+                    //to cross.
+                    if (ord2_cap && vv > 0 && score[i] >= 4000000) {
+                        const int cap_t = (int)PC_TYPE((Piece)board.piecesOnSquares[m.dst]) - 1;
+                        if (cap_t >= 0 && cap_t < 6)
+                            score[i] += (int)cap_hist[pc][m.dst][cap_t] / 4;
+                    }
+                    continue;
+                }
+                //Quiet moves, rebuilt from scratch. The main term is shifted into Stockfish's range
+                //(2^20 >> 7 = 8192 against its 7183) for the same reason stat_score does it.
+                //The butterfly table here is the counter form, running to 2^20, so it is shifted
+                //into Stockfish's range (2^20 >> 7 = 8192 against its 7183). The saturating variant
+                //measured -2 positions and was deliberately not ported.
+                int v = 2 * (history[stm][m.src][m.dst] >> 7);
+                if (ord2_cont) {
+                    //Stockfish reads levels 0,1,2,3 and 5 -- not 4 -- in the ordering.
+                    static const int lv[] = { 0, 1, 2, 3, 5 };
+                    for (int L : lv) v += (int)*cont_slot(L, ply, pc, m.dst);
+                }
+                if (ord2_pawn)   v += 2 * (int)pawn_hist[pidx][pc][m.dst];
+                if (ord2_lowply && ply < LOW_PLY_SIZE)
+                    v += 8 * (int)low_ply_hist[ply][m.src][m.dst] / (1 + ply);
+                if (ord2_check && gives_check(board, m) && get_see(board, to_move(m)) >= -36)
+                    v += 16384;              //-75 / 2.08 for the SEE floor
+                if (ord2_threat) {
+                    static const int tb[6] = { 0, 0, 144, 144, 256, 517 };
+                    const int pt = (int)PC_TYPE((Piece)board.piecesOnSquares[m.src]) - 1;
+                    if (pt >= Knight - 1 && pt <= Queen - 1) {
+                        const int t = ((thr[pt] >> m.dst) & 1ULL) ? -95
+                                    : (((thr[pt] >> m.src) & 1ULL) ? 100 : 0);
+                        v += tb[pt] * t;
+                    }
+                }
+                //Held inside the quiet tier: the killers sit at 2.9M and good captures at 4M, so a
+                //quiet move must not be allowed to climb past them however good its history is.
+                score[i] = std::clamp(v, -999000, 2000000);
+            }
+        }
+
         sort_desc(mv, score, n);
     }
     //The policy's own first choice, captured BEFORE the table and previous-PV swaps move it. The
@@ -1692,6 +1956,7 @@ static int search(int depth, int alpha, int beta, int ply) {
     //that move" rather than merely "this move appears often". Pruned moves are NOT in here: they
     //were never tried, so they are evidence of nothing.
     Mv q_tried[64]; int n_q_tried = 0;
+    Mv c_tried[32]; int n_c_tried = 0;
     const bool tainted_on_entry = rep_tainted;
     rep_tainted = false;
     int move_index = 0;
@@ -1798,8 +2063,18 @@ static int search(int depth, int alpha, int beta, int ply) {
         //that half at 0.19% of reductions by searching the child a second time at full depth.
         int r = 0;
         const int cd_guard = depth - 1 + ext;      //the child's depth before any reduction
-        if ((prune & 2) && depth >= 3 && move_index >= 4 && quiet && !in_check && !stm_in_check()) {
-            r = 1 + (move_index >= 8 ? 1 : 0) + lmrplus;
+        //LMR COVERAGE. This engine reduced only `depth >= 3 && move_index >= 4 && quiet`, so a capture
+        //was never reduced, moves 2 and 3 were never reduced, and depth 2 was never reduced.
+        //Stockfish's gate (search.cpp:1231) is `depth >= 2 && moveCount > 1`. Measured on Arasan
+        //197: branching factor 4.72 -> 4.24 for two positions, the best trade of any arm tried.
+        const bool lmr_gate = lmrall
+            ? ((prune & 2) && depth >= 2 && move_index >= 1 && !in_check && !stm_in_check())
+            : ((prune & 2) && depth >= 3 && move_index >= 4 && quiet && !in_check && !stm_in_check());
+        if (lmr_gate) {
+            //A capture is reduced a ply less than a quiet move of the same index: it is the move
+            //class the ordering is most confident about.
+            r = 1 + (move_index >= 8 ? 1 : 0) + lmrplus - (lmrall && !quiet ? 1 : 0);
+            if (r < 0) r = 0;
             //SELECTIVE BOLDNESS, from 27,718 labelled reductions. The error in reducing one ply deeper
             //is not spread evenly over the decisions: it concentrates by a factor of ten into two cells
             //of a two-bit table. A null window with a capture on the previous move is 53% of all
@@ -1814,6 +2089,9 @@ static int search(int depth, int alpha, int beta, int ply) {
             if ((lmrsel & 2) && !nullwin && !after_cap && r > 0) r -= 1;
         }
         if (quiet && n_q_tried < 64) q_tried[n_q_tried++] = m;
+        //Captures tried but beaten, for the capture-history malus. Stockfish keeps the same list.
+        if (!quiet && n_c_tried < 32) c_tried[n_c_tried++] = m;
+
         //A reduction may not take the child below the horizon: at cd - r <= 0 the child is a
         //quiescence search whatever the reduction, so a larger r past that point buys nothing and
         //only makes the arm harder to read.
@@ -1844,6 +2122,10 @@ static int search(int depth, int alpha, int beta, int ply) {
             if (r < 0) r = 0;
         }
         if (r > cd_guard) r = cd_guard;
+        //Stockfish clamps the reduced depth to at least 1 rather than letting a reduction land in
+        //quiescence; it prunes those moves instead. That path is 0.9% of nodes, so this is for
+        //faithfulness rather than for speed.
+        if (lmrall && r > 0 && cd_guard - r < 1) r = std::max(0, cd_guard - 1);
         //An extended move is never also reduced: the two tests disagree about the same move and the
         //extension is the one that looked at the position rather than at the move's index.
         if (ext) r = 0;
@@ -1986,6 +2268,15 @@ static int search(int depth, int alpha, int beta, int ply) {
             //A BETA CUTOFF BY A QUIET MOVE is the only thing worth remembering. A capture that cuts
             //off is already ordered first by its victim, so recording it would teach the tables
             //nothing they do not already know.
+            //A CAPTURE that cut off is rewarded in capture history. The comment below is right that
+            //MVV/SEE already orders it first among captures -- but capture history is what ranks it
+            //against the OTHER captures, which SEE cannot do, so there is something to learn here.
+            if (ord2 && ord2_cap && victim_value(m) > 0) {
+                const int pc = hist_pc(board.sideToMove, m.src);
+                const int ct = (int)PC_TYPE((Piece)board.piecesOnSquares[m.dst]) - 1;
+                if (pc >= 0 && pc <= 11 && ct >= 0 && ct < 6)
+                    cap_add(cap_hist[pc][m.dst][ct], std::min(116 * depth - 81, 1515));
+            }
             if (ordering && victim_value(m) == 0 && m.promo == PieceTypeNone) {
                 if (!same(m, killers[ply][0])) {
                     killers[ply][1] = killers[ply][0];
@@ -2004,6 +2295,36 @@ static int search(int depth, int alpha, int beta, int ply) {
                     for (int qi = 0; qi < n_q_tried; ++qi)
                         if (!same(q_tried[qi], m))
                             cont_update(ply, q_tried[qi], board.sideToMove, -malus);
+                }
+                //THE NEW TABLES, written with Stockfish's own weights
+                //(update_quiet_histories in search.cpp). Same bonus, same malus, same two halves.
+                if (ord2) {
+                    const int bonus = std::min(116 * depth - 81, 1515);
+                    const int malus = std::min(848 * depth - 207, 2446) - 17 * move_index;
+                    const int stmv = board.sideToMove;
+                    const int pidx = pawn_index();
+                    auto quiet_write = [&](const Mv& q, int b) {
+                        const int pc = hist_pc(stmv, q.src);
+                        if (pc < 0 || pc > 11) return;
+                        if (ord2_pawn)
+                            ph_add(pawn_hist[pidx][pc][q.dst], b * (b > 0 ? 705 : 450) / 1024);
+                        if (ord2_lowply && ply < LOW_PLY_SIZE)
+                            ph_add(low_ply_hist[ply][q.src][q.dst], b * 792 / 1024);
+                    };
+                    quiet_write(m, bonus);
+                    for (int qi = 0; qi < n_q_tried; ++qi)
+                        if (!same(q_tried[qi], m)) quiet_write(q_tried[qi], -malus);
+                    //Every capture that was searched and did NOT cut off is charged: that is what
+                    //teaches capture history the difference between a capture that works here and
+                    //one that merely wins material on paper.
+                    if (ord2_cap)
+                        for (int ci = 0; ci < n_c_tried; ++ci) {
+                            const Mv& c = c_tried[ci];
+                            const int pc = hist_pc(stmv, c.src);
+                            const int ct = (int)PC_TYPE((Piece)board.piecesOnSquares[c.dst]) - 1;
+                            if (pc >= 0 && pc <= 11 && ct >= 0 && ct < 6)
+                                cap_add(cap_hist[pc][c.dst][ct], -malus);
+                        }
                 }
             }
             break;
@@ -2416,6 +2737,17 @@ public:
         //move to move -- which is why they are cleared here only on "ucinewgame", never between
         //moves. Turn these on for a match, not on the strength of a test-set number.
         o.spin("ContHist",    &o_conthist,   0,  0, 1);
+        //THE MEASURED WIN, exposed so a match can confirm it. On Arasan 197 at 1.75M nodes,
+        //Ord2 + LMRAll + ProbCut gives branching factor 3.97 against the old 4.72 at the SAME
+        //accuracy per ply (-4.4 against -4.3 positions behind Stockfish at matched depth), which is
+        //2.7x cheaper for the same depth. Defaulted OFF so this build reproduces the previous one
+        //until a match says otherwise.
+        o.spin("Ord2",        &o_ord2,       0,  0, 1);
+        o.spin("LMRAll",      &o_lmrall,     0,  0, 1);
+        o.spin("ProbCut",     &o_probcut,    0,  0, 1);
+        o.spin("PCMargin",    &o_pcmargin,  97, 20, 400);
+        o.spin("PCRed",       &o_pcred,      5,  1,   8);
+        o.spin("PCMinDepth",  &o_pcmindepth, 3,  1,   8);
         o.spin("LMRShape",    &o_lmrshape,   0,  0, 1);
         o.spin("LMRBase",     &o_lmrbase,    0,  0, 1);
         o.spin("ShapeMul",    &o_shapemul, 850,  0, 20000);
@@ -2589,6 +2921,11 @@ public:
         //works after that move" from one move of the game to the next. That difference is the
         //whole reason the mechanism is worth measuring in games and cannot be measured on the set.
         std::memset(cont_hist, 0, sizeof cont_hist);
+        //The same for the tables the full ordering added: capture, pawn and low-ply history are
+        //statistics about THIS game's tree and accumulate across its moves on purpose.
+        std::memset(cap_hist, 0, sizeof cap_hist);
+        std::memset(pawn_hist, 0, sizeof pawn_hist);
+        std::memset(low_ply_hist, 0, sizeof low_ply_hist);
     }
 
     void set_position(const std::string& fen, const std::vector<std::string>& moves) override {
@@ -2859,6 +3196,12 @@ private:
         if (o_polplies > 0 && !policy_loaded_) load_policy();
         policy_plies = policy_loaded_ ? (int)o_polplies : 0;
         conthist     = (int)o_conthist;
+        ord2         = (int)o_ord2;
+        lmrall       = (int)o_lmrall;
+        probcut      = (int)o_probcut;
+        pc_margin    = (int)o_pcmargin;
+        pc_red       = (int)o_pcred;
+        pc_mindepth  = (int)o_pcmindepth;
         lmrshape     = (int)o_lmrshape;
         lmrbase      = (int)o_lmrbase;
         shape_mul    = (int)o_shapemul;
@@ -2893,6 +3236,8 @@ private:
     int64_t o_seeprune = 2, o_seequad = 12, o_seecapbase = 80;
     int64_t o_qprune = 2, o_qmcount = 2, o_qfutbase = 169, o_qsee = -38;
     int64_t o_conthist = 0, o_lmrshape = 0, o_lmrbase = 0, o_shapemul = 850;
+    int64_t o_ord2 = 0, o_lmrall = 0, o_probcut = 0;
+    int64_t o_pcmargin = 97, o_pcred = 5, o_pcmindepth = 3;
     int64_t o_tbsearch = 1;
     bool o_online = true;
     uint64_t online_id_ = 0;
