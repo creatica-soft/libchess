@@ -139,8 +139,8 @@ target_include_directories(creatica_ab PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 # Link executable with libchess
 target_link_libraries(creatica PRIVATE chess curl)
 target_link_libraries(creatica_mcts PRIVATE chess curl)
-# No curl: the alpha-beta engine makes no online eval or tablebase lookups.
-target_link_libraries(creatica_ab PRIVATE chess)
+# curl for the online 7-piece tablebase probe (OnlineTablebase, off by default).
+target_link_libraries(creatica_ab PRIVATE chess curl)
 target_link_libraries(test_pos PRIVATE chess)
 target_link_libraries(test_see PRIVATE chess)
 target_link_libraries(perft PRIVATE chess)
