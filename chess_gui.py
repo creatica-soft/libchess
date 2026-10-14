@@ -761,16 +761,19 @@ POOL = EnginePool()
 def resolve_engine_name(name):
     """Validate an engine name and return it.
 
-    Only executables in this directory whose names begin with "creatica" may be
-    launched; this keeps the API from being a way to run arbitrary programs.
+    Only executables in this directory whose names begin with one of
+    ENGINE_PREFIXES may be launched; this keeps the API from being a way to run
+    arbitrary programs. The basename check is what enforces "in this directory":
+    without it a name could contain a path and escape SCRIPT_DIR entirely.
     """
     if not isinstance(name, str) or not name.strip():
         raise ApiError("an engine name is required")
     name = name.strip()
     if os.path.basename(name) != name or name.startswith("."):
         raise ApiError("invalid engine name: %r" % name)
-    if not name.startswith("creatica"):
-        raise ApiError("engine names must start with 'creatica': %r" % name)
+    if not name.startswith(ENGINE_PREFIXES):
+        raise ApiError("engine names must start with one of %s: %r"
+                       % ("/".join(ENGINE_PREFIXES), name))
     path = os.path.join(SCRIPT_DIR, name)
     if not (os.path.isfile(path) and os.access(path, os.X_OK)):
         raise ApiError("no such engine: %s" % name)
@@ -820,13 +823,27 @@ def run_search(name, env_overrides, fen, movetime_ms, options=None,
         eng.lock.release()
 
 
+# Engines may be named "creatica*" or "stockfish*", and must be executable files in THIS
+# directory. The prefix rule is a whitelist, not decoration: the API would otherwise be a way to
+# run an arbitrary program, so a request may only ever name a basename that matches one of these
+# and resolves inside SCRIPT_DIR -- which is what the basename check in resolve_engine_name()
+# enforces.
+#
+# "stockfish" was added because the Stockfish binaries were ALREADY HERE --
+# stockfish-macos-m1-apple-silicon and -17, the 18 and 17 releases -- and the engine list simply
+# could not see them. Nothing was missing and nothing was broken; the whitelist named one engine
+# family and there are two. A reference opponent is the whole point of a tournament, so excluding
+# the only one present was the defect.
+ENGINE_PREFIXES = ("creatica", "stockfish")
+
+
 def list_engines():
-    """Executable files in this directory whose names start with 'creatica'."""
+    """Executable files in this directory whose names match ENGINE_PREFIXES."""
     names = []
     try:
         with os.scandir(SCRIPT_DIR) as entries:
             for entry in entries:
-                if not entry.name.startswith("creatica"):
+                if not entry.name.startswith(ENGINE_PREFIXES):
                     continue
                 try:
                     if not entry.is_file(follow_symlinks=True):
