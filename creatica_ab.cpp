@@ -46,6 +46,7 @@
 #include "nnue/nnue/nnue_accumulator.h"
 #include "nnue/bitboard.h"
 #include "libchess.h"
+#include "tbprobe.h"
 #include "policy_net.h"
 
 //NNUEContext and the nnue wrapper functions come from libchess.h as of 36d447b. This block used to
@@ -1132,6 +1133,53 @@ static thread_local int pv_len[MAX_PLY];
 //    needs it for the continuation keys -- so the root-relative adjustment tt_to_store() needs is
 //    available, but it is deliberately still not applied here: `-MATE_CP` is unadjusted and
 //    changing what quiescence stores would change every arm measured against this baseline.
+//=== SYZYGY INSIDE THE SEARCH ===
+//WHAT THIS BUYS over the root probe alone. The root probe only fires when the ending is ALREADY on
+//the board. This one fires on every node that reaches the tables, so a search five plies from a
+//won or drawn ending gets the exact verdict instead of an NNUE guess -- which is how an engine
+//knows to walk into a drawn rook ending rather than avoid it, or to avoid one it thinks is won.
+//Fathom's own note says engines should use tb_probe_wdl() during search.
+//
+//PLY-INDEPENDENT ON PURPOSE. A win is a win, so the score carries no distance and needs no
+//root-relative adjustment -- which matters because tt_to_store()/tt_from_store() only adjust the
+//MATE band, so a ply-relative score below it would be stored at one ply and read at another and be
+//silently wrong. The cost of carrying no distance is that the search has no reason to prefer a
+//faster win, and the answer to that is the ROOT probe: it uses DTZ and always plays the
+//distance-optimal move when the position is in the tables, so conversion is handled where it can
+//be handled exactly.
+//
+//TWO TRAPS IN THE API, both of which bite silently:
+//  - tb_probe_wdl() RETURNS TB_RESULT_FAILED WHENEVER rule50 != 0. So 0 must be passed, and it is
+//    not a shortcut: passing the real halfmove clock -- which this search does maintain correctly
+//    through do_move/undo_move -- would have disabled the probe on nearly every position. The
+//    consequence to know about is that the WDL value therefore IGNORES the fifty-move rule, so in
+//    a position with a high clock a reported win may in truth be a draw.
+//  - castling rights also force a failure, because Syzygy cannot express castling. Excluded here
+//    rather than probed and discarded.
+static int tb_search = 1;                    //use the tables inside the search
+static unsigned tb_pieces_max = 0;           //TB_LARGEST once initialised; 0 means no tables
+static const int TB_SCORE_CP = 20000;        //well below MATE_IN_MAX, so no mate arithmetic applies
+static thread_local long long tbhits = 0;
+
+static inline bool tb_probe_node(int& out) {
+    if (!tb_search || tb_pieces_max == 0 || board.castlingRights) return false;
+    const unsigned pieces = (unsigned)bitCount(board.side[ColorWhite] | board.side[ColorBlack]);
+    if (pieces > tb_pieces_max) return false;
+    const Square ep = legalEnPassantMove(board);
+    const unsigned wdl = tb_probe_wdl(
+        board.side[ColorWhite], board.side[ColorBlack], board.pieceTypes[King - 1],
+        board.pieceTypes[Queen - 1], board.pieceTypes[Rook - 1], board.pieceTypes[Bishop - 1],
+        board.pieceTypes[Knight - 1], board.pieceTypes[Pawn - 1],
+        0, 0, ep == SquareNone ? 0 : (unsigned)ep,
+        board.sideToMove == ColorWhite ? 1 : 0);
+    if (wdl == TB_RESULT_FAILED) return false;
+    ++tbhits;
+    //0 loss, 4 win, 1..3 draw. 1, 2 and 3 are blessed loss, draw and cursed win -- decided on the
+    //board but drawn by the fifty-move rule -- and all three really are draws for our purposes.
+    out = wdl == 4 ? TB_SCORE_CP : (wdl == 0 ? -TB_SCORE_CP : 0);
+    return true;
+}
+
 static int qsearch(int alpha, int beta, int ext, int ply) {
     ++nodes; ++qnodes;
     if (timed_out()) return 0;
@@ -1154,6 +1202,12 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
                 if (d.flag == TT_UPPER && sc <= alpha) { ++tt_cutoffs; return sc; }
             }
         }
+    }
+    //THE TABLES IN QUIESCENCE TOO. Quiescence is about half the nodes, and an ending reached by a
+    //sequence of captures is exactly the shape of position that lands in the tables.
+    if (tb_search && ply > 0) {
+        int tbv;
+        if (tb_probe_node(tbv)) return tbv;
     }
     //Hoisted out of the branch below so delta pruning can use it. -MATE_CP when in check, where
     //there is no stand-pat and no pruning either.
@@ -1396,6 +1450,25 @@ static int search(int depth, int alpha, int beta, int ply) {
             if (ttse) tt_store_eval(tt_slot(zh.hash), zh.hash, nev);
         }
     }
+    //THE TABLES, ASKED BEFORE THE EVALUATION. Not at the root: ply 0 has to produce a move, and the
+    //root's own DTZ probe already answers that case exactly. Stored at the maximum depth because the
+    //answer IS exact -- it can legitimately satisfy any deeper probe, which is the one case where a
+    //depth-preferred table should never replace an entry.
+    if (tb_search && ply > 0) {
+        int tbv;
+        if (tb_probe_node(tbv)) {
+            if (tt_on && !out_of_time && !excluded) {
+                TTEntry * e = tt_slot(zh.hash);
+                TTData d;
+                d.score = (int16_t)tbv;
+                d.depth = 255;
+                d.flag  = TT_EXACT;
+                tt_write(e, zh.hash, d);
+            }
+            return tbv;
+        }
+    }
+
     //THE CORRECTION, read once and applied before anything consumes the evaluation. Everything
     //downstream -- razoring, the null-move gate, reverse futility, per-move futility, the
     //improving flag, and the residual written back at the end of this node -- sees the corrected
@@ -2029,7 +2102,6 @@ static thread_local bool ctx_ready = false;
 //it into something a GUI, a tournament or the lichess bot can play against.
 //==================================================================================================
 #include "uci_engine.h"
-#include "tbprobe.h"
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -2047,6 +2119,8 @@ static const double LATENCY_ALLOWANCE = 300.0;
 //Well inside the mate band (MATE_IN_MAX is 29936), so print_score() reports it as a centipawn
 //score and no mate-distance arithmetic is applied to it.
 static const int TB_WIN_CP = 10000;
+
+
 static int root_move_number = 1;
 
 //COPIED FROM creatica.cpp's CreaticaEngine, deliberately and with regret.
@@ -2114,6 +2188,7 @@ static bool worker_setup(int tid) {
     std::memset(killers, 0, sizeof killers);
     std::memset(history, 0, sizeof history);
     nodes = qnodes = policy_orders = 0;
+    tbhits = 0;
     rep_tainted = false; ext_used = 0;
     killer_first = history_cutoffs = 0;
     null_tries = null_cuts = lmr_tries = lmr_researches = 0;
@@ -2133,6 +2208,9 @@ static bool worker_setup(int tid) {
 //TOTALS ACROSS THREADS, for the nps the GUI is shown. Each thread counts its own nodes in a
 //thread_local, so the helpers publish theirs here as they finish iterations.
 static std::atomic<long long> total_nodes{0};
+//Published so the info line can carry it: "tbhits" is a standard UCI field, and without it there
+//is no way to see from the outside whether the tables are being reached at all.
+static std::atomic<long long> total_tbhits{0};
 static std::chrono::steady_clock::time_point search_start;
 
 static long long elapsed_ms() {
@@ -2180,8 +2258,9 @@ static std::string worker(int tid) {
                 const long long n  = total_nodes.load() + nodes;
                 std::printf("info depth %d ", d);
                 print_score(v);
-                std::printf(" nodes %lld time %lld nps %lld pv",
-                            n, ms, ms > 0 ? n * 1000 / ms : n);
+                std::printf(" nodes %lld time %lld nps %lld tbhits %lld pv",
+                            n, ms, ms > 0 ? n * 1000 / ms : n,
+                            total_tbhits.load() + tbhits);
                 for (int i = 0; i < pv_len[0] && i < MAX_PLY; ++i)
                     std::printf(" %s", uci_of(pv_line[0][i]).c_str());
                 std::printf("\n");
@@ -2192,6 +2271,7 @@ static std::string worker(int tid) {
         if (fixdepth && d >= fixdepth) break;
     }
     total_nodes.fetch_add(nodes);
+    total_tbhits.fetch_add(tbhits);
     (void)reached;
     return best_uci;
 }
@@ -2247,6 +2327,10 @@ public:
         //in a head-to-head against creatica_mcts -- which has both local tables and online probes
         //-- measures the missing tables rather than the search.
         o.string("SyzygyPath", &syzygy_path_, "", [this] { on_syzygy_path(); });
+        //Probing inside the search, not only at the root. On by default: it is exact information
+        //for the cost of a table lookup, and the alternative is an NNUE guess about a position
+        //whose value is known.
+        o.spin("SyzygyInSearch", &o_tbsearch, 1, 0, 1);
         //THE POLICY NET, AND WHY IT DEFAULTS TO OFF.
         //
         //The prober loads this net unconditionally and orders the first POLICY_PLIES plies with
@@ -2304,6 +2388,9 @@ public:
             std::printf("info string error no tablebases found in %s\n", syzygy_path_.c_str());
         } else {
             tb_ready_ = true;
+            //The search reads its own copy rather than TB_LARGEST directly, so that turning the
+            //option off actually turns the probing off instead of merely hiding it.
+            tb_pieces_max = TB_LARGEST;
             std::printf("info string tablebases initialised in %s, max %u pieces\n",
                         syzygy_path_.c_str(), TB_LARGEST);
         }
@@ -2426,6 +2513,7 @@ public:
         stop_requested.store(false);
         out_of_time = false;
         total_nodes.store(0);
+        total_tbhits.store(0);
         search_start = std::chrono::steady_clock::now();
         fixnodes = lim.nodes;
         fixdepth = lim.depth;
@@ -2569,6 +2657,7 @@ private:
         lmrshape     = (int)o_lmrshape;
         lmrbase      = (int)o_lmrbase;
         shape_mul    = (int)o_shapemul;
+        tb_search    = (int)o_tbsearch;
         qprune       = (int)o_qprune;
         q_mcount     = (int)o_qmcount;
         q_futbase    = (int)o_qfutbase;
@@ -2599,6 +2688,7 @@ private:
     int64_t o_seeprune = 2, o_seequad = 12, o_seecapbase = 80;
     int64_t o_qprune = 2, o_qmcount = 2, o_qfutbase = 169, o_qsee = -38;
     int64_t o_conthist = 0, o_lmrshape = 0, o_lmrbase = 0, o_shapemul = 850;
+    int64_t o_tbsearch = 1;
     int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 1;
     std::string syzygy_path_;
     std::string policy_net_path_ = "nnue_policy_pisp2.bin";
