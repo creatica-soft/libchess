@@ -2102,7 +2102,10 @@ static thread_local bool ctx_ready = false;
 //it into something a GUI, a tournament or the lichess bot can play against.
 //==================================================================================================
 #include "uci_engine.h"
+#include "json.hpp"
+#include <curl/curl.h>
 #include <thread>
+#include <unordered_map>
 #include <mutex>
 #include <condition_variable>
 
@@ -2211,6 +2214,83 @@ static std::atomic<long long> total_nodes{0};
 //Published so the info line can carry it: "tbhits" is a standard UCI field, and without it there
 //is no way to see from the outside whether the tables are being reached at all.
 static std::atomic<long long> total_tbhits{0};
+
+//=== THE ONLINE TABLEBASE, lichess's 7-piece set ===
+//WHY IT IS ASYNCHRONOUS, and why a synchronous port would have been a regression. creatica used to
+//probe lichess on the move's own clock, and on failure searched afterwards anyway -- so a timed-out
+//probe cost its timeout AND a full search. Measured over one self-play session: 26 timeouts in one
+//engine's log against 8 in the other's, at three seconds each, in games with a 120 second base
+//clock, and one game lost on time. The answer is to spend nothing: post the request, search exactly
+//as if there were no tables, and use the answer only if it has arrived by the time the search ends.
+//
+//NOT PORTED, deliberately: the PREFETCH of the position after our own move. It is an optimisation
+//whose failure modes are the subtlest in the original -- it has to reason about whether the
+//tablebase leaves the opponent a unique best move before predicting their reply, because
+//tablebase.lichess.ovh rate-limits and two bots on one machine share an IP, and it must not call
+//fen2board() on the worker thread because that rebuilds libchess's PROCESS-WIDE castling tables
+//underneath a running search. Coverage is the same without it; only the latency differs.
+static std::mutex              ol_mtx;
+static std::condition_variable ol_cv;
+static std::string             ol_req_fen;
+static uint64_t                ol_req_id = 0;
+static bool                    ol_req_live = false;
+static bool                    ol_quit = false;
+static std::thread             ol_worker;
+static bool                    ol_worker_started = false;
+//The answer slot, stamped with the request it belongs to so a late reply cannot be played for the
+//wrong position -- the failure that would be hardest to notice and worst to make.
+static std::mutex              ol_ans_mtx;
+static uint64_t                ol_ans_id = 0;
+static std::string             ol_ans_move;
+static int                     ol_ans_score = 0;
+//An endgame revisits positions, and a cached answer costs nothing and no request.
+static std::unordered_map<std::string, std::pair<int, std::string>> ol_cache;
+
+static size_t ol_write(void * p, size_t sz, size_t n, void * ud) {
+    ((std::string *)ud)->append((char *)p, sz * n);
+    return sz * n;
+}
+
+//ONE HANDLE, REUSED, owned by the worker thread alone -- a fresh curl_easy_init() per probe throws
+//away the warm connection, which is most of the latency on a 7-piece endgame's worth of lookups.
+static bool ol_probe(const std::string& fen, int& score, std::string& move) {
+    static CURL * curl = nullptr;
+    if (!curl) curl = curl_easy_init();
+    if (!curl) return false;
+    std::string body;
+    char * esc = curl_easy_escape(curl, fen.c_str(), (int)fen.size());
+    const std::string url = std::string("http://tablebase.lichess.ovh/standard?fen=")
+                          + (esc ? esc : fen.c_str());
+    if (esc) curl_free(esc);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ol_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    //GENEROUS, because nothing waits for this. The clock no longer needs protecting from it.
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+    const CURLcode rc = curl_easy_perform(curl);
+    long http = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
+    if (rc != CURLE_OK || http != 200 || body.empty()) return false;
+    try {
+        const nlohmann::json d = nlohmann::json::parse(body);
+        if (d.contains("category")) {
+            const std::string c = d["category"];
+            //"maybe-win" and "maybe-loss" are win/loss subject to the fifty-move rule, which is the
+            //same compromise the local WDL probe makes, so they are treated the same way.
+            if (c == "win" || c == "syzygy-win" || c == "maybe-win")        score =  TB_SCORE_CP;
+            else if (c == "loss" || c == "syzygy-loss" || c == "maybe-loss") score = -TB_SCORE_CP;
+            else                                                            score = 0;
+        }
+        if (d.contains("moves") && d["moves"].is_array() && !d["moves"].empty()
+            && d["moves"][0].contains("uci"))
+            move = d["moves"][0].value("uci", "");
+    } catch (const nlohmann::json::parse_error&) {
+        return false;
+    }
+    return !move.empty();
+}
 static std::chrono::steady_clock::time_point search_start;
 
 static long long elapsed_ms() {
@@ -2331,6 +2411,9 @@ public:
         //for the cost of a table lookup, and the alternative is an NNUE guess about a position
         //whose value is known.
         o.spin("SyzygyInSearch", &o_tbsearch, 1, 0, 1);
+        //The online 7-piece set. Off by default: it reaches the network, which belongs to the
+        //operator to decide, and a local tournament does not want it.
+        o.check("OnlineTablebase", &o_online, false);
         //THE POLICY NET, AND WHY IT DEFAULTS TO OFF.
         //
         //The prober loads this net unconditionally and orders the first POLICY_PLIES plies with
@@ -2356,6 +2439,57 @@ public:
         o.spin("PolicyPlies", &o_polplies, 3, 0, 8);
         o.string("PolicyNet", &policy_net_path_, "nnue_policy_pisp2.bin",
                  [this] { load_policy(); });
+    }
+
+    //THE WORKER, started on demand and joined in quit(). Not detached: a detached thread that
+    //outlives main() holds a curl handle and a mutex this translation unit owns.
+    void start_online_worker() {
+        if (ol_worker_started) return;
+        ol_worker_started = true;
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        ol_worker = std::thread([] {
+            for (;;) {
+                std::string fen; uint64_t id;
+                {
+                    std::unique_lock<std::mutex> lk(ol_mtx);
+                    ol_cv.wait(lk, [] { return ol_req_live || ol_quit; });
+                    if (ol_quit) return;
+                    fen = ol_req_fen; id = ol_req_id; ol_req_live = false;
+                }
+                int score = 0; std::string move;
+                bool answered = false;
+                {
+                    std::lock_guard<std::mutex> lk(ol_ans_mtx);
+                    auto it = ol_cache.find(fen);
+                    if (it != ol_cache.end()) {
+                        score = it->second.first; move = it->second.second;
+                        answered = !move.empty();
+                    }
+                }
+                if (!answered) {
+                    answered = ol_probe(fen, score, move);
+                    std::lock_guard<std::mutex> lk(ol_ans_mtx);
+                    ol_cache[fen] = { score, answered ? move : std::string() };
+                }
+                if (!answered) continue;
+                std::lock_guard<std::mutex> lk(ol_ans_mtx);
+                //STAMPED WITH THE REQUEST, so an answer that arrives after the engine has moved on
+                //is discarded instead of being played for a position that is no longer on the board.
+                ol_ans_id = id; ol_ans_move = move; ol_ans_score = score;
+            }
+        });
+    }
+
+    //Posted and forgotten. Nothing waits on it; run() looks in the answer slot when the search is
+    //already over.
+    void post_online_probe(const std::string& fen) {
+        if (!o_online) return;
+        start_online_worker();
+        std::lock_guard<std::mutex> lk(ol_mtx);
+        ol_req_fen = fen;
+        ol_req_id = ++online_id_;
+        ol_req_live = true;
+        ol_cv.notify_one();
     }
 
     //Loaded on demand, and a FAILURE IS NOT FATAL. The prober aborts when the net is missing,
@@ -2522,6 +2656,19 @@ public:
             std::printf("info string searchmoves is not implemented; searching all moves\n");
             std::fflush(stdout);
         }
+        //POSTED BEFORE THE SEARCH STARTS, so the request and the search overlap. Only for
+        //positions the LOCAL tables cannot answer and lichess might: at most 7 pieces, no castling.
+        //A ponder search is excluded -- the position it is pondering is a guess.
+        if (!lim.ponder && o_online) {
+            Board b{};
+            if (fen2board(b, root_fen.c_str()) == 0 && !b.castlingRights) {
+                const unsigned pc = (unsigned)bitCount(b.side[ColorWhite] | b.side[ColorBlack]);
+                if (pc <= 7 && pc > tb_pieces_max) {
+                    char fb[MAX_FEN_STRING_LEN];
+                    post_online_probe(board2fen(b, fb));
+                }
+            }
+        }
         //ANSWERED BY THE TABLE, so there is nothing to search. A ponder search is NOT short-circuited
         //-- UCI forbids an unsolicited bestmove after "go ponder", and the table's answer will still
         //be there on ponderhit.
@@ -2555,7 +2702,15 @@ public:
         set_clock(lim);
     }
 
-    void quit() override { stop(); }
+    void quit() override {
+        stop();
+        if (ol_worker_started) {
+            { std::lock_guard<std::mutex> lk(ol_mtx); ol_quit = true; }
+            ol_cv.notify_all();
+            if (ol_worker.joinable()) ol_worker.join();
+            curl_global_cleanup();
+        }
+    }
 
     bool custom(const std::string& line) override {
         if (line == "eval") {
@@ -2583,6 +2738,19 @@ private:
         for (auto& th : pool) th.join();
         //A SEARCH THAT FOUND NOTHING STILL HAS TO ANSWER. A GUI that gets no bestmove hangs
         //forever, so fall back to any legal move rather than going silent.
+        //THE ONLINE ANSWER, if it arrived while we were searching. It cost nothing on the clock:
+        //the search ran to its own completion either way. A tablebase verdict beats a search, so it
+        //wins -- but only if it belongs to THIS move's request.
+        {
+            std::lock_guard<std::mutex> lk(ol_ans_mtx);
+            if (o_online && ol_ans_id == online_id_ && !ol_ans_move.empty()) {
+                std::printf("info depth 1 ");
+                print_score(ol_ans_score);
+                std::printf(" nodes 0 time %lld tbhits 1 pv %s\n",
+                            elapsed_ms(), ol_ans_move.c_str());
+                best = ol_ans_move;
+            }
+        }
         if (best.empty()) best = any_legal_move();
         if (best.empty()) std::printf("bestmove 0000\n");
         else              std::printf("bestmove %s\n", best.c_str());
@@ -2689,6 +2857,8 @@ private:
     int64_t o_qprune = 2, o_qmcount = 2, o_qfutbase = 169, o_qsee = -38;
     int64_t o_conthist = 0, o_lmrshape = 0, o_lmrbase = 0, o_shapemul = 850;
     int64_t o_tbsearch = 1;
+    bool o_online = false;
+    uint64_t online_id_ = 0;
     int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 1;
     std::string syzygy_path_;
     std::string policy_net_path_ = "nnue_policy_pisp2.bin";
