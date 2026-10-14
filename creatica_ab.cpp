@@ -1843,6 +1843,7 @@ static thread_local bool ctx_ready = false;
 //it into something a GUI, a tournament or the lichess bot can play against.
 //==================================================================================================
 #include "uci_engine.h"
+#include "tbprobe.h"
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -1857,6 +1858,9 @@ static std::string root_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - -
 //reach the driver and the next position come back, and that time comes off the clock without ever
 //having been in the allocation.
 static const double LATENCY_ALLOWANCE = 300.0;
+//Well inside the mate band (MATE_IN_MAX is 29936), so print_score() reports it as a centipawn
+//score and no mate-distance arithmetic is applied to it.
+static const int TB_WIN_CP = 10000;
 static int root_move_number = 1;
 
 //COPIED FROM creatica.cpp's CreaticaEngine, deliberately and with regret.
@@ -2030,6 +2034,29 @@ public:
         o.spin("SingularExt", &o_singext,   50,  0, 400);
         o.spin("CorrHist",    &o_corrhist,   0,  0, 2);
         o.spin("RepCheck",    &o_repcheck,   1,  0, 2);
+        //Syzygy. Without it, endgames are played by a search that does not know the result, which
+        //in a head-to-head against creatica_mcts -- which has both local tables and online probes
+        //-- measures the missing tables rather than the search.
+        o.string("SyzygyPath", &syzygy_path_, "", [this] { on_syzygy_path(); });
+    }
+
+    //tb_init() is not re-entrant here, the same guard creatica.cpp uses.
+    void on_syzygy_path() {
+        if (tb_ready_) {
+            std::printf("info string SyzygyPath: tablebases already initialised; ignoring\n");
+            std::fflush(stdout);
+            return;
+        }
+        if (syzygy_path_.empty()) return;
+        tb_init(syzygy_path_.c_str());
+        if (TB_LARGEST == 0) {
+            std::printf("info string error no tablebases found in %s\n", syzygy_path_.c_str());
+        } else {
+            tb_ready_ = true;
+            std::printf("info string tablebases initialised in %s, max %u pieces\n",
+                        syzygy_path_.c_str(), TB_LARGEST);
+        }
+        std::fflush(stdout);
     }
 
     void init() override {
@@ -2089,6 +2116,52 @@ public:
         root_move_number = b.moveNumber;
     }
 
+    //SYZYGY AT THE ROOT. Not in the search: a WDL probe inside the tree would also be worth
+    //having, but it means giving win/draw/loss its own score band so mate-distance handling does
+    //not misread it, and getting that wrong is a silent, position-dependent error. The root probe
+    //is self-contained, cannot affect any other position, and removes the handicap where it is
+    //actually visible in a game -- an ending reached at the root that is won or drawn by rule and
+    //would otherwise be played by a search that does not know it.
+    //
+    //Probed by whether the probe ANSWERS, not by the piece count, which is the lesson creatica.cpp
+    //records at length: TB_LARGEST is raised to 6 by a partial 6-piece set, so a piece-count test
+    //routes positions to tables that were never downloaded and they are then never searched
+    //either. Castling is excluded because Syzygy cannot express it.
+    bool probe_tb_root(std::string& best, int& score_cp) {
+        if (!tb_ready_ || TB_LARGEST == 0) return false;
+        Board b{};
+        if (fen2board(b, root_fen.c_str()) != 0) return false;
+        if (b.castlingRights) return false;
+        const unsigned pieces = (unsigned)bitCount(b.side[ColorWhite] | b.side[ColorBlack]);
+        if (pieces > TB_LARGEST) return false;
+        const Square ep = legalEnPassantMove(b);
+        const unsigned res = tb_probe_root(
+            b.side[ColorWhite], b.side[ColorBlack], b.pieceTypes[King - 1],
+            b.pieceTypes[Queen - 1], b.pieceTypes[Rook - 1], b.pieceTypes[Bishop - 1],
+            b.pieceTypes[Knight - 1], b.pieceTypes[Pawn - 1],
+            b.halfmoveClock, 0, ep == SquareNone ? 0 : (unsigned)ep,
+            (b.sideToMove ^ 1) == ColorBlack ? 1 : 0, NULL);
+        if (res == TB_RESULT_FAILED) return false;      //not in the tables we actually hold
+        //STALEMATE AND CHECKMATE ARE NOT FAILURES, and they carry NO MOVE -- the from/to fields are
+        //meaningless. Reading them anyway produced "bestmove a1a1", which is not a move: the first
+        //test position, 8/8/8/8/8/4k3/4p3/4K3 w, really is stalemate, because the black pawn on e2
+        //covers d1 and f1 while the black king covers d2 and f2. Fall through to the search, which
+        //handles having no legal moves correctly.
+        if (res == TB_RESULT_STALEMATE || res == TB_RESULT_CHECKMATE) return false;
+        const unsigned wdl = TB_GET_WDL(res);           //0 loss, 4 win, 1..3 draw
+        //A TABLEBASE WIN IS NOT A MATE. The first version reported MATE_CP - 1, which came out as
+        //"score mate 1" for a KRvK win at DTZ 27 -- a claim to mate next move that is simply false,
+        //and the kind of thing a GUI adjudicates on. DTZ is distance to ZEROING, not to mate, so
+        //there is no mate distance to report here. A large cp score, reduced by DTZ so a slower win
+        //scores lower, says "won by rule" without claiming to know how fast.
+        const int dtz = (int)TB_GET_DTZ(res);
+        score_cp = wdl == 4 ? TB_WIN_CP - dtz : (wdl == 0 ? -(TB_WIN_CP - dtz) : 0);
+        const unsigned from = TB_GET_FROM(res), to = TB_GET_TO(res), promo = TB_GET_PROMOTES(res);
+        best = std::string(square[from]) + square[to];
+        if (uciPromoLetter[6 - promo]) best += uciPromoLetter[6 - promo];
+        return true;
+    }
+
     void go(const uci::Limits& lim) override {
         stop();
         last_limits_ = lim;
@@ -2104,6 +2177,20 @@ public:
         if (!lim.searchmoves.empty()) {
             std::printf("info string searchmoves is not implemented; searching all moves\n");
             std::fflush(stdout);
+        }
+        //ANSWERED BY THE TABLE, so there is nothing to search. A ponder search is NOT short-circuited
+        //-- UCI forbids an unsolicited bestmove after "go ponder", and the table's answer will still
+        //be there on ponderhit.
+        if (!lim.ponder) {
+            std::string tb_best; int tb_score = 0;
+            if (probe_tb_root(tb_best, tb_score)) {
+                std::printf("info depth 1 ");
+                print_score(tb_score);
+                std::printf(" nodes 0 time 0 pv %s\n", tb_best.c_str());
+                std::printf("bestmove %s\n", tb_best.c_str());
+                std::fflush(stdout);
+                return;
+            }
         }
         driver_ = std::thread([this] { this->run(); });
     }
@@ -2235,6 +2322,8 @@ private:
     int64_t o_qdepth = 6, o_asp = 25, o_seeord = 1;
     int64_t o_seeprune = 2, o_seequad = 12, o_seecapbase = 80;
     int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 1;
+    std::string syzygy_path_;
+    bool tb_ready_ = false;
 };
 
 int main(int argc, char ** argv) {
