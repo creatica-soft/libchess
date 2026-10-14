@@ -19,6 +19,9 @@ add_library(chess SHARED board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp z
 # Define the executable
 #add_executable(creatica attic/creatica.cpp attic/uci.cpp tbcore.c tbprobe.c)  # historical; does not compile against the current API
 add_executable(creatica creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c)
+# The historical MCTS engine, kept as a target so it cannot rot unnoticed. Shares uci_frontend.cpp
+# on purpose -- see the note at the top of creatica_search_mcts.cpp.
+add_executable(creatica_mcts creatica_search_mcts.cpp creatica_mcts.cpp uci_frontend.cpp tbprobe.c)
 add_executable(test_pos test_pos.cpp)
 add_executable(perft perft.cpp)
 add_executable(test_nnue tbprobe.c test_nnue.cpp)
@@ -44,6 +47,7 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # Release-specific optimizations
     target_compile_options(chess PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
     target_compile_options(creatica PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
+    target_compile_options(creatica_mcts PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
     target_compile_options(test_tb PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
     target_compile_options(test_nnue PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
     target_compile_options(test_smp PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
@@ -60,6 +64,7 @@ elseif(MSVC)
 
     target_compile_options(chess PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
     target_compile_options(creatica PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
+    target_compile_options(creatica_mcts PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
     target_compile_options(test_nnue PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
     target_compile_options(test_tb PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
     target_compile_options(test_smp PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
@@ -70,6 +75,7 @@ elseif(MSVC)
     # Release-specific optimizations
     target_compile_options(chess PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
     target_compile_options(creatica PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
+    target_compile_options(creatica_mcts PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
     target_compile_options(test_nnue PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
     target_compile_options(test_tb PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
     target_compile_options(test_smp PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
@@ -98,6 +104,7 @@ else()
     # separate object exported nothing while producing a dozen unused-symbol warnings.
     target_compile_options(chess PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(creatica PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    target_compile_options(creatica_mcts PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_nnue PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_tb PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_smp PRIVATE -Wall -O3 -march=native -DNDEBUG)
@@ -116,9 +123,11 @@ set_source_files_properties(nnue/nnue/network.cpp PROPERTIES OBJECT_DEPENDS
 
 target_include_directories(chess PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 target_include_directories(creatica PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
+target_include_directories(creatica_mcts PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 
 # Link executable with libchess
 target_link_libraries(creatica PRIVATE chess curl)
+target_link_libraries(creatica_mcts PRIVATE chess curl)
 target_link_libraries(test_pos PRIVATE chess)
 target_link_libraries(perft PRIVATE chess)
 target_link_libraries(test_nnue PRIVATE chess)
