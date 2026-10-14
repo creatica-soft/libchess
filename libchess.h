@@ -242,7 +242,15 @@ enum Antidiagonal : uint8_t {
 inline constexpr const char * pieceType[] = {"any", "pawn", "knight", "bishop", "rook", "queen", "king", "none"};
 //inline constexpr const char * pieceType[] = {"none", "pawn", "knight", "bishop", "rook", "queen", "king", "any"};
 inline constexpr float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 1.0f }; //scaled down by kings value of 10
-inline constexpr int pieceValueCP[] = { 0, 100, 300, 320, 500, 900, 10000 };
+//ONE ENTRY PER PieceType VALUE, PieceTypeNone INCLUDED. The enum runs PieceTypeAny(0), Pawn(1)
+//.. King(6), PieceTypeNone(7), so a seven-element table is indexed out of bounds by any code that
+//looks up the value of "no piece" -- which get_see() does for every QUIET move, where the square
+//it moves to is empty. That path only became reachable when SEE started being asked about quiet
+//moves (Step 14 pruning); before that get_see() was only ever called on captures and the defect
+//was latent. Both PieceTypeAny and PieceTypeNone are worth nothing, so both read 0.
+inline constexpr int pieceValueCP[] = { 0, 100, 300, 320, 500, 900, 10000, 0 };
+static_assert(sizeof pieceValueCP / sizeof pieceValueCP[0] == PieceTypeNone + 1,
+              "pieceValueCP must cover every PieceType value, PieceTypeNone included");
 inline constexpr float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
 inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
     {0, 0, 0, 0, 0, 0, 0},       // None
@@ -304,7 +312,9 @@ inline constexpr Diagonal SQ_DIAG(Square sq) {
     return static_cast<Diagonal>(7 + SQ_RANK(sq) - SQ_FILE(sq));
 }
 inline constexpr Antidiagonal SQ_ANTIDIAG(Square sq) {
-    return static_cast<Antidiagonal>(SQ_FILE(sq) + SQ_RANK(sq));
+    //Both operands are cast to int before the addition: adding two DIFFERENT enumeration types
+    //is deprecated in C++20 and warned about in every translation unit that includes this header.
+    return static_cast<Antidiagonal>(static_cast<int>(SQ_FILE(sq)) + static_cast<int>(SQ_RANK(sq)));
 }
 inline constexpr PieceType PC_TYPE(Piece pc) {
     return static_cast<PieceType>(static_cast<int>(pc) & 7);
@@ -918,7 +928,15 @@ CHESS_API int nnue_features(const Board& board, NNUEContext& ctx, unsigned char 
 CHESS_API int nnue_feature_dims();
 //==================================================================================================
 //CHESS_API int get_see(const Board& board, const Move move, const PieceType capturedType); //move has been made
-//CHESS_API int get_see(const Board& board, Move move); //overload for above when the move has not been made
+//STATIC EXCHANGE EVALUATION, for a move that has NOT been made yet: what the exchange on the
+//destination square is worth once both sides have recaptured with their cheapest attacker each
+//time, in centipawns from board.sideToMove's point of view. Negative means it loses material.
+//Handles en passant and promotions. Revived 2026-10-12 -- see the note above the definition in
+//board.cpp for the one case whose magnitude is unreliable.
+CHESS_API int get_see(const Board& board, Move move);
+//Every piece of either colour attacking `sq` under the given occupancy. Exported for get_see()'s
+//x-ray walk, which removes each captured piece from `occupied` and re-asks.
+CHESS_API uint64_t attackers_to(const Board& board, const Square sq, const uint64_t occupied);
 CHESS_API int uci2move_idx(const char * uci_move, Move& move);
 CHESS_API char * idx2uci(const int move_idx, char * uci_move);
 CHESS_API Move& idx2move(const int move_idx, Move& move);
