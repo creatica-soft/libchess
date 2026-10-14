@@ -22,9 +22,9 @@ add_executable(creatica creatica_search.cpp creatica.cpp uci_frontend.cpp tbprob
 # The historical MCTS engine, kept as a target so it cannot rot unnoticed. Shares uci_frontend.cpp
 # on purpose -- see the note at the top of creatica_search_mcts.cpp.
 add_executable(creatica_mcts creatica_search_mcts.cpp creatica_mcts.cpp uci_frontend.cpp tbprobe.c)
-# The alpha-beta engine. No tbprobe.c: it has no tablebase support yet, deliberately -- see the
-# header of creatica_ab.cpp for the full list of what it does not have.
-add_executable(creatica_ab creatica_ab.cpp uci_frontend.cpp)
+# The alpha-beta engine. Syzygy is probed at the ROOT only; see creatica_ab.cpp's header for the
+# full list of what it does not have.
+add_executable(creatica_ab creatica_ab.cpp uci_frontend.cpp tbprobe.c)
 add_executable(test_pos test_pos.cpp)
 # The regression guard for get_see(); see the note at the top of test_see.cpp.
 add_executable(test_see test_see.cpp)
