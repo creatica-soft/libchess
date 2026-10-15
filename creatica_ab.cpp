@@ -197,7 +197,14 @@ static int lmrprobe = 0;
 //because reducing harder everywhere compounds: shallower subtrees feed worse values upward. This
 //knob is how the question gets answered empirically rather than argued.
 static int lmrplus = 0;
-static int lmrall  = 0;   //0 the old gate, 1 Stockfish's `depth >= 2 && moveCount > 1`
+static int lmrall  = 0;
+//THE OTHER HALF OF STOCKFISH'S STEP 17, without which LMRAll is a reduction rule with no
+//compensation. Measured on Arasan 197 at 1.75M nodes/position: the adjustment list ALONE costs 10
+//positions (83 -> 73); the extension clamp alone is neutral; together they give branching factor
+//3.62 -> 3.05 at unchanged accuracy. Aggressive half without compensating half is what made every
+//earlier arm look like a trade.
+static int lmradj = 0;   //1: Stockfish's reduction adjustment list
+static int lmrext = 0;   //1: Stockfish's clamp, which can EXTEND as well as reduce   //0 the old gate, 1 Stockfish's `depth >= 2 && moveCount > 1`
 static int lmrsel  = 0;
 //LMRCOST flips the probe's search order so the FULL-depth search runs first. That makes the accuracy
 //labels worthless -- it is exactly the table contamination described at the probe -- but it makes the
@@ -992,20 +999,6 @@ static int generate(Mv * out, bool captures_only) {
     return n;
 }
 
-//IS THE SIDE TO MOVE IN CHECK, computed rather than remembered.
-//
-//Computed from the board. There is no cached alternative any more -- the four derived flags were
-//removed from Board in 36d447b, which is why STALECHECK and QSTALE are gone from this file.
-//as a side effect, so it is only valid for the position kingMoves() was last called on. Reading it at
-//the top of a node -- before generating that node's moves -- returns the parent's or a sibling's
-//answer. That stale read let null-move pruning fire while the side to move was in CHECK: the opponent
-//then captured the king, and the next generator call dereferenced a null pointer. It also fed the
-//in-check depth extension and the mate-versus-stalemate decision at terminal nodes.
-//EXT: the check extension. `if (in_check) ++depth` adds a ply every time the side to move is in
-//check, and nothing bounds it -- in a forcing sequence the depth never decreases, so the search can
-//spend without limit on checks. While the check test was reading a stale cache this line almost never
-//fired, which is why the bug looked beneficial. EXT=0 turns the extension off, EXT=N allows at most N
-//of them on one path, EXT=-1 is the old unbounded behaviour.
 static int ext_limit = -1;
 //THREADS: Lazy SMP thread count including thread 0. 1 is the single-threaded search exactly.
 static int threads = 1;
@@ -1250,6 +1243,8 @@ static void order_by_policy(Mv * mv, int n) {
     pol_margin_valid = true;
 }
 
+static thread_local bool ss_is_pv[MAX_PLY];   //was this ply a PV node, for Stockfish's clamp
+static thread_local int root_delta = 1;       //the root window width, for the reduction base
 static thread_local Mv prev_pv[MAX_PLY];   //the previous iteration's PV, for ordering
 static thread_local bool prev_pv_set[MAX_PLY];
 static thread_local Mv pv_line[MAX_PLY][MAX_PLY];
@@ -1516,12 +1511,20 @@ static bool passed_pawn_push(const Mv& m, int min_rel) {
     return (enemy_pawns & block) == 0;
 }
 
-static int search(int depth, int alpha, int beta, int ply) {
+//cut_node CARRIES STOCKFISH'S NODE CLASSIFICATION. PvNode falls out of the window
+//(beta != alpha + 1); cutNode is passed down explicitly as upstream does it;
+//allNode = !(PvNode || cutNode). Three of Stockfish's rules read it: the reduction's cut-node
+//term, the clamp that lets a reduction become an EXTENSION, and the gate on internal iterative
+//reductions.
+static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     ++nodes;
     pv_len[ply] = 0;
     if (timed_out()) return 0;
     if (ply >= MAX_PLY - 2) return eval_cp(alpha, beta);
     guard_ply = ply; guard_depth = depth; guard_where = "search";
+    const bool pv_node  = (beta != alpha + 1);
+    const bool all_node = !(pv_node || cut_node);
+    if (ply < MAX_PLY) ss_is_pv[ply] = pv_node;
     bool granted = false;
     struct ExtGuard { bool& g; ExtGuard(bool& b) : g(b) {} ~ExtGuard() { if (g) --ext_used; } } eg(granted);
     if (repcheck && ply > 0 && repeated(ply)) { rep_tainted = true; return 0; }  //see repeated()
@@ -1679,7 +1682,7 @@ static int search(int depth, int alpha, int beta, int ply) {
             //No piece moved, so the child's continuation keys must point at the "no move" row
             //rather than inherit whatever this ply last tried.
             if (ply < MAX_PLY) { ss_mv_pc[ply] = 12; ss_mv_to[ply] = 0; }
-            const int v = -search(depth - 1 - R, -beta, -beta + 1, ply + 1);
+            const int v = -search(depth - 1 - R, -beta, -beta + 1, ply + 1, false);
             board.sideToMove = (Color)stm;
             board.enPassant  = saved_ep;
             zh = saved;
@@ -1736,7 +1739,7 @@ static int search(int depth, int alpha, int beta, int ply) {
                 //most candidates outright. Only what survives it is worth a real search.
                 int v = -qsearch(-pcbeta, -pcbeta + 1, 0, ply + 1);
                 if (v >= pcbeta && cdepth > 0)
-                    v = -search(cdepth, -pcbeta, -pcbeta + 1, ply + 1);
+                    v = -search(cdepth, -pcbeta, -pcbeta + 1, ply + 1, !cut_node);
                 undo_move(board, mm, st); accumulator_stack_pop(ctx); zh = saved;
                 if (out_of_time) return 0;
                 if (v >= pcbeta) {
@@ -1897,13 +1900,27 @@ static int search(int depth, int alpha, int beta, int ply) {
             if (same(mv[i], tt_move)) { ++tt_move_hits; std::swap(mv[0], mv[i]); break; }
     //The previous iteration's move for this ply goes first: that is what makes iterative deepening
     //pay for itself, and it is the cheapest ordering improvement available.
-    if (prev_pv_set[ply])
-        for (int i = 1; i < n; ++i)
-            if (same(mv[i], prev_pv[ply])) { std::swap(mv[0], mv[i]); break; }
+    //THE PREVIOUS-PV PROMOTION, REMOVED. It ran AFTER the table move had been swapped to the
+    //front, and `prev_pv[]` is written once per iteration from the ROOT pv and applied at every
+    //node at that ply -- so at a node off the PV path it promoted a move from an UNRELATED
+    //position and pushed the table move to an arbitrary index. Measured on Arasan 197:
+    //8,398,490 promotions per run, 1,863,008 of them (22.2%) displaced the table move.
+    //
+    //Harmless while only moves 4 and later were reduced. Severe with LMRAll, which reduces every
+    //move after the first: the displaced table move was reduced, and a reduced search that fails
+    //low is never re-searched. The singular test also requires `same(mv[0], tt_move)`, so it
+    //switched off at exactly those nodes.
+    //
+    //Stockfish has no equivalent: the table IS the previous iteration's memory, keyed on the
+    //POSITION rather than the ply, and upstream additionally protects it with `r -= 2006`.
+    //Removing this improved BOTH branching factor (3.97 -> 3.62) and accuracy (79 -> 84 of 197),
+    //which no other change in this effort did.
     //THE SINGULAR TEST. Run here, after ordering, because the policy variant needs the margin the
     //ordering just computed, and because both variants need the move list to know whether the table
     //move is even present. `sing_ok` means the table move -- which ordering has put at mv[0] -- has
     //earned its extra ply, and the move loop applies it to that move only.
+    //Stockfish's ttCapture, read before any move is made.
+    const bool tt_capture = have_tt_move && victim_value(tt_move) != 0;
     bool sing_ok = false;
     const bool sing_eligible =
         have_tt_move && !excluded && ply > 0 && !in_check && depth >= sing_depth
@@ -1928,7 +1945,7 @@ static int search(int depth, int alpha, int beta, int ply) {
         ++sing_tests;
         const int sb = tt_score - sing_margin;
         sing_excl[ply] = tt_move; sing_excl_set[ply] = true;
-        const int sv = search(depth / 2, sb - 1, sb, ply);
+        const int sv = search(depth / 2, sb - 1, sb, ply, cut_node);
         sing_excl_set[ply] = false;
         //The verification search ran at THIS ply and overwrote the PV being built here. The move
         //loop only rewrites it when a move improves on `best`, so a node where every move fails low
@@ -2062,7 +2079,9 @@ static int search(int depth, int alpha, int beta, int ply) {
         //so a reduction that hid a good move is invisible to the search that made it. The probe measures
         //that half at 0.19% of reductions by searching the child a second time at full depth.
         int r = 0;
-        const int cd_guard = depth - 1 + ext;      //the child's depth before any reduction
+        const int cd_guard = depth - 1 + ext;
+        //Stockfish's `!bestMove`: nothing has beaten alpha at this node yet.
+        const bool have_best_yet = (best > alpha_orig);      //the child's depth before any reduction
         //LMR COVERAGE. This engine reduced only `depth >= 3 && move_index >= 4 && quiet`, so a capture
         //was never reduced, moves 2 and 3 were never reduced, and depth 2 was never reduced.
         //Stockfish's gate (search.cpp:1231) is `depth >= 2 && moveCount > 1`. Measured on Arasan
@@ -2107,25 +2126,64 @@ static int search(int depth, int alpha, int beta, int ply) {
                 const double ld = std::log((double)std::max(1, depth));
                 const double lm = std::log((double)std::max(1, move_index));
                 r1024 = (int)(21.46 * ld * 21.46 * lm) + 1182;
+                //Stockfish's base has two more terms (search.cpp:1757): a PV node, whose window is
+                //as wide as the root's, gets ~0.78 ply LESS reduction, and a node whose evaluation
+                //is not trending up gets ~40% of the scale MORE.
+                if (lmradj) {
+                    const int scale = (int)(21.46 * ld * 21.46 * lm);
+                    r1024 -= (beta - alpha) * 794 / std::max(1, root_delta);
+                    if (!improving) r1024 += scale * 205 / 512;
+                }
             } else {
                 r1024 = r * 1024;
             }
             //The whole point of the exercise: a move with a good track record after the move that
             //led here is barely reduced; a bad one is reduced far more than any constant would dare.
-            const int ss_sc = (ply < MAX_PLY)
-                            ? stat_score(ply, (int)ss_mv_pc[ply], m.dst, m.src,
-                                         board.sideToMove ^ 1)
-                            : 0;
+            //STOCKFISH'S ADJUSTMENT LIST (search.cpp:1195-1217). The two that matter are
+            //opposites and together they are the shape of the rule: reduce HARD where it is cheap,
+            //and protect the table move wherever the ordering has put it.
+            if (lmradj) {
+                r1024 -= move_index * 66;
+                if (cut_node)   r1024 += 2864 + 966 * (have_tt_move ? 0 : 1);
+                if (tt_capture) r1024 += 1210 + (depth < 8 ? 963 : 0);
+                if (have_tt_move && same(m, tt_move)) r1024 -= 2006;
+            }
+            //The statScore, with Stockfish's capture branch and its offsets. The -3206 is not
+            //decoration: it is 0.3 ply of reduction that was never applied.
+            int ss_sc;
+            if (lmradj && !quiet) {
+                const int ct = (int)PC_TYPE((Piece)board.piecesOnSquares[m.dst]) - 1;
+                const int pcx = hist_pc(board.sideToMove, m.src);
+                ss_sc = 826 * victim_value(m) / 128 - 5030;
+                if (ord2 && ord2_cap && pcx >= 0 && pcx <= 11 && ct >= 0 && ct < 6)
+                    ss_sc += (int)cap_hist[pcx][m.dst][ct];
+            } else {
+                ss_sc = (ply < MAX_PLY)
+                      ? stat_score(ply, (int)ss_mv_pc[ply], m.dst, m.src, board.sideToMove ^ 1)
+                      : 0;
+                if (lmradj) ss_sc -= 3206;
+            }
             r1024 -= ss_sc * shape_mul / std::max(1, shape_div);
             ++shape_n; shape_sum += r1024; shape_absum += std::abs(ss_sc);
             r = r1024 / 1024;
-            if (r < 0) r = 0;
+            //Floored only without the extension clamp: with it, a negative r IS the extension.
+            if (!lmrext && r < 0) r = 0;
         }
-        if (r > cd_guard) r = cd_guard;
+        //STOCKFISH'S CLAMP (search.cpp:1238), which is an extension as much as a reduction. Applied
+        //ONLY to a move the LMR gate selected: applying it to every move let a child be searched
+        //deeper than its parent, so depth never decreased and the search ran to the ply limit.
+        if (lmrext && lmr_gate && r > 0) {
+            const int hi = cd_guard + (all_node ? 0 : 1) + ((pv_node && !have_best_yet) ? 1 : 0);
+            int d_lmr = std::max(1, std::min(cd_guard - r, hi))
+                      + ((ply >= 1 && ss_is_pv[ply - 1]) ? 1 : 0);
+            d_lmr = std::min(d_lmr, cd_guard + 1);
+            r = cd_guard - d_lmr;
+        }
+        if (!lmrext && r > cd_guard) r = cd_guard;
         //Stockfish clamps the reduced depth to at least 1 rather than letting a reduction land in
         //quiescence; it prunes those moves instead. That path is 0.9% of nodes, so this is for
         //faithfulness rather than for speed.
-        if (lmrall && r > 0 && cd_guard - r < 1) r = std::max(0, cd_guard - 1);
+        if (!lmrext && lmrall && r > 0 && cd_guard - r < 1) r = std::max(0, cd_guard - 1);
         //An extended move is never also reduced: the two tests disagree about the same move and the
         //extension is the one that looked at the position rather than at the move's index.
         if (ext) r = 0;
@@ -2155,10 +2213,10 @@ static int search(int depth, int alpha, int beta, int ply) {
             }
         }
         int v;
-        if (r) {
+        if (r != 0) {
             ++lmr_tries;
             const long long n_before_red = nodes;
-            v = -search(cd - r, -alpha - 1, -alpha, ply + 1);
+            v = -search(cd - r, -alpha - 1, -alpha, ply + 1, true);
             const long long c_red = nodes - n_before_red;   //clean: nothing has searched this child yet
             //THE PROBE. Sampled deterministically off the position hash so a collection run can be
             //repeated exactly. It runs BEFORE the ordinary re-search so that both searches see the
@@ -2184,15 +2242,15 @@ static int search(int depth, int alpha, int beta, int ply) {
                 int v_r2, v_r1, v_full;
                 if (lmrcost) {
                     const long long n0 = nodes;
-                    v_full = -search(cd, -alpha - 1, -alpha, ply + 1);
+                    v_full = -search(cd, -alpha - 1, -alpha, ply + 1, true);
                     c_full = nodes - n0;
-                    v_r2 = -search(cd - r - 2, -alpha - 1, -alpha, ply + 1);
-                    v_r1 = -search(cd - r - 1, -alpha - 1, -alpha, ply + 1);
+                    v_r2 = -search(cd - r - 2, -alpha - 1, -alpha, ply + 1, true);
+                    v_r1 = -search(cd - r - 1, -alpha - 1, -alpha, ply + 1, true);
                 } else {
-                    v_r2 = -search(cd - r - 2, -alpha - 1, -alpha, ply + 1);
-                    v_r1 = -search(cd - r - 1, -alpha - 1, -alpha, ply + 1);
+                    v_r2 = -search(cd - r - 2, -alpha - 1, -alpha, ply + 1, true);
+                    v_r1 = -search(cd - r - 1, -alpha - 1, -alpha, ply + 1, true);
                     const long long n0 = nodes;
-                    v_full = -search(cd, -alpha - 1, -alpha, ply + 1);
+                    v_full = -search(cd, -alpha - 1, -alpha, ply + 1, true);
                     c_full = nodes - n0;      //UNDERSTATED here: the two searches above warmed the table
                 }
                 const int v_red  = v;
@@ -2227,7 +2285,11 @@ static int search(int depth, int alpha, int beta, int ply) {
                     }
                 }
             }
-            if (!out_of_time && v > alpha) { ++lmr_researches; v = -search(cd, -beta, -alpha, ply + 1); }
+            //An extended move (r < 0) was already searched beyond full depth, so there is nothing
+            //deeper to re-search. Stockfish's gate is the same: `if (value > alpha && d < newDepth)`.
+            if (!out_of_time && v > alpha && cd - r < cd) {
+                ++lmr_researches; v = -search(cd, -beta, -alpha, ply + 1, false);
+            }
         } else if (pvs_on && move_index > 0) {
             //PRINCIPAL VARIATION SEARCH. The ordering has already put the move most likely to be
             //best first, so every move after it is searched on a NULL WINDOW -- a question with a
@@ -2241,13 +2303,13 @@ static int search(int depth, int alpha, int beta, int ply) {
             //would be thrown away. The first move keeps the full window: with nothing yet above
             //alpha there is no bound to test against.
             ++pvs_nulls;
-            v = -search(cd, -alpha - 1, -alpha, ply + 1);
+            v = -search(cd, -alpha - 1, -alpha, ply + 1, !cut_node);
             if (!out_of_time && v > alpha && v < beta) {
                 ++pvs_researches;
-                v = -search(cd, -beta, -alpha, ply + 1);
+                v = -search(cd, -beta, -alpha, ply + 1, false);
             }
         } else {
-            v = -search(cd, -beta, -alpha, ply + 1);
+            v = -search(cd, -beta, -alpha, ply + 1, false);
         }
         ++move_index;
         //The singular grant is released once after the loop, not here -- it was taken once for the
@@ -2528,6 +2590,7 @@ static bool worker_setup(int tid) {
     accumulator_stack_reset(ctx);
     getHash(zh, board, z);
     std::memset(prev_pv_set, 0, sizeof prev_pv_set);
+    std::memset(ss_is_pv, 0, sizeof ss_is_pv);
     std::memset(path_hash, 0, sizeof path_hash);
     std::memset(killers, 0, sizeof killers);
     std::memset(history, 0, sizeof history);
@@ -2653,7 +2716,9 @@ static std::string worker(int tid) {
         if (asp_window > 0 && d >= 3 && iters_done >= 2) {
             int w = asp_window, lo = score - w, hi = score + w;
             for (;;) {
-                v = search(d, lo, hi, 0);
+                //Stockfish's rootDelta: the aspiration window's width, which its reduction base divides by.
+                root_delta = std::max(1, hi - lo);
+                v = search(d, lo, hi, 0, false);
                 if (out_of_time) break;
                 if (v > lo && v < hi) break;
                 ++asp_researches;
@@ -2662,7 +2727,8 @@ static std::string worker(int tid) {
                 else         hi = (w > 4 * asp_window) ?  MATE_CP + 1 : score + w;
             }
         } else {
-            v = search(d, -MATE_CP - 1, MATE_CP + 1, 0);
+            root_delta = 2 * MATE_CP + 2;      //the full window, when aspiration is not armed
+            v = search(d, -MATE_CP - 1, MATE_CP + 1, 0, false);
         }
         if (out_of_time) break;
         ++iters_done;
@@ -2745,6 +2811,8 @@ public:
         o.spin("Ord2",        &o_ord2,       0,  0, 1);
         o.spin("LMRAll",      &o_lmrall,     0,  0, 1);
         o.spin("ProbCut",     &o_probcut,    0,  0, 1);
+        o.spin("LMRAdj",      &o_lmradj,     0,  0, 1);
+        o.spin("LMRExt",      &o_lmrext,     0,  0, 1);
         o.spin("PCMargin",    &o_pcmargin,  97, 20, 400);
         o.spin("PCRed",       &o_pcred,      5,  1,   8);
         o.spin("PCMinDepth",  &o_pcmindepth, 3,  1,   8);
@@ -3199,6 +3267,8 @@ private:
         ord2         = (int)o_ord2;
         lmrall       = (int)o_lmrall;
         probcut      = (int)o_probcut;
+        lmradj       = (int)o_lmradj;
+        lmrext       = (int)o_lmrext;
         pc_margin    = (int)o_pcmargin;
         pc_red       = (int)o_pcred;
         pc_mindepth  = (int)o_pcmindepth;
@@ -3226,7 +3296,60 @@ private:
         //arm built on the cached eval measured negative or unresolved. On its own it just creates
         //eval-only entries that displace real ones. The reference config has ttse=0; an engine
         //running a configuration that was never measured is not the engine the numbers describe.
+        //PINNED, THEN RECONSIDERED BY THE DEPENDENCY RESOLVER. Pinning these to 0 is right for the
+        //measured reference, but it silently disables every rule that compares against a node
+        //evaluation -- and this engine exposes CorrHist, which does exactly that. The resolver below
+        //turns them back on when an option that needs them is set, so the pin cannot make a live
+        //option inert.
         ttse = 0; evmode = 0;
+        resolve_option_dependencies();
+    }
+
+    //DEPENDENCIES BETWEEN OPTIONS, RESOLVED HERE RATHER THAN REMEMBERED BY WHOEVER SETS THEM.
+    //
+    //WHY THIS EXISTS. In the prober, move-count pruning read `improving`, which read a node
+    //evaluation that was never populated because two other flags were off. The rule did not fail --
+    //it silently took its most aggressive branch at every node, and the result was read as a
+    //property of the search rather than as a misconfiguration. A UCI operator has even less chance
+    //of catching that than a measurement script does: there is no stderr to watch, and a GUI sets
+    //one option at a time.
+    //
+    //So anything that READS a table or a value must turn on whatever WRITES it, and must say so.
+    void resolve_option_dependencies() {
+        int forced = 0;
+        auto force = [&](int& flag, int to, const char * why) {
+            if (flag == to) return;
+            std::printf("info string dependency: %s (was %d, now %d)\n", why, flag, to);
+            flag = to; ++forced;
+        };
+        //The full ordering reads continuation history at five levels. Those tables are written only
+        //when ContHist is on, so without it the ordering silently loses its largest term -- which
+        //is exactly how continuation history came to measure as nothing: nothing read it, and then
+        //nothing wrote what did.
+        if (ord2 && ord2_cont) force(conthist, std::max(conthist, 1),
+            "Ord2 orders by continuation history, which only ContHist writes -> ContHist");
+        //The shaped reduction's statScore and continuation-history pruning read the same tables.
+        if (lmrshape) force(conthist, std::max(conthist, 1),
+            "LMRShape's statScore reads continuation history -> ContHist");
+        //The log base only takes effect inside the shaped path.
+        if (lmradj) force(lmrshape, 1,
+            "LMRAdj's terms are in 1024ths of a ply and only the shaped path carries them -> LMRShape");
+        if (lmrext) force(lmrshape, 1,
+            "LMRExt needs a reduction in 1024ths to clamp -> LMRShape");
+        if (lmrbase) force(lmrshape, 1,
+            "LMRBase only applies inside the shaped reduction -> LMRShape");
+        //CORRHIST WAS A NO-OP IN THIS ENGINE. The correction is applied behind
+        //`if (have_nev && cv)`, and have_nev needs evmode >= 1 plus a stored evaluation, which
+        //needs ttse. Both are pinned to 0 three lines above, so the option appeared in the UCI
+        //list, accepted values, wrote its residual tables -- and changed nothing the search did.
+        //Found by auditing every option against what it reads rather than only the ones that had
+        //already produced a wrong measurement.
+        if (corrhist) {
+            force(evmode, std::max(evmode, 1), "CorrHist corrects the node evaluation -> EVMODE");
+            force(ttse, 1, "EVMODE=1 reads a STORED evaluation, so something must store it -> TTSE");
+        }
+        if (forced)
+            std::fflush(stdout);
     }
 
     std::thread driver_;
@@ -3237,6 +3360,7 @@ private:
     int64_t o_qprune = 2, o_qmcount = 2, o_qfutbase = 169, o_qsee = -38;
     int64_t o_conthist = 0, o_lmrshape = 0, o_lmrbase = 0, o_shapemul = 850;
     int64_t o_ord2 = 0, o_lmrall = 0, o_probcut = 0;
+    int64_t o_lmradj = 0, o_lmrext = 0;
     int64_t o_pcmargin = 97, o_pcred = 5, o_pcmindepth = 3;
     int64_t o_tbsearch = 1;
     bool o_online = true;
