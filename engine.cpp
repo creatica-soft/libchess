@@ -74,10 +74,6 @@ static char * engineFgets(char * buf, int size, FILE * f) {
 #include "nnue/bitboard.h"
 #include "libchess.h"
 
-//#ifdef __cplusplus
-//extern "C" {
-//#endif
-
 #ifndef __APPLE__ // macOS
 unsigned int arc4random_uniform(unsigned int upper_bound) {
     if (upper_bound == 0) return 0;
@@ -593,9 +589,25 @@ int getPV(const Engine& engine, struct Evaluation ** eval, const int multiPV) {
 		return 1;
 	}
 	for (int i = 0; i < multiPV; i++) prevLine[i] = NULL;
-	int pv;
-	char * tmpLine;
+	int pv = 0;
+	char * tmpLine = NULL;
 	size_t len, prevLen[MAX_UCI_MULTI_PV] = { 0 };
+	//THE COUNT CANNOT BE VERIFIED FROM HERE -- the API is a bare Evaluation ** with no length --
+	//but a NULL entry can be, and that is what a count too large looks like from inside. Fail with
+	//a message naming the mismatch instead of dereferencing it: the previous behaviour was a SEGV
+	//in a release dylib, which tells the caller nothing about which array was too short.
+	for (int i = 0; i < multiPV; i++) {
+		if (!eval[i]) {
+			fprintf(stderr, "getPV() error: asked for %d PV lines but eval[%d] is NULL -- the "
+			        "caller's array is shorter than the requested line count\n", multiPV, i);
+			if (engine.logfile) {
+				fprintf(engine.logfile, "getPV() error: asked for %d PV lines but eval[%d] is NULL\n",
+				        multiPV, i);
+				fflush(engine.logfile);
+			}
+			return 1;
+		}
+	}
 	for (int i = 0; i < multiPV; i++) {
 		unsigned char maxPlies = eval[i]->maxPlies;
 	  memset(eval[i], 0, sizeof(struct Evaluation));
@@ -841,16 +853,30 @@ int go(const Engine& engine, struct Evaluation ** eval) {
 		fflush(engine.logfile);
 	}
 	if (engine.infinite) return 0;
-	int multiPV = nametoindex(engine, "MultiPV", Spin);
-	if (multiPV < 0) {
+	//AN INDEX IS NOT A VALUE. nametoindex() returns a position in optionSpin[], and the line below
+	//used to be `multiPV = 1;` on the not-found path -- setting the INDEX to 1 and then reading
+	//`engine.optionSpin[multiPV].value`, which is whatever the engine's SECOND advertised spin
+	//option happens to hold. Driving creatica_ab, which does not advertise MultiPV, that is
+	//Threads: with CREATICA_THREADS=2 getPV() was asked for two PV lines, walked off the end of a
+	//caller array holding one, and dereferenced NULL. It worked by luck at Threads=1 and never
+	//fired against the MCTS engine, which does advertise MultiPV. The comment above
+	//setEngineSpin() records this same confusion being fixed elsewhere; this site was missed.
+	const int multiPVIdx = nametoindex(engine, "MultiPV", Spin);
+	int pvLines = 1;
+	if (multiPVIdx < 0) {
 		if (engine.logfile) {
-			fprintf(engine.logfile, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
+			fprintf(engine.logfile, "go() note: engine %s does not advertise MultiPV; reading a single PV\n",
+			        engine.id[0] ? engine.id : engine.engineName);
 			fflush(engine.logfile);
 		}
-		fprintf(stderr, "engine() failed: nametoindex(MultiPV, Spin) return -1\n");
-		return 1;
+		fprintf(stderr, "go() note: engine %s does not advertise MultiPV; reading a single PV\n",
+		        engine.id[0] ? engine.id : engine.engineName);
+	} else {
+		pvLines = (int)engine.optionSpin[multiPVIdx].value;
 	}
-	return getPV(engine, eval, engine.optionSpin[multiPV].value);
+	//An engine may advertise MultiPV and still report 0 if it has never been set.
+	if (pvLines < 1) pvLines = 1;
+	return getPV(engine, eval, pvLines);
 }
 
 float getEval(const Engine& engine) {
@@ -1136,8 +1162,6 @@ int engine(Engine& engine, const char * engineName) {
 }
 
 void initChessEngine(Engine& chessEngine, const char * engineName, const long long movetime, const int depth, const int hashSize, const int threadNumber, const char * syzygyPath, const int multiPV, const bool logging, const bool limitStrength, const int elo) {
-  //Engine * chessEngine = (struct Engine *)calloc(1, sizeof(struct Engine));
-  //Engine * chessEngine = new(Engine);
   chessEngine.movetime = movetime;
   chessEngine.depth = depth;
   int res = engine(chessEngine, engineName);
@@ -1173,8 +1197,13 @@ void initChessEngine(Engine& chessEngine, const char * engineName, const long lo
   if (idx >= 0) chessEngine.optionSpin[idx].value = hashSize;
   idx = nametoindex(chessEngine, "Threads", Spin);
   if (idx >= 0) chessEngine.optionSpin[idx].value = threadNumber;
+  //A NULL syzygyPath means "no tablebases", which is the obvious way to call this and used to
+  //strncpy() from NULL. Both callers in this repo pass a real path, so it never fired until an
+  //engine without tablebases was driven; the option is advertised either way, so idx >= 0 and the
+  //guard above does not help.
   idx = nametoindex(chessEngine, "SyzygyPath", String);
-  if (idx >= 0) strncpy(chessEngine.optionString[idx].value, syzygyPath, MAX_UCI_OPTION_STRING_LEN);
+  if (idx >= 0 && syzygyPath && syzygyPath[0])
+    strncpy(chessEngine.optionString[idx].value, syzygyPath, MAX_UCI_OPTION_STRING_LEN - 1);
   idx = nametoindex(chessEngine, "UCI_Elo", Spin);
   if (idx >= 0) chessEngine.optionSpin[idx].value = elo;
   idx = nametoindex(chessEngine, "UCI_LimitStrength", Check);
@@ -1211,7 +1240,6 @@ void initChessEngine(Engine& chessEngine, const char * engineName, const long lo
     printf("initChessEngine() error: isReady() returned false\n");
   	return;
   }
-  //return chessEngine;
 }
 
 void releaseChessEngine(Engine& chessEngine) {
@@ -1269,10 +1297,5 @@ void releaseChessEngine(Engine& chessEngine) {
 		chessEngine.hProcess = INVALID_HANDLE_VALUE;
 	}
 #endif
-  //delete chessEngine;
-  //chessEngine = nullptr;
 }
 
-//#ifdef __cplusplus
-//}
-//#endif
