@@ -107,6 +107,26 @@ evaluation and tablebase lookups. No curl source is included in this repository,
 so there is nothing to redistribute; curl's own licence is a permissive
 MIT/X-derivative. See <https://curl.se/docs/copyright.html>.
 
+## Arasan test suite — `testsets/arasan2026.epd`
+
+The 197-position tactical suite from Jon Dart's Arasan chess engine, taken
+verbatim from the `tests/` directory of
+<https://github.com/jdart1/arasan-chess>. It is input data for the search
+measurements, not code, and nothing links against it.
+
+Copyright 1994-2026 by Jon Dart. Distributed under Arasan's own licence, whose
+terms are the MIT licence's and which names the `tests` directory explicitly:
+
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction... The above copyright notice and this
+> permission notice shall be included in all copies or substantial portions of
+> the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+`testsets/arasan2026.tsv` is generated from the `.epd` by
+`testsets/epd2tsv.cpp` and is the form the probes read; it is a derived work of
+the same file and carries the same notice.
+
 ---
 
 ## If you redistribute
