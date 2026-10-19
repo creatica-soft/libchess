@@ -944,6 +944,17 @@ CHESS_API int get_see(const Board& board, Move move);
 //x-ray walk, which removes each captured piece from `occupied` and re-asks.
 CHESS_API uint64_t attackers_to(const Board& board, const Square sq, const uint64_t occupied);
 CHESS_API int uci2move_idx(const char * uci_move, Move& move);
+//THE TWO HELPERS uci2move_idx() MAKES NECESSARY, since it does no legality check at all. Both used
+//to be private statics duplicated in creatica.cpp and creatica_ab.cpp, and the copies drifted.
+//normalise_castling() rewrites lichess's king-takes-rook castling, which it sends in games created
+//FROM A POSITION, into the king's two-square move libchess wants -- and leaves a real Chess960
+//game alone, where the king-takes-rook form is what libchess itself generates.
+//illegal_reason() returns nullptr when the move is legal on this board, otherwise WHY. The reason
+//matters: a refusal on a move from a driver that only sends legal moves means our board and theirs
+//have diverged, and without it the symptom is a crash in kingMoves() during a later search.
+CHESS_API void normalise_castling(const Board& board, Move& move);
+CHESS_API const char * illegal_reason(Board& board, const Move& m);
+CHESS_API bool is_legal_move(Board& board, const Move& m);
 CHESS_API char * idx2uci(const int move_idx, char * uci_move);
 CHESS_API Move& idx2move(const int move_idx, Move& move);
 CHESS_API int san2move(Board& board, const char * san_move, Move& move);

@@ -12,6 +12,78 @@
 //extern "C" {
 //#endif
 
+//THE UCI MOVE HELPERS THAT BELONG BESIDE uci2move_idx(), and until now lived twice over in the two
+//engines. Both were private statics of creatica.cpp's class with a copy pasted into
+//creatica_ab.cpp, and the copies drifted exactly as the note there predicted: creatica_ab gained
+//eight diagnostic reasons while creatica kept a bare bool, and two explanatory comments were lost
+//in the paste -- one of which made a correct line ("double check: king only") read as a bug, and
+//another of which overstated which lichess games speak the king-takes-rook dialect.
+//
+//uci2move_idx() does no legality check whatsoever, which is what makes both of these necessary.
+
+//THE KING-TAKES-ROOK CASTLING DIALECT. lichess sends castling as the king's move to the ROOK's
+//square in games created FROM A POSITION -- standard rules, isChess960 false -- where libchess
+//wants the king's two-square move. In a real Chess960 game the king-takes-rook form is what
+//libchess itself wants (castlingMoves() generates it and do_move() recognises castling by exactly
+//the castlingRooks test below), so rewriting it there would turn a castling move into a plain king
+//move that is not even legal. Hence the isChess960 guard.
+//
+//Why it matters: uci2move_idx() took "e8a8" literally, the king was marched onto its own rook, and
+//the Board left behind was illegal -- the next search read a king bitboard that made no sense and
+//died in kingMoves(). That is what an "engine produced nothing for 60000 ms" stall looked like.
+//
+//PC_TYPE/PC_COLOR, never "& 7" or ">> 3": libchess.h defines a global operator&(T enum, int) that
+//IGNORES its second operand and always masks with 1, so "mover & 7" silently evaluates to 0 for
+//every piece. chess_types.h documents that operator as broken; the first version of this function
+//stepped on it and never fired.
+void normalise_castling(const Board& board, Move& move) {
+    if (move.promoType != PieceTypeNone) return;
+    if (board.isChess960) return;
+    const Piece mover = static_cast<Piece>(board.piecesOnSquares[move.src]);
+    const Piece onDst = static_cast<Piece>(board.piecesOnSquares[move.dst]);
+    if (PC_TYPE(mover) != King || PC_TYPE(onDst) != Rook) return;   //not king-takes-rook
+    if (PC_COLOR(mover) != PC_COLOR(onDst)) return;                 //enemy rook: a real capture
+    if (!(board.castlingRooks & (1ULL << move.dst))) return;        //rook has no castling right
+    const Square from = static_cast<Square>(move.src), to = static_cast<Square>(move.dst);
+    const File f = SQ_FILE(to) > SQ_FILE(from) ? FileG : FileC;
+    move.dst = SQ(SQ_RANK(from), f);
+}
+
+//IS THIS MOVE LEGAL ON THIS BOARD, and if not, WHY. Returns nullptr when legal.
+//
+//Returning the reason rather than a bool is the whole point. When this fires on a move from a
+//driver that only sends legal moves, our board and theirs have DIVERGED, and the failure mode is
+//the worst kind: the Board is corrupted, and the crash arrives in kingMoves() during a later
+//search, far from the cause. A bare `false` threw away everything needed to find it.
+const char * illegal_reason(Board& board, const Move& m) {
+    if (m.src >= Square_NB || m.dst >= Square_NB) return "square index out of range";
+    if (!((board.side[board.sideToMove] >> m.src) & 1ULL))
+        return "no piece of the side to move on the from-square";
+    auto [king_moves, pinned, pinning, checkers, kingSq] = kingMoves(board);
+    if (m.src == kingSq)
+        return ((king_moves >> m.dst) & 1ULL) ? nullptr
+             : (checkers ? "king move does not escape check"
+                         : "not a legal king move (occupied, or into check)");
+    //DOUBLE CHECK: KING MOVES ONLY. Reached only for a non-king move, because every king move was
+    //answered above. The position is legal; this move is not. Capturing one checker leaves the
+    //other, blocking one leaves the other, and no single move does both -- if the capture square
+    //were also on the second checker's line to the king then the captured piece was blocking that
+    //line and the second piece was not checking at all. generate() stops in the same place.
+    if (bitCount(checkers) > 1) return "double check: only a king move can be legal";
+    auto [check_mask, ep_mask] = checkers ? checkMask(board, kingSq, checkers)
+                                          : std::make_pair(0xffffffffffffffffULL, 0ULL);
+    const PieceType pt = PC_TYPE(static_cast<Piece>(board.piecesOnSquares[m.src]));
+    if (pt < Pawn || pt > Queen) return "from-square holds no piece type that moves";
+    const uint64_t mv = piece_moves(board, pt, static_cast<Square>(m.src), kingSq,
+                                    pinned, pinning, check_mask, ep_mask);
+    if ((mv >> m.dst) & 1ULL) return nullptr;
+    if ((pinned >> m.src) & 1ULL) return "piece is pinned and this move would expose the king";
+    if (checkers) return "does not address the check (no capture of the checker, no block)";
+    return "destination not reachable by that piece";
+}
+
+bool is_legal_move(Board& board, const Move& m) { return illegal_reason(board, m) == nullptr; }
+
 int uci2move_idx(const char * uci_move, Move& move) {
   assert(uci_move);
   assert(strlen(uci_move) >= 4);
