@@ -71,13 +71,14 @@ static const int MAX_PLY   = 64;
 static const int MATE_IN_MAX = MATE_CP - MAX_PLY;
 static int  policy_plies   = 3;
 static int  qdepth         = 6;
+//REPCHECK=2 is not an option - it must be removed to avoid cluttering the code with dubious options!
 //REPCHECK: scoring the first recurrence of a position as a draw. It is creatica's own rule, and it is
 //needed once a table exists because a score computed inside a cycle must not escape it -- but it is
 //also far more aggressive inside alpha-beta than inside MCTS, and combined with a table it invites the
 //graph-history error, where a 0 stored because THIS path repeated is reused on a path that does not.
 //Switchable so the table's own contribution can be measured apart from it. REPCHECK=2 keeps the rule
 //but refuses to store anything in the table from a subtree that used it, which is the sound version.
-static int  repcheck       = 1;
+//static int  repcheck       = 2;
 //Set when the subtree below the current node scored a repetition, so its score is not written to the
 //table under REPCHECK=2.
 static thread_local bool rep_tainted = false;
@@ -751,15 +752,11 @@ static inline bool timed_out() {
     return out_of_time;
 }
 
-//THE TRANSPOSITION TABLE. The single biggest thing missing from the first version of the probe, and
-//the reason it is worth adding: iterative deepening re-searches the same positions over and over, and
+//THE TRANSPOSITION TABLE. Iterative deepening re-searches the same positions over and over, and
 //without a table every re-search starts from nothing. The table gives back two quite different things
 //-- a score that can cut the node off outright, and, when it cannot, the move that was best there last
 //time, which is the cheapest and strongest ordering hint available.
 //
-//The incremental hash it is keyed on was verified against a fresh getHash() over 567,436 nodes with
-//zero mismatches before this was written. An unverified hash does not produce a weaker search, it
-//produces a wrong one: entries from unrelated positions collide and are believed.
 enum { TT_NONE = 0, TT_EXACT = 1, TT_LOWER = 2, TT_UPPER = 3 };
 //THE TABLE, MADE SAFE TO SHARE. Several threads write 16-byte entries with no lock, so a reader can
 //see one thread's key beside another thread's score -- a TORN entry, which looks valid and is not.
@@ -774,8 +771,8 @@ enum { TT_NONE = 0, TT_EXACT = 1, TT_LOWER = 2, TT_UPPER = 3 };
 //soon enough. It is here because every expensive mistake in this project has been a SILENT one, and
 //a few instructions per probe is a cheap way to make this class of failure impossible rather than
 //merely improbable.
-//THE STATIC EVAL LIVES IN THE TABLE, which is what makes interior-node pruning free. Arkadi's
-//point: iterative deepening starts at depth 1, so a node at ply p was a QUIESCENCE LEAF at iteration
+//THE STATIC EVAL LIVES IN THE TABLE, which is what makes interior-node pruning free.
+//Iterative deepening starts at depth 1, so a node at ply p was a QUIESCENCE LEAF at iteration
 //p+1 and was evaluated there. At every later iteration it is an interior node whose evaluation has
 //already been paid for -- it only needs storing. Stockfish does exactly this, writing
 //`unadjustedStaticEval` into the entry and reading `ttData.eval` back on a hit rather than
@@ -866,13 +863,8 @@ static inline void tt_write(TTEntry * e, uint64_t hash, const TTData& in) {
     e->data = d;
     e->key  = hash ^ d;                       //published last
 }
-//TT=0 turns the table off. It exists because the original probe had no switch: ab_p3.tsv and
-//ab_tt_p3.tsv were produced by two different BUILDS twenty minutes apart, which means the 2.9-point
-//accuracy drop between them cannot be attributed to the table rather than to anything else edited
-//that morning. An arm that needs a recompile is not an arm.
-static int tt_on = 1;
 //QTT=1 extends the table into quiescence; 0 is the incumbent behaviour exactly.
-static int qtt_on = 0;
+//static int qtt_on = 0;
 //DELTA: the delta-pruning margin in centipawns. -1 is OFF and is the incumbent search exactly.
 static int delta_margin = -1;
 //PVS=1 searches every move after the first on a null window; 0 is the incumbent full-window search.
@@ -918,6 +910,93 @@ static thread_local uint64_t path_hash[MAX_PLY + 8];
 //engine that cannot see a repetition already on the board will repeat into a draw while winning,
 //and will not claim one while losing. Written once per `position` command, read-only in search.
 static std::vector<uint64_t> game_hashes;
+//UPCOMING REPETITION, and the cuckoo table it needs (Stockfish position.cpp:1186).
+//
+//A DIFFERENT QUESTION FROM repeated(). repeated() asks "has this position already occurred", which
+//makes 0 the node's value. This asks "is there a move FROM here that would repeat" -- a cycle is
+//REACHABLE -- and the answer is a FLOOR on the node's value rather than the value: if we can force
+//a repetition then this node is worth at least a draw, so alpha rises to 0 and the search carries
+//on looking for better. It gains nothing when we are already winning and saves the half point when
+//we are losing, which is exactly the case that matters in a game.
+//
+//HOW THE TABLE WORKS. A reversible non-pawn move between s1 and s2 changes the position key by a
+//constant depending only on (piece, s1, s2). Store every such constant; then if the key difference
+//between the current position and one some plies back equals a stored constant, a single move
+//connects them, so repeating is one move away. Cuckoo displacement keeps it to one probe pair.
+//
+//THE KEY FORMULA IS NOT STOCKFISH'S. Upstream hashes only occupied squares, so a move's delta is
+//two piece terms plus the side key. libchess XORs a key for EMPTY squares as well
+//(zobrist-hash.cpp), so vacating s1 and filling s2 toggles four terms. Copying the two-term
+//version builds a table that never matches anything.
+//
+//PAWNS ARE EXCLUDED, as upstream excludes them, and that is what makes the absent rule50 bound
+//safe: a pawn move or a capture cannot be undone, so a key difference across one can never equal a
+//single-non-pawn-move constant. Null moves ARE bounded, because a null move's delta is the side key
+//alone and would corrupt the accumulator below.
+enum { CUCKOO_SIZE = 8192 };
+static uint64_t cuckoo_key[CUCKOO_SIZE];
+static uint8_t  cuckoo_s1[CUCKOO_SIZE], cuckoo_s2[CUCKOO_SIZE];
+static bool     cuckoo_used[CUCKOO_SIZE];
+//THE FIFTY-MOVE RULE, which this search did not know about. board.halfmoveClock is maintained
+//branchlessly by do_move() and restored by undo_move() from the StateInfo, so the clock has been
+//correct at every node since the rework -- nothing read it. Demonstrated on rook-and-king against
+//king, the same position differing only in the halfmove field: 572 at clock 0, and without the rule
+//still +296 at clock 99, a position the rules have already drawn.
+//
+//Stockfish's condition has a subtlety worth keeping: `rule50 > 99 && (!checkers() || has a legal
+//move)`. Being checkmated on the hundredth half-move beats the draw claim. That splits in two --
+//the not-in-check case needs no move list, the in-check case is answered after generation.
+//
+//NOT tainted. The clock is part of the position for this purpose: a position whose clock stands at
+//100 is drawn by whatever route it was reached, so the score is safe to store.
+static int      r50 = 1;
+static int      uprep = 0;
+static thread_local long long uprep_hits = 0, uprep_raised = 0;
+//Plies since the last null move on this path; -1 means none seen. Written by the child at entry
+//from a flag the parent sets, because the parent has many recursion sites and one null move.
+static thread_local int ss_pfn[MAX_PLY];
+static thread_local bool next_is_null = false;
+static inline int cuckoo_h1(uint64_t k) { return (int)(k & 0x1fffULL); }
+static inline int cuckoo_h2(uint64_t k) { return (int)((k >> 16) & 0x1fffULL); }
+
+static int cuckoo_build() {
+    std::memset(cuckoo_key, 0, sizeof cuckoo_key);
+    std::memset(cuckoo_used, 0, sizeof cuckoo_used);
+    int count = 0;
+    for (int c = 0; c < Color_NB; ++c)
+        for (PieceType pt = Knight; pt <= King; pt = (PieceType)(pt + 1))
+            for (int s1 = 0; s1 < Square_NB; ++s1)
+                for (int s2 = s1 + 1; s2 < Square_NB; ++s2) {
+                    const Stockfish::Square a = (Stockfish::Square)s1;
+                    uint64_t reach = 0;
+                    switch (pt) {
+                        case Knight: reach = Stockfish::attacks_bb<Stockfish::KNIGHT>(a, 0); break;
+                        case Bishop: reach = Stockfish::attacks_bb<Stockfish::BISHOP>(a, 0); break;
+                        case Rook:   reach = Stockfish::attacks_bb<Stockfish::ROOK>(a, 0); break;
+                        case Queen:  reach = Stockfish::attacks_bb<Stockfish::BISHOP>(a, 0)
+                                           | Stockfish::attacks_bb<Stockfish::ROOK>(a, 0); break;
+                        case King:   reach = Stockfish::attacks_bb<Stockfish::KING>(a, 0); break;
+                        default: break;
+                    }
+                    if (!((reach >> s2) & 1ULL)) continue;
+                    uint64_t key = z.nonPawns[c][pt - 2][s1] ^ z.nonPawns[c][pt - 2][s2]
+                                 ^ z.emptySquares[s1] ^ z.emptySquares[s2] ^ z.blackMove;
+                    uint8_t a1 = (uint8_t)s1, a2 = (uint8_t)s2;
+                    int i = cuckoo_h1(key);
+                    for (;;) {
+                        std::swap(cuckoo_key[i], key);
+                        std::swap(cuckoo_s1[i], a1);
+                        std::swap(cuckoo_s2[i], a2);
+                        const bool was_used = cuckoo_used[i];
+                        cuckoo_used[i] = true;
+                        if (!was_used) break;
+                        i = (i == cuckoo_h1(key)) ? cuckoo_h2(key) : cuckoo_h1(key);
+                    }
+                    ++count;
+                }
+    return count;   //3668 for a correct enumeration, which is Stockfish's own assertion
+}
+
 static inline bool repeated(int ply) {
     for (int i = ply - 2; i >= 0; i -= 2) if (path_hash[i] == zh.hash) return true;
     //Walk the game backwards in steps of two: only positions with the same side to move can
@@ -933,6 +1012,73 @@ static inline bool repeated(int ply) {
     //0 game-history hits before, 9 after.
     for (int i = (int)game_hashes.size() - 2 + (ply & 1); i >= 0; i -= 2)
         if (game_hashes[(size_t)i] == zh.hash) return true;
+    return false;
+}
+
+//THE KEY d PLIES BACK: the search path first, then the game the driver gave us. This second half is
+//what the prober cannot have -- it searches isolated positions -- and it is the half that matters
+//in play, because a cycle available near the root involves moves already made in the game.
+static inline bool hist_key(int ply, int d, uint64_t& out) {
+    if (d < 0) return false;
+    if (d <= ply) { out = path_hash[ply - d]; return true; }
+    const size_t back = (size_t)(d - ply);
+    if (back > game_hashes.size()) return false;
+    out = game_hashes[game_hashes.size() - back];
+    return true;
+}
+
+//Walks back two plies at a time -- a cycle must hand the move back to the same side -- accumulating
+//`other`, which is zero only when everything but one piece's placement has cancelled between the
+//two positions. That is the cheap filter; the cuckoo probe is the confirmation.
+static bool upcoming_repetition(int ply) {
+    if (!uprep) return false;
+    //min(rule50, pliesFromNull), Stockfish's bound: no position before the last irreversible move
+    //can recur, so walking past it is wasted work. The clock was available all along.
+    int end = std::min(ply + (int)game_hashes.size(), (int)board.halfmoveClock);
+    if (ply < MAX_PLY && ss_pfn[ply] >= 0) end = std::min(end, ss_pfn[ply]);
+    if (end < 3) return false;
+
+    uint64_t cur = 0, prev = 0;
+    if (!hist_key(ply, 0, cur) || !hist_key(ply, 1, prev)) return false;
+    uint64_t other = cur ^ prev ^ z.blackMove;
+
+    for (int i = 3; i <= end; i += 2) {
+        //h(i-1) ^ h(i), NOT h(i-2) ^ h(i-1). Stockfish steps its StateInfo pointer twice per
+        //iteration and accumulates the pair it lands between; with the wrong pair `other` collapses
+        //to cur ^ h(i-1), which is zero only when the position two plies back is identical -- a
+        //case repeated() has already returned on. The detector then finds NOTHING and reads as
+        //ineffective rather than wrong. Only a firing count tells those apart, which is why one is
+        //reported.
+        uint64_t k1 = 0, back = 0;
+        if (!hist_key(ply, i - 1, k1) || !hist_key(ply, i, back)) return false;
+        other ^= k1 ^ back ^ z.blackMove;
+        if (other != 0) continue;
+        const uint64_t move_key = cur ^ back;
+        int j = cuckoo_h1(move_key);
+        if (!(cuckoo_used[j] && cuckoo_key[j] == move_key)) {
+            j = cuckoo_h2(move_key);
+            if (!(cuckoo_used[j] && cuckoo_key[j] == move_key)) continue;
+        }
+        const int s1 = cuckoo_s1[j], s2 = cuckoo_s2[j];
+        //between_bb(s1, s2) INCLUDES s2, so s2 is XORed out: the squares strictly between must be
+        //empty and the piece may sit at either end.
+        const uint64_t occ = board.side[ColorWhite] | board.side[ColorBlack];
+        const uint64_t betw = Stockfish::between_bb((Stockfish::Square)s1, (Stockfish::Square)s2)
+                            ^ (1ULL << s2);
+        if (betw & occ) continue;
+        ++uprep_hits;
+        if (ply > i) return true;      //a cycle wholly inside the search path
+        //AT OR BEFORE THE ROOT Stockfish requires one more repetition, because the move might
+        //reach the current position rather than repeat from it. Its test reads a per-position
+        //`repetition` field kept in do_move; the equivalent here is to require that the position
+        //i plies back occurs more than once in the history we hold.
+        int seen = 0;
+        for (int d = i; d <= ply + (int)game_hashes.size(); d += 2) {
+            uint64_t h = 0;
+            if (!hist_key(ply, d, h)) break;
+            if (h == back && ++seen >= 2) return true;
+        }
+    }
     return false;
 }
 
@@ -976,7 +1122,8 @@ static int generate(Mv * out, bool captures_only) {
     }
     if (bitCount(checkers) > 1) return n;
     auto [cm, em] = checkers ? checkMask(board, ksq, checkers) : std::make_pair(~0ULL, 0ULL);
-    for (PieceType pt = Queen; pt >= Pawn; --pt) {
+    //for (PieceType pt = Queen; pt >= Pawn; --pt) {
+    for (PieceType pt = Pawn; pt <= Queen; ++pt) {      
         uint64_t occ = board.side[board.sideToMove] & board.pieceTypes[pt - 1];
         while (occ) {
             move.src = (Square)lsBit(occ);
@@ -1105,6 +1252,7 @@ static int eval_cp_depth(int budget, int alpha, int beta);
 //Defined below with the ordering rules; declared here because the in-check search orders its
 //evasions by it.
 static inline int victim_value(const Mv& m);
+//static inline int attacker_value(const Mv& m);
 static inline bool stm_in_check();
 //WINDOWED. The unwindowed version of this took a full maximum over every legal evasion, which cost
 //29.5 evaluations per in-check node and 84.5% of ALL evaluation work in the probe -- with the
@@ -1148,7 +1296,10 @@ static int eval_cp_depth(int budget, int alpha, int beta) {
     //usually the best evasion, and victim value is what the rest of the probe orders by.
     {
         int sc[MAX_MOVES];
-        for (int i = 0; i < nev; ++i) sc[i] = victim_value(ev[i]);
+        for (int i = 0; i < nev; ++i) {
+          sc[i] = victim_value(ev[i]);
+          //if (sc[i] > 0) sc[i] = sc[i] * 10 - attacker_value(ev[i]);
+        }
         sort_desc(ev, sc, nev);
     }
     int best = -MATE_CP;
@@ -1189,6 +1340,12 @@ static inline int victim_value(const Mv& m) {
     if (p == PieceNone) return 0;
     return PIECE_CP[p & 7];
 }
+
+/*static inline int attacker_value(const Mv& m) {
+    const int p = board.piecesOnSquares[m.src];
+    if (p == PieceNone) return 0;
+    return PIECE_CP[p & 7];
+}*/
 
 //Set by order_by_policy() for the node it was called on, and only valid immediately after that
 //call -- the policy runs at a node, and any recursion invalidates it.
@@ -1318,7 +1475,7 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
     const bool in_check = stm_in_check();
     const int alpha_orig = alpha;
     Mv qtt_move{0, 0, 0}; bool have_qtt_move = false;
-    if (tt_on && qtt_on) {
+    //if (qtt_on) {
         ++tt_probes;
         const TTEntry * e = tt_slot(zh.hash);
         TTData d;
@@ -1334,7 +1491,7 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
                 if (d.flag == TT_UPPER && sc <= alpha) { ++tt_cutoffs; return sc; }
             }
         }
-    }
+    //}
     //THE TABLES IN QUIESCENCE TOO. Quiescence is about half the nodes, and an ending reached by a
     //sequence of captures is exactly the shape of position that lands in the tables.
     if (tb_search && ply > 0) {
@@ -1349,7 +1506,7 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
         //Stored HERE rather than with the entry at the end of the function: the next line returns on
         //a stand-pat at or above beta, which is a large share of quiescence nodes, and those would
         //otherwise never record the evaluation they just paid for.
-        if (tt_on && ttse) tt_store_eval(tt_slot(zh.hash), zh.hash, stand);
+        if (ttse) tt_store_eval(tt_slot(zh.hash), zh.hash, stand);
         //STORED RAW, USED CORRECTED, exactly as Stockfish does it. The table holds the unadjusted
         //evaluation and the correction is applied after reading, which is the only ordering that
         //stays right when the tables have moved on by the time the entry is read again.
@@ -1371,6 +1528,8 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
     Mv mv[MAX_MOVES];
     const int n = generate(mv, !in_check);          //in check, every legal move is a reply
     if (in_check && n == 0) return -MATE_CP;
+    //The same rule in quiescence.
+    if (r50 && board.halfmoveClock > 99 && (!in_check || n > 0)) return 0;
     {
         int score[MAX_MOVES];
         //SEEORD=2 orders quiescence by SEE too. Every move here is a capture, so this is the most
@@ -1467,8 +1626,10 @@ static int qsearch(int alpha, int beta, int ext, int ply) {
         if (best > alpha) alpha = best;
         if (alpha >= beta) break;
     }
-    if (tt_on && qtt_on && !out_of_time && std::abs(best) < MATE_IN_MAX
-        && !(repcheck == 2 && rep_tainted)) {
+    //if (qtt_on && !out_of_time && std::abs(best) < MATE_IN_MAX
+    if (!out_of_time && std::abs(best) < MATE_IN_MAX
+        //&& !(repcheck == 2 && rep_tainted)) {
+        && !rep_tainted) {  
         TTEntry * e = tt_slot(zh.hash);
         //Depth 0, so this can only replace another quiescence entry, never a searched one.
         TTData old;
@@ -1522,13 +1683,72 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     if (timed_out()) return 0;
     if (ply >= MAX_PLY - 2) return eval_cp(alpha, beta);
     guard_ply = ply; guard_depth = depth; guard_where = "search";
+    //PLIES FROM NULL, for upcoming_repetition()'s backward walk. Consumed here because the parent
+    //has many recursion sites and exactly one of them is the null move.
+    if (ply < MAX_PLY) {
+        const bool from_null = next_is_null;
+        next_is_null = false;
+        ss_pfn[ply] = from_null ? 0 : (ply > 0 ? (ss_pfn[ply - 1] >= 0 ? ss_pfn[ply - 1] + 1 : -1)
+                                               : -1);
+    }
     const bool pv_node  = (beta != alpha + 1);
     const bool all_node = !(pv_node || cut_node);
     if (ply < MAX_PLY) ss_is_pv[ply] = pv_node;
     bool granted = false;
     struct ExtGuard { bool& g; ExtGuard(bool& b) : g(b) {} ~ExtGuard() { if (g) --ext_used; } } eg(granted);
-    if (repcheck && ply > 0 && repeated(ply)) { rep_tainted = true; return 0; }  //see repeated()
+    //if (repcheck && ply > 0 && repeated(ply)) { rep_tainted = true; return 0; }  //see repeated()
+    if (ply > 0 && repeated(ply)) { rep_tainted = true; return 0; }  //see repeated()
+    //FIFTY MOVES, the half needing no move list: not in check, so no mate can pre-empt the claim.
+    if (r50 && ply > 0 && board.halfmoveClock > 99 && !stm_in_check()) return 0;
+    //We just check for repetition and return updated alpha 0 without checking if it's greater than beta and alpha_orig less than 0
+    //TO FIX: mimic Stockfish repetition handling unless it's handled somewhere else:
+    //if (ply > 0 && alpha < 0 && repeated(ply)) { rep_tainted = true; alpha = 0; if (alpha >= beta) return 0; }
+
+    // Stockfish logic: Check if we have an upcoming move that draws by repetition
+    /*if (!rootNode && alpha < VALUE_DRAW && pos.upcoming_repetition(ss->ply))
+    {
+        alpha = value_draw(nodes);
+        if (alpha >= beta) return alpha;
+    }*/
+    
+    
+    //TO FIX: Step 3. Mate distance pruning from stockfish search seems to be missing
+    
     path_hash[ply] = zh.hash;
+    //UPCOMING REPETITION (Stockfish search.cpp:584), which answers the "TO FIX" above. A reachable
+    //cycle is a FLOOR on this node's value, not its value: if a repetition can be forced the node
+    //is worth at least a draw, so alpha rises and the search carries on looking for better.
+    //`alpha < 0` because there is nothing to gain once we are already at or above a draw.
+    //
+    //Note this is NOT the same question as repeated() two lines up, and the commented-out
+    //alternative there would be wrong: repeated() asks whether the position in hand has ALREADY
+    //occurred, which makes 0 its value, so returning without consulting the window is correct and
+    //is what Stockfish's own is_draw() path does. Raising alpha there instead would carry on
+    //searching a position that is already drawn.
+    //
+    //Placed after path_hash[ply] is written, because the backward walk reads it as the current key.
+    if (uprep && ply > 0 && alpha < 0 && upcoming_repetition(ply)) {
+        //TAINTED UNCONDITIONALLY, with no knob, because the alternative is not a cheaper trade.
+        //
+        //The raise is PATH-DEPENDENT -- it holds because of the moves already played -- so a score
+        //derived from it is not a property of the position. Storing it lets a different path
+        //reaching the same position believe a bound it never earned: the graph-history interaction,
+        //and the same error as an MCTS node whose value came from one particular route.
+        //
+        //Three positions on this, not two. Stockfish refuses table CUTOFFS (reading), and only
+        //above a halfmove clock of 90 -- laxer than this and narrower. We refuse the STORE
+        //(writing) for any path-dependent value, which is stricter. Storing it anyway is simply
+        //wrong, and measured worse too (78 of 197 against 82). That option has been removed.
+        //
+        //The cost is real and accepted: +20% nodes here, 387,054 against 467,633 on one position,
+        //because a tainted subtree loses its table entry. To reclaim it, ADD Stockfish's
+        //late-clock cutoff guard on top -- possible now that the search reads board.halfmoveClock
+        //-- rather than drop the taint.
+        rep_tainted = true;
+        ++uprep_raised;
+        alpha = 0;
+        if (alpha >= beta) return 0;
+    }
     const int alpha_orig = alpha;
     const bool in_check = stm_in_check();
     //Bounded by ext_limit; see the note there. `ext_used` counts the extensions already granted on
@@ -1547,7 +1767,7 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     //because it was computed WITH the excluded move and so answers a different question. Nothing is
     //written back for the same reason. And the test does not recurse.
     const bool excluded = sing_excl_set[ply];
-    if (tt_on && depth > 0) {
+    if (depth > 0) {
         ++tt_probes;
         const TTEntry * e = tt_slot(zh.hash);
         TTData d;
@@ -1597,7 +1817,7 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     if (tb_search && ply > 0) {
         int tbv;
         if (tb_probe_node(tbv)) {
-            if (tt_on && !out_of_time && !excluded) {
+            if (!out_of_time && !excluded) {
                 TTEntry * e = tt_slot(zh.hash);
                 TTData d;
                 d.score = (int16_t)tbv;
@@ -1682,6 +1902,7 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
             //No piece moved, so the child's continuation keys must point at the "no move" row
             //rather than inherit whatever this ply last tried.
             if (ply < MAX_PLY) { ss_mv_pc[ply] = 12; ss_mv_to[ply] = 0; }
+            next_is_null = true;
             const int v = -search(depth - 1 - R, -beta, -beta + 1, ply + 1, false);
             board.sideToMove = (Color)stm;
             board.enPassant  = saved_ep;
@@ -1746,7 +1967,7 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
                     ++pc_cuts;
                     //The verification is worth keeping: it is a genuine lower bound at cdepth + 1,
                     //so later visits to this node inherit it instead of re-proving it.
-                    if (tt_on && !(repcheck == 2 && rep_tainted)) {
+                    if (!rep_tainted) {
                         TTEntry * e = tt_slot(zh.hash);
                         TTData old;
                         const bool have = tt_read(e, zh.hash, old);
@@ -1768,6 +1989,8 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     Mv mv[MAX_MOVES];
     const int n = generate(mv, false);
     if (n == 0) return in_check ? -MATE_CP + ply : 0;
+    //FIFTY MOVES, the in-check half: n > 0 means the side to move is not mated, so the claim holds.
+    if (r50 && ply > 0 && board.halfmoveClock > 99) return 0;
     //ONE REPLY. With a single legal move the node has one child whatever the depth, so the ply is
     //very nearly free, and a forced sequence no longer consumes the horizon it did not choose to
     //enter. `granted` guards against stacking this on top of the check extension on the same node,
@@ -2441,7 +2664,7 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     }
     const bool subtree_tainted = rep_tainted;
     rep_tainted = tainted_on_entry || subtree_tainted;
-    if (tt_on && !out_of_time && !excluded && !(repcheck == 2 && subtree_tainted)) {
+    if (!out_of_time && !excluded && !subtree_tainted) {
         TTEntry * e = tt_slot(zh.hash);
         TTData old;
         const bool have = tt_read(e, zh.hash, old);
@@ -2532,8 +2755,17 @@ static int root_move_number = 1;
 //COPIED FROM creatica.cpp's CreaticaEngine, deliberately and with regret.
 //
 //normalise_castling() and is_legal() are 40 lines of subtle, hard-won move handling -- the
-//king-takes-rook castling dialect lichess speaks in standard games, and the refusal of any move
-//string that is not legal on the board we actually hold. They are private statics of the MCTS
+//king-takes-rook castling dialect lichess speaks in games created FROM A POSITION, and the refusal
+//of any move string that is not legal on the board we actually hold.
+//
+//"in standard games" is what this comment used to say, and that was an overstatement introduced by
+//copying it from creatica.cpp, whose version is precise: lichess speaks the 960 dialect in standard
+//games CREATED FROM A POSITION, where isChess960 is false. The evidence is a fromPosition game
+//stream carrying "moves":"e1h1 e8h8 ..." under "variant":{"key":"fromPosition"}. What lichess sends
+//for castling in an ordinary standard game from the initial position is NOT verified here -- the
+//bot's logs record only the engine's own output, never the raw stream -- and nothing depends on it:
+//the rewrite below fires only when the destination holds our OWN rook and that rook is in
+//castlingRooks, so a plain "e1g1" passes through untouched. They are private statics of the MCTS
 //engine's class, so there is no way to call them from here.
 //
 //Duplicating them is exactly the fault uci_engine.h's own header comment complains about: a bug
@@ -2554,19 +2786,41 @@ static void normalise_castling(const Board& b, Move& move) {
     move.dst = SQ(SQ_RANK(from), f);
 }
 
-static bool is_legal_move(Board& b, const Move& m) {
-    if (m.src >= Square_NB || m.dst >= Square_NB) return false;
-    if (!((b.side[b.sideToMove] >> m.src) & 1ULL)) return false;
+//RETURNS THE REASON, not a bool. The check costs 0.021 us -- 39 us for a whole 60-move game, or
+//0.002% of one move's thinking time -- so it is not worth removing; but a bare `false` threw away
+//the only information that matters. When this fires, the driver's board and ours have DIVERGED,
+//and the next search on a corrupted Board segfaults in kingMoves() a minute later looking like a
+//hang. That is what the e8a8 castling-dialect bug did, and it took a reproduction case to find.
+//The reason string is what turns the next such bug into one log line.
+static const char * illegal_reason(Board& b, const Move& m) {
+    if (m.src >= Square_NB || m.dst >= Square_NB) return "square index out of range";
+    if (!((b.side[b.sideToMove] >> m.src) & 1ULL))
+        return "no piece of the side to move on the from-square";
     auto [king_moves, pinned, pinning, checkers, kingSq] = kingMoves(b);
-    if (m.src == kingSq) return (king_moves >> m.dst) & 1ULL;
-    if (bitCount(checkers) > 1) return false;
+    if (m.src == kingSq)
+        return ((king_moves >> m.dst) & 1ULL) ? nullptr
+             : (checkers ? "king move does not escape check"
+                         : "not a legal king move (occupied, or into check)");
+    //DOUBLE CHECK: KING MOVES ONLY. Reached only for a NON-king move, because the line above has
+    //already answered every king move. The position is perfectly legal; this move is not. Capturing
+    //one checker leaves the other; blocking one leaves the other; and no single move can do both,
+    //because if the capture square were also on the second checker's line to the king then the
+    //captured piece was blocking that line and the second piece was not checking at all.
+    //generate() stops in the same place for the same reason, so this mirrors the generator rather
+    //than inventing a rule. The explanation existed in creatica.cpp ("double check: king only") and
+    //was lost when this function was copied here -- which is the duplication this file already
+    //flags as debt.
+    if (bitCount(checkers) > 1) return "double check: only a king move can be legal";
     auto [check_mask, ep_mask] = checkers ? checkMask(b, kingSq, checkers)
                                           : std::make_pair(0xffffffffffffffffULL, 0ULL);
     const PieceType pt = PC_TYPE(static_cast<Piece>(b.piecesOnSquares[m.src]));
-    if (pt < Pawn || pt > Queen) return false;
+    if (pt < Pawn || pt > Queen) return "from-square holds no piece type that moves";
     const uint64_t mv = piece_moves(b, pt, static_cast<Square>(m.src), kingSq,
                                     pinned, pinning, check_mask, ep_mask);
-    return (mv >> m.dst) & 1ULL;
+    if ((mv >> m.dst) & 1ULL) return nullptr;
+    if ((pinned >> m.src) & 1ULL) return "piece is pinned and this move would expose the king";
+    if (checkers) return "does not address the check (no capture of the checker, no block)";
+    return "destination not reachable by that piece";
 }
 
 //A SCORE AS UCI WANTS IT. Mates are returned by the search root-relative as -MATE_CP + ply, so the
@@ -2592,6 +2846,8 @@ static bool worker_setup(int tid) {
     std::memset(prev_pv_set, 0, sizeof prev_pv_set);
     std::memset(ss_is_pv, 0, sizeof ss_is_pv);
     std::memset(path_hash, 0, sizeof path_hash);
+    for (int i = 0; i < MAX_PLY; ++i) ss_pfn[i] = -1;
+    next_is_null = false;
     std::memset(killers, 0, sizeof killers);
     std::memset(history, 0, sizeof history);
     nodes = qnodes = policy_orders = 0;
@@ -2743,11 +2999,11 @@ static std::string worker(int tid) {
             if (tid == 0) {
                 const long long ms = elapsed_ms();
                 const long long n  = total_nodes.load() + nodes;
-                std::printf("info depth %d ", d);
+                std::printf("info depth %d seldepth %d multipv 1 ", d, d);
                 print_score(v);
-                std::printf(" nodes %lld time %lld nps %lld tbhits %lld pv",
-                            n, ms, ms > 0 ? n * 1000 / ms : n,
-                            total_tbhits.load() + tbhits);
+                std::printf(" nodes %lld nps %lld hashfull 100 tbhits %lld time %lld pv",
+                            n, ms > 0 ? n * 1000 / ms : n,
+                            total_tbhits.load() + tbhits, ms);
                 for (int i = 0; i < pv_len[0] && i < MAX_PLY; ++i)
                     std::printf(" %s", uci_of(pv_line[0][i]).c_str());
                 std::printf("\n");
@@ -2811,6 +3067,7 @@ public:
         o.spin("Ord2",        &o_ord2,       0,  0, 1);
         o.spin("LMRAll",      &o_lmrall,     0,  0, 1);
         o.spin("ProbCut",     &o_probcut,    0,  0, 1);
+        o.spin("UpcomingRep", &o_uprep,     0,  0, 1);
         o.spin("LMRAdj",      &o_lmradj,     0,  0, 1);
         o.spin("LMRExt",      &o_lmrext,     0,  0, 1);
         o.spin("PCMargin",    &o_pcmargin,  97, 20, 400);
@@ -2822,6 +3079,8 @@ public:
         o.spin("LMRPlus",     &o_lmrplus,    0, -2, 3);
         o.spin("SingularExt", &o_singext,   50,  0, 400);
         o.spin("CorrHist",    &o_corrhist,   0,  0, 2);
+        //TO FIX! Why on earth do we need this erroneous options! REPCHECK=2 is obvious - we must remove this option!
+        //The same applies to a range of other dubious options that just clutter the code!
         //REPCHECK 2, NOT 1, AND THIS IS A CHANGE FROM WHAT WAS MEASURED. A repetition is a
         //property of the PATH, not of the position -- creatica_mcts says so at length, having
         //found that stamping a path-local draw onto a shared node made every later visit from any
@@ -2834,7 +3093,7 @@ public:
         //position with no game history, so the hazard barely arises there. In a game it arises
         //constantly, and a wrong draw score believed out of the table is exactly the kind of
         //silent error this project keeps paying for.
-        o.spin("RepCheck",    &o_repcheck,   2,  0, 2);
+        //o.spin("RepCheck",    &o_repcheck,   2,  0, 2);
         //Syzygy. Without it, endgames are played by a search that does not know the result, which
         //in a head-to-head against creatica_mcts -- which has both local tables and online probes
         //-- measures the missing tables rather than the search.
@@ -2971,6 +3230,14 @@ public:
     void init() override {
         Stockfish::Bitboards::init();
         zobristHash(z);
+        //AFTER zobristHash(z): every cuckoo key is derived from those numbers, so building the
+        //table earlier fills it with keys made from zeroes. A correct enumeration yields 3668,
+        //which is the count Stockfish asserts.
+        {
+            const int n = cuckoo_build();
+            if (n != 3668)
+                std::printf("info string cuckoo table built %d keys, expected 3668\n", n);
+        }
         init_nnue();
         apply_hash();
     }
@@ -3013,14 +3280,33 @@ public:
         //that has occurred.
         game_hashes.clear();
         game_hashes.push_back(h.hash);
+        size_t move_index = 0;
         for (const std::string& ms : moves) {
+            ++move_index;
             Move m = {};
             uci2move_idx(ms.c_str(), m);
+            const Move raw = m;
             normalise_castling(b, m);
-            if (!is_legal_move(b, m)) {
+            if (const char * why = illegal_reason(b, m)) {
                 //STOP AT THE FIRST REFUSED MOVE rather than applying the rest to a board the
-                //driver does not have.
-                std::printf("info string illegal move %s ignored\n", ms.c_str());
+                //driver does not have -- and SAY ENOUGH TO REPRODUCE IT. A refusal here means the
+                //driver's board and ours have diverged, which is a defect on our side until proven
+                //otherwise: the move came from a source that only sends legal moves. What is needed
+                //to find it is the move as sent, the move after castling normalisation (so a
+                //dialect problem is visible), where in the list it was, the FEN it was refused on,
+                //and the reason.
+                char fen[MAX_FEN_STRING_LEN];
+                std::printf("info string REFUSED move %zu of %zu: \"%s\"", move_index, moves.size(),
+                            ms.c_str());
+                if (raw.src != m.src || raw.dst != m.dst || raw.promoType != m.promoType) {
+                    const std::string norm = std::string(square[m.src]) + square[m.dst];
+                    std::printf(" (normalised to \"%s\")", norm.c_str());
+                }
+                std::printf(" -- %s\n", why);
+                std::printf("info string   position it was refused on: %s\n", board2fen(b, fen));
+                std::printf("info string   our board and the driver's have DIVERGED; dropping the "
+                            "remaining %zu move(s), so this root is NOT the driver's position\n",
+                            moves.size() - move_index);
                 std::fflush(stdout);
                 break;
             }
@@ -3163,6 +3449,12 @@ public:
             std::printf("info string static eval %d cp (side to move)\n", eval_cp());
             std::fflush(stdout);
             return true;
+        } else if (line == "pieces") {
+          Board b{};
+          if (fen2board(b, root_fen.c_str()) != 0) return false;
+          unsigned numberOfPieces = 0;
+          numberOfPieces = (unsigned)bitCount(b.side[ColorWhite] | b.side[ColorBlack]);
+          std::printf("%d\n", numberOfPieces);
         }
         return false;
     }
@@ -3267,6 +3559,7 @@ private:
         ord2         = (int)o_ord2;
         lmrall       = (int)o_lmrall;
         probcut      = (int)o_probcut;
+        uprep        = (int)o_uprep;
         lmradj       = (int)o_lmradj;
         lmrext       = (int)o_lmrext;
         pc_margin    = (int)o_pcmargin;
@@ -3283,11 +3576,12 @@ private:
         lmrplus      = (int)o_lmrplus;
         sing_margin  = (int)o_singext;
         corrhist     = (int)o_corrhist;
-        repcheck     = (int)o_repcheck;
+        //repcheck     = (int)o_repcheck;
         threads      = (int)o_threads;
         //The pieces of the reference config that are not exposed: they were measured and there is
         //no reason to let a GUI turn them off.
-        tt_on = 1; qtt_on = 1; pvs_on = 1; prune = 3; ext_limit = -1;
+        //qtt_on = 1; 
+        pvs_on = 1; prune = 3; ext_limit = -1;
         delta_margin = 0; sing_depth = 2; sing_plies = 3;
         //ttse STAYS OFF, and setting it to 1 here was a bug caught by checking the engine against
         //the prober: same position, same depth, same score of 381, but 1,426,648 nodes against
@@ -3361,11 +3655,12 @@ private:
     int64_t o_conthist = 0, o_lmrshape = 0, o_lmrbase = 0, o_shapemul = 850;
     int64_t o_ord2 = 0, o_lmrall = 0, o_probcut = 0;
     int64_t o_lmradj = 0, o_lmrext = 0;
+    int64_t o_uprep = 0;
     int64_t o_pcmargin = 97, o_pcred = 5, o_pcmindepth = 3;
     int64_t o_tbsearch = 1;
     bool o_online = true;
     uint64_t online_id_ = 0;
-    int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0, o_repcheck = 2;
+    int64_t o_lmrplus = 0, o_singext = 50, o_corrhist = 0; //, o_repcheck = 2;
     std::string syzygy_path_;
     std::string policy_net_path_ = "nnue_policy_pisp2.bin";
     bool policy_loaded_ = false;
