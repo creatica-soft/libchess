@@ -949,6 +949,30 @@ static bool     cuckoo_used[CUCKOO_SIZE];
 //
 //NOT tainted. The clock is part of the position for this purpose: a position whose clock stands at
 //100 is drawn by whatever route it was reached, so the score is safe to store.
+//THE FIVE RULES THAT RE-VALIDATED ONCE THE PREVIOUS-PV DEFECT WAS FIXED. Each had measured
+//negative or inert through that bug, which displaced the table move at 22% of 8.4M promotions and
+//so made every reduction and skip downstream of it unsafe. Measured again on arm d (Arasan 197,
+//1.75M nodes/position), each alone:
+//  CHPrune    bf -0.22, +18 positions   continuation-history pruning (Step 14)
+//  LMRRes     bf -0.23, accuracy flat   Stockfish's re-search policy (Step 17)
+//  SingCut    bf -0.03, +8              the free fail-high when the singular search beats beta
+//  IIR        bf -0.05, +6              internal iterative reductions (Step 10), gated on !allNode
+//  SProbCut   bf -0.06, +5              Step 12, a table lookup and nothing else
+//Stacked with CorrHist=2 they take bf from 3.24 to 2.76 and accuracy from 64 to 84 of 197.
+//Deliberately NOT ported: Stockfish's move-count threshold at its own divisor (-20 positions, and
+//at the gentle divisor it is +7 but still unported pending a match), and its capture and quiet
+//futility rules, both of which measured inert here.
+static thread_local long long sing_cuts = 0, sing_negs = 0, iir_fired = 0, sprobcut_fired = 0;
+static thread_local long long chprune_fired = 0;
+static int      chprune = 0;
+static int      chprune_margin = 400;   //swept, not ported: this table's scale is not Stockfish's
+static int      lmrres = 0;
+static int      singcut = 0;
+static int      singneg = 0;    //Stockfish's extension = -3 when the singular test fails
+static int      iir = 0;
+static int      iir_depth = 6;
+static int      sprobcut = 0;
+static int      sprobcut_margin = 192;  //Stockfish's 400 at PawnValue 208
 static int      r50 = 1;
 static int      uprep = 0;
 static thread_local long long uprep_hits = 0, uprep_raised = 0;
@@ -1920,6 +1944,19 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
         }
     }
 
+    //INTERNAL ITERATIVE REDUCTIONS (Stockfish Step 10, search.cpp:895).
+    //`!allNode` is Stockfish's gate. Without the classification this applied to every node
+    //without a table move, which is why IIR fired 7 times and read as inert.
+    if (iir && !excluded && !all_node && depth >= iir_depth && !have_tt_move) { --depth; ++iir_fired; }
+    //A SMALL PROBCUT (Stockfish Step 12, search.cpp:961). No search at all: a lower bound already
+    //this far above beta, stored at nearly this depth, answers the question on its own.
+    if (sprobcut && !excluded && ply > 0 && tt_flag == TT_LOWER && tt_depth >= depth - 4
+        && beta < MATE_IN_MAX && beta > -MATE_IN_MAX
+        && std::abs(tt_score) < MATE_IN_MAX && tt_score >= beta + sprobcut_margin) {
+        ++sprobcut_fired;
+        return beta + sprobcut_margin;
+    }
+    //PROBCUT. See the note beside the knobs. Placed where Stockfish places it: after the null move
     //PROBCUT. See the note beside the knobs. Placed where Stockfish places it: after the null move
     //and before the main move loop, so a node that the null move already cut never reaches it.
     if (probcut && ply > 0 && !in_check && !excluded && depth >= pc_mindepth
@@ -2145,6 +2182,9 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     //Stockfish's ttCapture, read before any move is made.
     const bool tt_capture = have_tt_move && victim_value(tt_move) != 0;
     bool sing_ok = false;
+    //Stockfish's `extension = -3` when the singular test FAILS and the stored value is above beta:
+    //the table move is not special after all, so it is reduced rather than extended.
+    bool sing_neg_move = false;
     const bool sing_eligible =
         have_tt_move && !excluded && ply > 0 && !in_check && depth >= sing_depth
         && (sing_plies < 0 || ply < sing_plies)
@@ -2175,6 +2215,16 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
         //would otherwise report the verification search's line as its own.
         pv_len[ply] = 0;
         if (!out_of_time && sv < sb) { sing_ok = true; ++ext_sing; }
+        //THE TWO BRANCHES THIS ENGINE NEVER HAD. The verification search EXCLUDED the table move,
+        //so a result at or above beta says the node fails high without it -- nothing else need be
+        //searched, and that is a free cutoff. And a failed test whose stored value is above beta
+        //says the table move is not special after all, which upstream answers with a three-ply
+        //REDUCTION rather than a ply of extension.
+        else if (!out_of_time && singcut && sv >= beta && std::abs(sv) < MATE_IN_MAX) {
+            ++sing_cuts;
+            return sv;
+        }
+        else if (!out_of_time && singneg && tt_score >= beta) { sing_neg_move = true; ++sing_negs; }
     }
     if (sing_ok) ++ext_used;      //released after the move loop
 
@@ -2259,6 +2309,19 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
         auto [dp, dts] = accumulator_stack_push(ctx);
         const ZobristHash saved = zh;
         updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
+        //CONTINUATION-HISTORY PRUNING (Stockfish Step 14). The move's record after the move that
+        //led here, with no reference to the position at all.
+        if (chprune && conthist && !ext && quiet && !in_check && best > -MATE_IN_MAX
+            && ply < MAX_PLY && !stm_in_check()) {
+            const int ch = stat_score(ply, (int)ss_mv_pc[ply], m.dst, m.src, board.sideToMove ^ 1);
+            if (ch < -chprune_margin * depth) {
+                ++chprune_fired;
+                undo_move(board, mm, st); accumulator_stack_pop(ctx); zh = saved;
+                continue;
+            }
+        }
+        //FUTILITY PRUNING FOR CAPTURES (Stockfish Step 14). A capture is exempt from the quiet
+        //rules above, so without this a losing capture is searched at full depth however hopeless
         //MOVE COUNT PRUNING. LMR searches a late quiet move shallower; this does not search it at
         //all. Both bets are invisible when wrong -- a reduction that hid a good move is never
         //re-searched either -- but the skip returns the whole subtree instead of a fraction of it,
@@ -2402,6 +2465,7 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
             d_lmr = std::min(d_lmr, cd_guard + 1);
             r = cd_guard - d_lmr;
         }
+        if (sing_neg_move && have_tt_move && same(m, tt_move)) r += 3;
         if (!lmrext && r > cd_guard) r = cd_guard;
         //Stockfish clamps the reduced depth to at least 1 rather than letting a reduction land in
         //quiescence; it prunes those moves instead. That path is 0.9% of nodes, so this is for
@@ -2511,7 +2575,24 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
             //An extended move (r < 0) was already searched beyond full depth, so there is nothing
             //deeper to re-search. Stockfish's gate is the same: `if (value > alpha && d < newDepth)`.
             if (!out_of_time && v > alpha && cd - r < cd) {
-                ++lmr_researches; v = -search(cd, -beta, -alpha, ply + 1, false);
+                //STOCKFISH'S RE-SEARCH POLICY (search.cpp:1249), behind LMRRes. Upstream does not
+                //return to full depth: it adjusts by a ply according to how far the value cleared
+                //the best score, and re-searches only while that adjusted depth still exceeds the
+                //reduced one. The saving is the SKIP, not the ply -- when the value only just
+                //cleared, the adjusted depth falls to or below the reduced depth and the re-search
+                //is abandoned. Worth measuring and worth not overselling: bf -0.23 at unchanged
+                //accuracy.
+                if (lmrres) {
+                    const bool deeper    = v > best + 20 + 2 * cd;
+                    const bool shallower = v < best + 4;
+                    const int nd = cd + (deeper ? 1 : 0) - (shallower ? 1 : 0);
+                    if (nd > cd - r) {
+                        ++lmr_researches;
+                        v = -search(nd, -beta, -alpha, ply + 1, false);
+                    }
+                } else {
+                    ++lmr_researches; v = -search(cd, -beta, -alpha, ply + 1, false);
+                }
             }
         } else if (pvs_on && move_index > 0) {
             //PRINCIPAL VARIATION SEARCH. The ordering has already put the move most likely to be
@@ -3068,6 +3149,13 @@ public:
         o.spin("LMRAll",      &o_lmrall,     0,  0, 1);
         o.spin("ProbCut",     &o_probcut,    0,  0, 1);
         o.spin("UpcomingRep", &o_uprep,     0,  0, 1);
+        o.spin("CHPrune",     &o_chprune,    0,  0, 1);
+        o.spin("CHPruneMargin", &o_chprunemargin, 400, 1, 20000);
+        o.spin("LMRRes",      &o_lmrres,     0,  0, 1);
+        o.spin("SingCut",     &o_singcut,    0,  0, 1);
+        o.spin("SingNeg",     &o_singneg,    0,  0, 1);
+        o.spin("IIR",         &o_iir,        0,  0, 1);
+        o.spin("SProbCut",    &o_sprobcut,   0,  0, 1);
         o.spin("LMRAdj",      &o_lmradj,     0,  0, 1);
         o.spin("LMRExt",      &o_lmrext,     0,  0, 1);
         o.spin("PCMargin",    &o_pcmargin,  97, 20, 400);
@@ -3560,6 +3648,13 @@ private:
         lmrall       = (int)o_lmrall;
         probcut      = (int)o_probcut;
         uprep        = (int)o_uprep;
+        chprune      = (int)o_chprune;
+        chprune_margin = (int)o_chprunemargin;
+        lmrres       = (int)o_lmrres;
+        singcut      = (int)o_singcut;
+        singneg      = (int)o_singneg;
+        iir          = (int)o_iir;
+        sprobcut     = (int)o_sprobcut;
         lmradj       = (int)o_lmradj;
         lmrext       = (int)o_lmrext;
         pc_margin    = (int)o_pcmargin;
@@ -3626,6 +3721,10 @@ private:
         if (lmrshape) force(conthist, std::max(conthist, 1),
             "LMRShape's statScore reads continuation history -> ContHist");
         //The log base only takes effect inside the shaped path.
+        if (chprune) force(conthist, std::max(conthist, 1),
+            "CHPrune prunes on continuation history, which only ContHist writes -> ContHist");
+        if (singcut || singneg) force(sing_margin, std::max(sing_margin, 50),
+            "SingCut and SingNeg are branches of the singular test -> SingularExt");
         if (lmradj) force(lmrshape, 1,
             "LMRAdj's terms are in 1024ths of a ply and only the shaped path carries them -> LMRShape");
         if (lmrext) force(lmrshape, 1,
@@ -3656,6 +3755,8 @@ private:
     int64_t o_ord2 = 0, o_lmrall = 0, o_probcut = 0;
     int64_t o_lmradj = 0, o_lmrext = 0;
     int64_t o_uprep = 0;
+    int64_t o_chprune = 0, o_chprunemargin = 400, o_lmrres = 0;
+    int64_t o_singcut = 0, o_singneg = 0, o_iir = 0, o_sprobcut = 0;
     int64_t o_pcmargin = 97, o_pcred = 5, o_pcmindepth = 3;
     int64_t o_tbsearch = 1;
     bool o_online = true;
