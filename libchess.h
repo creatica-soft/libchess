@@ -912,6 +912,12 @@ CHESS_API void free_nnue_context(NNUEContext& ctx);
 //the Board -- see the note on BoardState above for why that field could not be trusted. When it is
 //true the net is not consulted and NNUE_CHECK is returned.
 CHESS_API double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check);
+//THE SAME EVALUATION WITH STOCKFISH'S OPTIMISM TERM. nnue/evaluate.cpp already implements the full
+//blend for Board -- the complexity scaling, the material term, all of it -- and evaluate_nnue()
+//was simply passing 0. `optimism` is in STOCKFISH'S units, where a pawn is 208, because the
+//constants it is blended against (7191, 77871) are. Stockfish derives it at the root as
+//137 * avg / (|avg| + 91) for the side to move there, negated for the other side.
+CHESS_API double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in_check, int optimism);
 
 //Accumulator discipline: push -> do_move_dp -> ... -> undo_move -> pop, one context per thread.
 //reset() is required before evaluating a position unrelated to the last one.
