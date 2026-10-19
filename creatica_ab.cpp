@@ -2862,74 +2862,13 @@ static int root_move_number = 1;
 
 //COPIED FROM creatica.cpp's CreaticaEngine, deliberately and with regret.
 //
-//normalise_castling() and is_legal() are 40 lines of subtle, hard-won move handling -- the
-//king-takes-rook castling dialect lichess speaks in games created FROM A POSITION, and the refusal
-//of any move string that is not legal on the board we actually hold.
-//
-//"in standard games" is what this comment used to say, and that was an overstatement introduced by
-//copying it from creatica.cpp, whose version is precise: lichess speaks the 960 dialect in standard
-//games CREATED FROM A POSITION, where isChess960 is false. The evidence is a fromPosition game
-//stream carrying "moves":"e1h1 e8h8 ..." under "variant":{"key":"fromPosition"}. What lichess sends
-//for castling in an ordinary standard game from the initial position is NOT verified here -- the
-//bot's logs record only the engine's own output, never the raw stream -- and nothing depends on it:
-//the rewrite below fires only when the destination holds our OWN rook and that rook is in
-//castlingRooks, so a plain "e1g1" passes through untouched. They are private statics of the MCTS
-//engine's class, so there is no way to call them from here.
-//
-//Duplicating them is exactly the fault uci_engine.h's own header comment complains about: a bug
-//fixed in one copy stays unfixed in the other. They belong in a shared header, and the only reason
-//they are not in one is that factoring them out edits creatica.cpp, which means relinking the
-//deployed ./creatica binary -- not something to do while the bot can run. FACTOR THESE OUT the
-//next time creatica is rebuilt on purpose.
-static void normalise_castling(const Board& b, Move& move) {
-    if (move.promoType != PieceTypeNone) return;
-    if (b.isChess960) return;
-    const Piece mover = static_cast<Piece>(b.piecesOnSquares[move.src]);
-    const Piece onDst = static_cast<Piece>(b.piecesOnSquares[move.dst]);
-    if (PC_TYPE(mover) != King || PC_TYPE(onDst) != Rook) return;
-    if (PC_COLOR(mover) != PC_COLOR(onDst)) return;
-    if (!(b.castlingRooks & (1ULL << move.dst))) return;
-    const Square from = static_cast<Square>(move.src), to = static_cast<Square>(move.dst);
-    const File f = SQ_FILE(to) > SQ_FILE(from) ? FileG : FileC;
-    move.dst = SQ(SQ_RANK(from), f);
-}
-
-//RETURNS THE REASON, not a bool. The check costs 0.021 us -- 39 us for a whole 60-move game, or
-//0.002% of one move's thinking time -- so it is not worth removing; but a bare `false` threw away
-//the only information that matters. When this fires, the driver's board and ours have DIVERGED,
-//and the next search on a corrupted Board segfaults in kingMoves() a minute later looking like a
-//hang. That is what the e8a8 castling-dialect bug did, and it took a reproduction case to find.
-//The reason string is what turns the next such bug into one log line.
-static const char * illegal_reason(Board& b, const Move& m) {
-    if (m.src >= Square_NB || m.dst >= Square_NB) return "square index out of range";
-    if (!((b.side[b.sideToMove] >> m.src) & 1ULL))
-        return "no piece of the side to move on the from-square";
-    auto [king_moves, pinned, pinning, checkers, kingSq] = kingMoves(b);
-    if (m.src == kingSq)
-        return ((king_moves >> m.dst) & 1ULL) ? nullptr
-             : (checkers ? "king move does not escape check"
-                         : "not a legal king move (occupied, or into check)");
-    //DOUBLE CHECK: KING MOVES ONLY. Reached only for a NON-king move, because the line above has
-    //already answered every king move. The position is perfectly legal; this move is not. Capturing
-    //one checker leaves the other; blocking one leaves the other; and no single move can do both,
-    //because if the capture square were also on the second checker's line to the king then the
-    //captured piece was blocking that line and the second piece was not checking at all.
-    //generate() stops in the same place for the same reason, so this mirrors the generator rather
-    //than inventing a rule. The explanation existed in creatica.cpp ("double check: king only") and
-    //was lost when this function was copied here -- which is the duplication this file already
-    //flags as debt.
-    if (bitCount(checkers) > 1) return "double check: only a king move can be legal";
-    auto [check_mask, ep_mask] = checkers ? checkMask(b, kingSq, checkers)
-                                          : std::make_pair(0xffffffffffffffffULL, 0ULL);
-    const PieceType pt = PC_TYPE(static_cast<Piece>(b.piecesOnSquares[m.src]));
-    if (pt < Pawn || pt > Queen) return "from-square holds no piece type that moves";
-    const uint64_t mv = piece_moves(b, pt, static_cast<Square>(m.src), kingSq,
-                                    pinned, pinning, check_mask, ep_mask);
-    if ((mv >> m.dst) & 1ULL) return nullptr;
-    if ((pinned >> m.src) & 1ULL) return "piece is pinned and this move would expose the king";
-    if (checkers) return "does not address the check (no capture of the checker, no block)";
-    return "destination not reachable by that piece";
-}
+//normalise_castling() and illegal_reason() NOW LIVE IN libchess, beside uci2move_idx() which is
+//what makes them necessary -- it does no legality check at all. They used to be private statics of
+//creatica.cpp's class with a copy pasted here, and the copies drifted exactly as the note that
+//stood here predicted: this one gained eight diagnostic reasons while creatica kept a bare bool,
+//and two explanatory comments were lost in the paste. One of those made a correct line ("double
+//check: king only") read as a bug; the other overstated which lichess games speak the
+//king-takes-rook dialect. Both are fixed in the single copy.
 
 //A SCORE AS UCI WANTS IT. Mates are returned by the search root-relative as -MATE_CP + ply, so the
 //distance in plies is MATE_CP - |v| and UCI wants it in MOVES, rounded up.

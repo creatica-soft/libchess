@@ -900,71 +900,29 @@ private:
     bool           have_limits_ = false;
     std::string    last_position_fen_;               //the last "position" command, for log_position_command()
     std::vector<std::string> last_position_moves_;
+    //normalise_castling() and the legality check NOW LIVE IN libchess, beside uci2move_idx() --
+    //which is what makes them necessary, since it does no legality check at all. They were private
+    //statics here with a copy pasted into creatica_ab.cpp, and the copies drifted: that one grew
+    //eight diagnostic reasons while this one kept a bare bool, and two explanatory comments were
+    //lost in the paste. One copy is now the only copy.
 
-    //Lichess reports castling as KING-TAKES-ROOK -- "e8a8", never "e8c8" -- in every game created
-    //from a position, which is the Chess960 convention. The opening book makes every bot-vs-bot
-    //game a "fromPosition" game, so from the day the book went in, every castle came back in a
-    //notation this engine could not read.
-    //
-    //The two strings name the same move, but uci2move_idx() does no legality check whatsoever: it
-    //took "e8a8" literally, ff_move() marched the king onto its own rook, and the Board left behind
-    //was illegal. The next search then read a king bitboard that no longer made sense and died in
-    //kingMoves(). That is the "engine produced nothing for 60000 ms" stall -- the engine was not
-    //hanging, it had segfaulted. One move reproduces it: "position fen <any position where black
-    //may castle long> moves e8a8" then "go" is a SIGSEGV, while the identical "e8c8" is not.
-    static void normalise_castling(const Board& b, Move& move) {
-        if (move.promoType != PieceTypeNone) return;
-        //NOT in a real Chess960 game. There the king-takes-rook form is what libchess itself
-        //wants: castlingMoves() generates it, and do_move() recognises castling by exactly the
-        //test below (board.cpp: isChess960 && castlingRooks & SQ_BIT(move.dst)). Rewriting
-        //"e8a8" to "e8c8" there would turn a castling move into a plain king move to c8, which
-        //is not even legal. The conversion exists only because lichess speaks the 960 castling
-        //dialect in STANDARD games created from a position, where isChess960 is false.
-        if (b.isChess960) return;
-        const Piece mover = static_cast<Piece>(b.piecesOnSquares[move.src]);
-        const Piece onDst = static_cast<Piece>(b.piecesOnSquares[move.dst]);
-        //PC_TYPE/PC_COLOR, never "& 7" or ">> 3". libchess.h defines a global
-        //operator&(T enum, int) that IGNORES its second operand and always masks with 1 -- so
-        //"mover & 7" silently evaluates to 0 for every piece, and the first version of this
-        //function never fired. chess_types.h documents that operator as broken; this is what
-        //stepping on it looks like.
-        if (PC_TYPE(mover) != King || PC_TYPE(onDst) != Rook) return;  //not king-takes-rook
-        if (PC_COLOR(mover) != PC_COLOR(onDst)) return;                //enemy rook: a real capture
-        if (!(b.castlingRooks & (1ULL << move.dst))) return;           //rook has no castling right
-        //Side is decided by which way the rook lies from the king, so this is correct for Chess960
-        //start squares too, not just for the standard a/h files.
-        const Square from = static_cast<Square>(move.src), to = static_cast<Square>(move.dst);
-        const File f = SQ_FILE(to) > SQ_FILE(from) ? FileG : FileC;
-        move.dst = SQ(SQ_RANK(from), f);
-    }
-
-    //No move string may be applied without being checked first. The board this mutates is read by
-    //every subsequent search, so an unrecognised move must be refused rather than played -- an
-    //engine has to answer a bad "position" line with a complaint, not a segfault.
-    static bool is_legal(Board& b, const Move& m) {
-        if (m.src >= Square_NB || m.dst >= Square_NB) return false;
-        if (!((b.side[b.sideToMove] >> m.src) & 1ULL)) return false;   //not our piece
-        auto [king_moves, pinned, pinning, checkers, kingSq] = kingMoves(b);
-        if (m.src == kingSq) return (king_moves >> m.dst) & 1ULL;
-        if (bitCount(checkers) > 1) return false;                      //double check: king only
-        auto [check_mask, ep_mask] = checkers ? checkMask(b, kingSq, checkers)
-                                              : std::make_pair(0xffffffffffffffffULL, 0ULL);
-        const PieceType pt = PC_TYPE(static_cast<Piece>(b.piecesOnSquares[m.src]));
-        if (pt < Pawn || pt > Queen) return false;
-        const uint64_t mv = piece_moves(b, pt, static_cast<Square>(m.src), kingSq,
-                                        pinned, pinning, check_mask, ep_mask);
-        return (mv >> m.dst) & 1ULL;
-    }
 
     bool play(const std::string& uci_move) {
         Move move = {};
         uci2move_idx(uci_move.c_str(), move);
+        const Move raw = move;
         normalise_castling(board, move);
-        if (!is_legal(board, move)) {
+        //NAMES THE REASON, which the bare bool could not. A refusal here means our board and the
+        //driver's have diverged -- the move came from a source that only sends legal moves -- so it
+        //is a defect on our side until shown otherwise, and the reason plus the FEN is what makes
+        //it findable instead of reappearing later as a crash in kingMoves().
+        if (const char * why = illegal_reason(board, move)) {
             char fen[MAX_FEN_STRING_LEN];
-            log_file("play() error: refusing illegal move %s in %s (pid %d)\n",
-                     uci_move.c_str(), board2fen(board, fen), (int)getpid());
-            print("info string illegal move %s ignored\n", uci_move.c_str());
+            log_file("play() error: refusing %s in %s -- %s (pid %d)\n",
+                     uci_move.c_str(), board2fen(board, fen), why, (int)getpid());
+            print("info string REFUSED \"%s\"%s -- %s\n", uci_move.c_str(),
+                  (raw.src != move.src || raw.dst != move.dst) ? " (castling normalised)" : "", why);
+            print("info string   position it was refused on: %s\n", board2fen(board, fen));
             return false;
         }
         updateHash(zh, board, move, ff_move(board, move), z);
@@ -1054,7 +1012,7 @@ private:
                     //none of which ever fetched anything. The legality test below is the real check.
                     if (move.size() < 4) continue;
                     uci2move_idx(move.c_str(), m);
-                    if (!is_legal(b, m)) continue;
+                    if (!is_legal_move(b, m)) continue;
                     ff_move(b, m);
                     char buf[MAX_FEN_STRING_LEN];
                     std::string child(board2fen(b, buf));
