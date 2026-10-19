@@ -910,6 +910,15 @@ static thread_local uint64_t path_hash[MAX_PLY + 8];
 //engine that cannot see a repetition already on the board will repeat into a draw while winning,
 //and will not claim one while losing. Written once per `position` command, read-only in search.
 static std::vector<uint64_t> game_hashes;
+//STOCKFISH'S `st->repetition`, for the GAME history as well as the search path. 0 when that
+//position had not occurred before within its reversible window; +i when it occurred i plies
+//earlier and that occurrence was not itself a repetition; -i when it was. upcoming_repetition()
+//only asks whether it is nonzero, but the sign is what upstream stores and costs nothing.
+//
+//Built once per `position` command beside game_hashes rather than per node -- the driver replays
+//the whole move list every move anyway, so the search pays nothing for it.
+static std::vector<int> game_rep;
+static thread_local int ss_rep[MAX_PLY + 4];
 //UPCOMING REPETITION, and the cuckoo table it needs (Stockfish position.cpp:1186).
 //
 //A DIFFERENT QUESTION FROM repeated(). repeated() asks "has this position already occurred", which
@@ -1096,12 +1105,12 @@ static bool upcoming_repetition(int ply) {
         //reach the current position rather than repeat from it. Its test reads a per-position
         //`repetition` field kept in do_move; the equivalent here is to require that the position
         //i plies back occurs more than once in the history we hold.
-        int seen = 0;
-        for (int d = i; d <= ply + (int)game_hashes.size(); d += 2) {
-            uint64_t h = 0;
-            if (!hist_key(ply, d, h)) break;
-            if (h == back && ++seen >= 2) return true;
-        }
+        //`stp->repetition`, read in O(1) from ss_rep[] for the search path or game_rep[] for the
+        //game, instead of the occurrence count this used to approximate it with.
+        const int earlier = (i <= ply) ? ss_rep[ply - i]
+                          : ((size_t)(i - ply) <= game_rep.size()
+                             ? game_rep[game_rep.size() - (size_t)(i - ply)] : 0);
+        if (earlier != 0) return true;
     }
     return false;
 }
@@ -1739,6 +1748,24 @@ static int search(int depth, int alpha, int beta, int ply, bool cut_node) {
     //TO FIX: Step 3. Mate distance pruning from stockfish search seems to be missing
     
     path_hash[ply] = zh.hash;
+    //THE REPETITION DEPTH for this node. Starts at i = 4 as upstream does: a position cannot recur
+    //after two plies, which would need both sides to have made a move that changed nothing. The
+    //walk crosses into the game history, so a cycle begun before the root is seen correctly.
+    if (ply < MAX_PLY) {
+        ss_rep[ply] = 0;
+        const int end = std::min(ply + (int)game_hashes.size(), (int)board.halfmoveClock);
+        for (int i = 4; i <= end; i += 2) {
+            uint64_t h = 0;
+            if (!hist_key(ply, i, h)) break;
+            if (h == zh.hash) {
+                const int earlier = (i <= ply) ? ss_rep[ply - i]
+                                 : ((size_t)(i - ply) <= game_rep.size()
+                                    ? game_rep[game_rep.size() - (size_t)(i - ply)] : 0);
+                ss_rep[ply] = earlier ? -i : i;
+                break;
+            }
+        }
+    }
     //UPCOMING REPETITION (Stockfish search.cpp:584), which answers the "TO FIX" above. A reachable
     //cycle is a FLOOR on this node's value, not its value: if a repetition can be forced the node
     //is worth at least a draw, so alpha rises and the search carries on looking for better.
@@ -3367,7 +3394,9 @@ public:
         //engine would see repetitions everywhere. The starting position counts: it is a position
         //that has occurred.
         game_hashes.clear();
+        game_rep.clear();
         game_hashes.push_back(h.hash);
+        game_rep.push_back(0);
         size_t move_index = 0;
         for (const std::string& ms : moves) {
             ++move_index;
@@ -3400,10 +3429,24 @@ public:
             }
             updateHash(h, b, m, ff_move(b, m), z);
             game_hashes.push_back(h.hash);
+            //The repetition depth of the position just reached, by the rule the search uses.
+            //b.halfmoveClock is current here because ff_move() has just maintained it.
+            {
+                int rep = 0;
+                const int idx = (int)game_hashes.size() - 1;
+                const int end = std::min(idx, (int)b.halfmoveClock);
+                for (int i = 4; i <= end; i += 2)
+                    if (game_hashes[(size_t)(idx - i)] == h.hash) {
+                        rep = game_rep[(size_t)(idx - i)] ? -i : i;
+                        break;
+                    }
+                game_rep.push_back(rep);
+            }
         }
         //The root itself is the last entry; repeated() walks the history BEFORE the root, so drop
         //it to avoid matching the root against itself at ply 0.
         if (!game_hashes.empty()) game_hashes.pop_back();
+        if (!game_rep.empty()) game_rep.pop_back();   //kept in step with game_hashes
         char fenbuf[MAX_FEN_STRING_LEN];
         root_fen = board2fen(b, fenbuf);
         root_move_number = b.moveNumber;
