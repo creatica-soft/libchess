@@ -44,6 +44,7 @@ CHESS_API void cleanup_nnue();
 CHESS_API void init_nnue_context(NNUEContext& ctx);
 CHESS_API void free_nnue_context(NNUEContext& ctx);
 CHESS_API double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check);
+CHESS_API double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in_check, int optimism);
 
 static Stockfish::Eval::NNUE::Networks * networks = nullptr;
 
@@ -88,9 +89,13 @@ void free_nnue_context(NNUEContext& ctx) {
 //thing gets NNUE_CHECK -- a value every existing caller already tests for -- instead of a plausible
 //evaluation of a position whose king is under attack.
 double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check) {
+    return evaluate_nnue_opt(board, ctx, in_check, 0);
+}
+
+double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in_check, int optimism) {
     if (in_check) return 0.00001; //special value for checks
     Stockfish::Value v;
-    v = Stockfish::Eval::evaluate(*networks, board, *ctx.accumulator_stack, *ctx.caches, 0);
+    v = Stockfish::Eval::evaluate(*networks, board, *ctx.accumulator_stack, *ctx.caches, optimism);
     //comment out next line to keep it from the perspective of the side to move
     //v = ctx.pos->side_to_move() == Stockfish::WHITE ? v : -v; 
     return 0.01 * Stockfish::Eval::to_cp(v, board);
