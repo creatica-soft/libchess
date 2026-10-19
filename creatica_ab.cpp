@@ -982,6 +982,22 @@ static int      iir = 0;
 static int      iir_depth = 6;
 static int      sprobcut = 0;
 static int      sprobcut_margin = 192;  //Stockfish's 400 at PawnValue 208
+//OPTIMISM. Stockfish derives it once per root iteration from the running average root score and
+//feeds it to the EVALUATION, where nnue/evaluate.cpp blends it against the NNUE output scaled by
+//complexity and material. We run the same network and the fork already implements that blend --
+//evaluate_nnue() was passing a hard 0, which is the only reason it was unavailable.
+//
+//Measured on the full stack (Arasan 197, 1.75M nodes/position): 84 -> 91 of 197 at unchanged
+//branching factor. The best accuracy result of this effort, and one hardcoded zero away all along.
+//
+//Units: Stockfish's 137 and 91, and the 7191/77871 they are blended against, are in ITS units
+//where a pawn is 208. The root average here is centipawns, so it is scaled before the formula.
+//Sign: positive for the side to move AT THE ROOT, negated for the other side, because the average
+//is that side's score.
+static int      optimism = 0;
+static thread_local int root_avg = -MATE_CP - 1;   //running average of the root score
+static thread_local int root_optimism = 0;         //already in Stockfish's units
+static thread_local int root_stm = 0;
 static int      r50 = 1;
 static int      uprep = 0;
 static thread_local long long uprep_hits = 0, uprep_raised = 0;
@@ -1315,7 +1331,11 @@ static int eval_cp_depth(int budget, int alpha, int beta) {
     //performed, a 4.3x slowdown and ten points of accuracy. The Board no longer carries the flag
     //and evaluate_nnue() takes it as an argument, so there is nothing left to go stale.
     const bool in_check = stm_in_check();
-    if (!in_check) return (int)std::lround(evaluate_nnue(board, ctx, in_check) * 100.0);
+    if (!in_check) {
+        const int opt = optimism ? (board.sideToMove == root_stm ? root_optimism : -root_optimism)
+                                 : 0;
+        return (int)std::lround(evaluate_nnue_opt(board, ctx, in_check, opt) * 100.0);
+    }
     //In check, so the net cannot score it: resolve it by searching the evasions, with the caller's
     //window so a cutoff still ends it early. Out of budget, say so honestly rather than returning 0
     //or a bound -- a side in check with no resolution left is in trouble, and half a pawn down is a
@@ -3012,6 +3032,12 @@ static std::string worker(int tid) {
     std::string best_uci;
     if (!worker_setup(tid)) return best_uci;
     int reached = 0, score = 0;
+    //RESET PER SEARCH, not per game. The engine searches once per move and the side to move
+    //alternates, so carrying root_stm across moves would invert optimism's sign, and carrying
+    //root_avg would centre it on the opponent's score. Stockfish rebuilds both per search too.
+    root_avg = -MATE_CP - 1;
+    root_optimism = 0;
+    root_stm = (int)board.sideToMove;
     int iters_done = 0;
     const int d0 = 1 + (tid % std::max(1, stagger));
     for (int d = d0; d < MAX_PLY - 4; ++d) {
@@ -3037,6 +3063,14 @@ static std::string worker(int tid) {
         ++iters_done;
         if (pv_len[0] > 0) {
             best_uci = uci_of(pv_line[0][0]); reached = d; score = v;
+            //Stockfish's RootMove::averageScore, weighted 2:1 toward the newest value so it
+            //tracks without being yanked, and the optimism derived from it.
+            root_avg = (root_avg == -MATE_CP - 1) ? v : (2 * v + root_avg) / 3;
+            if (optimism) {
+                const int avg_sf = (int)((long long)root_avg * 208 / 100);
+                const int a = avg_sf < 0 ? -avg_sf : avg_sf;
+                root_optimism = 137 * avg_sf / (a + 91);
+            }
             for (int i = 0; i < pv_len[0] && i < MAX_PLY; ++i) {
                 prev_pv[i] = pv_line[0][i]; prev_pv_set[i] = true;
             }
@@ -3115,6 +3149,7 @@ public:
         o.spin("LMRAll",      &o_lmrall,     0,  0, 1);
         o.spin("ProbCut",     &o_probcut,    0,  0, 1);
         o.spin("UpcomingRep", &o_uprep,     0,  0, 1);
+        o.spin("Optimism",    &o_optimism,   0,  0, 1);
         o.spin("CHPrune",     &o_chprune,    0,  0, 1);
         o.spin("CHPruneMargin", &o_chprunemargin, 400, 1, 20000);
         o.spin("LMRRes",      &o_lmrres,     0,  0, 1);
@@ -3630,6 +3665,7 @@ private:
         lmrall       = (int)o_lmrall;
         probcut      = (int)o_probcut;
         uprep        = (int)o_uprep;
+        optimism     = (int)o_optimism;
         chprune      = (int)o_chprune;
         chprune_margin = (int)o_chprunemargin;
         lmrres       = (int)o_lmrres;
@@ -3737,6 +3773,7 @@ private:
     int64_t o_ord2 = 0, o_lmrall = 0, o_probcut = 0;
     int64_t o_lmradj = 0, o_lmrext = 0;
     int64_t o_uprep = 0;
+    int64_t o_optimism = 0;
     int64_t o_chprune = 0, o_chprunemargin = 400, o_lmrres = 0;
     int64_t o_singcut = 0, o_singneg = 0, o_iir = 0, o_sprobcut = 0;
     int64_t o_pcmargin = 97, o_pcred = 5, o_pcmindepth = 3;
