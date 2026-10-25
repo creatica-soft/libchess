@@ -1434,6 +1434,28 @@ struct Worker {
     }
 
     //Records the move about to be made at `ply` for the child's history and continuation keys.
+    //The child's key for an ordinary move, from the board before it, so its table bucket can be
+    //fetched while the move and its NNUE update are still being made (upstream prefetches inside
+    //do_move()). Castling, en passant, double pushes and moves that may change castling rights
+    //are left to the prefetch after the move; a wrong guess would only fetch an unused line.
+    inline bool predict_child_key(const Mv& m, uint64_t& out) {
+        const int pc = board.piecesOnSquares[m.src];
+        const int pt = PC_TYPE((Piece)pc), c = (int)board.sideToMove;
+        if (is_castle(m) || is_ep(m)) return false;
+        if (pt == Pawn && (m.src ^ m.dst) == 16) return false;
+        if (board.castlingRights && (pt == King || pt == Rook || m.dst == 0 || m.dst == 7 || m.dst == 56 || m.dst == 63))
+            return false;
+        const auto key = [&](int col, int t, int sq) {
+            return t == Pawn ? z.pawns[col][sq - 8] : z.nonPawns[col][t - 2][sq];
+        };
+        uint64_t k = zh.hash ^ zh.prevEnPassant ^ z.blackMove;
+        k ^= key(c, pt, m.src) ^ z.emptySquares[m.src];
+        const int victim = PC_TYPE((Piece)board.piecesOnSquares[m.dst]);
+        k ^= board.piecesOnSquares[m.dst] == PieceNone ? z.emptySquares[m.dst] : key(1 - c, victim, m.dst);
+        k ^= key(c, is_promo_pc(m.promo) ? (int)m.promo : pt, m.dst);
+        out = k;
+        return true;
+    }
     inline void record_move(int ply, const Mv& m) {
         const int moved = PC_TYPE(board.piecesOnSquares[m.src]);
         const int onto  = is_promo_pc(m.promo) ? m.promo : moved;
@@ -1582,6 +1604,7 @@ struct Worker {
             const ZobristHash saved = zh;
             if (ply < MAX_PLY) record_move(ply, m);
             ++nodes_sf;
+            { uint64_t ck; if (predict_child_key(m, ck)) tt_prefetch(ck); }
             updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
             tt_prefetch(zh.hash);
             update_keys(ply);
@@ -1864,6 +1887,7 @@ struct Worker {
                     auto [dp, dts] = accumulator_stack_push(ctx);
                     const ZobristHash saved = zh;
                     ++nodes_sf;
+                    { uint64_t ck; if (predict_child_key(m, ck)) tt_prefetch(ck); }
                     updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
                     tt_prefetch(zh.hash);
                     update_keys(ply);
@@ -1990,6 +2014,7 @@ struct Worker {
             auto [dp, dts] = accumulator_stack_push(ctx);
             const ZobristHash saved = zh;
             ++nodes_sf;
+            { uint64_t ck; if (predict_child_key(m, ck)) tt_prefetch(ck); }
             updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
             tt_prefetch(zh.hash);
             update_keys(ply);
