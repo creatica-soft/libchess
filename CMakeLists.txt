@@ -14,7 +14,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Define the library (libchess.dll or chess.lib)
-add_library(chess SHARED board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp)
+set(CHESS_SOURCES board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp)
+add_library(chess SHARED ${CHESS_SOURCES})
 
 # Define the executable
 #add_executable(creatica attic/creatica.cpp attic/uci.cpp tbcore.c tbprobe.c)  # historical; does not compile against the current API
@@ -122,7 +123,20 @@ else()
     target_compile_options(chess PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(creatica PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(creatica_mcts PRIVATE -Wall -O3 -march=native -DNDEBUG)
-    target_compile_options(creatica_ab PRIVATE -Wall -O3 -march=native -DNDEBUG)
+    # creatica_ab is built as ONE binary with the library's sources compiled in, so full LTO can
+    # optimise across the search/library boundary, as Stockfish's own build does. On Apple Silicon
+    # it takes Stockfish's apple-silicon flags (Makefile: ARCH=apple-silicon COMP=clang), NEON and
+    # dot-product kernels included. libchess.dylib keeps its own flags: other engines load it.
+    target_sources(creatica_ab PRIVATE ${CHESS_SOURCES})
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        target_compile_options(creatica_ab PRIVATE -Wall -DNDEBUG -DUSE_PTHREADS -O3 -funroll-loops
+            -mdynamic-no-pic -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -march=armv8.2-a+dotprod
+            -DUSE_NEON_DOTPROD -flto=full)
+        target_link_options(creatica_ab PRIVATE -flto=full)
+    else()
+        target_compile_options(creatica_ab PRIVATE -Wall -O3 -march=native -DNDEBUG -flto)
+        target_link_options(creatica_ab PRIVATE -flto)
+    endif()
     target_compile_options(gui_helper PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_see PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_nnue PRIVATE -Wall -O3 -march=native -DNDEBUG)
@@ -150,8 +164,13 @@ target_include_directories(creatica_ab PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 # Link executable with libchess
 target_link_libraries(creatica PRIVATE chess curl)
 target_link_libraries(creatica_mcts PRIVATE chess curl)
-# curl for the online 7-piece tablebase probe (OnlineTablebase, off by default).
-target_link_libraries(creatica_ab PRIVATE chess curl)
+# curl for the online 7-piece tablebase probe (OnlineTablebase). Outside MSVC creatica_ab
+# compiles the library's sources in (see its compile options above) and does not link libchess.
+if(MSVC)
+    target_link_libraries(creatica_ab PRIVATE chess curl)
+else()
+    target_link_libraries(creatica_ab PRIVATE curl pthread)
+endif()
 target_link_libraries(gui_helper PRIVATE chess)
 target_link_libraries(test_pos PRIVATE chess)
 target_link_libraries(test_bm PRIVATE chess)

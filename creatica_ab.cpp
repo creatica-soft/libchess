@@ -1,4 +1,4 @@
-// cmake . && make creatica_ab      (or: c++ -std=c++20 -Wall -O3 -I . -L . creatica_ab.cpp uci_frontend.cpp tbprobe.c -o creatica_ab -Wl,-lchess,-lcurl,-rpath,.)
+// cmake . && make creatica_ab      (or, on Apple Silicon: c++ -std=c++20 -Wall -DNDEBUG -DUSE_PTHREADS -O3 -funroll-loops -mdynamic-no-pic -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -march=armv8.2-a+dotprod -DUSE_NEON_DOTPROD -flto=full -I . -I nnue creatica_ab.cpp uci_frontend.cpp tbprobe.c board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp -o creatica_ab -lcurl -lpthread)
 //
 // CREATICA AB -- the alpha-beta engine.
 //
@@ -729,6 +729,7 @@ struct Worker {
     uint64_t path_hash[MAX_PLY + 8];
     Mv  pv_line[MAX_PLY][MAX_PLY];
     int pv_len[MAX_PLY];
+    int16_t * cont_rows[MAX_PLY][CONT_LEVELS];   //each ply's continuation rows, by level
     CorrKeys ss_keys[MAX_PLY + 4];         //pawn, minor and non-pawn keys, per ply
     uint64_t key_pre[MAX_PLY][8];          //the bitboards before the move made at each ply
     int history[2][MVIDX_N];
@@ -769,12 +770,19 @@ struct Worker {
         return k;
     }
 
+    //(ss - level - 1)->continuationHistory, as a row pointer. Set once per node by enter_node():
+    //a node's rows depend only on moves made at earlier plies, which stay fixed while it is active.
+    inline void set_cont_rows(int ply) {
+        for (int level = 0; level < CONT_LEVELS; ++level) {
+            const int q = ply - (level + 1);        //the ply at which that earlier move was made
+            if (q < 0 || ss_mv_pc[q] == 12) { cont_rows[ply][level] = &cont_hist[0][0][12][0][0][0]; continue; }   //upstream's sentinel
+            const int pchk = ss_incheck[q] ? 1 : 0;
+            const int pcap = (q + 1 < MAX_PLY && prev_cap_sq[q + 1] != 64) ? 1 : 0;
+            cont_rows[ply][level] = &cont_hist[pchk][pcap][ss_mv_pc[q]][ss_mv_to[q]][0][0];
+        }
+    }
     inline int16_t * cont_slot(int level, int ply, int pc, int to) {
-        const int q = ply - (level + 1);            //the ply at which that earlier move was made
-        if (q < 0 || ss_mv_pc[q] == 12) return &cont_hist[0][0][12][0][pc][to];   //upstream's sentinel
-        const int pchk = ss_incheck[q] ? 1 : 0;
-        const int pcap = (q + 1 < MAX_PLY && prev_cap_sq[q + 1] != 64) ? 1 : 0;
-        return &cont_hist[pchk][pcap][ss_mv_pc[q]][ss_mv_to[q]][pc][to];
+        return cont_rows[ply][level] + pc * 64 + to;
     }
 
     inline int stat_score(int ply, int pc, uint8_t to, uint8_t from, uint8_t promo, int stm) {
@@ -1238,64 +1246,64 @@ struct Worker {
     //the king; quiets are pushes, double pushes, under-promotion pushes, the pieces, the king.
     int gen_pseudo(const NodeInfo& ni, Mv * out, bool captures) {
         int n = 0;
-        auto push = [&](uint8_t a, uint8_t b, uint8_t c) { if (n < MAX_MOVES) out[n++] = {a, b, c}; };
         const int stm = (int)board.sideToMove;
-        const uint64_t them = board.side[1 - stm];
-        const uint64_t empty = ~(board.side[ColorWhite] | board.side[ColorBlack]);
-        const int up = (stm == ColorWhite) ? 8 : -8;
-        struct PD { uint8_t src, dst; };
-        PD p1[16], p2[16], prR[16], prL[16], prP[16], cR[16], cL[16], ep[16];
-        int n1 = 0, n2 = 0, nR = 0, nL = 0, nP = 0, ncR = 0, ncL = 0, nep = 0;
-        for (uint64_t occp = board.side[stm] & board.pieceTypes[Pawn - 1]; occp; occp &= occp - 1) {
-            const Square src = (Square)lsBit(occp);
-            for (uint64_t mvb = piece_moves(board, Pawn, src, ni.ksq, 0, 0, ~0ULL, 0); mvb; mvb &= mvb - 1) {
-                const Square dst = (Square)lsBit(mvb);
-                const int diff = (int)dst - (int)src;
-                const bool occupied = ((them >> dst) & 1ULL) != 0;
-                Move pm = {}; pm.src = src; pm.dst = dst; pm.promoType = PieceTypeNone;
-                const PD e = { (uint8_t)src, (uint8_t)dst };
-                if (promoMove(board, pm)) {
-                    if (diff == up)          prP[nP++] = e;
-                    else if (diff == up + 1) prR[nR++] = e;
-                    else                     prL[nL++] = e;
-                } else if (diff == up)       p1[n1++] = e;
-                else if (diff == up + up)    p2[n2++] = e;
-                else if (!occupied)          ep[nep++] = e;
-                else if (diff == up + 1)     cR[ncR++] = e;
-                else                         cL[ncL++] = e;
-            }
-        }
-        auto by_dst = [](PD * a, int k) {
-            for (int i = 1; i < k; ++i) {
-                const PD t = a[i]; int j = i - 1;
-                while (j >= 0 && a[j].dst > t.dst) { a[j + 1] = a[j]; --j; }
-                a[j + 1] = t;
+        const uint64_t us = board.side[stm], them = board.side[1 - stm];
+        const uint64_t empty = ~(us | them);
+        const uint64_t pawns = us & board.pieceTypes[Pawn - 1];
+        //Pawn moves by bitboard shift, as upstream's generate_pawn_moves: each direction's
+        //destinations come out in square order, and the source is the destination less the step.
+        const bool white = stm == ColorWhite;
+        const int up = white ? 8 : -8;
+        const uint64_t rank8 = white ? 0xFF00000000000000ULL : 0x00000000000000FFULL;   //promotion rank
+        const uint64_t rank3 = white ? 0x0000000000FF0000ULL : 0x0000FF0000000000ULL;   //after a double push's first step
+        const auto shift = [&](uint64_t b, int d) { return d > 0 ? b << d : b >> -d; };
+        //Toward the h-file is up + 1, toward the a-file up - 1; the source file must allow it.
+        const uint64_t right = shift(pawns & ~FILE_H_BB, up + 1), left = shift(pawns & ~FILE_A_BB, up - 1);
+        const uint64_t push1 = shift(pawns, up) & empty;
+        auto emit = [&](uint64_t b, int step, std::initializer_list<uint8_t> promos) {
+            for (; b; b &= b - 1) {
+                const int dst = lsBit(b);
+                for (uint8_t q : promos) if (n < MAX_MOVES) out[n++] = { (uint8_t)(dst - step), (uint8_t)dst, q };
             }
         };
-        by_dst(p1, n1); by_dst(p2, n2); by_dst(prR, nR); by_dst(prL, nL); by_dst(prP, nP);
-        by_dst(cR, ncR); by_dst(cL, ncL); by_dst(ep, nep);
-        const uint64_t target = captures ? them : empty;
         if (captures) {
-            for (int i = 0; i < nR; ++i) for (uint8_t q : {Queen, Rook, Bishop, Knight}) push(prR[i].src, prR[i].dst, q);
-            for (int i = 0; i < nL; ++i) for (uint8_t q : {Queen, Rook, Bishop, Knight}) push(prL[i].src, prL[i].dst, q);
-            for (int i = 0; i < nP; ++i) push(prP[i].src, prP[i].dst, (uint8_t)Queen);
-            for (int i = 0; i < ncR; ++i) push(cR[i].src, cR[i].dst, (uint8_t)PieceTypeNone);
-            for (int i = 0; i < ncL; ++i) push(cL[i].src, cL[i].dst, (uint8_t)PieceTypeNone);
-            for (int i = 0; i < nep; ++i) push(ep[i].src, ep[i].dst, (uint8_t)PieceTypeNone);
+            emit(right & them & rank8, up + 1, {Queen, Rook, Bishop, Knight});
+            emit(left & them & rank8, up - 1, {Queen, Rook, Bishop, Knight});
+            emit(push1 & rank8, up, {Queen});
+            emit(right & them & ~rank8, up + 1, {PieceTypeNone});
+            emit(left & them & ~rank8, up - 1, {PieceTypeNone});
+            if (board.enPassant != FileNone) {
+                const int epsq = (white ? 40 : 16) + (int)board.enPassant;
+                const uint64_t epb = 1ULL << epsq;
+                //The capturers in square order, as the generator met them.
+                uint64_t from = (shift(epb & ~FILE_A_BB, -up - 1) | shift(epb & ~FILE_H_BB, -up + 1)) & pawns;
+                for (; from; from &= from - 1)
+                    if (n < MAX_MOVES) out[n++] = { (uint8_t)lsBit(from), (uint8_t)epsq, (uint8_t)PieceTypeNone };
+            }
         } else {
-            for (int i = 0; i < n1; ++i) push(p1[i].src, p1[i].dst, (uint8_t)PieceTypeNone);
-            for (int i = 0; i < n2; ++i) push(p2[i].src, p2[i].dst, (uint8_t)PieceTypeNone);
-            for (int i = 0; i < nP; ++i) for (uint8_t q : {Rook, Bishop, Knight}) push(prP[i].src, prP[i].dst, q);
+            emit(push1 & ~rank8, up, {PieceTypeNone});
+            emit(shift(push1 & rank3, up) & empty, up + up, {PieceTypeNone});
+            emit(push1 & rank8, up, {Rook, Bishop, Knight});
         }
+        const uint64_t target = captures ? them : empty;
+        const uint64_t occ = us | them;
         for (PieceType pt = Knight; pt <= Queen; ++pt)
-            for (uint64_t occ = board.side[stm] & board.pieceTypes[pt - 1]; occ; occ &= occ - 1) {
-                const Square src = (Square)lsBit(occ);
-                for (uint64_t mvb = piece_moves(board, pt, src, ni.ksq, 0, 0, ~0ULL, 0) & target; mvb; mvb &= mvb - 1)
-                    push((uint8_t)src, (uint8_t)lsBit(mvb), (uint8_t)PieceTypeNone);
+            for (uint64_t pcs = us & board.pieceTypes[pt - 1]; pcs; pcs &= pcs - 1) {
+                const auto src = (Stockfish::Square)lsBit(pcs);
+                uint64_t att = 0;
+                switch (pt) {
+                    case Knight: att = Stockfish::attacks_bb<Stockfish::KNIGHT>(src); break;
+                    case Bishop: att = Stockfish::attacks_bb<Stockfish::BISHOP>(src, occ); break;
+                    case Rook:   att = Stockfish::attacks_bb<Stockfish::ROOK>(src, occ); break;
+                    default:     att = Stockfish::attacks_bb<Stockfish::BISHOP>(src, occ)
+                                     | Stockfish::attacks_bb<Stockfish::ROOK>(src, occ); break;
+                }
+                for (att &= target; att; att &= att - 1)
+                    if (n < MAX_MOVES) out[n++] = { (uint8_t)src, (uint8_t)lsBit(att), (uint8_t)PieceTypeNone };
             }
         //King moves, castling included, from the legal set: captures onto enemy pieces, the rest quiet.
         for (uint64_t km = ni.kmoves & (captures ? them : ~them); km; km &= km - 1)
-            push((uint8_t)ni.ksq, (uint8_t)lsBit(km), (uint8_t)PieceTypeNone);
+            if (n < MAX_MOVES) out[n++] = { (uint8_t)ni.ksq, (uint8_t)lsBit(km), (uint8_t)PieceTypeNone };
         return n;
     }
 
@@ -1442,6 +1450,7 @@ struct Worker {
         else          ss_pfn[ply] = from_null ? 0 : ss_pfn[ply - 1] + 1;
         path_hash[ply] = zh.hash;
         set_repetition(ply);
+        set_cont_rows(ply);
     }
 
     //Records the move about to be made at `ply` for the child's history and continuation keys.
@@ -1819,7 +1828,10 @@ struct Worker {
                 const File saved_ep = board.enPassant;
                 board.sideToMove = (Color)(1 - stm);
                 board.enPassant  = FileNone;
-                getHash(zh, board, z);
+                //do_null_move()'s key update: the side to move flips and en passant goes.
+                zh.hash ^= z.blackMove;
+                if (saved_ep != FileNone) zh.hash ^= z.enPassant[saved_ep];
+                zh.prevEnPassant = 0;
                 tt_prefetch(zh.hash);
                 ss_mv_pc[ply] = 12; ss_mv_onto[ply] = 12; ss_mv_to[ply] = 0;
                 ss_mv_promo[ply] = PieceTypeNone;
