@@ -45,6 +45,7 @@ CHESS_API void init_nnue_context(NNUEContext& ctx);
 CHESS_API void free_nnue_context(NNUEContext& ctx);
 CHESS_API double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check);
 CHESS_API double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in_check, int optimism);
+CHESS_API int evaluate_nnue_value(const Board& board, NNUEContext& ctx, int optimism);
 
 static Stockfish::Eval::NNUE::Networks * networks = nullptr;
 
@@ -99,6 +100,12 @@ double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in_check, in
     //comment out next line to keep it from the perspective of the side to move
     //v = ctx.pos->side_to_move() == Stockfish::WHITE ? v : -v; 
     return 0.01 * Stockfish::Eval::to_cp(v, board);
+}
+
+//Stockfish's own Value, unconverted. See the note on the declaration in libchess.h.
+int evaluate_nnue_value(const Board& board, NNUEContext& ctx, int optimism) {
+    return (int)Stockfish::Eval::evaluate(*networks, board, *ctx.accumulator_stack, *ctx.caches,
+                                          optimism);
 }
 
 //Size of the NNUE feature vector: the feature transformer's post-activation output, the
