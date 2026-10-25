@@ -528,31 +528,6 @@ static inline bool gives_check_ci(const Board& b, const CheckInfo& ci, const Mv&
     }
     return false;
 }
-//pos.check_squares(type_of(pc)) & to: a direct check by the moved piece, which is what the
-//move picker's check bonus asks (the pawn, for a promotion).
-static inline bool gives_check(const Board& b, const Mv& m) {
-    const uint64_t occ = (b.side[ColorWhite] | b.side[ColorBlack]) & ~(1ULL << m.src);
-    const uint64_t kbb = b.pieceTypes[King - 1] & b.side[1 - b.sideToMove];
-    if (!kbb) return false;
-    const int ksq = lsBit(kbb);
-    const int pt = (int)PC_TYPE((Piece)b.piecesOnSquares[m.src]);
-    const Stockfish::Square d = (Stockfish::Square)m.dst;
-    switch (pt) {
-        case Pawn: {
-            const uint64_t a = b.sideToMove == ColorWhite
-                             ? ((((1ULL << m.dst) & ~FILE_A_BB) << 7) | (((1ULL << m.dst) & ~FILE_H_BB) << 9))
-                             : ((((1ULL << m.dst) & ~FILE_A_BB) >> 9) | (((1ULL << m.dst) & ~FILE_H_BB) >> 7));
-            return (a >> ksq) & 1ULL;
-        }
-        case Knight: return (Stockfish::attacks_bb<Stockfish::KNIGHT>(d, occ) >> ksq) & 1ULL;
-        case Bishop: return (Stockfish::attacks_bb<Stockfish::BISHOP>(d, occ) >> ksq) & 1ULL;
-        case Rook:   return (Stockfish::attacks_bb<Stockfish::ROOK>(d, occ) >> ksq) & 1ULL;
-        case Queen:  return ((Stockfish::attacks_bb<Stockfish::BISHOP>(d, occ)
-                            | Stockfish::attacks_bb<Stockfish::ROOK>(d, occ)) >> ksq) & 1ULL;
-        default: return false;
-    }
-}
-
 //=== SYZYGY IN THE TREE, upstream's Step 5 ===
 static unsigned tb_cardinality = 0;      //min(SyzygyProbeLimit, TB_LARGEST); 0 when no tables
 static int  tb_probe_depth = 1;          //SyzygyProbeDepth
@@ -573,6 +548,7 @@ enum PickStage {
 };
 struct PickerState {
     const NodeInfo * ni = nullptr;
+    const CheckInfo * ci = nullptr;   //the node's check squares, for the quiet scorer
     Mv tt{0, 0, 0};
     int stage = MAIN_TT;
     int depth = 0, ply = 0, threshold = 0;
@@ -1355,7 +1331,11 @@ struct Worker {
                 static const int lv[] = { 0, 1, 2, 3, 5 };
                 for (int L : lv) v += (int)*cont_slot(L, p.ply, pc, m.dst);
             }
-            if (gives_check(board, m) && see_ge(m, -75)) v += 16384;
+            //pos.check_squares(pt) & to: the squares the moved piece would check from, computed on
+            //the board as it stands, as upstream's are -- so a slider leaving its own line to the
+            //king earns no bonus.
+            const int mpt = (int)PC_TYPE((Piece)board.piecesOnSquares[m.src]);
+            if (p.ci && p.ci->valid && ((p.ci->chk[mpt - 1] >> m.dst) & 1ULL) && see_ge(m, -75)) v += 16384;
             const int pt = (int)PC_TYPE((Piece)board.piecesOnSquares[m.src]) - 1;
             const int t = ((thr[pt] >> m.dst) & 1ULL) ? -19 : (((thr[pt] >> m.src) & 1ULL) ? 20 : 0);
             v += pieceValueSF[pt + 1] * t * (pt + 1 == King ? 0 : 1);
@@ -1674,6 +1654,12 @@ struct Worker {
             if (alpha >= beta) return alpha;
         }
         const bool in_check = stm_in_check();
+        //kingMoves() once per node, when something first needs it: ProbCut or the move loop.
+        NodeInfo ni; bool ni_ready = false;
+        const auto node_ni = [&]() -> const NodeInfo& {
+            if (!ni_ready) { ni = node_info(); ni_ready = true; }
+            return ni;
+        };
         ss_incheck[ply] = in_check;
         const bool prior_capture = ss_cap_type[ply] >= 0;
         const bool prev_ok = ply > 0 && ss_mv_pc[ply - 1] != 12;    //prevSq != SQ_NONE
@@ -1863,7 +1849,7 @@ struct Worker {
             if (depth >= 3 && !is_decisive(beta) && !(tt_flag >= 0 && tt_score < pcbeta)) {
                 const int see_need = pcbeta - nev;
                 const int cdepth = std::clamp(depth - 5 - (nev - beta) / 315, 0, depth);
-                const NodeInfo pni = node_info();
+                const NodeInfo& pni = node_ni();
                 PickerState pp;
                 pick_init_probcut(pp, pni, tt_move, have_tt_move, see_need);
                 Mv m;
@@ -1906,9 +1892,10 @@ struct Worker {
             && tt_score >= beta + 418 && !is_decisive(beta) && !is_decisive(tt_score))
             return beta + 418;
 
-        const NodeInfo ni = node_info();
+        node_ni();
         const CheckInfo ci = check_info(board);
         PickerState mp;
+        mp.ci = &ci;
         pick_init(mp, ni, tt_move, have_tt_move, depth, ply);
         const bool sing_shuffling =
             have_tt_move && !cap_stage(tt_move)
