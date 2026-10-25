@@ -256,6 +256,14 @@ inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
     {0, 0, 0, 0, 0, 0, 0},       // None
     {0, 105, 205, 305, 405, 505, 605}, // Pawn attacking
     {0, 104, 204, 304, 404, 504, 604}, // Knight attacking
+//STOCKFISH'S PieceValue (types.h: Pawn 208, Knight 781, Bishop 825, Rook 1276, Queen 2538), in its
+//internal units -- the units get_see() returns and its evaluation is computed in. Not merely a
+//rescaling of pieceValueCP: the RATIOS differ (a knight is 3.75 pawns here against 3.0 there, a
+//queen 12.2 against 9.0), so the two tables disagree about which exchanges lose material. The king
+//entry is a sentinel that must exceed any exchange balance; one side's whole army is 9,966.
+inline constexpr int pieceValueSF[] = { 0, 208, 781, 825, 1276, 2538, 30000, 0 };
+static_assert(sizeof pieceValueSF / sizeof pieceValueSF[0] == PieceTypeNone + 1,
+              "pieceValueSF must cover every PieceType value, PieceTypeNone included");
     {0, 103, 203, 303, 403, 503, 603}, // Bishop attacking
     {0, 102, 202, 302, 402, 502, 602}, // Rook attacking
     {0, 101, 201, 301, 401, 501, 601}, // Queen attacking
@@ -923,6 +931,13 @@ CHESS_API double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in
 //reset() is required before evaluating a position unrelated to the last one.
 CHESS_API std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
 CHESS_API void accumulator_stack_pop(NNUEContext& ctx);
+//THE SAME EVALUATION AS STOCKFISH'S OWN `Value`, with no conversion at all. evaluate_nnue() and
+//evaluate_nnue_opt() return 0.01 * to_cp(v), and to_cp() is NOT v / PawnValue: since Stockfish 17
+//it divides by the win-rate model's `a`, about 377 internal units per 100 "centipawns" across the
+//whole material range -- so a centipawn is ~3.77 internal units, not 2.08, and is also rounded to an
+//integer on the way out. A search that ports Stockfish's margins needs the evaluation in the units
+//those margins are written in, which is this. Not meaningful in check: the caller must not ask.
+CHESS_API int evaluate_nnue_value(const Board& board, NNUEContext& ctx, int optimism);
 CHESS_API void accumulator_stack_reset(NNUEContext& ctx);
 
 //The human-readable evaluation trace, i.e. what the UCI "eval" command prints.
@@ -936,7 +951,8 @@ CHESS_API int nnue_feature_dims();
 //CHESS_API int get_see(const Board& board, const Move move, const PieceType capturedType); //move has been made
 //STATIC EXCHANGE EVALUATION, for a move that has NOT been made yet: what the exchange on the
 //destination square is worth once both sides have recaptured with their cheapest attacker each
-//time, in centipawns from board.sideToMove's point of view. Negative means it loses material.
+//time, in STOCKFISH'S INTERNAL UNITS (pieceValueSF: a pawn is 208) from board.sideToMove's point of
+//view. Negative means it loses material. (It used centipawns from pieceValueCP until 2026-10-24.)
 //Handles en passant and promotions. Revived 2026-10-12 -- see the note above the definition in
 //board.cpp for the one case whose magnitude is unreliable.
 CHESS_API int get_see(const Board& board, Move move);
