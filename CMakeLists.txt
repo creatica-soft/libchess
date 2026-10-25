@@ -18,8 +18,6 @@ set(CHESS_SOURCES board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-
 add_library(chess SHARED ${CHESS_SOURCES})
 
 # Define the executable
-#add_executable(creatica attic/creatica.cpp attic/uci.cpp tbcore.c tbprobe.c)  # historical; does not compile against the current API
-add_executable(creatica creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c)
 # The historical MCTS engine, kept as a target so it cannot rot unnoticed. Shares uci_frontend.cpp
 # on purpose -- see the note at the top of creatica_search_mcts.cpp.
 add_executable(creatica_mcts creatica_search_mcts.cpp creatica_mcts.cpp uci_frontend.cpp tbprobe.c)
@@ -47,7 +45,6 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(STATUS "clang-cl compiler detected. Using Clang-style flags.")
     
     target_compile_options(chess PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
-    #target_compile_options(creatica PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
     target_compile_options(test_tb PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
     target_compile_options(test_nnue PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
     target_compile_options(test_smp PRIVATE -W3 -D_CRT_SECURE_NO_WARNINGS)
@@ -58,7 +55,6 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     
     # Release-specific optimizations
     target_compile_options(chess PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
-    target_compile_options(creatica PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
     target_compile_options(creatica_mcts PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
     target_compile_options(creatica_ab PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
     target_compile_options(test_tb PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math  -flto -mavx2 -mbmi2 -mpopcnt>)
@@ -77,7 +73,6 @@ elseif(MSVC)
     message(STATUS "MSVC compiler detected. Using MSVC-style flags.")
 
     target_compile_options(chess PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
-    target_compile_options(creatica PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
     target_compile_options(creatica_mcts PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
     target_compile_options(creatica_ab PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
     target_compile_options(test_nnue PRIVATE /utf-8 /MP /W3 /D_CRT_SECURE_NO_WARNINGS  /DNDEBUG /DNO_PREFETCH /DUSE_POPCNT /DUSE_PEXT /wd4101 /wd4996 /wd4267 /wd4244 /wd4334 /wd4022 /wd4312)
@@ -90,7 +85,6 @@ elseif(MSVC)
     
     # Release-specific optimizations
     target_compile_options(chess PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
-    target_compile_options(creatica PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
     target_compile_options(creatica_mcts PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
     target_compile_options(creatica_ab PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
     target_compile_options(test_nnue PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /arch:AVX2 /fp:fast>)
@@ -121,22 +115,25 @@ else()
     # tbcore.c is deliberately not a target source -- tbprobe.c #includes it, and the
     # separate object exported nothing while producing a dozen unused-symbol warnings.
     target_compile_options(chess PRIVATE -Wall -O3 -march=native -DNDEBUG)
-    target_compile_options(creatica PRIVATE -Wall -O3 -march=native -DNDEBUG)
-    target_compile_options(creatica_mcts PRIVATE -Wall -O3 -march=native -DNDEBUG)
-    # creatica_ab is built as ONE binary with the library's sources compiled in, so full LTO can
-    # optimise across the search/library boundary, as Stockfish's own build does. On Apple Silicon
-    # it takes Stockfish's apple-silicon flags (Makefile: ARCH=apple-silicon COMP=clang), NEON and
-    # dot-product kernels included. libchess.dylib keeps its own flags: other engines load it.
-    target_sources(creatica_ab PRIVATE ${CHESS_SOURCES})
-    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-        target_compile_options(creatica_ab PRIVATE -Wall -DNDEBUG -DUSE_PTHREADS -O3 -funroll-loops
-            -mdynamic-no-pic -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -march=armv8.2-a+dotprod
-            -DUSE_NEON_DOTPROD -flto=full)
-        target_link_options(creatica_ab PRIVATE -flto=full)
-    else()
-        target_compile_options(creatica_ab PRIVATE -Wall -O3 -march=native -DNDEBUG -flto)
-        target_link_options(creatica_ab PRIVATE -flto)
-    endif()
+    # creatica_ab and creatica_mcts are built as ONE binary each, with the library's sources compiled
+    # in, so full LTO can optimise across the search/library boundary, as Stockfish's own build does.
+    # On Apple Silicon they take Stockfish's apple-silicon flags (Makefile: ARCH=apple-silicon
+    # COMP=clang), NEON and dot-product kernels included. libchess.dylib keeps its own flags: the
+    # other targets load it.
+    function(build_like_stockfish tgt)
+        target_sources(${tgt} PRIVATE ${CHESS_SOURCES})
+        if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+            target_compile_options(${tgt} PRIVATE -Wall -DNDEBUG -DUSE_PTHREADS -O3 -funroll-loops
+                -mdynamic-no-pic -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -march=armv8.2-a+dotprod
+                -DUSE_NEON_DOTPROD -flto=full)
+            target_link_options(${tgt} PRIVATE -flto=full)
+        else()
+            target_compile_options(${tgt} PRIVATE -Wall -O3 -march=native -DNDEBUG -flto)
+            target_link_options(${tgt} PRIVATE -flto)
+        endif()
+    endfunction()
+    build_like_stockfish(creatica_ab)
+    build_like_stockfish(creatica_mcts)
     target_compile_options(gui_helper PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_see PRIVATE -Wall -O3 -march=native -DNDEBUG)
     target_compile_options(test_nnue PRIVATE -Wall -O3 -march=native -DNDEBUG)
@@ -157,19 +154,18 @@ set_source_files_properties(nnue/nnue/network.cpp PROPERTIES OBJECT_DEPENDS
   "${PROJECT_SOURCE_DIR}/nn-c288c895ea92.nnue;${PROJECT_SOURCE_DIR}/nn-37f18f62d772.nnue")
 
 target_include_directories(chess PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
-target_include_directories(creatica PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 target_include_directories(creatica_mcts PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 target_include_directories(creatica_ab PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 
 # Link executable with libchess
-target_link_libraries(creatica PRIVATE chess curl)
-target_link_libraries(creatica_mcts PRIVATE chess curl)
-# curl for the online 7-piece tablebase probe (OnlineTablebase). Outside MSVC creatica_ab
-# compiles the library's sources in (see its compile options above) and does not link libchess.
+# curl for the online 7-piece tablebase probe. Outside MSVC creatica_ab and creatica_mcts compile
+# the library's sources in (build_like_stockfish above) and do not link libchess.
 if(MSVC)
     target_link_libraries(creatica_ab PRIVATE chess curl)
+    target_link_libraries(creatica_mcts PRIVATE chess curl)
 else()
     target_link_libraries(creatica_ab PRIVATE curl pthread)
+    target_link_libraries(creatica_mcts PRIVATE curl pthread)
 endif()
 target_link_libraries(gui_helper PRIVATE chess)
 target_link_libraries(test_pos PRIVATE chess)
