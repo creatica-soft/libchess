@@ -561,6 +561,32 @@ void quit(const Engine& engine) {
 	fclose(engine.fromEngine);
 	remove(engine.namedPipeTo);
 	remove(engine.namedPipeFrom);
+#ifndef _WIN32
+	//REAP THE CHILD, which this function used to leave running. Sending "quit" and closing the
+	//pipes is not enough: an engine that is wedged, mid-search, or simply never read the command
+	//survives with its stdin FIFO already unlinked, and its input loop then spins on EOF at 100%
+	//of a core for as long as the machine is up. Two Stockfish children did exactly that for four
+	//hours after a driver gave up on an engine, each holding a core, with PPID 1 and a FIFO on
+	//fd 0. releaseChessEngine() has always reaped properly; quit() simply did not call it, and
+	//callers that use quit() as their shutdown -- which the header invites -- leaked every time.
+	//
+	//Same two-stage shape as releaseChessEngine(): wait briefly for a clean exit, then insist.
+	if (engine.enginePid > 0) {
+		int status = 0;
+		bool reaped = false;
+		for (int i = 0; i < 20; ++i) {            //up to ~2 s
+			pid_t r = waitpid((pid_t)engine.enginePid, &status, WNOHANG);
+			if (r == (pid_t)engine.enginePid || (r == -1 && errno == ECHILD)) { reaped = true; break; }
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+		if (!reaped) {
+			fprintf(stderr, "quit(): engine pid %d did not exit on quit; killing it\n",
+			        engine.enginePid);
+			kill((pid_t)engine.enginePid, SIGKILL);
+			waitpid((pid_t)engine.enginePid, &status, 0);
+		}
+	}
+#endif
 }
 
 bool position(const Engine& engine) {
@@ -579,6 +605,79 @@ bool position(const Engine& engine) {
 		fflush(engine.logfile);
 	}
 	return isReady(engine);
+}
+
+//PARSES A UCI info LINE BY KEYWORD, not by position.
+//
+//The UCI specification lists the info tokens as OPTIONAL and mandates no order -- the only ordering
+//requirement is its note that "all infos belonging to the pv should be sent together". Engines
+//routinely omit seldepth, multipv, hashfull and tbhits, and may append lowerbound or upperbound
+//after the score. So the two positional sscanf()s this replaces were stricter than the protocol:
+//they demanded exactly ten fields in one sequence, and ANY deviation made the whole line
+//unparseable. That is also why creatica had to emit a literal `hashfull 100` -- not for telemetry
+//but to satisfy the parser, since dropping the field dropped the entire line.
+//
+//Two further faults of the old version, fixed here rather than carried over:
+//  - it failed SILENTLY. Neither sscanf matching left the Evaluation untouched and reported
+//    nothing, so a non-conforming engine produced zeros with no indication why.
+//  - `MATE_SCORE * (matein / abs(matein))` divides by zero on `score mate 0`, which is exactly what
+//    an engine sends when it is mated at the root.
+//
+//Returns true when the line carried both a score and a pv, which is what the caller needs from it.
+//Unknown keywords are skipped with their argument rather than aborting the parse, so a token this
+//code has never heard of costs nothing.
+static bool info_parse(const char * line, struct Evaluation * ev) {
+	bool got_pv = false, got_score = false;
+	const char * p = line;
+	while (*p == ' ') ++p;
+	if (strncmp(p, "info", 4) == 0) p += 4;
+	while (*p) {
+		while (*p == ' ') ++p;
+		if (!*p) break;
+		char tok[24];
+		size_t k = 0;
+		while (*p && *p != ' ' && k + 1 < sizeof tok) tok[k++] = *p++;
+		tok[k] = '\0';
+		char * end = NULL;
+		if (!strcmp(tok, "depth"))         { ev->depth    = (int)strtol(p, &end, 10); p = end; }
+		else if (!strcmp(tok, "seldepth")) { ev->seldepth = (int)strtol(p, &end, 10); p = end; }
+		else if (!strcmp(tok, "multipv"))  { ev->multipv  = (int)strtol(p, &end, 10); p = end; }
+		else if (!strcmp(tok, "nodes"))    { ev->nodes    = strtoull(p, &end, 10);    p = end; }
+		else if (!strcmp(tok, "nps"))      { ev->nps      = strtoull(p, &end, 10);    p = end; }
+		else if (!strcmp(tok, "hashfull")) { ev->hashful  = (int)strtol(p, &end, 10); p = end; }
+		else if (!strcmp(tok, "tbhits"))   { ev->tbhits   = (int)strtol(p, &end, 10); p = end; }
+		else if (!strcmp(tok, "time"))     { ev->time     = strtoull(p, &end, 10);    p = end; }
+		else if (!strcmp(tok, "score")) {
+			while (*p == ' ') ++p;
+			if (!strncmp(p, "cp", 2)) {
+				p += 2;
+				ev->scorecp = (int)strtol(p, &end, 10); p = end;
+				got_score = true;
+			} else if (!strncmp(p, "mate", 4)) {
+				p += 4;
+				ev->matein = (int)strtol(p, &end, 10); p = end;
+				//Signed without dividing by abs(), so `mate 0` -- mated at the root -- is 0 rather
+				//than undefined behaviour.
+				ev->scorecp = ev->matein > 0 ? MATE_SCORE : (ev->matein < 0 ? -MATE_SCORE : 0);
+				got_score = true;
+			}
+		}
+		else if (!strcmp(tok, "pv")) {
+			while (*p == ' ') ++p;
+			snprintf(ev->pv, sizeof ev->pv, "%s", p);
+			got_pv = true;
+			break;                      //the pv runs to the end of the line
+		}
+		else if (!strcmp(tok, "string") || !strcmp(tok, "refutation") || !strcmp(tok, "currline"))
+			break;                      //free text or a variable-length list, to end of line
+		else if (!strcmp(tok, "lowerbound") || !strcmp(tok, "upperbound"))
+			;                           //modifiers, no argument
+		else {                          //an unknown keyword: drop its argument and carry on
+			while (*p == ' ') ++p;
+			while (*p && *p != ' ') ++p;
+		}
+	}
+	return got_pv && got_score;
 }
 
 int getPV(const Engine& engine, struct Evaluation ** eval, const int multiPV) {
@@ -645,9 +744,15 @@ int getPV(const Engine& engine, struct Evaluation ** eval, const int multiPV) {
 						}		  
 						break;
 					}
-					if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score cp %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->scorecp), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) != 10) {
-					  if (sscanf(prevLine[i], "info depth %d seldepth %d multipv %d score mate %d nodes %llu nps %llu hashfull %d tbhits %d time %llu pv %1024[abcdefghnqr12345678\040]", &(eval[i]->depth), &(eval[i]->seldepth), &(eval[i]->multipv), &(eval[i]->matein), &(eval[i]->nodes), &(eval[i]->nps), &(eval[i]->hashful), &(eval[i]->tbhits), &(eval[i]->time), eval[i]->pv) == 10)
-					    eval[i]->scorecp = MATE_SCORE * (eval[i]->matein/abs(eval[i]->matein));
+					if (!info_parse(prevLine[i], eval[i])) {
+						//SAYS SO, where the old parser said nothing. A line that carries no score or
+						//no pv is not usable, and silence here looked like an engine returning zeros.
+						if (engine.logfile) {
+							fprintf(engine.logfile, "getPV() warning: unparseable info line: %s\n",
+							        prevLine[i]);
+							fflush(engine.logfile);
+						}
+						fprintf(stderr, "getPV() warning: unparseable info line: %s\n", prevLine[i]);
 					}
 					//truncate pv string to maxPlies
 					char * tmpLine = eval[i]->pv;
@@ -1161,9 +1266,10 @@ int engine(Engine& engine, const char * engineName) {
 	return 0;
 }
 
-void initChessEngine(Engine& chessEngine, const char * engineName, const long long movetime, const int depth, const int hashSize, const int threadNumber, const char * syzygyPath, const int multiPV, const bool logging, const bool limitStrength, const int elo) {
+void initChessEngine(Engine& chessEngine, const char * engineName, const long long movetime, const int depth, const int hashSize, const int threadNumber, const char * syzygyPath, const int multiPV, const bool logging, const bool limitStrength, const int elo, const int nodes) {
   chessEngine.movetime = movetime;
   chessEngine.depth = depth;
+  chessEngine.nodes = nodes;
   int res = engine(chessEngine, engineName);
   if (res) {
     printf("initChessEngine() error: engine(%s) returned %d\n", engineName, res);

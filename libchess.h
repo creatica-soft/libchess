@@ -120,7 +120,12 @@
 //32, not 16. creatica advertises 17 spin options as of RepetitionGuard, and the seventeenth used
 //to abort getOptions() outright -- see the note there. Headroom rather than exactly enough, because
 //the failure mode of being one over is silent option loss in an unrelated category.
-#define MAX_UCI_OPTION_SPIN_NUM 32
+//RAISED FROM 32, which creatica_ab had outgrown: it advertises 38 spin options and getOptions()
+//was dropping the last six with a warning, so a driver could not set the very options that produce
+//the measured gains. creatica sits at 31, one short of the same wall. 64 is headroom rather than a
+//new ceiling to grow into -- each entry is a name plus four int64, so the whole increase is about
+//2 KB on the Engine struct, which is heap-allocated per driven engine.
+#define MAX_UCI_OPTION_SPIN_NUM 64
 #define MAX_UCI_OPTION_CHECK_NUM 16
 #define MAX_UCI_OPTION_COMBO_NUM 4
 #define MAX_UCI_OPTION_COMBO_VARS 8
@@ -251,11 +256,6 @@ inline constexpr float pieceValue[] = { 0.0f, 0.1f, 0.30f, 0.32f, 0.50f, 0.90f, 
 inline constexpr int pieceValueCP[] = { 0, 100, 300, 320, 500, 900, 10000, 0 };
 static_assert(sizeof pieceValueCP / sizeof pieceValueCP[0] == PieceTypeNone + 1,
               "pieceValueCP must cover every PieceType value, PieceTypeNone included");
-inline constexpr float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
-inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
-    {0, 0, 0, 0, 0, 0, 0},       // None
-    {0, 105, 205, 305, 405, 505, 605}, // Pawn attacking
-    {0, 104, 204, 304, 404, 504, 604}, // Knight attacking
 //STOCKFISH'S PieceValue (types.h: Pawn 208, Knight 781, Bishop 825, Rook 1276, Queen 2538), in its
 //internal units -- the units get_see() returns and its evaluation is computed in. Not merely a
 //rescaling of pieceValueCP: the RATIOS differ (a knight is 3.75 pawns here against 3.0 there, a
@@ -264,6 +264,11 @@ inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
 inline constexpr int pieceValueSF[] = { 0, 208, 781, 825, 1276, 2538, 30000, 0 };
 static_assert(sizeof pieceValueSF / sizeof pieceValueSF[0] == PieceTypeNone + 1,
               "pieceValueSF must cover every PieceType value, PieceTypeNone included");
+inline constexpr float pieceMobility[] = { 0.0f, 4.0f, 8.0f, 11.0f, 14.0f, 25.0f, 8.0f }; //max value - used for norm
+inline constexpr int MVV_LVA[7][7] = { //[attacker][victim]
+    {0, 0, 0, 0, 0, 0, 0},       // None
+    {0, 105, 205, 305, 405, 505, 605}, // Pawn attacking
+    {0, 104, 204, 304, 404, 504, 604}, // Knight attacking
     {0, 103, 203, 303, 403, 503, 603}, // Bishop attacking
     {0, 102, 202, 302, 402, 502, 602}, // Rook attacking
     {0, 101, 201, 301, 401, 501, 601}, // Queen attacking
@@ -926,11 +931,6 @@ CHESS_API double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_che
 //constants it is blended against (7191, 77871) are. Stockfish derives it at the root as
 //137 * avg / (|avg| + 91) for the side to move there, negated for the other side.
 CHESS_API double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in_check, int optimism);
-
-//Accumulator discipline: push -> do_move_dp -> ... -> undo_move -> pop, one context per thread.
-//reset() is required before evaluating a position unrelated to the last one.
-CHESS_API std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
-CHESS_API void accumulator_stack_pop(NNUEContext& ctx);
 //THE SAME EVALUATION AS STOCKFISH'S OWN `Value`, with no conversion at all. evaluate_nnue() and
 //evaluate_nnue_opt() return 0.01 * to_cp(v), and to_cp() is NOT v / PawnValue: since Stockfish 17
 //it divides by the win-rate model's `a`, about 377 internal units per 100 "centipawns" across the
@@ -938,6 +938,11 @@ CHESS_API void accumulator_stack_pop(NNUEContext& ctx);
 //integer on the way out. A search that ports Stockfish's margins needs the evaluation in the units
 //those margins are written in, which is this. Not meaningful in check: the caller must not ask.
 CHESS_API int evaluate_nnue_value(const Board& board, NNUEContext& ctx, int optimism);
+
+//Accumulator discipline: push -> do_move_dp -> ... -> undo_move -> pop, one context per thread.
+//reset() is required before evaluating a position unrelated to the last one.
+CHESS_API std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx);
+CHESS_API void accumulator_stack_pop(NNUEContext& ctx);
 CHESS_API void accumulator_stack_reset(NNUEContext& ctx);
 
 //The human-readable evaluation trace, i.e. what the UCI "eval" command prints.
@@ -1019,7 +1024,7 @@ CHESS_API void getMoveType(char *, unsigned int);
 CHESS_API void ecoClassify(Game& game, EcoLine **, int);
 
 CHESS_API int engine(Engine& engine, const char * path);
-CHESS_API void initChessEngine(Engine& chessEngine, const char * engineName, const int64_t movetime, const int depth, const int hashSize, const int threadNumber, const char * syzygyPath, const int multiPV, const bool logging, const bool limitStrength, const int elo);
+CHESS_API void initChessEngine(Engine& chessEngine, const char * engineName, const int64_t movetime, const int depth, const int hashSize, const int threadNumber, const char * syzygyPath, const int multiPV, const bool logging, const bool limitStrength, const int elo, const int nodes = 0);
 CHESS_API void releaseChessEngine(Engine& chessEngine);
 CHESS_API int nametoindex(const Engine& engine, const char * option, OptionType optionType);
 CHESS_API int getOptions(Engine& engine);
