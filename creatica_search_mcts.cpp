@@ -14,8 +14,8 @@
 // near-identical uci-*.cpp files, and that is how a bug fixed in one copy stays unfixed in the
 // others. This engine links the shared frontend.
 
-//For MacOS using clang
-// c++ -std=c++20 -Wall -O3 -flto -I $HOME/libchess  -L $HOME/libchess -Wl,-lchess,-lcurl,-rpath,$HOME/libchess creatica_search_mcts.cpp creatica_mcts.cpp uci_frontend.cpp tbprobe.c -o creatica_mcts
+//For MacOS on Apple Silicon using clang, from the repo root (Stockfish's apple-silicon flags, library compiled in, as CMake builds it)
+// c++ -std=c++20 -Wall -DNDEBUG -DUSE_PTHREADS -O3 -funroll-loops -mdynamic-no-pic -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -march=armv8.2-a+dotprod -DUSE_NEON_DOTPROD -flto=full -I . -I nnue creatica_search_mcts.cpp creatica_mcts.cpp uci_frontend.cpp tbprobe.c board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp -o creatica_mcts -lcurl -lpthread
 
 // -O3 -g -fno-omit-frame-pointer - options for profiling
 //
