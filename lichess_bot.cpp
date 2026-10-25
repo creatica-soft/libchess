@@ -579,11 +579,9 @@ using json = nlohmann::json;
 std::mt19937 rng;
 struct Engine creatica;
 struct Evaluation * evaluations[MULTI_PV] = { nullptr };
-//enum GameStateStatus { created, started, aborted, mate, resign, stalemate, timeout, draw, outoftime, cheat, noStart, unknownFinish, insufficientMaterialClaim, variantEnd };
 enum GameStateStatus { unknown, created, started, aborted, mate, resign, stalemate, timeout, draw, outoftime, cheat, noStart, unknownFinish, insufficientMaterialClaim, variantEnd };
 std::vector<std::string> gameSS = { "unknown", "created", "started", "aborted", "mate", "resign", "stalemate", "timeout", "draw", "outoftime", "cheat", "noStart", "unknownFinish", "insufficientMaterialClaim", "variantEnd" };
 int game_states = 15;
-//std::string gameStateStatus = "";
 std::atomic<int> gameStateStatus {0};
 
 struct Bot {

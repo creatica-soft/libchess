@@ -15,13 +15,7 @@
 //  * NOT the global enum operator templates (operator++/--/+/- in
 //    libchess.h). They are constrained only by std::is_enum, so they apply to
 //    every Stockfish enum as well as libchess's own, which is why nnue/ must
-//    not see them. The three that were outright broken have been repaired:
-//    operator&(T,int) ignored its second argument and always masked with 1 and
-//    is now GONE entirely (mask with a plain int, or use PC_TYPE/PC_COLOR);
-//    postfix operator++ incremented and then assigned the old value back, so it
-//    left its operand unchanged, and now returns the old value by value; and
-//    operator-= was declared to return int while assigning to a T&, so it did
-//    not compile when instantiated. None of the three had a live call site.
+//    not see them. 
 //  * NOT noise.h, the MAX_* macros, the char* name tables, or the SQ_*/PC_*
 //    helpers. None of them is referenced from nnue/.
 //
@@ -79,14 +73,6 @@ enum Piece : uint8_t {
 };
 
 struct Board {
-    //isCheck / isStaleMate / isMate were REMOVED on 2026-10-12, along with num_moves below. They
-    //were caches, valid only immediately after kingMoves() or isCheckMateStaleMate() on this exact
-    //position: do_move() preserved them so undo_move() could restore them, but never recomputed
-    //them, so after a move they described the PARENT. Nothing in the type system said so and the
-    //same bug was found three times -- the flags leaking across positions in fen2board, isMate and
-    //isStaleMate missing from StateInfo, and a stale isCheck making evaluate_nnue() return its
-    //in-check sentinel for a quiet position (a 4.3x slowdown and ten points of accuracy in an
-    //alpha-beta probe). isCheckMateStaleMate() now RETURNS a BoardState; see libchess.h.
     bool isChess960 = false;
     Color sideToMove = ColorWhite;
     File enPassant = FileNone; //a FILE index, not a square; FileNone == 8 means "no en passant"

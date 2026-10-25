@@ -20,7 +20,7 @@ int main(int argc, char ** argv) {
     Stockfish::Bitboards::init();
     std::FILE * f = std::fopen(argv[1], "r");
     if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[1]); return 2; }
-    std::printf("game\tply\tfen\tplayed_uci\tplayed_san\tbest_cp\tplayed_cp\tacceptable\tsf_lines\n");
+    //std::printf("game\tply\tfen\tplayed_uci\tplayed_san\tbest_cp\tplayed_cp\tacceptable\tsf_lines\n");
     char line[1024];
     int n = 0, bad = 0;
     while (std::fgets(line, sizeof line, f)) {
@@ -54,8 +54,8 @@ int main(int argc, char ** argv) {
         std::string uci = std::string(square[mv.src]) + square[mv.dst];
         if (mv.promoType >= Knight && mv.promoType <= Queen && uciPromoLetter[mv.promoType])
             uci += uciPromoLetter[mv.promoType];
-        std::printf("%s\t0\t%s\t%s\t%s\t0\t0\t%s\t-\n",
-                    id, fen.c_str(), uci.c_str(), s.c_str(), uci.c_str());
+        //std::printf("%s\t0\t%s\t%s\t%s\t0\t0\t%s\t-\n", id, fen.c_str(), uci.c_str(), s.c_str(), uci.c_str());
+        std::printf("%s\t%s\n", fen.c_str(), uci.c_str());
         ++n;
     }
     std::fclose(f);
