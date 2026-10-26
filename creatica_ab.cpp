@@ -1,18 +1,12 @@
 // cmake . && make creatica_ab      (or, on Apple Silicon: c++ -std=c++20 -Wall -DNDEBUG -DUSE_PTHREADS -O3 -funroll-loops -mdynamic-no-pic -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -march=armv8.2-a+dotprod -DUSE_NEON_DOTPROD -flto=full -I . -I nnue creatica_ab.cpp uci_frontend.cpp tbprobe.c board.cpp engine.cpp fen.cpp move.cpp pgn.cpp tag.cpp zobrist-hash.cpp nnue/nnue/network.cpp nnue/nnue/nnue_accumulator.cpp nnue/nnue/nnue_misc.cpp nnue/nnue/features/half_ka_v2_hm.cpp nnue/nnue/features/full_threats.cpp nnue/bitboard.cpp nnue/evaluate.cpp nnue/memory.cpp nnue/misc.cpp nnue/nnue.cpp -o creatica_ab -lcurl -lpthread)
 //
 // CREATICA AB -- the alpha-beta engine.
-//
-// THE SEARCH IS abprobe5's (creatica_experiments/abprobe5.cpp), ported without its switches. That
-// instrument was aligned rule by rule with Stockfish 18's search.cpp and measured level with it on
-// Arasan 197: at fixed depth 18, 136 solved against Stockfish's 135 on 553,986 mean nodes against
-// 561,610; at 1.75M nodes, 154 against 152. Stockfish's behaviour is the only configuration -- there
-// are no search options -- and the instrument's counters are gone; what is counted is what UCI shows.
+// Most things get ported from Stockfish 18
 //
 // UNITS. Everything inside the search is Stockfish's internal units (PawnValue 208): evaluations
-// come from evaluate_nnue_value(), SEE from get_see(), and every margin is upstream's literal. Scores
+// come from evaluate_nnue_value(), and every margin is upstream's literal. Scores
 // become centipawns only on the info line, through the same win-rate model Stockfish uses.
-//
-// WHAT THE ENGINE ADDS AROUND IT, none of which the instrument needed:
+// FEATURES:
 //   - persistent Lazy SMP threads, so the history tables carry from move to move as upstream's do
 //     and are cleared only by ucinewgame;
 //   - the game history in the repetition rules, which a test position does not have;
@@ -97,9 +91,9 @@ static const int VALUE_NONE = 32002;
 static inline bool is_promo_pc(uint8_t p) { return p >= Knight && p <= Queen; }
 
 //=== HISTORY TABLES ===
-//mainHistory and lowPlyHistory are keyed by from, to and promotion piece, as upstream's raw()
-//move encoding is.
-enum { MVIDX_N = 1 << 15 };
+//mainHistory and lowPlyHistory are keyed by from (6 bits), to (6 bits) and promotion piece (3 bits), as upstream's raw()
+//move encoding is, 15 bits total
+enum { MVIDX_N = 1 << 15 }; //32,168
 static inline int mv_idx(uint8_t from, uint8_t to, uint8_t promo) {
     return (int)from | ((int)to << 6) | (((int)promo & 7) << 12);
 }
@@ -107,10 +101,10 @@ static const int HIST_LIMIT = 7183;          //mainHistory
 static const int MAIN_HIST_DEFAULT = 68;     //upstream's mainHistoryDefault
 static const int CAP_LIMIT = 10692;          //CapturePieceToHistory
 static const int CONT_LIMIT = 30000;         //PieceToHistory
-static const int LOW_PLY_SIZE = 5;
+static const int LOW_PLY_SIZE = 5;           //First dim in LowPlyHistory
 static const int PAWN_HIST_BASE = 8192;      //PAWN_HISTORY_BASE_SIZE
 static const int CORR_LIMIT = 1024;          //CORRECTION_HISTORY_LIMIT
-static const int CORR_BASE = 1 << 16;        //CORRHIST_BASE_SIZE
+static const int CORR_BASE = 1 << 16;        //CORRHIST_BASE_SIZE, 65,536
 enum { CONT_LEVELS = 6 };
 
 static const int cont_w[CONT_LEVELS] = { 1133, 683, 312, 582, 149, 474 };   //conthist_bonuses
@@ -385,10 +379,10 @@ static std::vector<int> game_rep;
 //empty squares as well, so a move's constant has four square terms, not upstream's two.
 enum { CUCKOO_SIZE = 8192 };
 static uint64_t cuckoo_key[CUCKOO_SIZE];
-static uint8_t  cuckoo_s1[CUCKOO_SIZE], cuckoo_s2[CUCKOO_SIZE];
+static uint8_t  cuckoo_s1[CUCKOO_SIZE], cuckoo_s2[CUCKOO_SIZE]; //two slots, each for its own indexing function
 static bool     cuckoo_used[CUCKOO_SIZE];
-static inline int cuckoo_h1(uint64_t k) { return (int)(k & 0x1fffULL); }
-static inline int cuckoo_h2(uint64_t k) { return (int)((k >> 16) & 0x1fffULL); }
+static inline int cuckoo_h1(uint64_t k) { return (int)(k & 0x1fffULL); } //indexing function 1, k is cuckoo key
+static inline int cuckoo_h2(uint64_t k) { return (int)((k >> 16) & 0x1fffULL); } //indexing function 2
 static int cuckoo_build() {
     std::memset(cuckoo_key, 0, sizeof cuckoo_key);
     std::memset(cuckoo_used, 0, sizeof cuckoo_used);
@@ -737,8 +731,9 @@ struct Worker {
     //The pawn-history index: a mix of the two pawn bitboards, a few operations and so not worth
     //keeping incrementally. (Indexing by the Zobrist pawn key instead changed which structures
     //share a slot, and with it the tree.)
-    inline uint64_t pawn_key(int ply) {
-        (void)ply;
+    //inline uint64_t pawn_key(int ply) {
+    inline uint64_t pawn_key() {
+        //(void)ply; //to avoid compiler warning of unused variable
         uint64_t k = board.pieceTypes[Pawn - 1] & board.side[ColorWhite];
         const uint64_t b = board.pieceTypes[Pawn - 1] & board.side[ColorBlack];
         k = k * 0x9E3779B97F4A7C15ULL ^ (b + 0x165667B19E3779F9ULL);
@@ -789,7 +784,7 @@ struct Worker {
         if (ply >= 0 && ply < LOW_PLY_SIZE)
             stat_add(low_ply_hist[ply][mv_idx(from, to, promo)], bonus * 805 / 1024, 7183);
         cont_update_pc(ply, pc, to, bonus * 896 / 1024);
-        stat_add(pawn_entry(pawn_key(ply), pc, to), bonus * (bonus > 0 ? 905 : 505) / 1024, 8192);
+        stat_add(pawn_entry(pawn_key(), pc, to), bonus * (bonus > 0 ? 905 : 505) / 1024, 8192);
     }
 
     //The continuation rows: piece_on(to) of the move one ply back, against the moves two and four back.
@@ -1050,8 +1045,12 @@ struct Worker {
     }
 
     inline bool is_ep(const Mv& m) {
+        const uint64_t pawnRanks[] = { RANK5, RANK4 }; 
         const int p = board.piecesOnSquares[m.src];
-        return p != PieceNone && (p & 7) == Pawn && board.piecesOnSquares[m.dst] == PieceNone
+        return board.enPassant != FileNone 
+            && (p & 7) == Pawn 
+            && board.piecesOnSquares[m.dst] == PieceNone
+            && (SQ_BIT(m.src) & pawnRanks[board.sideToMove])
             && ((m.src ^ m.dst) & 7) != 0;
     }
 
@@ -1211,8 +1210,21 @@ struct Worker {
     //Position::legal() for a pseudo-legal move. King moves come from the legal set, en passant (whose
     //discovered checks are irregular) asks the library, and a pinned piece must stay on its pin line.
     inline bool legal(const NodeInfo& ni, const Mv& m) {
-        if (m.src == ni.ksq) return true;
-        if (is_ep(m)) return is_legal_move(board, to_move(m));
+        if (m.src == ni.ksq) return true; //king's move - legal from kingMoves()
+        //En passant, as upstream's legal() tests it: with both pawns gone and the capturer on its
+        //destination, no enemy slider may see the king -- a rook or queen along the rank, or a
+        //bishop or queen along a diagonal the captured pawn was blocking. Outside check is the only
+        //case that reaches here: evasions come from libchess's legal list and table moves are
+        //validated by is_legal_move().
+        if (is_ep(m)) {
+            const int capsq = (m.dst & 7) | (m.src & 56);           //the captured pawn: dst's file, src's rank
+            const uint64_t occ = ((board.side[ColorWhite] | board.side[ColorBlack])
+                                  ^ SQ_BIT(m.src) ^ SQ_BIT(capsq)) | SQ_BIT(m.dst);
+            const uint64_t them = board.side[1 - board.sideToMove];
+            const auto k = (Stockfish::Square)ni.ksq;
+            return !(Stockfish::attacks_bb<Stockfish::ROOK>(k, occ) & them & (board.pieceTypes[Rook - 1] | board.pieceTypes[Queen - 1]))
+                && !(Stockfish::attacks_bb<Stockfish::BISHOP>(k, occ) & them & (board.pieceTypes[Bishop - 1] | board.pieceTypes[Queen - 1]));
+        }
         if (!((ni.pinned >> m.src) & 1ULL)) return true;
         return (Stockfish::line_bb((Stockfish::Square)m.src, (Stockfish::Square)ni.ksq) >> m.dst) & 1ULL;
     }
@@ -1321,7 +1333,8 @@ struct Worker {
         thr[Rook - 1] = pawn_atk | minor_atk;
         thr[Queen - 1] = thr[Rook - 1] | attacks_by_type(board, them, Rook);
         thr[King - 1] = 0;                               //PieceValue[KING] is 0: the term vanishes
-        const uint64_t pk = pawn_key(p.ply);
+        //const uint64_t pk = pawn_key(p.ply);
+        const uint64_t pk = pawn_key();
         for (int i = from; i < to; ++i) {
             const Mv& m = p.moves[i];
             const int pc = hist_pc(stm, m.src);
@@ -1814,7 +1827,7 @@ struct Worker {
                          eval_diff * 9, HIST_LIMIT);
                 const int ppc = (int)ss_mv_onto[ply - 1];
                 if (!tt_hit && (ppc % 6) != (Pawn - 1) && !is_promo_pc(ss_mv_promo[ply - 1]))
-                    stat_add(pawn_entry(pawn_key(ply), ppc, ss_mv_to[ply - 1]), eval_diff * 13, 8192);
+                    stat_add(pawn_entry(pawn_key(), ppc, ss_mv_to[ply - 1]), eval_diff * 13, 8192);
             }
             //Step 7: razoring.
             if (!pv_node && nev_pr < alpha - 485 - 281 * depth * depth)
@@ -1963,7 +1976,7 @@ struct Worker {
                     int hist = 0;
                     if (sc_pc >= 0 && sc_pc <= 11)
                         hist = (int)*cont_slot(0, ply, sc_pc, m.dst) + (int)*cont_slot(1, ply, sc_pc, m.dst)
-                             + pawn_read(pawn_key(ply), sc_pc, m.dst);
+                             + pawn_read(pawn_key(), sc_pc, m.dst);
                     if (hist < -4083 * depth) continue;
                     hist += 69 * history[stm][mv_idx(m.src, m.dst, m.promo)] / 32;
                     lmr_depth += hist / 3208;
@@ -2152,7 +2165,7 @@ struct Worker {
                      scaled * 243 / 32768, HIST_LIMIT);
             const int ppc = (int)ss_mv_onto[ply - 1];
             if ((ppc % 6) != (Pawn - 1) && !is_promo_pc(ss_mv_promo[ply - 1]))
-                stat_add(pawn_entry(pawn_key(ply), ppc, ss_mv_to[ply - 1]), scaled * 290 / 8192, 8192);
+                stat_add(pawn_entry(pawn_key(), ppc, ss_mv_to[ply - 1]), scaled * 290 / 8192, 8192);
         }
         //And so is a prior capture.
         else if (prev_ok && prior_capture) {
