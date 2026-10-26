@@ -219,7 +219,6 @@ inline bool isEnPassantLegal(const Board& board, const Square sq, const Square e
     //remove both pawns
     uint64_t occ = occupations(board);
     occ ^= (SQ_BIT(sq) | SQ_BIT(ep)); 
-    //uint64_t rankAttacks = get_rook_moves(kingSq, occ) & ranks_bb[SQ_RANK(kingSq)];
     uint64_t rankAttacks = Stockfish::attacks_bb<Stockfish::ROOK>(static_cast<Stockfish::Square>(kingSq), occ) & ranks_bb[SQ_RANK(kingSq)];
     uint64_t enemySliders = board.side[OPP_COLOR(board.sideToMove)] & (board.pieceTypes[Rook - 1] | board.pieceTypes[Queen - 1]);
     return (rankAttacks & enemySliders) == 0;
