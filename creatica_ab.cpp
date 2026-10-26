@@ -93,7 +93,7 @@ static inline bool is_promo_pc(uint8_t p) { return p >= Knight && p <= Queen; }
 //=== HISTORY TABLES ===
 //mainHistory and lowPlyHistory are keyed by from (6 bits), to (6 bits) and promotion piece (3 bits), as upstream's raw()
 //move encoding is, 15 bits total
-enum { MVIDX_N = 1 << 15 }; //32,168
+enum { MVIDX_N = 1 << 15 }; //32,768
 static inline int mv_idx(uint8_t from, uint8_t to, uint8_t promo) {
     return (int)from | ((int)to << 6) | (((int)promo & 7) << 12);
 }
