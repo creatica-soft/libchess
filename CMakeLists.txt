@@ -25,7 +25,7 @@ add_executable(creatica_ab creatica_ab.cpp uci_frontend.cpp tbprobe.c)
 # The ablation copy of creatica_ab, which stays the baseline; see the top of creatica_abl.cpp.
 add_executable(creatica_abl creatica_abl.cpp uci_frontend.cpp tbprobe.c)
 # Alpha-beta from first principles, built up in measured layers; see the top of creatica_fp.cpp.
-add_executable(creatica_fp creatica_fp.cpp uci_frontend.cpp)
+add_executable(creatica_fp creatica_fp.cpp uci_frontend.cpp tbprobe.c)
 # Component A of the chess GUI. A CMake target because it was NOT one: the binary went stale on
 # 2025-09-15 and nothing rebuilt it, so when the Board struct lost its cache fields the stale
 # executable kept the old layout inlined while linking the new library. Every field offset past
@@ -174,12 +174,12 @@ target_include_directories(creatica_fp PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 if(MSVC)
     target_link_libraries(creatica_ab PRIVATE chess curl)
     target_link_libraries(creatica_abl PRIVATE chess curl)
-    target_link_libraries(creatica_fp PRIVATE chess)
+    target_link_libraries(creatica_fp PRIVATE chess curl)
     target_link_libraries(creatica_mcts PRIVATE chess curl)
 else()
     target_link_libraries(creatica_ab PRIVATE curl pthread)
     target_link_libraries(creatica_abl PRIVATE curl pthread)
-    target_link_libraries(creatica_fp PRIVATE pthread)
+    target_link_libraries(creatica_fp PRIVATE curl pthread)
     target_link_libraries(creatica_mcts PRIVATE curl pthread)
 endif()
 target_link_libraries(gui_helper PRIVATE chess)
