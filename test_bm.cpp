@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <algorithm>
 #include <iostream>
 #include <fstream>
@@ -27,7 +28,11 @@ static const char * stockfish_path_default(void) {
     return buf;
 }
 const char * engine_path;
-int movetime = 2000, depth = 0, nodes = 0, hash = 256, threads = 1, avg_time = 0, avg_depth = 0, avg_seldepth = 0, avg_nodes = 0, avg_hashful = 0, avg_tbhits = 0;
+int movetime = 2000, depth = 0, nodes = 0, hash = 256, threads = 1;
+//one value per position for each statistic, for the mean and the standard deviation. Doubles, because
+//a sum of squared node deviations is ~1e14 and overflows any int
+struct Stat { const char * name; std::vector<double> v; };
+Stat stats[] = { {"time", {}}, {"depth", {}}, {"seldepth", {}}, {"nodes", {}}, {"nps", {}}, {"hashful", {}}, {"tbhits", {}} };
 //syzygy under $HOME, resolved at RUN TIME instead of being written in as one machine's absolute
 //path -- this is a public repository. Where the caller reads an environment variable it still wins; this
 //is only the fallback. Resolved once, on the first call, before any thread is started.
@@ -63,12 +68,9 @@ std::string test(std::string fenString) {
     fprintf(stderr, "Error in engine communication\n");
     exit(1);
   }
-  avg_time += evaluations[0]->time;
-  avg_depth += evaluations[0]->depth;
-  avg_seldepth += evaluations[0]->seldepth;
-  avg_nodes += evaluations[0]->nodes;
-  avg_hashful += evaluations[0]->hashful;
-  avg_tbhits += evaluations[0]->tbhits;
+  const double values[] = { (double)evaluations[0]->time, (double)evaluations[0]->depth, (double)evaluations[0]->seldepth,
+    (double)evaluations[0]->nodes, (double)evaluations[0]->nps, (double)evaluations[0]->hashful, (double)evaluations[0]->tbhits };
+  for (int i = 0; i < 7; i++) stats[i].v.push_back(values[i]);
   std::cout << fenString << " bm " << evaluations[0]->bestmove << " depth " << evaluations[0]->depth << " seldepth " << evaluations[0]->seldepth << " nodes " << evaluations[0]->nodes << " nps " << evaluations[0]->nps << " hashful " << evaluations[0]->hashful << " tbhits " << evaluations[0]->tbhits << " time " << evaluations[0]->time;
   return evaluations[0]->bestmove;
 }
@@ -98,28 +100,27 @@ int main(int argc, char ** argv) {
       std::vector<std::string> col;
       { std::stringstream ss(line); std::string c; while (std::getline(ss, c, '\t')) col.push_back(c); }
       if (col.size() != 2) continue;
-      positions++;
       //one call per FEN, and do not stop at the first failure - report them all
+      positions++;
       std::string bm = test(col[0]);
       std::string result = " solved";
       if (col[1] == bm) {
         solved++;
-      } else result = " failed, correct " + bm;
+      } else result = " failed, correct " + col[1];
       std::cout << " pos " << positions << result << std::endl;
     }
-    avg_time /= positions;
-    avg_depth /= positions;
-    avg_seldepth /= positions;
-    avg_nodes /= positions;
-    avg_hashful /= positions;
-    avg_tbhits /= positions;
     std::cout << "Total Arasan positions: " << positions << ", solved: " << solved << std::endl;
-    std::cout << "Avg time " << avg_time << std::endl;
-    std::cout << "Avg depth " << avg_depth << std::endl;
-    std::cout << "Avg seldepth " << avg_seldepth << std::endl;
-    std::cout << "Avg nodes " << avg_nodes << std::endl;
-    std::cout << "Avg hashful " << avg_hashful << std::endl;
-    std::cout << "Avg tbhits " << avg_tbhits << std::endl;
+    for (int i = 0; i < 7; i++) {
+      const Stat & s = stats[i];
+      if (s.v.empty()) break;
+      double mean = 0, var = 0;
+      for (double x : s.v) mean += x;
+      mean /= s.v.size();
+      for (double x : s.v) var += (x - mean) * (x - mean);
+      //depths to one decimal, as a fraction of a ply matters there; the rest are whole numbers
+      const int decimals = (i == 1 || i == 2) ? 1 : 0;
+      std::printf("Avg %s %.*f +/- %.*f\n", s.name, decimals, mean, decimals, std::sqrt(var / s.v.size()));
+    }
 	}
 	else if (argc >= 8) {
 	  std::string fenString = "", bm = argv[7];
@@ -131,6 +132,6 @@ int main(int argc, char ** argv) {
 	  else std::cout << " failed, correct " << bm << std::endl;
 	} else std::cerr << "usage: ENGINE=path MOVETIME=ms DEPTH=x NODES=y THREADS=z HASH=mb ./test_bm <file.tsv | FEN bm>" << std::endl;
 	quit(chess_engine);
-  releaseChessEngine(chess_engine);
-  return 0;
+    releaseChessEngine(chess_engine);
+    return 0;
 }
