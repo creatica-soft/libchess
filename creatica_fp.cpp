@@ -29,9 +29,14 @@
 //      (written, but off: it lost);
 //  13. capture history and one continuation history, updated as the quiet history is;
 //  14. two more continuation histories: our own previous move, and the one before it;
-//  15. late move reductions by history: less for a quiet move with a good history, more for a bad one.
-// Tried and left out, because they lost: extending every check, and skipping captures that lose
-// material in the quiescence search (SEE below 0, and below -80).
+//  15. late move reductions by history: less for a quiet move with a good history, more for a bad one;
+//  16. quiescence pruning, as upstream's: move count, futility and SEE;
+//  17. pruning at shallow depth, upstream's step 14 whole: futility at the parent on the reduced
+//      depth, capture futility, continuation history pruning, SEE with history (replacing layer
+//      6's parent futility and layer 11).
+// Tried and left out, because they lost: extending every check, and, on the earlier infrastructure,
+// skipping captures that lose material in the quiescence search (SEE below 0, and below -80; layer 16
+// has the second again, with upstream's other quiescence pruning).
 //
 // UNITS. Everything inside the search is Stockfish's internal units (PawnValue 208). Scores become
 // centipawns only on the info line, through the same win-rate model Stockfish uses.
@@ -1557,15 +1562,36 @@ struct Worker {
         //The picker yields the table's move, then captures and queen promotions by the value they
         //win; in check, every evasion. Each is searched with the window negated (what is good for
         //the opponent is bad for us); a move scoring at least beta ends the node.
+        //
+        //PRUNING, as upstream's, once some move (or standing pat) has scored better than a loss. A
+        //capture that gives no check, is not a recapture on the square just moved to, and is not a
+        //promotion is pruned: after the first two such moves; when even the evaluation plus a margin
+        //(351) plus its victim cannot reach alpha; or when its exchange cannot win what that margin
+        //leaves short of alpha. And in check, once an evasion has scored, the quiet evasions are
+        //skipped; any capture losing more than 80 by SEE is too.
         const int alpha0 = alpha;
         const NodeInfo ni = node_info();
+        const CheckInfo ci = check_info(board);
         PickerState mp;
         pick_init(mp, ni, tt_move, have_tt_move, 0, ply);
+        const int futility_base = in_check ? -MATE_CP - 1 : eval + 351;
+        const int prev_sq = (ply > 0 && ss_mv_pc[ply - 1] != 12) ? ss_mv_to[ply - 1] : 64;
         Mv best_mv{0, 0, 0};
         int move_seen = 0;
         Mv m;
         while (pick_next(mp, m)) {
             ++move_seen;
+            if (!is_loss(best)) {
+                if (!gives_check_ci(board, ci, m) && m.dst != prev_sq && !is_loss(futility_base)
+                    && m.promo == PieceTypeNone) {
+                    if (move_seen > 2) continue;
+                    const int futility_value = futility_base + victim_value(m);
+                    if (futility_value <= alpha) { best = std::max(best, futility_value); continue; }
+                    if (!see_ge(m, alpha - futility_base)) { best = std::max(best, std::min(alpha, futility_base)); continue; }
+                }
+                if (!cap_stage(m)) continue;
+                if (!see_ge(m, -80)) continue;
+            }
             Undo u;
             make(ply, m, u);
             const int v = -qsearch(-beta, -alpha, ply + 1, pv);
@@ -1842,28 +1868,51 @@ struct Worker {
                 && move_seen >= (3 + depth * depth) / (2 - improving))
                 mp.skip_quiets = true;
 
-            //FUTILITY, at the parent: near the leaves, a quiet move that gives no check cannot lift a
-            //static evaluation this far below alpha back above it.
-            if (move_seen > 1 && !pv && !in_check && quiet && !check && depth <= 6 && !is_decisive(alpha)
-                && eval + FUTILITY_MARGIN * depth <= alpha) {
-                best = std::max(best, eval + FUTILITY_MARGIN * depth);
-                continue;
-            }
-
-            //SEE PRUNING, as upstream's: a move whose exchange on its destination loses more than a
-            //margin is not searched. A capture or a check may give up 166 per ply of depth, so the
-            //deeper the node, the bigger the sacrifice still looked at. A quiet move is held to
-            //25 * d * d, d being the depth its reduced search would have, so a late quiet move that
-            //hangs a piece is dropped. The first move is never pruned, nor one that would sacrifice
-            //the last piece when a stalemate could save the game (alpha below a draw).
+            //PRUNING AT SHALLOW DEPTH, upstream's step 14 whole: a move is dropped without being made
+            //when it cannot plausibly lift the score to alpha. "Shallow" is the depth the move's own
+            //reduced search would have (lmr_depth), so the tests reach far up the tree for moves that
+            //LMR would cut back anyway. Not at the root, not with only pawns left, and not until some
+            //move has scored better than a loss, so the first move is never dropped.
             if (ply > 0 && has_non_pawn_material() && !is_loss(best)) {
+                int lmr_depth = depth - 1 - lmr_tab[std::min(depth, 63)][std::min(move_seen - 1, 63)] / 1024;
+                const int stm = (int)board.sideToMove;
+                const int pc = hist_pc(stm, m.src);
+                const bool pc_ok = pc >= 0 && pc <= 11;
                 if (!quiet || check) {
-                    if ((alpha >= 0 || non_pawn_value() != moved_value(m)) && !see_ge(m, -166 * depth))
+                    //A capture or a check. FUTILITY: a capture that gives no check, near the leaves,
+                    //whose victim and history added to the evaluation still fall short of alpha.
+                    //(Not in check, where there is no evaluation.)
+                    const int capt_hist = pc_ok ? (int)cap_hist[pc][m.dst][cap_slot_to(m)] : 0;
+                    if (!check && !in_check && lmr_depth < 7
+                        && eval + 232 + 217 * lmr_depth + victim_value(m) + 131 * capt_hist / 1024 <= alpha)
+                        continue;
+                    //SEE: one whose exchange loses more than 166 per ply of depth, more for a capture
+                    //with a good history; except a sacrifice of the last piece when stalemate could
+                    //save the game (alpha below a draw).
+                    const int margin = std::max(166 * depth + capt_hist / 29, 0);
+                    if ((alpha >= 0 || non_pawn_value() != moved_value(m)) && !see_ge(m, -margin))
                         continue;
                 } else {
-                    const int lmr_depth = std::max(depth - 1 - lmr_tab[std::min(depth, 63)][std::min(move_seen - 1, 63)] / 1024, 0);
-                    if (!see_ge(m, -25 * lmr_depth * lmr_depth))
+                    //A quiet move. CONTINUATION HISTORY: one that has failed so often after these two
+                    //earlier moves that its score is below -4083 per ply of depth.
+                    int hist = pc_ok ? (int)*cont_slot(0, ply, pc, m.dst) + (int)*cont_slot(1, ply, pc, m.dst) : 0;
+                    if (hist < -4083 * depth) continue;
+                    //The history, with the quiet table's, then shifts lmr_depth by about a ply per
+                    //3208 of score: a good move is treated as deeper, a bad one as shallower.
+                    hist += 69 * history[stm][mv_idx(m.src, m.dst, m.promo)] / 32;
+                    lmr_depth += hist / 3208;
+                    //FUTILITY at the parent: the evaluation plus 127 per ply of lmr_depth (more while no
+                    //move has raised alpha, more when the evaluation is above alpha) still at or below
+                    //alpha. Not in check. The bound it gives is kept as the node's best.
+                    const bool have_bm = best_mv.src != 0 || best_mv.dst != 0;
+                    const int fv = eval + 42 + 161 * (have_bm ? 0 : 1) + 127 * lmr_depth + (eval > alpha ? 85 : 0);
+                    if (!in_check && lmr_depth < 13 && fv <= alpha) {
+                        if (best <= fv && !is_decisive(best) && !is_win(fv)) best = fv;
                         continue;
+                    }
+                    //SEE: one that loses more than 25 * d * d, d the (history-shifted) lmr_depth.
+                    lmr_depth = std::max(lmr_depth, 0);
+                    if (!see_ge(m, -25 * lmr_depth * lmr_depth)) continue;
                 }
             }
 
