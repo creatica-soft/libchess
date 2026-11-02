@@ -19,7 +19,7 @@ make chess       # just libchess.dylib / .so / .dll
 make test_pos    # a single target
 ```
 
-CMake targets: `chess` (the shared library), the engines `creatica_ab` (alpha-beta) and `creatica_mcts` (MCTS), `test_pos`, `test_nnue`, `test_tb`, `test_smp`, `tournament`, `lichess_bot`. **`CMakeLists.txt` is the only authority on what is live code** — most `.cpp` files in the repo root are not part of any target.
+CMake targets: `chess` (the shared library), the engines `creatica_ab` (alpha-beta) and `creatica_mcts` (MCTS), `test_pos`, `test_nnue`, `test_tb`, `test_smp`, `tournament`, `lichess_bot`, and `creatica_ab_pgo` (not part of `make all`: it plays a one-minute training run, then builds creatica_ab with clang's profile; same search, about 4% faster; any source change retrains). **`CMakeLists.txt` is the only authority on what is live code** — most `.cpp` files in the repo root are not part of any target.
 
 Notes:
 - The library is ~110 MB because both NNUE nets are embedded at compile time via `incbin`. Net filenames are `#define`s in `nnue/evaluate.h` (`EvalFileDefaultNameBig` / `EvalFileDefaultNameSmall`); switching nets means editing that header and rebuilding `chess`.

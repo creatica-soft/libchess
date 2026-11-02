@@ -127,8 +127,7 @@ else()
     # On Apple Silicon they take Stockfish's apple-silicon flags (Makefile: ARCH=apple-silicon
     # COMP=clang), NEON and dot-product kernels included. libchess.dylib keeps its own flags: the
     # other targets load it.
-    function(build_like_stockfish tgt)
-        target_sources(${tgt} PRIVATE ${CHESS_SOURCES})
+    function(stockfish_flags tgt)
         if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
             target_compile_options(${tgt} PRIVATE -Wall -DNDEBUG -DUSE_PTHREADS -O3 -funroll-loops
                 -mdynamic-no-pic -DIS_64BIT -DUSE_POPCNT -DUSE_NEON=8 -march=armv8.2-a+dotprod
@@ -138,6 +137,10 @@ else()
             target_compile_options(${tgt} PRIVATE -Wall -O3 -march=native -DNDEBUG -flto)
             target_link_options(${tgt} PRIVATE -flto)
         endif()
+    endfunction()
+    function(build_like_stockfish tgt)
+        target_sources(${tgt} PRIVATE ${CHESS_SOURCES})
+        stockfish_flags(${tgt})
     endfunction()
     build_like_stockfish(creatica_ab)
     build_like_stockfish(creatica_abl)
@@ -192,3 +195,61 @@ target_link_libraries(test_tb PRIVATE chess)
 target_link_libraries(test_smp PRIVATE chess)
 target_link_libraries(tournament PRIVATE chess)
 target_link_libraries(lichess_bot PRIVATE chess curl)
+
+# creatica_ab_pgo: creatica_ab with clang's profile-guided optimisation, the way Stockfish's own
+# releases are built. Same search, node for node, about 4% faster. Not part of `make all`, because it
+# has to play a training run; ask for it with `make creatica_ab_pgo`. Plain creatica_ab is untouched.
+# Changing any source retrains: creatica_ab_gen rebuilds, so the profile does, so the stamp does, and
+# every object includes the stamp, which is what recompiles them against the new profile.
+if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(PGO_DIR ${CMAKE_BINARY_DIR}/CMakeFiles/pgo)
+    set(PGO_DATA ${PGO_DIR}/creatica_ab.profdata)
+    set(PGO_STAMP ${PGO_DIR}/profile_stamp.h)
+    set(PGO_TRAIN ${PROJECT_SOURCE_DIR}/testsets/pgo_train.tsv)
+    if(APPLE)
+        set(LLVM_PROFDATA xcrun llvm-profdata)
+    else()
+        find_program(LLVM_PROFDATA llvm-profdata)
+    endif()
+
+    add_executable(creatica_ab_gen EXCLUDE_FROM_ALL creatica_ab.cpp uci_frontend.cpp tbprobe.c)
+    build_like_stockfish(creatica_ab_gen)
+    target_compile_options(creatica_ab_gen PRIVATE -fprofile-instr-generate)
+    target_link_options(creatica_ab_gen PRIVATE -fprofile-instr-generate)
+    set_target_properties(creatica_ab_gen PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PGO_DIR})
+
+    # One thread at fixed nodes: the same training run gives the same profile.
+    add_custom_command(OUTPUT ${PGO_DATA} ${PGO_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${PGO_DIR}/train.profraw
+        COMMAND ${CMAKE_COMMAND} -E env LLVM_PROFILE_FILE=${PGO_DIR}/train.profraw HOME=/nonexistent
+                ENGINE=$<TARGET_FILE:creatica_ab_gen> HASH=64 THREADS=1 MOVETIME=0 NODES=1000000
+                $<TARGET_FILE:test_bm> ${PGO_TRAIN} > ${PGO_DIR}/train.out
+        COMMAND ${LLVM_PROFDATA} merge -o ${PGO_DATA} ${PGO_DIR}/train.profraw
+        COMMAND ${CMAKE_COMMAND} -E touch ${PGO_STAMP}
+        DEPENDS creatica_ab_gen test_bm ${PGO_TRAIN}
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMENT "Training creatica_ab's profile"
+        VERBATIM)
+    add_custom_target(creatica_ab_profile DEPENDS ${PGO_DATA} ${PGO_STAMP})
+
+    # The training run never enters these files, so they have no profile to use and clang rightly
+    # warns if asked to. They are compiled without it and still join the same link-time optimisation.
+    set(PGO_UNPROFILED engine.cpp pgn.cpp tag.cpp nnue/nnue/nnue_misc.cpp nnue/memory.cpp nnue/misc.cpp)
+    set(PGO_PROFILED ${CHESS_SOURCES})
+    list(REMOVE_ITEM PGO_PROFILED ${PGO_UNPROFILED})
+    add_library(creatica_ab_unprofiled OBJECT EXCLUDE_FROM_ALL ${PGO_UNPROFILED})
+    stockfish_flags(creatica_ab_unprofiled)
+    target_include_directories(creatica_ab_unprofiled PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
+
+    add_executable(creatica_ab_pgo EXCLUDE_FROM_ALL creatica_ab.cpp uci_frontend.cpp tbprobe.c
+        ${PGO_PROFILED} $<TARGET_OBJECTS:creatica_ab_unprofiled>)
+    add_dependencies(creatica_ab_pgo creatica_ab_profile)
+    stockfish_flags(creatica_ab_pgo)
+    target_compile_options(creatica_ab_pgo PRIVATE -fprofile-instr-use=${PGO_DATA} -include ${PGO_STAMP})
+    target_link_options(creatica_ab_pgo PRIVATE -fprofile-instr-use=${PGO_DATA})
+
+    target_include_directories(creatica_ab_gen PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
+    target_include_directories(creatica_ab_pgo PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
+    target_link_libraries(creatica_ab_gen PRIVATE curl pthread)
+    target_link_libraries(creatica_ab_pgo PRIVATE curl pthread)
+endif()
