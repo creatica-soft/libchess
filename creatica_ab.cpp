@@ -43,8 +43,8 @@ static Zobrist z;
 static const int MATE_CP       = 32000;                    //VALUE_MATE
 static const int MAX_PLY       = 246;
 static const int MATE_IN_MAX   = MATE_CP - MAX_PLY;        //VALUE_MATE_IN_MAX_PLY
-static const int VALUE_TB      = MATE_IN_MAX - 1;
-static const int TB_WIN_IN_MAX = VALUE_TB - MAX_PLY;       //VALUE_TB_WIN_IN_MAX_PLY
+static const int VALUE_TB      = MATE_IN_MAX - 1;          // i.e. MATE_CP - MAX_PLY - 1 = 31753
+static const int TB_WIN_IN_MAX = VALUE_TB - MAX_PLY;       //VALUE_TB_WIN_IN_MAX_PLY i.e. MATE_CP - 2 * MAX_PLY - 1 = 31507
 static inline bool is_win(int v)      { return v >=  TB_WIN_IN_MAX; }
 static inline bool is_loss(int v)     { return v <= -TB_WIN_IN_MAX; }
 static inline bool is_decisive(int v) { return is_win(v) || is_loss(v); }
@@ -122,7 +122,7 @@ static size_t shared_hist_threads = 0;
 
 static inline void stat_add(int& e, int bonus, int limit) {
     const int b = std::clamp(bonus, -limit, limit);
-    e = e + b - e * std::abs(b) / limit;
+    e = e + b - e * std::abs(b) / limit; //bounded non-linear update
 }
 static inline void stat_add(int16_t& e, int bonus, int limit) {
     const int b = std::clamp(bonus, -limit, limit);
@@ -296,14 +296,14 @@ static inline int tt_rel_age(uint64_t w) {
 static inline size_t tt_index(uint64_t key) {
     return (size_t)(((unsigned __int128)key * (unsigned __int128)tt_buckets) >> 64);
 }
-//probe(): the entry holding this position, or the one to replace, which is the shallowest after
-//age is taken off. The node keeps the slot and writes back into it, as upstream's TTWriter does,
-//even if its subtree has since written something else there.
 //prefetch(tt.first_entry(key())): the child's bucket is fetched while the move is still being
 //made, as upstream's do_move() fetches it, so the probe at the child's entry does not stall.
 static inline void tt_prefetch(uint64_t hash) {
     __builtin_prefetch(&tt[tt_index(hash) * (size_t)TT_WAYS]);
 }
+//tt_probe(): the entry holding this position, or the one to replace, which is the shallowest after
+//age is taken off. The node keeps the slot and writes back into it, as upstream's TTWriter does,
+//even if its subtree has since written something else there.
 static inline TTEntry * tt_probe(uint64_t hash) {
     TTEntry * base = &tt[tt_index(hash) * (size_t)TT_WAYS];
     for (int i = 0; i < TT_WAYS; ++i)
@@ -676,7 +676,8 @@ struct Worker {
     long long root_msq = 0;
     int  ss_eval[MAX_PLY];
     int  ss_cutoff_cnt[MAX_PLY + 4];     //ss->cutoffCnt
-    int  ss_rep[MAX_PLY + 4];            //st->repetition
+    int  ss_rep[MAX_PLY + 4];            //st->repetition - distance in plies to the same position in search or game history for a given ply in search
+                                         //negative for subsequent repetitions
     int  ss_pfn[MAX_PLY];                //st->pliesFromNull; -1 when no null move
     bool next_is_null = false;
     //The move made at each ply: the moved piece (the pawn on a promotion) for the continuation and
@@ -702,7 +703,7 @@ struct Worker {
     int16_t * cont_rows[MAX_PLY][CONT_LEVELS];   //each ply's continuation rows, by level
     CorrKeys ss_keys[MAX_PLY + 4];         //pawn, minor and non-pawn keys, per ply
     uint64_t key_pre[MAX_PLY][8];          //the bitboards before the move made at each ply
-    int history[2][MVIDX_N];
+    int history[2][MVIDX_N];               //move eval history per side
     int16_t cap_hist[12][64][7];               //[piece][to][captured type, 0 none]
     int16_t low_ply_hist[LOW_PLY_SIZE][MVIDX_N];
     //ONE continuation table, as upstream has: continuationHistory[inCheck][capture][piece][to] is the
@@ -731,9 +732,7 @@ struct Worker {
     //The pawn-history index: a mix of the two pawn bitboards, a few operations and so not worth
     //keeping incrementally. (Indexing by the Zobrist pawn key instead changed which structures
     //share a slot, and with it the tree.)
-    //inline uint64_t pawn_key(int ply) {
     inline uint64_t pawn_key() {
-        //(void)ply; //to avoid compiler warning of unused variable
         uint64_t k = board.pieceTypes[Pawn - 1] & board.side[ColorWhite];
         const uint64_t b = board.pieceTypes[Pawn - 1] & board.side[ColorBlack];
         k = k * 0x9E3779B97F4A7C15ULL ^ (b + 0x165667B19E3779F9ULL);
@@ -864,12 +863,12 @@ struct Worker {
     inline int tt_from_store(int v, int ply) {
         const int r50c = (int)board.halfmoveClock;
         if (is_win(v)) {
-            if (v >= MATE_IN_MAX && MATE_CP - v > 100 - r50c) return TB_WIN_IN_MAX - 1;
+            if (v >= MATE_IN_MAX && MATE_CP - v > 100 - r50c) return TB_WIN_IN_MAX - 1; //31506
             if (VALUE_TB - v > 100 - r50c) return TB_WIN_IN_MAX - 1;
             return v - ply;
         }
         if (is_loss(v)) {
-            if (v <= -MATE_IN_MAX && MATE_CP + v > 100 - r50c) return -TB_WIN_IN_MAX + 1;
+            if (v <= -MATE_IN_MAX && MATE_CP + v > 100 - r50c) return -TB_WIN_IN_MAX + 1; //-31506
             if (VALUE_TB + v > 100 - r50c) return -TB_WIN_IN_MAX + 1;
             return v + ply;
         }
@@ -905,7 +904,7 @@ struct Worker {
         }
     }
 
-    //is_repetition(): a repetition inside the search, or a third occurrence through the game.
+    //is_repetition(): a repetition inside the search, or a third occurrence through the game??
     inline bool repeated(int ply) {
         return ply < MAX_PLY && ss_rep[ply] != 0 && ss_rep[ply] < ply;
     }
@@ -1057,11 +1056,11 @@ struct Worker {
     //King takes own rook is how libchess encodes Chess960 castling.
     inline bool is_castle(const Mv& m) {
         const int p = board.piecesOnSquares[m.src];
-        if (p == PieceNone || (p & 7) != King) return false;
+        if ((p & 7) != King) return false;
         const int df = (int)(m.dst & 7) - (int)(m.src & 7);
         if (df >= 2 || df <= -2) return true;
         const int q = board.piecesOnSquares[m.dst];
-        return q != PieceNone && (q & 7) == Rook && ((q ^ p) & 8) == 0;
+        return (q & 7) == Rook && ((q ^ p) & 8) == 0;
     }
 
     //capture_stage(): captures, queen promotions and en passant.
@@ -1333,7 +1332,6 @@ struct Worker {
         thr[Rook - 1] = pawn_atk | minor_atk;
         thr[Queen - 1] = thr[Rook - 1] | attacks_by_type(board, them, Rook);
         thr[King - 1] = 0;                               //PieceValue[KING] is 0: the term vanishes
-        //const uint64_t pk = pawn_key(p.ply);
         const uint64_t pk = pawn_key();
         for (int i = from; i < to; ++i) {
             const Mv& m = p.moves[i];
@@ -1452,9 +1450,9 @@ struct Worker {
     //do_move()). Castling, en passant, double pushes and moves that may change castling rights
     //are left to the prefetch after the move; a wrong guess would only fetch an unused line.
     inline bool predict_child_key(const Mv& m, uint64_t& out) {
+        if (is_castle(m) || is_ep(m)) return false;
         const int pc = board.piecesOnSquares[m.src];
         const int pt = PC_TYPE((Piece)pc), c = (int)board.sideToMove;
-        if (is_castle(m) || is_ep(m)) return false;
         if (pt == Pawn && (m.src ^ m.dst) == 16) return false;
         if (board.castlingRights && (pt == King || pt == Rook || m.dst == 0 || m.dst == 7 || m.dst == 56 || m.dst == 63))
             return false;
@@ -1525,6 +1523,7 @@ struct Worker {
             if (!claimable) { Mv dm[MAX_MOVES]; claimable = generate(dm, false) > 0; }
             if (claimable) return 0;
         }
+        
         //Step 3: the table. pvHit is the entry's own bit; a cutoff needs a non-PV node and a bound.
         TTEntry * const slot = tt_probe(zh.hash);
         Mv qtt_move{0, 0, 0}; bool have_qtt_move = false;
@@ -1546,6 +1545,7 @@ struct Worker {
                 }
             }
         }
+        
         //Step 4: the stand pat, corrected, and improved by a usable table bound.
         int stand = -MATE_CP + ply;
         int stand_raw = -MATE_CP + ply;     //before correction, which is what the table holds
@@ -1591,6 +1591,7 @@ struct Worker {
         while (pick_next(mp, m)) {
             if (!legal(ni, m)) continue;
             ++q_count;
+            
             //Step 6: pruning.
             if (!is_loss(best)) {
                 const bool is_promo  = is_promo_pc(m.promo);
@@ -1658,7 +1659,7 @@ struct Worker {
 
     //=== THE MAIN SEARCH, upstream's search<NodeType> ===
     int search(int depth, int alpha, int beta, int ply, bool cut_node, bool pv) {
-        if (pv && seldepth < ply + 1) seldepth = ply + 1;
+        if (pv && seldepth < ply + 1) seldepth = ply + 1; //ply is zero-based, seldepth is 1-based
         pv_len[ply] = 0;
         if (timed_out()) return 0;
         if (depth <= 0) return qsearch(alpha, beta, ply, pv);
@@ -1672,6 +1673,7 @@ struct Worker {
         const bool pv_node  = pv;
         const bool all_node = !(pv_node || cut_node);
         const int stm = (int)board.sideToMove;
+        
         //Step 2: draws. The fifty-move rule loses to a mate delivered on the hundredth half-move.
         if (ply > 0 && board.halfmoveClock > 99) {
             bool claimable = !stm_in_check();
@@ -1683,6 +1685,7 @@ struct Worker {
             alpha = value_draw();
             if (alpha >= beta) return alpha;
         }
+        
         //Step 3: mate distance pruning.
         if (ply > 0) {
             alpha = std::max(-MATE_CP + ply, alpha);
@@ -1690,13 +1693,13 @@ struct Worker {
             if (alpha >= beta) return alpha;
         }
         const bool in_check = stm_in_check();
+        ss_incheck[ply] = in_check;
         //kingMoves() once per node, when something first needs it: ProbCut or the move loop.
         NodeInfo ni; bool ni_ready = false;
         const auto node_ni = [&]() -> const NodeInfo& {
             if (!ni_ready) { ni = node_info(); ni_ready = true; }
             return ni;
         };
-        ss_incheck[ply] = in_check;
         const bool prior_capture = ss_cap_type[ply] >= 0;
         const bool prev_ok = ply > 0 && ss_mv_pc[ply - 1] != 12;    //prevSq != SQ_NONE
 
@@ -1746,7 +1749,7 @@ struct Worker {
                                                  : (tt_flag == TT_UPPER || tt_flag == TT_EXACT);
             if (usable) nev_pr = tt_score;
         }
-        const int eval_prev  = ply >= 1 ? ss_eval[ply - 1] : VALUE_NONE;
+        const int eval_prev  = ply >= 1 ? ss_eval[ply - 1] : VALUE_NONE; //32002
         const int eval_prev2 = ply >= 2 ? ss_eval[ply - 2] : VALUE_NONE;
         bool improving = nev > eval_prev2;
         const bool opp_worsening = nev > -eval_prev;
@@ -1789,7 +1792,7 @@ struct Worker {
             }
         }
 
-        //Step 5: the tablebases.
+        //Step 5: the tablebases. step 5 goes after step 6 is correct, just wrong step numbering in upstream
         int best = -MATE_CP - 1;          //bestValue
         int tb_max = MATE_CP + 1;         //maxValue
         if (ply > 0 && !excluded && tb_cardinality) {
@@ -1825,14 +1828,16 @@ struct Worker {
                 const int eval_diff = std::clamp(-(eval_prev + nev), -209, 167) + 59;
                 stat_add(history[1 - stm][mv_idx(ss_mv_from[ply - 1], ss_mv_to[ply - 1], ss_mv_promo[ply - 1])],
                          eval_diff * 9, HIST_LIMIT);
-                const int ppc = (int)ss_mv_onto[ply - 1];
+                const int ppc = (int)ss_mv_onto[ply - 1]; //promo piece or moving piece if not a promo move from prev ply
                 if (!tt_hit && (ppc % 6) != (Pawn - 1) && !is_promo_pc(ss_mv_promo[ply - 1]))
                     stat_add(pawn_entry(pawn_key(), ppc, ss_mv_to[ply - 1]), eval_diff * 13, 8192);
             }
-            //Step 7: razoring.
+            
+            //Step 7: razoring (not a traditional formula for aggressive pruning of futile non-pv nodes with margin = a + b * depth^2). qsearch() returns without checking if it beats alpha or not. In standard razoring, if it does, then full depth search is performed
             if (!pv_node && nev_pr < alpha - 485 - 281 * depth * depth)
                 return qsearch(alpha, beta, ply, false);
-            //Step 8: futility pruning, child node.
+            
+            //Step 8: reverse futility pruning, stockfish's term "child node futility pruning", also called "static null move pruning"
             {
                 const int fmult  = tt_hit ? 76 : 53;
                 const int margin = fmult * depth
@@ -1842,15 +1847,16 @@ struct Worker {
                     && (!have_tt_move || tt_capture) && !is_loss(beta) && !is_win(nev_pr))
                     return (2 * beta + nev_pr) / 3;
             }
+            
             //Step 9: the null move, verified at depth.
             if (cut_node && nev >= beta - 18 * depth + 350 && !excluded && non_pawn_material(stm)
                 && ply >= nmp_min_ply && !is_loss(beta)) {
                 const int R = 7 + depth / 3;
                 const ZobristHash saved = zh;
+                //do_null_move()'s key update: the side to move flips and en passant goes.
                 const File saved_ep = board.enPassant;
                 board.sideToMove = (Color)(1 - stm);
                 board.enPassant  = FileNone;
-                //do_null_move()'s key update: the side to move flips and en passant goes.
                 zh.hash ^= z.blackMove;
                 if (saved_ep != FileNone) zh.hash ^= z.enPassant[saved_ep];
                 zh.prevEnPassant = 0;
@@ -1878,8 +1884,10 @@ struct Worker {
                 }
             }
             if (nev >= beta) improving = true;
+            
             //Step 10: internal iterative reductions.
             if (!all_node && depth >= 6 && !have_tt_move && prior_reduction <= 3) --depth;
+            
             //Step 11: ProbCut.
             const int pcbeta = beta + 235 - 63 * (improving ? 1 : 0);
             if (depth >= 3 && !is_decisive(beta) && !(tt_flag >= 0 && tt_score < pcbeta)) {
@@ -1924,11 +1932,12 @@ struct Worker {
             }
         }
 
-        //moves_loop. Step 12: a small ProbCut on the table bound alone.
+        //Step 12: a small ProbCut on the table bound alone.
         if ((tt_flag == TT_LOWER || tt_flag == TT_EXACT) && tt_depth >= depth - 4
             && tt_score >= beta + 418 && !is_decisive(beta) && !is_decisive(tt_score))
             return beta + 418;
 
+        //Step 13: the move loop.
         node_ni();
         const CheckInfo ci = check_info(board);
         PickerState mp;
@@ -1938,8 +1947,6 @@ struct Worker {
             have_tt_move && !cap_stage(tt_move)
             && (int)board.halfmoveClock >= 10 && ply >= 20 && ss_pfn[ply] > 6
             && tt_move.src == ss_mv_to[ply - 2] && ss_mv_from[ply - 2] == ss_mv_to[ply - 4];
-
-        //Step 13: the move loop.
         const int npm_us = non_pawn_material(stm);
         Mv best_mv{0, 0, 0}; bool have_bm = false;
         Mv q_tried[32]; int n_q_tried = 0;
@@ -1960,19 +1967,23 @@ struct Worker {
             int new_depth = depth - 1;
             int r1024 = sf_red1024(improving, depth, move_seen, beta - alpha, root_delta);
             if (ss_ttpv[ply]) r1024 += 946;
-            //Step 14: pruning at shallow depth.
+            
+            //Step 14: bad move (futility) pruning at shallow depth, excluding pawn end-games (without making the move).
             if (ply > 0 && npm_us && !is_loss(best)) {
+                
+                //MCP (Move Count Pruning (skips quiet moves) for move_seen >= ~ depth ^ 2, at least >= 2)
                 if (move_seen >= (3 + depth * depth) / (2 - (improving ? 1 : 0))) mp.skip_quiets = true;
+                
                 int lmr_depth = new_depth - r1024 / 1024;
-                if (!quiet || gchk) {
+                if (!quiet || gchk) { //gives check, capture or queen promo
                     const int capt_hist = (sc_pc >= 0 && sc_pc <= 11) ? (int)cap_hist[sc_pc][m.dst][victim_slot] : 0;
                     if (!gchk && lmr_depth < 7
                         && nev + 232 + 217 * lmr_depth + victim_value(m) + 131 * capt_hist / 1024 <= alpha)
                         continue;
                     const int margin = std::max(166 * depth + capt_hist / 29, 0);
                     const int moved_val = pieceValueSF[PC_TYPE((Piece)board.piecesOnSquares[m.src])];
-                    if ((alpha >= 0 || npm_us != moved_val) && !see_ge(m, -margin)) continue;
-                } else {
+                    if ((alpha >= 0 || npm_us != moved_val) && !see_ge(m, -margin)) continue; //skip bad capture
+                } else { //quiet move and non-queen promo, which may be skipped after certain number of moves (~ depth^2) by move picker
                     int hist = 0;
                     if (sc_pc >= 0 && sc_pc <= 11)
                         hist = (int)*cont_slot(0, ply, sc_pc, m.dst) + (int)*cont_slot(1, ply, sc_pc, m.dst)
@@ -1989,20 +2000,21 @@ struct Worker {
                     if (!see_ge(m, -25 * lmr_depth * lmr_depth)) continue;
                 }
             }
+            
             //Step 15: singular extension, multi-cut and the negative extensions, for the table move.
             //The excluded search shares this ply's stack entry, so its moveCount is what the table
-            //move's child reads afterwards, as upstream's does.
+            //move's child reads afterwards, as upstream's does. depth >= 6, tt_depth >= 3
             int extension = 0;
             if (is_tt && !excluded && ply > 0 && depth >= 6 + (ss_ttpv[ply] ? 1 : 0)
                 && (tt_flag == TT_LOWER || tt_flag == TT_EXACT) && !is_decisive(tt_score)
                 && tt_depth >= depth - 3 && !sing_shuffling) {
-                const int sb = tt_score - (53 + 75 * ((ss_ttpv[ply] && !pv_node) ? 1 : 0)) * depth / 60;
+                const int sb = tt_score - (53 + 75 * ((ss_ttpv[ply] && !pv_node) ? 1 : 0)) * depth / 60; //reduce beta below tt_score ~ depth
                 sing_excl[ply] = m; sing_excl_set[ply] = true;
-                const int sv = search(new_depth / 2, sb - 1, sb, ply, cut_node, false);
+                const int sv = search(new_depth / 2, sb - 1, sb, ply, cut_node, false); //search at half depth with null window
                 sing_excl_set[ply] = false;
                 pv_len[ply] = 0;
                 if (out_of_time) return 0;
-                if (sv < sb) {
+                if (sv < sb) { //single best move confirmed
                     const int corr_adj = std::abs(cv) / 230673;
                     const int dm = -4 + 199 * (pv_node ? 1 : 0) - 201 * (tt_capture ? 0 : 1) - corr_adj
                                  - 897 * tt_move_hist / 127649 - ((ply > root_depth) ? 42 : 0);
@@ -2012,7 +2024,7 @@ struct Worker {
                     extension = 1 + ((sv < sb - dm) ? 1 : 0) + ((sv < sb - tm) ? 1 : 0);
                     ++depth;
                 }
-                else if (sv >= beta && !is_decisive(sv)) {
+                else if (sv >= beta && !is_decisive(sv)) { //no single best move - multi-cut: one more move besides tt move that has already failed high because of bounds above - tt_flag, is enough to confirm cut node)
                     stat_add(tt_move_hist, std::max(-400 - 100 * depth, -4000), 8192);
                     return sv;
                 }
@@ -2021,6 +2033,7 @@ struct Worker {
             }
             new_depth += extension;
             record_move(ply, m);
+            
             //Step 16: make the move.
             Move mm = to_move(m);
             StateInfo st = {};
@@ -2055,13 +2068,14 @@ struct Worker {
             r1024 -= ss_sc * 850 / 8192;
             if (all_node) r1024 += r1024 / (depth + 1);
             int v = best;
+            
             //Step 17: late move reduction, which may also extend.
             if (depth >= 2 && move_seen > 1) {
                 const int d_lmr = std::max(1, std::min(cd - r1024 / 1024, cd + 2)) + (pv_node ? 1 : 0);
                 ss_reduction[ply] = cd - d_lmr;
                 v = -search(d_lmr, -alpha - 1, -alpha, ply + 1, true, false);
                 ss_reduction[ply] = 0;
-                if (!out_of_time && v > alpha) {
+                if (!out_of_time && v > alpha) { //reduced depth search failed high, re-search at normal depth
                     const bool deeper    = d_lmr < cd && v > best + 50;
                     const bool shallower = v < best + 9;
                     cd += (deeper ? 1 : 0) - (shallower ? 1 : 0);
@@ -2069,13 +2083,15 @@ struct Worker {
                     cont_update_pc(ply, (int)ss_mv_pc[ply], m.dst, 1365);
                 }
             }
-            //Step 18: a full-depth null-window search, reduced once or twice when LMR is skipped.
+            
+            //Step 18: a full-depth null-window search, reduced once or twice when LMR (Step 17) is skipped.
             else if (!pv_node || move_seen > 1) {
                 const int r18 = r1024 + (have_tt_move ? 0 : 1140);
                 v = -search(cd - ((r18 > 3957) ? 1 : 0) - ((r18 > 5654 && cd > 2) ? 1 : 0),
                             -alpha - 1, -alpha, ply + 1, !cut_node, false);
             }
-            //The PV search, for the first move and for any that beat alpha.
+            
+            //The PV search with full window, for the first move and for any that beat alpha.
             if (pv_node && !out_of_time && (move_seen == 1 || v > alpha)) {
                 if (is_tt && ((have_tt_score && is_decisive(tt_score) && tt_depth > 0) || tt_depth > 1))
                     cd = std::max(cd, 1);
@@ -2083,6 +2099,7 @@ struct Worker {
             }
             undo_move(board, mm, st); accumulator_stack_pop(ctx); zh = saved;
             if (out_of_time) return 0;
+            
             //Step 19: the root's per-move averages, and its scored move.
             if (ply == 0) {
                 if (RootHist * rh = root_hist_find(m)) {
@@ -2238,12 +2255,12 @@ struct Worker {
         std::memset(ss_reduction, 0, sizeof ss_reduction);
         std::memset(ss_mv_count, 0, sizeof ss_mv_count);
         std::memset(ss_stat, 0, sizeof ss_stat);
-        std::memset(ss_mv_pc, 12, sizeof ss_mv_pc);
-        std::memset(ss_mv_onto, 12, sizeof ss_mv_onto);
+        std::memset(ss_mv_pc, 12, sizeof ss_mv_pc); //no move
+        std::memset(ss_mv_onto, 12, sizeof ss_mv_onto); //no move
         std::memset(ss_mv_to, 0, sizeof ss_mv_to);
         std::memset(ss_mv_from, 0, sizeof ss_mv_from);
         std::memset(ss_mv_promo, PieceTypeNone, sizeof ss_mv_promo);
-        std::memset(prev_cap_sq, 64, sizeof prev_cap_sq);
+        std::memset(prev_cap_sq, 64, sizeof prev_cap_sq); //SquareNone = 64
         std::memset(ss_cap_type, -1, sizeof ss_cap_type);
         std::memset(sing_excl_set, 0, sizeof sing_excl_set);
         std::memset(path_hash, 0, sizeof path_hash);
@@ -2273,22 +2290,23 @@ struct Worker {
             int v;
             root_scored = false;
             if (iters_done >= 1) {
-                int delta = 5 + tid % 8 + (int)((root_msq < 0 ? -root_msq : root_msq) / 9000);
+                int delta = 5 + tid % 8 + (int)((root_msq < 0 ? -root_msq : root_msq) / 9000); // 8 is not the max number of threads
+                //small initial window for subsequent iterations 
                 int lo = std::max(root_avg - delta, -MATE_CP - 1);
                 int hi = std::min(root_avg + delta,  MATE_CP + 1);
                 int failed_high = 0;
                 for (;;) {
-                    const int ad = std::max(1, d - failed_high);
-                    root_delta = std::max(1, hi - lo);
+                    const int ad = std::max(1, d - failed_high); //reduce depth by failed_high count
+                    root_delta = std::max(1, hi - lo); //used in search
                     root_scored = false;
                     v = search(ad, lo, hi, 0, false, true);
                     if (out_of_time) break;
                     if (pv_len[0] > 0) root_first = pv_line[0][0];   //the stable_sort after every root search
-                    if (v <= lo) {
+                    if (v <= lo) { //shift the window down if fail low and adjust its size
                         hi = lo;
                         lo = std::max(v - delta, -MATE_CP - 1);
                         failed_high = 0;
-                    } else if (v >= hi) {
+                    } else if (v >= hi) { //shift the window up if fail high and adjust its size
                         lo = std::max(hi - delta, lo);
                         hi = std::min(v + delta, MATE_CP + 1);
                         ++failed_high;

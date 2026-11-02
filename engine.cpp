@@ -974,8 +974,7 @@ int go(const Engine& engine, struct Evaluation ** eval) {
 			        engine.id[0] ? engine.id : engine.engineName);
 			fflush(engine.logfile);
 		}
-		fprintf(stderr, "go() note: engine %s does not advertise MultiPV; reading a single PV\n",
-		        engine.id[0] ? engine.id : engine.engineName);
+		//fprintf(stderr, "go() note: engine %s does not advertise MultiPV; reading a single PV\n", engine.id[0] ? engine.id : engine.engineName);
 	} else {
 		pvLines = (int)engine.optionSpin[multiPVIdx].value;
 	}
