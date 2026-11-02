@@ -37,3 +37,11 @@ placeholders kept so the column count matches.
 EPD operation order is not fixed — `arasan2026.36` puts `id` before `bm` — so
 the converter takes the position from the first four whitespace-separated fields
 rather than splitting on `bm`, and appends `0 1` to make a six-field FEN.
+
+## arasan.tsv and arasan197.tsv (2 Nov 2026)
+
+`arasan.tsv` now has 178 positions. `arasan197.tsv` is the full set that every earlier result refers to. The 18 removed are positions
+creatica_ab missed at 1.75M nodes, hash 64, where Stockfish 18 with tablebases, each move forced for 100M nodes, gave the labelled move and creatica_ab's
+move the same expected result (gap under 0.03). The labelled move often still wins by more. The list is in `removed_same_result.tsv`.
+
+Also removed: `7b/8/kq6/8/8/1N2R3/K2P4/8 w - - 0 1`, seven pieces, which reaches the online tablebase, so its result depended on the network.
