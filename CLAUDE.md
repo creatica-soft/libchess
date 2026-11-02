@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`libchess` is a C++20 chess library (board representation, legal move generation, FEN/SAN/PGN, Zobrist hashing, Syzygy probing, NNUE evaluation) plus `creatica`, a UCI engine built on it that uses MCTS with NNUE leaf evaluation. `nnue/` is a heavily stripped and modified fork of Stockfish, ported to evaluate libchess's own `Board` instead of Stockfish's `Position`.
+`libchess` is a C++20 chess library (board representation, legal move generation, FEN/SAN/PGN, Zobrist hashing, Syzygy probing, NNUE evaluation) plus `creatica_ab` and `creatica_mcts` UCI engines (alpha-beta and MCTS) built on it that uses NNUE leaf evaluation. `nnue/` is a heavily stripped and modified fork of Stockfish, ported to evaluate libchess's own `Board` instead of Stockfish's `Position`.
 
-The top-level sources are MIT (see `LICENSE`); `nnue/` is a modified Stockfish fork under GPL-3 (see `COPYING`, and `nnue/README.md` for the modification notice the GPL requires). Every build target links the two, so **the built library and all the executables are GPL-3 works**, not MIT. `THIRD-PARTY-NOTICES.md` inventories every third-party component — Stockfish and its NNUE nets, incbin, Ronald de Man's Syzygy code, Fathom, nlohmann/json, uthash. When adding a vendored dependency, add it there too.
+The top-level sources are MIT (see `LICENSE`); `nnue/` is a modified Stockfish fork under GPL-3 (see `COPYING`, and `nnue/README.md` for the modification notice the GPL requires). Every build target links the two, so **the built library and all the executables are GPL-3 works**, not MIT. `THIRD-PARTY-NOTICES.md` inventories every third-party component — Stockfish and its NNUE nets, incbin, Ronald de Man's Syzygy code, Fathom, nlohmann/json. When adding a vendored dependency, add it there too.
 
 ## Build
 
@@ -19,14 +19,14 @@ make chess       # just libchess.dylib / .so / .dll
 make test_pos    # a single target
 ```
 
-CMake targets: `chess` (the shared library), the engines `creatica_ab` (alpha-beta) and `creatica_mcts` (MCTS), `test_pos`, `test_nnue`, `test_tb`, `test_smp`, `tournament`, `lichess_bot`, and `creatica_ab_pgo` (not part of `make all`: it plays a one-minute training run, then builds creatica_ab with clang's profile; same search, about 4% faster; any source change retrains). **`CMakeLists.txt` is the only authority on what is live code** — most `.cpp` files in the repo root are not part of any target.
+CMake targets: `chess` (the shared library), the engines `creatica_ab` (alpha-beta) and `creatica_mcts` (MCTS), `test_pos`, `test_nnue`, `test_tb`, `test_smp`, `tournament`, `lichess_bot`, `test_bm`, and `creatica_ab_pgo` (not part of `make all`: it plays a one-minute training run, then builds creatica_ab with clang's profile; same search, about 4% faster; any source change retrains). **`CMakeLists.txt` is the only authority on what is live code** — most `.cpp` files in the repo root are not part of any target.
 
 Notes:
 - The library is ~110 MB because both NNUE nets are embedded at compile time via `incbin`. Net filenames are `#define`s in `nnue/evaluate.h` (`EvalFileDefaultNameBig` / `EvalFileDefaultNameSmall`); switching nets means editing that header and rebuilding `chess`.
-- `CMakeLists.txt` sets the rpath to `${CMAKE_CURRENT_SOURCE_DIR}` and compiles with `-O3 -march=native`. Because the build is in-source, the rpath is the repo root, which is where `libchess.dylib` lands — so it needs no adjustment when building elsewhere. It used to be one machine's absolute path, which leaked a home directory into a public repo and produced executables that could not find the library on any other checkout.
+- `CMakeLists.txt` sets the rpath to `${CMAKE_CURRENT_SOURCE_DIR}` and compiles with `-O3 -march=native`. Because the build is in-source, the rpath is the repo root, which is where `libchess.dylib` lands — so it needs no adjustment when building elsewhere. 
 - `creatica_ab` and `creatica_mcts` are the exception to the shared library: outside MSVC each compiles the library's sources into itself (the `CHESS_SOURCES` list, via the `build_like_stockfish()` CMake function) so full LTO reaches across the search/library boundary, and on Apple Silicon it uses Stockfish's apple-silicon flags (`-DUSE_NEON=8 -DUSE_NEON_DOTPROD -DUSE_POPCNT -DIS_64BIT -march=armv8.2-a+dotprod -O3 -funroll-loops -flto=full`). Measured 2026-10-25, the NEON kernels are 1.7x faster than `-march=native` alone on the Stockfish 18 nets for creatica_ab, and creatica_mcts runs about 2.1x faster. `libchess.dylib` keeps `-O3 -march=native`; the other engines load it.
 - The build compiles with `-Wall` and **no `-Wno-*` suppressions**, and is warning-free. Keep it that way: fix the warning rather than silencing it, and do not paste `-Wno-*` flags into a new file's build-command comment. `tbcore.c` is deliberately not a target source — `tbprobe.c` `#include`s it, so a separate object would export nothing and only add warnings.
-- Files outside CMake carry their exact compile command in the **first comment line of the file** — that is the convention here. E.g. `creatica.cpp` starts with the `c++ -std=c++20 -Wall ... creatica_search.cpp creatica.cpp uci_frontend.cpp tbprobe.c -o creatica` line. Use it rather than inventing flags. Each of those lines names the same sources as its CMake target and must be kept in step with `CMakeLists.txt`; the g++/mingw variants carry a note saying they are not compile-tested, because there is no GCC and no Windows here.
+- Files outside CMake carry their exact compile command in the **first comment line of the file** — that is the convention here. E.g. `creatica_mcts.cpp` starts with the `c++ -std=c++20 -Wall ... creatica_search.cpp creatica_mcts.cpp uci_frontend.cpp tbprobe.c -o creatica_mcts` line. Use it rather than inventing flags. Each of those lines names the same sources as its CMake target and must be kept in step with `CMakeLists.txt`; the g++/mingw variants carry a note saying they are not compile-tested, because there is no GCC and no Windows here.
 
 ## Tests
 
@@ -43,8 +43,6 @@ There is no test framework. Each `test_*` is a standalone binary that takes a **
 
 `test_pos` is the correctness harness worth running after any change to move generation, `do_move`/`undo_move`, hashing, or the NNUE accumulator. For every legal move in a position it checks: FEN round-trip, `reconcile()` (bitboards vs. mailbox agree), incremental `updateHash()` vs. full `getHash()`, incremental NNUE accumulator vs. a fresh context, and the result against an external Stockfish's own eval. It reports failures on stdout and returns early — read the output; the exit code is not a verdict.
 
-External paths (`STOCKFISH`, `SYZYGY_PATH`, movetime, hash size, thread count) are `#define`s at the top of each test file, not CLI flags. Change the `#define` and rebuild. Current values are absolute paths into the author's home directory (`$HOME/stockfish-macos-m1-apple-silicon`, `$HOME/syzygy`) (5-piece tables).
-
 ## Required initialization
 
 Call once at program start, in this order:
@@ -56,11 +54,9 @@ init_nnue();                    // loads the embedded nets
 init_nnue_context(ctx);         // one NNUEContext per search thread
 ```
 
-`README.md`, the comment at the top of `libchess.h`, and several older root-level `.cpp` files still say to call `init_magic_bitboards()` / `cleanup_magic_bitboards()`. That is obsolete: `board.cpp` now uses `Stockfish::attacks_bb<>` from `nnue/bitboard.h`, and `magic_bitboards.cpp` has been moved to `attic/` — there is no longer any `magic_bitboards.*` in the repo root.
-
 ## Architecture
 
-**`struct Board`** (`chess_types.h:76`) — bitboards `side[2]` and `pieceTypes[6]`, plus a redundant `piecesOnSquares[64]` mailbox, castling rights/rooks, en passant file, side to move, and cached `isCheck`/`isMate`/`isStaleMate`. About 152 bytes and **carries no move history**; the caller owns the `StateInfo` stack.
+**`struct Board`** (`chess_types.h:76`) — bitboards `side[2]` and `pieceTypes[6]`, plus a redundant `piecesOnSquares[64]` mailbox, castling rights/rooks, en passant file, side to move. About 152 bytes and **carries no move history**; the caller owns the `StateInfo` stack.
 
 `Board` has exactly **one** definition, in `chess_types.h`, together with the five enums it needs (`Color`, `File`, `Square`, `PieceType`, `Piece`) and the `static_assert`s pinning its layout. `libchess.h` includes it; `nnue/board.h` is a one-line forwarder that keeps its name so the vendored tree's ten `#include "../board.h"` lines stay byte-identical and re-syncable from upstream. Do not re-introduce a second definition — it was duplicated until 2026-08-31, both copies mangled as `4Board`, so the linker could not tell them apart and a one-sided field change would have silently produced wrong evaluations with no diagnostic.
 
@@ -84,11 +80,9 @@ Move bitboards are consumed with `lsBit(moves)` / `moves &= moves - 1`. Promotio
 
 **External-engine driver** (`engine.cpp`) — spawns and drives a *separate* UCI engine over a pair of named pipes (`mkfifo` + `fork`/`execlp` on POSIX, `CreateNamedPipe` + `CreateProcess` on Win32): `initChessEngine`, `isReady`, `newGame`, `position`, `go`, `eval`, `getPV`, `stop`, `quit`, filling `struct Evaluation`. This is how `test_pos`, `tournament`, and `lichess_bot` obtain a reference eval or an opponent. It is unrelated to creatica's own search.
 
-**Creatica engine** — `creatica_search.cpp` (the MCTS search) + `creatica.cpp` (options, tablebase, game state) + `uci_frontend.cpp` (UCI protocol), sharing `creatica_search.hpp`. **One tree shared by all search threads**, not per-thread trees: `MCTSSearch::tree` is a `NodeMap`, a flat open-addressed table from Zobrist hash to `MCTSNode *`, so transpositions make it a DAG rather than a tree. `Edge` holds an atomic `MCTSNode *` child. Virtual loss, softmax move priors (from the NNUE policy head in `policy_net.h`, or from child evaluations when it is off), node value `W = tanh(eval / eval_scale)`, an exploration constant decaying linearly with depth, quiescence at leaves, Syzygy probing at ≤5 pieces, and libcurl lookups against online eval/tablebase endpoints. Every tunable is exposed as a UCI option (`EngineSpinOptions` in `libchess.h`) with a `#define` default in `creatica_search.hpp`.
+**Creatica engine** — `creatica_search.cpp` (the MCTS search) + `creatica_mcts.cpp` (options, tablebase, game state) + `uci_frontend.cpp` (UCI protocol), sharing `creatica_search.hpp`. **One tree shared by all search threads**, not per-thread trees: `MCTSSearch::tree` is a `NodeMap`, a flat open-addressed table from Zobrist hash to `MCTSNode *`, so transpositions make it a DAG rather than a tree. `Edge` holds an atomic `MCTSNode *` child. Virtual loss, softmax move priors (from the NNUE policy head in `policy_net.h`, or from child evaluations when it is off), node value `W = tanh(eval / eval_scale)`, an exploration constant decaying linearly with depth, quiescence at leaves, Syzygy probing at ≤5 pieces, and libcurl lookups against online eval/tablebase endpoints. Every tunable is exposed as a UCI option (`EngineSpinOptions` in `libchess.h`) with a `#define` default in `creatica_search.hpp`.
 
 Nodes live in one flat **arena** sized from `Hash` (`NodeArena` in `creatica_search.hpp`), never individually allocated; the mark stamps live in a parallel `uint32` array, and `search.tree` maps a Zobrist hash to `(slot index, identity stamp)` rather than to a pointer. Memory is reclaimed by a mark-sweep collector, `gc_mark()` plus the sweep in `gc()`, which frees **only nodes unreachable from the root** — the visit-count eviction that once truncated live subtrees is commented out. That property is load-bearing rather than incidental: search threads hold raw `MCTSNode *` across a whole simulation, and it is safe precisely because a node on a live path is reachable and so is never freed. A background "reaper" thread does the actual frees off the search's clock. See *The node arena* in `ENGINE_SETTINGS.md` for the measurements.
-
-`creatica_search.cpp` + `creatica.cpp` are no longer a CMake target (removed 2026-10-25): `creatica_mcts` (`creatica_search_mcts.cpp` + `creatica_mcts.cpp`) is the same engine and the one CMake builds. The deployed `./creatica` binary in the repo root is therefore not rebuilt by `make`; build it by its first-line compile command if it is ever needed again. The older `creatica.cpp` + `uci.cpp` pair, which called pre-rework signatures, lives in `attic/`.
 
 **PGN / game layer** (`pgn.cpp`, `tag.cpp`, `move.cpp`) — `countGames`, `initGame`, `playGame`, `ecoClassify` over fixed-size `Game`/`Tag`/`EcoLine` structures sized by the `MAX_*` macros at the top of `libchess.h`; SAN ↔ `Move` ↔ UCI conversion lives in `move.cpp`.
 
@@ -96,11 +90,8 @@ Nodes live in one flat **arena** sized from `Hash` (`NodeArena` in `creatica_sea
 
 The root directory is a working scratchpad, not a curated source tree. Numbered and suffixed variants — `chess_cnn2..9`, `train_chess_cnn*`, `boards_legal_moves*.c`, `uci-*.cpp`, `*copy.cpp`, `*.old`, `creatica-*` — are historical experiments, largely from an earlier libtorch CNN/MCTS line of work and from the original C version of the library. They are stale with respect to the current API. Check `CMakeLists.txt` before assuming a file matters, and do not "fix" or refactor the variants as a side effect of other work.
 
-`README.md` documents the pre-rework C codebase (`board.c`, `game_omp.c`, `piece.c`, `square.c`, OpenMP, SQLite, libtorch CNN training) and the cffi Python bindings flow (`gcc -E libchess.h > libchess.ph`; `python3 tasks.py`; `eval.py`). Those bindings no longer regenerate. `tasks.py`, `eval.py` and the generated `libchess.ph` have all moved to `attic/` and `test.py` is gone, but the real obstacle is the header: `libchess.h` declares 11 function templates, 52 `CHESS_API` functions taking or returning references, and 3 returning `std::pair`/`std::tuple`, none of which cffi's `cdef` can parse. Reviving them means writing a flat `extern "C"` shim, not preprocessing the header — the recipe at the top of `libchess.h` says so and is marked HISTORICAL. `chess.cpython-312-darwin.so` in the repo root is a June 2025 leftover that does not match the current library. Treat the README's build lines as historical.
-
 ## Conventions
 
-- Configuration is `#define`s at the top of the relevant `.cpp`, not flags or config files.
 - Boards are passed by reference; move generators return `uint64_t` bitboards; multi-value returns use `std::pair`/`std::tuple` with structured bindings.
 - Logging is C-style `printf`/`fprintf`; the engine writes `creatica.log` by default (overridable, and the lichess bot gives each account its own `creatica_<name>.log`), and `print()`/`log_file()` are the mutex-guarded wrappers.
 - Public library symbols are marked `CHESS_API` in `libchess.h` (a no-op outside Win32).

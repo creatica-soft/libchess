@@ -59,7 +59,6 @@ enum Square : uint8_t {
 };
 
 enum PieceType : uint8_t { PieceTypeAny, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeNone, PieceType_NB = 6, NonPawnType_NB = 5 };
-//enum PieceType : uint8_t { PieceTypeNone, Pawn, Knight, Bishop, Rook, Queen, King, PieceTypeAny, PieceType_NB = 6, NonPawnType_NB = 5 };
 
 // Piece enumeration: first three bits are used to encode the type, fourth bit defines the color, total 16 pieces
 // Shifting Piece by 3 to the right gives PieceColor: color = piece >> 3
@@ -68,7 +67,6 @@ enum PieceType : uint8_t { PieceTypeAny, Pawn, Knight, Bishop, Rook, Queen, King
 // PieceNone has color white and type PieceTypeNone
 enum Piece : uint8_t {
 	PieceWhite, WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceNone,
-	//PieceNone, WhitePawn, WhiteKnight, WhiteBishop, WhiteRook, WhiteQueen, WhiteKing, PieceWhite,
 	PieceBlack, BlackPawn, BlackKnight, BlackBishop, BlackRook, BlackQueen, BlackKing, Piece_NB = 12, NonPawn_NB = 10
 };
 
