@@ -1,0 +1,19 @@
+fen	label	label_score	ours	ours_score	gap
+r1r3k1/1ppn2bp/p1q1p1p1/3pP3/3PB1P1/PQ3NP1/3N4/2BK3R w - - 0 1	f3g5	+3	e4d3	+2	0.025
+r2q1rk1/ppp2p2/3p1np1/4pNQ1/4P1pP/1PPP4/1P3P2/R3K1R1 w Q - 0 1	g5h6	+5	e1c1	+2	0.023
+1r1rb1k1/5ppp/4p3/1p1p3P/1q2P2Q/pN3P2/PPP4P/1K1R2R1 w - - 0 1	g1g7	+6	d1d4	+2	0.010
+r2q1r2/1b2bpkp/p3p1p1/2ppP1P1/7R/1PN1BQR1/1PP2P1P/4K3 w - - 0 1	f3f6	+5	e3c5	+2	0.008
+r1b3r1/5p1k/p1n2P1p/P1qpp1P1/1p1p4/3P2Q1/BPPB2P1/R4RK1 w - - 0 1	g1f2	+3	a2b3	+2	0.004
+r1r3k1/1q3p1p/4p1pP/1bnpP1P1/pp1Q1P2/1P6/P1PR1N2/1K3B1R b - - 0 1	a4b3	+4	b5f1	+2	0.002
+3r2k1/pb3qbp/1p1p3r/nN4p1/1BPPp3/4PpP1/P1Q2P1P/2RR1BK1 b - - 0 1	f7h5	+4	g7f8	+2	0.000
+2r5/8/6k1/P1p3p1/2R5/1P1q4/1K4Q1/8 w - - 0 1	a5a6	+5	c4c3	+2	0.000
+r5n1/p1p1q2k/4b2p/3pB3/3PP1pP/8/PPPQ2P1/5RK1 w - - 0 1	d2f4	+5	e4d5	+2	0.000
+r1b2rk1/pp1p2pR/8/1pb2p2/5N2/7Q/qPPB1PPP/6K1 w - - 0 1	g2g3	+6	f4d3	+4	0.000
+2r1k2r/pp1bb1pp/6n1/3Q1p2/1B1N4/P7/1q4PP/4RRK1 w k - 0 1	b4e7	+7	f1f2	+4	0.000
+r4rk1/p4ppp/qp2p3/b5B1/n1R5/5N2/PP2QPPP/1R4K1 w - - 0 1	g5f6	+4	e2f1	+3	0.000
+1rbq1rk1/p5bp/3p2p1/2pP4/1p1n1BP1/3P3P/PP2N1B1/1R1Q1RK1 b - - 0 1	c8g4	+5	b8b7	+3	0.000
+3r2k1/pb3Np1/4pq1p/2pp1n2/3P4/1PQ5/P4PPP/R2R2K1 b - - 0 1	f5d4	+3	f6f7	+3	0.000
+r1q2rk1/1b2bppp/p1p1p3/4B3/PP6/3B3P/2P1QPP1/R2R2K1 w - - 0 1	d3h7	+5	e2h5	+3	0.000
+r2qrb1k/1p1b2p1/p2ppn1p/8/3NP3/1BN5/PPP3QP/1K3RR1 w - - 0 1	e4e5	+5	d4f3	+3	0.000
+5r2/3rkp2/2R2p2/p2Bb2Q/1p2P2P/4q1P1/Pp6/1K1R4 b - - 0 1	b4b3	+8	a5a4	+4	0.000
+3r1rk1/pbq1bp1p/1n1Rp1p1/2p1P1N1/4N2P/1P3Q2/PB3PP1/K6R w - - 0 1	h4h5	+3	f3g3	+3	0.000
