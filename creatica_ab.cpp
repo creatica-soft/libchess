@@ -2494,6 +2494,8 @@ public:
         //On by default, for parity with creatica, which probes lichess whenever its local tables
         //cannot answer. It costs nothing on the clock. Turn it off for a network-isolated run.
         o.check("OnlineTablebase", &o_online, true);
+        //Tells a GUI it may send go ponder. As upstream's, it changes nothing in the search.
+        o.check("Ponder", &o_ponder, false);
     }
 
     void init() override {
@@ -2875,6 +2877,7 @@ private:
     int64_t o_tbdepth = 1, o_tblimit = 7;
     bool o_tbrule50 = true;
     bool o_online = true;
+    bool o_ponder = false;
     uint64_t online_id_ = 0;
     std::string syzygy_path_;
     bool tb_ready_ = false;
