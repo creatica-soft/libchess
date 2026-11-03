@@ -13,7 +13,7 @@
 //   - Syzygy: upstream's Step 5 inside the tree, and a DTZ probe at the root;
 //   - the online 7-piece tablebase, asked in parallel with the search;
 //   - the table generation, so entries from earlier moves of the game age out as upstream's do;
-//   - creatica's time management.
+//   - the Move Overhead the lichess bot sets, since upstream's default of 10 ms assumes no network.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -82,7 +82,8 @@ static std::string uci_of(const Mv& m) {
 }
 
 //Upstream's RootMove::averageScore and meanSquaredScore, per root move, rebuilt every search.
-struct RootHist { Mv m{0,0,0}; int avg = -MATE_CP - 1; long long msq = 0; bool used = false; };
+//effort is upstream's too: the nodes spent under this move, which time management reads.
+struct RootHist { Mv m{0,0,0}; int avg = -MATE_CP - 1; long long msq = 0; bool used = false; long long effort = 0; };
 
 //=== THE SEARCH STACK, upstream's Stack fields as parallel arrays indexed by ply ===
 //ss->staticEval, holding upstream's VALUE_NONE where it has none. The improving and hindsight
@@ -194,7 +195,18 @@ static void reset_shared_histories(size_t threads) {
 static const int MAX_THREADS = 64;
 static std::atomic<bool> out_of_time{false};
 static std::atomic<bool> unlimited{false};          //go infinite / go ponder: never stop on the clock
-static std::atomic<long long> deadline_ns{0};       //steady_clock, in nanoseconds
+static std::atomic<long long> deadline_ns{0};       //tm.maximum() or movetime, steady_clock nanoseconds
+static std::atomic<bool> completed_one{false};      //completedDepth >= 1: nothing stops the search before it
+static std::atomic<long long> tm_optimum{0};        //tm.optimum(), milliseconds
+static std::atomic<bool> time_managed{false};       //limits.use_time_management()
+static std::atomic<bool> stop_on_ponderhit{false};  //the move's time ran out during a ponder search
+static std::atomic<bool> increase_depth{true};      //threads.increaseDepth
+static std::atomic<int> best_move_changes[MAX_THREADS];
+//The main thread's memory from one search of a game to the next (upstream's SearchManager).
+static double original_time_adjust = -1;
+static double previous_time_reduction = 0.85;
+static int best_previous_score = 32001;             //VALUE_INFINITE until the first search has ended
+static int best_previous_average = 32001;
 static std::atomic<long long> thread_nodes[MAX_THREADS];
 static std::atomic<long long> thread_tbhits[MAX_THREADS];
 static long long fixnodes = 0;
@@ -657,6 +669,7 @@ struct Worker {
     int root_delta = 1;        //upstream's rootDelta, the root window width
     int nmp_min_ply = 0;       //upstream's nmpMinPly
     int root_depth = 0;        //upstream's rootDepth
+    int root_moves = 0;        //rootMoves.size()
     //The root's TT move is upstream's rootMoves[0].pv[0], never the table's: the first legal move at
     //depth 1, then the best move of each root search that was not stopped (upstream's stable_sort).
     Mv root_first{0, 0, 0};
@@ -854,8 +867,11 @@ struct Worker {
                               : ((check_calls & 63) == 0 ? total_nodes() : 0);
             if (n >= fixnodes) { out_of_time.store(true); return true; }
         }
+        //check_time(): never during a ponder search, and never before one depth is complete.
         if ((check_calls & 1023) == 0 && !unlimited.load(std::memory_order_relaxed)
-            && now_ns() >= deadline_ns.load(std::memory_order_relaxed))
+            && completed_one.load(std::memory_order_relaxed)
+            && (stop_on_ponderhit.load(std::memory_order_relaxed)
+                || now_ns() >= deadline_ns.load(std::memory_order_relaxed)))
             out_of_time.store(true);
         return out_of_time.load(std::memory_order_relaxed);
     }
@@ -1505,6 +1521,58 @@ struct Worker {
     }
 
     //=== QUIESCENCE, upstream's qsearch ===
+    //
+    //WHAT IT IS FOR. search() runs out of depth at some point, but the position where it stops may be
+    //in the middle of an exchange: a queen just captured a rook and is about to be recaptured. The
+    //static evaluation of such a position is wrong by the value of the piece. qsearch() keeps playing
+    //captures and queen promotions (every legal reply when in check) until the position is quiet, and
+    //only then trusts the evaluation. It has no depth argument; it ends because captures run out.
+    //
+    //WHAT IT RETURNS. A score in Stockfish's units (PawnValue 208) from the side to move's point of
+    //view. A score between alpha and beta is exact; one at or below alpha says "at most this" (fail
+    //low); one at or above beta says "at least this" (fail high). `pv` is true on the principal
+    //variation, where the line is recorded for printing and the table is never allowed to end the node.
+    //When time runs out it returns 0, which every caller ignores because it tests out_of_time first.
+    //
+    //THE STEPS, in order (the numbers are upstream's step numbers, kept so the code can be compared
+    //with Stockfish's search.cpp line by line):
+    // - Entry: selective depth, the time check, the ply limit, and enter_node()'s bookkeeping
+    //   (plies since a null move, the path key, the repetition distance).
+    // - Draws: if the side to move can force a repetition and alpha is below a draw, alpha is raised
+    //   to a draw score; a repetition already on the path is a draw; so is the fifty-move rule,
+    //   except when the side to move is checkmated.
+    // - Step 3, the table. Its move, if any, is tried first. At a non-PV node an entry whose bound
+    //   already settles the window (an exact score, a lower bound >= beta, an upper bound <= alpha)
+    //   ends the node. An entry marked `unsearched` was written by the stand pat shortcut below,
+    //   without searching a single move, and is not trusted for this.
+    // - Step 4, the stand pat. Captures are optional, so the side to move can always "stand" on the
+    //   current position: its evaluation is a lower bound on the score. It is the NNUE evaluation (or
+    //   the one the table saved), shifted by correction history, and replaced by a table score when
+    //   that score's bound says it is closer to the truth. If the stand pat already reaches beta,
+    //   the node returns at once with a score halfway to beta, since the evaluation alone is not
+    //   trusted far above beta, and it leaves a table entry if the slot held nothing for this
+    //   position. Otherwise it raises alpha. In check there is no stand pat: the check must be
+    //   answered, and bestValue starts at "mated here".
+    // - The move loop. The picker yields the table move, then captures and queen promotions sorted by
+    //   victim value and capture history; in check it yields every evasion instead.
+    // - Step 6, pruning. It applies only once some score better than a forced loss is known, so
+    //   an escape from mate is never pruned. For a move that does not give check, is not a promotion
+    //   and is not a recapture on the square just captured on:
+    //     . after the first two moves, it is skipped outright;
+    //     . futility: if the stand pat plus 351 plus the captured piece still cannot reach alpha, the
+    //       move cannot help; that sum becomes the best score if it is higher, and the move is skipped;
+    //     . if the exchange on the target square (SEE) loses more than the margin the stand pat
+    //       leaves over alpha, it is skipped too.
+    //   Then, for every move: a non-capture (a quiet evasion, or a quiet table move) is skipped, and
+    //   so is any capture whose exchange loses more than 80.
+    // - Make the move, search the reply with the window negated and swapped, undo. A score above the
+    //   best raises it; one above alpha raises alpha and extends the PV; reaching beta ends the loop.
+    // - After the loop: in check with no legal move, the side to move is mated at this ply. A fail
+    //   high score is pulled halfway to beta. One stalemate the loop cannot see is caught: the last
+    //   move captured a rook or queen, the side to move has only king and pawns, and has no legal
+    //   move at all. Last, the result goes into the table at depth 0, as a lower bound if it reached
+    //   beta and an upper bound otherwise (qsearch never stores an exact score), with the best move
+    //   and the uncorrected evaluation.
     int qsearch(int alpha, int beta, int ply, bool pv) {
         if (pv && seldepth < ply + 1) seldepth = ply + 1;
         if (pv) pv_len[ply] = 0;
@@ -1658,6 +1726,116 @@ struct Worker {
     }
 
     //=== THE MAIN SEARCH, upstream's search<NodeType> ===
+    //
+    //WHAT IT IS FOR. Alpha-beta: the score of the current position searched `depth` more plies, from
+    //the side to move's point of view. Depth is a budget, not an exact count: reductions spend less
+    //of it on moves that look poor, extensions spend more on moves that look forced, and at depth 0
+    //the search hands over to qsearch(). `ply` is the distance from the root (0 at the root).
+    //
+    //WHAT IT RETURNS. As qsearch(): an exact score if it lies strictly between alpha and beta, an
+    //upper bound if it is <= alpha (no move was good enough), a lower bound if it is >= beta (one move
+    //was so good that the opponent will avoid this position, so the rest need not be searched). 0
+    //when time runs out, which every caller ignores by testing out_of_time.
+    //
+    //NODE TYPES, as Stockfish names them. A PV node (`pv`) lies on the expected best line and is
+    //searched with an open window. Every other node gets a null window, beta = alpha + 1, which only
+    //asks "is the score above alpha or not?" and is much cheaper. Non-PV nodes are further guessed to
+    //be cut nodes (`cut_node`: expected to fail high, so one good move should be enough) or all nodes
+    //(expected to fail low, so every move gets searched). The guess alternates from parent to child
+    //and decides how hard a node reduces and prunes.
+    //
+    //THE STACK. Stockfish keeps per-ply data in a Stack; here it is the ss_* arrays indexed by ply:
+    //the move made at each ply, its piece and squares, its statistics score, the static evaluation,
+    //whether the position was in check, a table hit or on the PV, the reduction the parent applied,
+    //the move count and the number of cutoffs among the children.
+    //
+    //THE STEPS, in order (upstream's numbering, so the code can be checked against search.cpp):
+    // - Entry: depth 0 goes to qsearch(); the ply limit; enter_node()'s bookkeeping.
+    // - Step 2, draws: the fifty-move rule (unless the side to move is mated), a repetition on the
+    //   path, and a repetition the side to move can force, which raises alpha to a draw score.
+    // - Step 3, mate distance pruning: a mate found nearer the root is worth more than any mate found
+    //   here, so the window shrinks to what is still achievable at this ply.
+    // - Step 4, the table: its move, score, bound and depth. During a singular search (`excluded`)
+    //   the node shares its table slot with the node proper and takes no cutoff from it.
+    // - Step 6, the static evaluation (before step 5, as upstream orders the code): the NNUE value,
+    //   corrected by correction history; `nev_pr` is the same improved by a usable table bound.
+    //   `improving` (better than two plies ago, i.e. our previous turn) and `opp_worsening` (better
+    //   for us than the opponent's previous evaluation) steer the pruning margins below. The parent's
+    //   reduction of the move that led here is judged in hindsight: if it was reduced by 3 plies or
+    //   more and the opponent's position did not get worse, a ply is added back; if it was reduced
+    //   by 2 or more and the evaluation swung by more than 173 towards us (the opponent's move looks
+    //   bad), a ply is taken away.
+    // - The early table cutoff at non-PV nodes, when the entry is deep enough and its bound settles
+    //   the window; on a fail high it also rewards the table move's history. It is withheld late in
+    //   the fifty-move count, and at depth 8 or more it is taken only if the entry for the position
+    //   after the table move agrees, because the same position reached by different paths can carry
+    //   a different history (repetitions, fifty-move counter).
+    // - Step 5, the tablebases: within the probed piece count, right after a capture or pawn move,
+    //   a win or loss or draw that settles the window ends the node and is stored. At a PV node a
+    //   bound that does not settle the window still limits the result.
+    // - Out of check only:
+    //     . the difference between this evaluation and the previous one teaches the opponent's last
+    //       move's history (a move that made the evaluation swing our way was a poor move for them);
+    //     . Step 7, razoring: an evaluation so far below alpha (by 485 + 281 * depth^2) that only
+    //       captures could save it goes straight to qsearch();
+    //     . Step 8, reverse futility pruning: an evaluation above beta by a margin growing with depth
+    //       returns without searching (only below depth 14, outside the PV tree, and when there is
+    //       no table move or the table move is a capture);
+    //     . Step 9, the null move: at a cut node with an evaluation near or above beta, pass the move
+    //       and search the opponent's reply at depth reduced by 7 + depth / 3. If even a free move
+    //       for the opponent cannot bring the score below beta, the node fails high. From depth 16 a
+    //       fail high is verified by a reduced search without the null move, because in zugzwang
+    //       passing is the best "move" and the test lies;
+    //     . Step 10, internal iterative reduction: a node with no table move at depth 6 or more,
+    //       not an all node, is searched one ply shallower, since its move ordering will be poor;
+    //     . Step 11, ProbCut: if a good capture (SEE at least the needed margin) beats beta + 235
+    //       in qsearch and then in a search about 5 plies shallower, the full search would almost
+    //       surely fail high too; the node returns and stores the result.
+    // - Step 12, a small ProbCut on the table alone: a lower bound from nearly this depth that beats
+    //   beta by 418 returns.
+    // - Step 13, the move loop. The picker yields the table move, good captures, good quiet moves,
+    //   bad captures, bad quiet moves (in check, the evasions). For each legal move it computes the
+    //   base reduction from the depth and the move number (r1024 is in 1/1024 ply) and then:
+    //     . Step 14, shallow pruning without making the move (not at the root, not when the side to
+    //       move has only king and pawns, and not until some move has been found that does not lose
+    //       by force). Move count pruning stops the picker from yielding further quiet moves once
+    //       (3 + depth^2) / 2 moves have been seen, twice as many when improving. A capture
+    //       or a checking move is skipped if even winning the victim cannot reach alpha, or if its
+    //       exchange loses more than the margin; a quiet move is skipped if its history is very bad,
+    //       if the evaluation plus a margin cannot reach alpha (futility), or if its exchange loses
+    //       more than the reduced depth allows.
+    //     . Step 15, extensions for the table move. The singular search asks: without the table
+    //       move, does any other move come within a margin of the table score, at half depth? If
+    //       not, the table move is the only good move and is extended by 1 to 3 plies. If some other
+    //       move even beats beta, two moves fail high and the node returns (multi-cut). Otherwise
+    //       the table move is reduced: by 3 if the table score already beats beta, by 2 at a cut node.
+    //     . Step 16, make the move and adjust the reduction: less for PV-tree nodes, the table move,
+    //       and moves with good statistics; more at cut nodes, after a capture as table move, when
+    //       the children have already produced several cutoffs, and at all nodes.
+    //     . Step 17, late move reductions: every move but the first, from depth 2, is searched with a
+    //       null window at the reduced depth (which can also exceed the full depth by up to 2 plies
+    //       when the reduction comes out negative). If it beats alpha it is searched again at full
+    //       depth, one ply more if it beat the best clearly, one less if barely, unless that is no
+    //       deeper than the reduced search was.
+    //     . Step 18, when step 17 does not apply: a null-window search at full depth, reduced by one
+    //       or two plies when the computed reduction is very large.
+    //     . At a PV node, the first move and any move that beat alpha get a full-window search.
+    //     . Step 19, at the root: each root move's running average score and squared score (for
+    //       the next iteration's aspiration window), and the nodes spent on it (for the time manager).
+    //       A new best root move after the first counts as a best move change.
+    //     . Step 20, the best score so far, alpha, the PV; at beta the loop stops (a cutoff). When
+    //       alpha rises the remaining moves get two plies less depth, as upstream does.
+    // - Step 21, after the loop: a fail high score is pulled towards beta; no legal move means mate
+    //   or stalemate (or, in a singular search, a fail low). Then the statistics. If a move raised
+    //   alpha, it gets a history bonus and the moves tried before it a malus, and the opponent's last
+    //   move gets a malus if it was the first move tried at its node (the second, when that node had
+    //   a table entry), since a first choice that was refuted was ordered badly. If nothing raised
+    //   alpha, the opponent's last
+    //   move evidently refuted this position and gets a bonus. The result goes into the table (exact
+    //   only at a PV node that raised alpha). Last, correction history learns how far the search
+    //   result was from the static evaluation, when the best move is not a capture and the result lies
+    //   on the side the bound can prove: above the evaluation when a move raised alpha, below it on a
+    //   fail low.
     int search(int depth, int alpha, int beta, int ply, bool cut_node, bool pv) {
         if (pv && seldepth < ply + 1) seldepth = ply + 1; //ply is zero-based, seldepth is 1-based
         pv_len[ply] = 0;
@@ -2032,13 +2210,14 @@ struct Worker {
                 else if (cut_node)         extension = -2;
             }
             new_depth += extension;
-            record_move(ply, m);
-            
+
             //Step 16: make the move.
+            record_move(ply, m);            
             Move mm = to_move(m);
             StateInfo st = {};
             auto [dp, dts] = accumulator_stack_push(ctx);
             const ZobristHash saved = zh;
+            const long long root_nodes_before = nodes_sf;   //nodeCount, for the root's effort
             ++nodes_sf;
             { uint64_t ck; if (predict_child_key(m, ck)) tt_prefetch(ck); }
             updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
@@ -2091,7 +2270,7 @@ struct Worker {
                             -alpha - 1, -alpha, ply + 1, !cut_node, false);
             }
             
-            //The PV search with full window, for the first move and for any that beat alpha.
+            //The PV search with full window, for the first move and for any that beats alpha.
             if (pv_node && !out_of_time && (move_seen == 1 || v > alpha)) {
                 if (is_tt && ((have_tt_score && is_decisive(tt_score) && tt_depth > 0) || tt_depth > 1))
                     cd = std::max(cd, 1);
@@ -2099,10 +2278,11 @@ struct Worker {
             }
             undo_move(board, mm, st); accumulator_stack_pop(ctx); zh = saved;
             if (out_of_time) return 0;
-            
+
             //Step 19: the root's per-move averages, and its scored move.
             if (ply == 0) {
                 if (RootHist * rh = root_hist_find(m)) {
+                    rh->effort += nodes_sf - root_nodes_before;
                     rh->avg = rh->used ? (v + rh->avg) / 2 : v;
                     const long long sq = (long long)v * (v < 0 ? -(long long)v : (long long)v);
                     rh->msq = rh->used ? (sq + rh->msq) / 2 : sq;
@@ -2110,7 +2290,10 @@ struct Worker {
                 }
             }
             const bool root_record = (ply == 0 && (move_seen == 1 || v > alpha));
-            if (root_record) { root_scored = true; root_scored_v = v; }
+            if (root_record) {
+                root_scored = true; root_scored_v = v;
+                if (move_seen > 1) best_move_changes[my_tid].fetch_add(1, std::memory_order_relaxed);
+            }
             const int inc = (v == best && ply + 2 >= root_depth && ((int)nodes_sf & 14) == 0
                              && !is_win(std::abs(v) + 1)) ? 1 : 0;
             if (v + inc > best) {
@@ -2234,6 +2417,66 @@ struct Worker {
 
     //ITERATIVE DEEPENING, one thread's worth (Worker::iterative_deepening). Lazy SMP: every thread
     //searches the same root and the threads meet only in the table and the shared histories.
+    //
+    //WHAT IT IS FOR. Instead of one search to a chosen depth, the root is searched to depth 1, then
+    //2, then 3, and so on until time runs out. Each iteration is cheap compared with the next,
+    //because it fills the table and the move histories, so the next one finds the best move first
+    //far more often and its cutoffs come sooner. It also means there is always a finished answer to
+    //play when the time is up.
+    //
+    //THREADS. Every thread runs this function on the same root. Thread 0 (the main thread) is the
+    //only one that prints, decides when to stop, and stops the others; the helpers only search, and
+    //help by filling the shared table. Their aspiration windows differ slightly (tid % 8), so they
+    //do not all search the same tree in step.
+    //
+    //SETUP. The thread copies the root board, rebuilds its NNUE accumulator and hash, ages its own
+    //histories from the previous move, resets the node counters and clears the per-ply stack arrays.
+    //The root's legal moves are counted (one legal move gets very little time) and the first one in
+    //generation order becomes the move tried first at depth 1, as upstream's unsorted rootMoves.
+    //
+    //EACH ITERATION, depth d:
+    // - Optimism: from the running average score of the move tried first, 142 * avg / (|avg| + 91),
+    //   which static_eval() passes to the NNUE evaluation for the root's side to move, negated for
+    //   the opponent, as upstream does.
+    // - Depth 1 is searched with a full window. From depth 2 on, the aspiration window: a narrow
+    //   window around that average score, wider when the move's scores have varied (root_msq). A
+    //   narrow window cuts far more, but the true score may lie outside it. If the search fails
+    //   low, the window moves down and widens; if it fails high, the window moves up and widens, and
+    //   each fail high in a row searches one ply shallower (a fail low resets that count). The
+    //   widening grows by a third per failure, until the score lands inside the window.
+    // - When the time manager says time is getting short (increase_depth false), search_again counts
+    //   up and the iteration searches shallower than d (by 3 * (search_again + 1) / 4 plies), so
+    //   it re-checks the current depth instead of starting a deeper one it would not finish.
+    // - After every root search, the move at the head of the PV is tried first next time.
+    // - If time ran out in the middle of an iteration, its best move is still kept, provided the
+    //   root has scored a move in this iteration and the score is not a loss that the unfinished
+    //   search has not proved; otherwise the last finished iteration's move stands.
+    // - A finished iteration's best move, score, depth and PV go into results[tid], and thread 0
+    //   prints the "info" line. The depth at which the best move last changed is remembered for the
+    //   time manager.
+    //
+    //WHEN TO STOP (thread 0 only). "go mate N" stops when a mate in N is found, "go depth N" at depth
+    //N, and "go nodes N" in timed_out(). Under a clock, after each finished iteration, this is the
+    //rest of Stockfish's time manager (tm_init() set the optimum and maximum time when the search
+    //began). The optimum time is scaled by four factors:
+    // - falling_eval, 0.57 to 1.70: more time when the score has dropped since the previous move's
+    //   search and since four iterations ago, the floor when it is steady or rising;
+    // - reduction, from time_reduction: less time the longer the best move has stayed the same
+    //   (time_reduction rises from about 0.66 to about 1.53 as the iterations since the last change
+    //   pass about 12), weighed against the previous move's own value;
+    // - instability, 1.02 + 2.14 * best move changes per thread: more time when the best move keeps
+    //   changing; the change count is halved every iteration, so old changes fade;
+    // - high_effort, 0.76 when the best move has taken more than 93% of this thread's nodes, which
+    //   means the other moves were refuted quickly.
+    //   With only one legal move it is at most 502 ms. If the elapsed time exceeds this total (or
+    //   the maximum), the search stops; while pondering it does not stop but answers at once on
+    //   ponderhit. Otherwise it continues, and if more than half the total is used, the next
+    //   iterations re-search instead of going deeper (increase_depth, above). Independently of all
+    //   this, timed_out() stops any search at the hard maximum, once one iteration is complete.
+    //
+    //AFTER THE LOOP. The helpers return. Thread 0 saves time_reduction for the next move's
+    //calculation. In "go infinite" or "go ponder" it waits for "stop" or "ponderhit", because the
+    //protocol forbids answering on its own; then it sets out_of_time, which stops the helpers.
     void iterate(int tid) {
         if (!ctx_ready) { init_nnue_context(ctx); ctx_ready = true; }
         ThreadResult& out = results[tid];
@@ -2269,15 +2512,23 @@ struct Worker {
         //rootMoves starts in generation order, so depth 1 opens on the first legal move.
         {
             Mv rm0[MAX_MOVES];
-            const int rn = generate(rm0, false);
-            have_root_first = rn > 0;
-            if (rn > 0) root_first = rm0[0];
+            root_moves = generate(rm0, false);
+            have_root_first = root_moves > 0;
+            if (root_moves > 0) root_first = rm0[0];
         }
         Mv last_pv[MAX_PLY]; int last_pvlen = 0;
         int iters_done = 0;
+        //Time management, on the main thread: what each iteration leaves for the next.
+        double time_reduction = 1, tot_best_move_changes = 0;
+        int iter_value[4], iter_idx = 0;
+        for (int& iv : iter_value) iv = best_previous_score == MATE_CP + 1 ? 0 : best_previous_score;
+        Mv last_best{0, 0, 0}; int last_best_move_depth = 0;
+        int search_again = 0;
         for (int d = 1; d < MAX_PLY - 4; ++d) {
             root_depth = d;
             seldepth = 0;
+            if (tid == 0) tot_best_move_changes /= 2;      //age out the best move's instability
+            if (!increase_depth.load(std::memory_order_relaxed)) ++search_again;
             //The window's centre and size, and the optimism, from the move that sorts first.
             if (have_root_first) {
                 RootHist * rh0 = root_hist_find(root_first);
@@ -2296,17 +2547,20 @@ struct Worker {
                 int hi = std::min(root_avg + delta,  MATE_CP + 1);
                 int failed_high = 0;
                 for (;;) {
-                    const int ad = std::max(1, d - failed_high); //reduce depth by failed_high count
+                    //Less depth after a fail high, and when time is short enough that this
+                    //iteration repeats the last depth instead of going deeper.
+                    const int ad = std::max(1, d - failed_high - 3 * (search_again + 1) / 4);
                     root_delta = std::max(1, hi - lo); //used in search
                     root_scored = false;
                     v = search(ad, lo, hi, 0, false, true);
                     if (out_of_time) break;
                     if (pv_len[0] > 0) root_first = pv_line[0][0];   //the stable_sort after every root search
-                    if (v <= lo) { //shift the window down if fail low and adjust its size
+                    if (v <= lo) { //shift the window down if fail low and widens its size
                         hi = lo;
                         lo = std::max(v - delta, -MATE_CP - 1);
                         failed_high = 0;
-                    } else if (v >= hi) { //shift the window up if fail high and adjust its size
+                        if (tid == 0) stop_on_ponderhit.store(false);
+                    } else if (v >= hi) { //shift the window up if fail high and widens its size
                         lo = std::max(hi - delta, lo);
                         hi = std::min(v + delta, MATE_CP + 1);
                         ++failed_high;
@@ -2329,7 +2583,9 @@ struct Worker {
                 break;
             }
             ++iters_done;
+            if (tid == 0) completed_one.store(true, std::memory_order_relaxed);
             if (pv_len[0] > 0) {
+                if (!same(last_best, pv_line[0][0])) { last_best = pv_line[0][0]; last_best_move_depth = d; }
                 last_pvlen = std::min(pv_len[0], MAX_PLY);
                 for (int i = 0; i < last_pvlen; ++i) last_pv[i] = pv_line[0][i];
                 out.have = true; out.best = last_pv[0]; out.score = v; out.depth = d;
@@ -2341,8 +2597,42 @@ struct Worker {
             if (go_mate && ((v >= MATE_IN_MAX && MATE_CP - v <= 2 * go_mate)
                             || (v <= -MATE_IN_MAX && MATE_CP + v <= 2 * go_mate))) break;
             if (fixdepth && d >= fixdepth) break;
+            for (int t = 0; t < search_threads; ++t)
+                tot_best_move_changes += best_move_changes[t].exchange(0, std::memory_order_relaxed);
+            //Do we have time for the next iteration? Spend more when the score falls or the best
+            //move keeps changing, less when one move has been best for many depths or took
+            //nearly all the nodes.
+            if (time_managed.load(std::memory_order_relaxed) && !stop_on_ponderhit.load()) {
+                RootHist * rh = root_hist_find(root_first);
+                const uint64_t nodes_effort = (uint64_t)(rh ? rh->effort : 0) * 100000
+                                            / std::max<uint64_t>(1, (uint64_t)nodes_sf);
+                double falling_eval = (11.85 + 2.24 * (best_previous_average - v)
+                                       + 0.93 * (iter_value[iter_idx] - v)) / 100.0;
+                falling_eval = std::clamp(falling_eval, 0.57, 1.70);
+                const double center = last_best_move_depth + 12.15;
+                time_reduction = 0.66 + 0.85 / (0.98 + std::exp(-0.51 * (iters_done - center)));
+                const double reduction = (1.43 + previous_time_reduction) / (2.28 * time_reduction);
+                const double instability = 1.02 + 2.14 * tot_best_move_changes / search_threads;
+                const double high_effort = nodes_effort >= 93340 ? 0.76 : 1.0;
+                double total_time = (double)tm_optimum.load() * falling_eval * reduction
+                                  * instability * high_effort;
+                if (root_moves == 1) total_time = std::min(502.0, total_time);
+                const double elapsed = (double)elapsed_ms();
+                const long long maximum_ns = deadline_ns.load() - std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(search_start.time_since_epoch()).count();
+                if (elapsed > std::min(total_time, (double)maximum_ns / 1e6)) {
+                    if (ponder_flag.load()) stop_on_ponderhit.store(true);
+                    else break;
+                } else {
+                    increase_depth.store(ponder_flag.load() || elapsed <= total_time * 0.50,
+                                         std::memory_order_relaxed);
+                }
+            }
+            iter_value[iter_idx] = v;
+            iter_idx = (iter_idx + 1) & 3;
         }
         if (tid != 0) return;
+        previous_time_reduction = time_reduction;
         //go infinite and go ponder never answer on their own: wait for stop or ponderhit.
         while (!out_of_time.load() && (ponder_flag.load() || infinite_flag))
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -2433,6 +2723,11 @@ static uint64_t                ol_ans_id = 0;
 static std::string             ol_ans_move;
 static int                     ol_ans_score = 0;
 static std::unordered_map<std::string, std::pair<int, std::string>> ol_cache;
+//The search an arriving answer may end: its id, or 0 for none. The answer replaces the search's
+//move anyway, so there is no reason to keep searching once it is here -- the search used to run its
+//whole allotted time first, 8.6 s of a 60+1 clock in a 6-piece position whose table is not local.
+//Not set for go infinite, which must wait for stop.
+static std::atomic<uint64_t>   ol_stop_id{0};
 static const int TB_CP = 20000;
 
 static size_t ol_write(void * p, size_t sz, size_t n, void * ud) {
@@ -2487,6 +2782,7 @@ public:
     void declare_options(uci::Options& o) override {
         o.spin("Hash",    &o_hash,    64, 1, 32768);
         o.spin("Threads", &o_threads,  1, 1, MAX_THREADS);
+        o.spin("Move Overhead", &o_overhead, 10, 0, 5000);
         o.string("SyzygyPath", &syzygy_path_, "", [this] { on_syzygy_path(); });
         o.spin("SyzygyProbeDepth", &o_tbdepth, 1, 1, 100);
         o.check("Syzygy50MoveRule", &o_tbrule50, true);
@@ -2521,6 +2817,9 @@ public:
         game_rep.clear();
         reset_shared_histories((size_t)search_threads);
         pool_run(JOB_CLEAR);
+        original_time_adjust = -1;
+        previous_time_reduction = 0.85;
+        best_previous_score = best_previous_average = MATE_CP + 1;
     }
 
     void set_position(const std::string& fen, const std::vector<std::string>& moves) override {
@@ -2621,7 +2920,12 @@ public:
         apply_threads();
         apply_hash();
         out_of_time.store(false);
-        for (int t = 0; t < MAX_THREADS; ++t) { thread_nodes[t].store(0); thread_tbhits[t].store(0); }
+        for (int t = 0; t < MAX_THREADS; ++t) {
+            thread_nodes[t].store(0); thread_tbhits[t].store(0); best_move_changes[t].store(0);
+        }
+        completed_one.store(false);
+        stop_on_ponderhit.store(false);
+        increase_depth.store(true);
         tt_gen = (uint8_t)((tt_gen + 1) & 31);       //new_search()
         search_start = std::chrono::steady_clock::now();
         fixnodes = lim.nodes;
@@ -2645,12 +2949,15 @@ public:
         //later search -- which it did while only a posted request moved the id on: a 6-piece
         //position's late answer was played as the bestmove of the 32-piece position after it.
         ++online_id_;
+        //Tablebase answers here and in the online one below use the line creatica_mcts prints, because
+        //lichess_bot knows a tablebase verdict by depth 1, nodes 1, tbhits 1, and offers its draw on it.
         //Answered by the local tables: nothing to search. Not after go ponder, which must not
         //answer on its own; the answer is still there on ponderhit.
         if (!lim.ponder) {
             std::string tb_best; int tb_score = 0;
             if (probe_tb_root(tb_best, tb_score)) {
-                std::printf("info depth 1 score cp %d nodes 0 time 0 pv %s\n", tb_score, tb_best.c_str());
+                std::printf("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time 0 pv %s\n",
+                            tb_score, tb_best.c_str());
                 std::printf("bestmove %s\n", tb_best.c_str());
                 std::fflush(stdout);
                 return;
@@ -2662,9 +2969,12 @@ public:
         //TB_LARGEST to 6, and a piece-count test then never asks about the 6-piece tables that
         //were not downloaded. creatica_mcts decides the same way. Only the root is ever sent:
         //lichess rate-limits, so the tree uses the local tables alone.
+        ol_stop_id.store(0);
         if (!lim.ponder && o_online && !root_board.castlingRights
-            && bitCount(root_board.side[ColorWhite] | root_board.side[ColorBlack]) <= 7)
+            && bitCount(root_board.side[ColorWhite] | root_board.side[ColorBlack]) <= 7) {
+            if (!lim.infinite) ol_stop_id.store(online_id_);
             post_online_probe(root_fen);
+        }
         driver_ = std::thread([this] { this->run(); });
     }
 
@@ -2673,8 +2983,8 @@ public:
         if (driver_.joinable()) driver_.join();
     }
 
-    //A ponder search has no deadline; ponderhit installs the real one, and the running search
-    //becomes a timed one without restarting.
+    //A ponder search has no deadline; ponderhit installs the real one, counted from the go ponder,
+    //and the running search becomes a timed one without restarting.
     void ponderhit() override {
         uci::Limits lim = last_limits_;
         lim.ponder = false;
@@ -2720,6 +3030,10 @@ private:
         pool_run(JOB_SEARCH);
         const int bt = best_thread(search_threads);
         const ThreadResult& r = results[bt];
+        if (r.have) {
+            best_previous_score = r.score;
+            if (RootHist * rh = workers[(size_t)bt]->root_hist_find(r.best)) best_previous_average = rh->avg;
+        }
         std::string best = r.have ? uci_of(r.best) : std::string();
         std::string ponder = (r.have && r.pvlen > 1) ? uci_of(r.pv[1]) : std::string();
         //THE ONLINE ANSWER, if it arrived for this move while we searched. A tablebase verdict
@@ -2727,7 +3041,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(ol_ans_mtx);
             if (o_online && ol_ans_id == online_id_ && !ol_ans_move.empty()) {
-                std::printf("info depth 1 score cp %d nodes 0 time %lld tbhits 1 pv %s\n",
+                std::printf("info depth 1 seldepth 1 multipv 1 score cp %d nodes 1 nps 1 hashfull 0 tbhits 1 time %lld pv %s\n",
                             ol_ans_score, elapsed_ms(), ol_ans_move.c_str());
                 best = ol_ans_move;
                 ponder.clear();
@@ -2787,6 +3101,7 @@ private:
                 if (!answered) continue;
                 std::lock_guard<std::mutex> lk(ol_ans_mtx);
                 ol_ans_id = id; ol_ans_move = move; ol_ans_score = score;
+                if (id == ol_stop_id.load()) out_of_time.store(true);
             }
         });
     }
@@ -2818,34 +3133,58 @@ private:
         std::fflush(stdout);
     }
 
-    //CREATICA'S OWN TIME MANAGEMENT, formula for formula: the latency allowance, the capping
-    //below MIN_TIME_THRESHOLD and the rest are documented against measurements in creatica.cpp,
-    //and an alpha-beta search has no reason to want a different allocation.
-    void set_clock(const uci::Limits& lim) {
-        if (lim.ponder || lim.infinite) { unlimited.store(true); return; }
-        double alloc;
-        if (lim.movetime_ms > 0) {
-            alloc = (double)lim.movetime_ms * 0.99;
-        } else if (!lim.wtime && !lim.btime) {
-            unlimited.store(true);          //"go", "go depth N", "go nodes N": nothing to budget
-            return;
-        } else {
-            const int64_t remaining = root_board.sideToMove == ColorWhite ? lim.wtime : lim.btime;
-            const int64_t inc       = root_board.sideToMove == ColorWhite ? lim.winc  : lim.binc;
-            int moves_left = lim.movestogo ? lim.movestogo : MAX_MOVES_REMAINING - root_move_number;
-            if (moves_left < MIN_MOVES_REMAINING) moves_left = MIN_MOVES_REMAINING;
-            int64_t r = remaining;
-            if (r > TIME_SAFETY_BUFFER) r -= TIME_SAFETY_BUFFER;
-            alloc = (double)r / moves_left + (double)inc * 0.5;
-            alloc -= LATENCY_ALLOWANCE;
-            if (remaining < MIN_TIME_THRESHOLD) alloc = std::min(alloc, (double)remaining * 0.5);
-            if (inc < 1000 && alloc < 3000) alloc = 100;
-            if (alloc < 100) alloc = 100;
-        }
+    //Upstream's TimeManagement::init, formula for formula: an optimum the search may stretch or
+    //shrink between iterations, and a maximum that stops it anywhere. Times are milliseconds.
+    void tm_init(long long time, long long inc, int movestogo, int ply, long long overhead) {
         const long long start_ns = (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        search_start.time_since_epoch()).count();
-        deadline_ns.store(start_ns + (long long)(alloc * 1e6));
-        unlimited.store(false);
+        tm_optimum.store(0);
+        deadline_ns.store(start_ns);
+        if (time == 0) return;
+        double opt_scale, max_scale;
+        int centi_mtg = movestogo ? std::min(movestogo * 100, 5000) : 5051;
+        if (time < 1000) centi_mtg = (int)((double)time * 5.051);   //under a second, a shorter horizon
+        const long long time_left = std::max(1LL,
+            time + (inc * (centi_mtg - 100) - overhead * (200 + centi_mtg)) / 100);
+        if (movestogo == 0) {
+            if (original_time_adjust < 0)
+                original_time_adjust = 0.3128 * std::log10((double)time_left) - 0.4354;
+            const double log_time = std::log10((double)time / 1000.0);
+            const double opt_constant = std::min(0.0032116 + 0.000321123 * log_time, 0.00508017);
+            const double max_constant = std::max(3.3977 + 3.03950 * log_time, 2.94761);
+            opt_scale = std::min(0.0121431 + std::pow(ply + 2.94693, 0.461073) * opt_constant,
+                                 0.213035 * (double)time / (double)time_left)
+                      * original_time_adjust;
+            max_scale = std::min(6.67704, max_constant + ply / 11.9847);
+        } else {
+            opt_scale = std::min((0.88 + ply / 116.4) / (centi_mtg / 100.0),
+                                 0.88 * (double)time / (double)time_left);
+            max_scale = 1.3 + 0.11 * (centi_mtg / 100.0);
+        }
+        long long optimum = (long long)(opt_scale * (double)time_left);
+        const long long maximum =
+            (long long)std::min(0.825179 * (double)time - (double)overhead, max_scale * (double)optimum) - 10;
+        if (o_ponder) optimum += optimum / 4;
+        tm_optimum.store(optimum);
+        deadline_ns.store(start_ns + maximum * 1000000);
+    }
+
+    void set_clock(const uci::Limits& lim) {
+        time_managed.store(false);
+        unlimited.store(lim.ponder || lim.infinite);
+        if (lim.infinite) return;
+        if (lim.movetime_ms > 0) {
+            const long long start_ns = (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           search_start.time_since_epoch()).count();
+            deadline_ns.store(start_ns + (long long)((double)lim.movetime_ms * 0.99 * 1e6));
+        } else if (!lim.wtime && !lim.btime) {
+            unlimited.store(true);          //"go", "go depth N", "go nodes N": nothing to budget
+        } else {
+            const bool white = root_board.sideToMove == ColorWhite;
+            tm_init(white ? lim.wtime : lim.btime, white ? lim.winc : lim.binc, lim.movestogo,
+                    std::max(2 * (root_move_number - 1), 0) + (white ? 0 : 1), o_overhead);
+            time_managed.store(true);
+        }
     }
 
     //Three entries per bucket, as upstream's clusters; resized only when the size changes,
@@ -2866,14 +3205,10 @@ private:
         pool_run(JOB_CLEAR);
     }
 
-    //The bestmove has to reach the driver and the next position come back, and that time comes
-    //off the clock without ever having been in the allocation (creatica.cpp).
-    static constexpr double LATENCY_ALLOWANCE = 300.0;
-
     std::thread driver_;
     std::unique_ptr<Worker> uci_worker_;
     uci::Limits last_limits_;
-    int64_t o_hash = 64, o_threads = 1;
+    int64_t o_hash = 64, o_threads = 1, o_overhead = 10;
     int64_t o_tbdepth = 1, o_tblimit = 7;
     bool o_tbrule50 = true;
     bool o_online = true;

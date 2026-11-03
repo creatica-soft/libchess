@@ -1290,6 +1290,80 @@ struct GameStanding {
     int  halfmove_clock = 0;
 };
 
+//How many pieces are on the board after the moves. Worked out here rather than with the engine's
+//"pieces" command because that command is private to our own engines: Stockfish answers "Unknown
+//command", and pieces() then waited out ENGINE_READ_TIMEOUT_MS on every move, burning a minute of
+//clock each time and returning 0, which also switched pondering off. 0 means the FEN did not parse.
+static int countPieces(const std::string& initial_fen, const std::string& moves) {
+    Board b = Board{};
+    if (fen2board(b, initial_fen == "startpos" ? startPosFen : initial_fen.c_str()) != 0) return 0;
+    std::istringstream ms(moves);
+    std::string mv;
+    while (ms >> mv) {
+        Move m;
+        uci2move_idx(mv.c_str(), m);
+        normalise_castling(b, m);
+        StateInfo st = {};
+        do_move(b, m, st);
+    }
+    return bitCount(b.side[0] | b.side[1]);
+}
+
+//Whether `uci` is a legal move after the game's moves. The game's own moves come from lichess and
+//are legal; the ponder move comes from the engine and is not known to be. It used to be appended
+//unchecked, and countPieces() then replayed it: do_move() on a move that does not exist in the
+//position (a piece missing from its source square, or squares outside the board from a malformed
+//string) writes outside the Board on the stack. That aborted the bot with "stack buffer overflow" in
+//ComputeAndPostMove on 2026-11-03, when getPV() handed back the previous search's ponder move.
+static bool legalPonderMove(const std::string& initial_fen, const std::string& moves, const char * uci) {
+    const size_t n = strlen(uci);
+    if (n < 4 || n > 5) return false;
+    if (uci[0] < 'a' || uci[0] > 'h' || uci[2] < 'a' || uci[2] > 'h') return false;
+    if (uci[1] < '1' || uci[1] > '8' || uci[3] < '1' || uci[3] > '8') return false;
+    if (n == 5 && !strchr("qrbn", uci[4])) return false;
+    Board b = Board{};
+    if (fen2board(b, initial_fen == "startpos" ? startPosFen : initial_fen.c_str()) != 0) return false;
+    std::istringstream ms(moves);
+    std::string mv;
+    while (ms >> mv) {
+        Move m;
+        uci2move_idx(mv.c_str(), m);
+        normalise_castling(b, m);
+        StateInfo st = {};
+        do_move(b, m, st);
+    }
+    Move p;
+    uci2move_idx(uci, p);
+    normalise_castling(b, p);
+    return is_legal_move(b, p);
+}
+
+//The game's moves as any UCI engine reads them. In a game created from a position lichess reports
+//castling as king-takes-rook, "e8h8", which only our own engines accept. Stockfish, not in
+//UCI_Chess960 mode, drops that move and every move after it, so it still saw the side that had
+//just castled on move, played that side's move for it and was refused, "Piece on e8 cannot move to
+//g8", on every turn until it flagged. Done by replay because the text cannot tell castling from a
+//rook on e1 going to h1. Unchanged if the FEN does not parse.
+static std::string standardCastling(const std::string& initial_fen, const std::string& moves) {
+    Board b = Board{};
+    if (fen2board(b, initial_fen == "startpos" ? startPosFen : initial_fen.c_str()) != 0) return moves;
+    std::string out;
+    std::istringstream ms(moves);
+    std::string mv;
+    while (ms >> mv) {
+        Move m;
+        uci2move_idx(mv.c_str(), m);
+        const auto as_sent = m.dst;
+        normalise_castling(b, m);
+        if (m.dst != as_sent) mv[2] = mv[2] > mv[0] ? 'g' : 'c';
+        StateInfo st = {};
+        do_move(b, m, st);
+        if (!out.empty()) out += ' ';
+        out += mv;
+    }
+    return out;
+}
+
 static GameStanding replayStanding(const std::string& initial_fen, const std::string& moves) {
     GameStanding gs;
     Board b = Board{};
@@ -1313,6 +1387,7 @@ static GameStanding replayStanding(const std::string& initial_fen, const std::st
     while (ms >> mv) {
         Move m;
         uci2move_idx(mv.c_str(), m);
+        normalise_castling(b, m);
         StateInfo st = {};
         do_move(b, m, st);
         seen.push_back(key(b));
@@ -1432,15 +1507,20 @@ void ComputeAndPostMove(const std::string& game_id, const bool draw_offer, const
         //std::cout << "ComputeAndPostMove() debug: and getting PV..." << std::endl; 
         strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
         if (!moves.empty()) {
-          strncpy(creatica.moves, moves.c_str(), MAX_UCI_MOVES_LEN);
+          strncpy(creatica.moves, standardCastling(initial_fen, moves).c_str(), MAX_UCI_MOVES_LEN);
           //uci GUIs use last move as a ponder move for "go ponder" command
           //lichess last move in position command has already been played, hence we need to play it, 
           //otherwise, the engine will ponder on it!
           //actually, it is easier to just append our ponder move to lichess moves - the engine does not care what it is anyway
           if (bot_ponder && !our_turn && strcmp(evaluations[0]->ponder, "") != 0) {
-            strcat(creatica.moves, " ");
-            strcat(creatica.moves, evaluations[0]->ponder);
-            ponder_move_sent = true;
+            if (legalPonderMove(initial_fen, moves, evaluations[0]->ponder)) {
+              strcat(creatica.moves, " ");
+              strcat(creatica.moves, evaluations[0]->ponder);
+              ponder_move_sent = true;
+            } else
+              std::cerr << "ComputeAndPostMove() warning: the engine's ponder move '"
+                        << evaluations[0]->ponder << "' is not legal here; not pondering this move"
+                        << std::endl;
           }
         } else creatica.moves[0] = '\0';
 int pos_retries = 0;
@@ -1460,7 +1540,7 @@ try_pos: if (!position(creatica)) {
           strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
           goto try_pos;
         }
-        int numberOfPieces = pieces(creatica);
+        const int numberOfPieces = countPieces(initial_fen, creatica.moves);
         creatica.wtime = wtime;
         creatica.btime = btime;
         creatica.winc = winc;
@@ -1473,7 +1553,7 @@ try_again:  clearTablebaseVerdict();   //see clearTablebaseVerdict(): go() does 
               initChessEngine(creatica, engine_path.c_str(), MOVETIME, DEPTH, bot_hash, bot_threads, SYZYGY_PATH, MULTI_PV, false, false, ELO_CREATICA);
               setEngineOptions();
               strncpy(creatica.position, initial_fen.c_str(), MAX_FEN_STRING_LEN);
-              strncpy(creatica.moves, moves.c_str(), MAX_UCI_MOVES_LEN);
+              strncpy(creatica.moves, standardCastling(initial_fen, moves).c_str(), MAX_UCI_MOVES_LEN);
               if (!position(creatica)) {
                 fprintf(stderr, "ComputeAndPostMove() error: position() returned false after restart, fen %s\n", creatica.position);
                 return; //lose this move, not the whole bot
@@ -1533,6 +1613,7 @@ try_again:  clearTablebaseVerdict();   //see clearTablebaseVerdict(): go() does 
                 while (ms >> mv) {
                   Move m2;
                   uci2move_idx(mv.c_str(), m2);
+                  normalise_castling(b, m2);
                   StateInfo st = {};
                   do_move(b, m2, st);
                 }

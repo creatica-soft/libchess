@@ -726,6 +726,10 @@ int getPV(const Engine& engine, struct Evaluation ** eval, const int multiPV) {
 			end--;
 		}
 		if (strstr(line, "bestmove ") - line == 0) {
+			//A bestmove line without a ponder move must leave no ponder move. sscanf leaves the field
+			//alone when " ponder" is missing, so it kept the PREVIOUS search's prediction, and the bot
+			//appended that stale move to the game -- see legalPonderMove() in lichess_bot.cpp.
+			eval[0]->ponder[0] = '\0';
 			if ((sscanf(line, "bestmove %5s ponder %5s", eval[0]->bestmove, eval[0]->ponder) == 2) || (sscanf(line, "bestmove %5s", eval[0]->bestmove) == 1)) {
 				if (strncmp(eval[0]->bestmove, "(none", 5) == 0 || eval[0]->bestmove[0] == '\0') {
 					for (int i = 0; i < multiPV; i++) {
@@ -809,7 +813,10 @@ int getPV(const Engine& engine, struct Evaluation ** eval, const int multiPV) {
 						// if it is greater, then truncate
 						if (len > eval[pv]->maxPlies)
 							len = eval[pv]->maxPlies;
-					  if (len >= prevLen[pv]) {
+						//A tablebase verdict, one node at depth 1, is one move long and may follow a deeper
+						//search, as creatica_ab's online answer does, so longest-PV must not drop it.
+						const bool tb_verdict = strncmp(line, "info depth 1 ", 13) == 0 && strstr(line, " nodes 1 ");
+					  if (len >= prevLen[pv] || tb_verdict) {
 							prevLen[pv] = len;
 							if (prevLine[pv]) {
 								free(prevLine[pv]);
@@ -835,7 +842,12 @@ int getPV(const Engine& engine, struct Evaluation ** eval, const int multiPV) {
   					eval[0]->nag = 20; //there is no nag for mate
 					}
 					return 0;
-        } else if ((tmpLine = strstr(line, " score cp 0"))) {//info depth 0 score cp 0 (stalemate)
+        //DEPTH 0, not just a score of 0. A line with no multipv field and a 0 score is also how
+        //creatica_ab reports a tablebase draw, "info depth 1 score cp 0 ... pv c6c5", and UCI allows
+        //it. Read as stalemate, it returned "none" before reaching the real bestmove, so the bot fell
+        //back to its first legal move in every drawn tablebase position and gave away a rook in
+        //vhmrb94M.
+        } else if (strstr(line, " depth 0 ") && (tmpLine = strstr(line, " score cp 0"))) {
 					eval[0]->depth = 0;
 					strcpy(eval[0]->bestmove, "none");
 					eval[0]->scorecp = 0;
