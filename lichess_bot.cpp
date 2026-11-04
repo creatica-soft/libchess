@@ -15,6 +15,7 @@
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <csignal>
+#include <unistd.h>     // write() and _exit() in the signal handler
 #include <random>       // For RNG in GetAndProcessBots
 #include "json.hpp"     // https://github.com/nlohmann/json
 #include "nnue/bitboard.h"
@@ -571,6 +572,20 @@ static bool challengerAllowed(const std::string& challenger_id) {
     return accept_only.empty() || accept_only.count(challenger_id) > 0;
 }
 std::atomic<bool> playing {true};
+//A sleep that ends early when shutdown begins; returns whether the bot is still playing. Every
+//long wait goes through this. Plain sleep_for calls are why Ctrl-C stopped working: main() joins
+//the challenge thread, which could be inside HttpRequest's 429 back-off, a full minute per attempt
+//for up to six attempts, and so shutdown took up to six minutes.
+static bool sleep_while_playing(std::chrono::milliseconds d) {
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (playing.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= until) return true;
+        std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
+            until - now, std::chrono::milliseconds(100)));
+    }
+    return false;
+}
 std::mutex mutex;
 std::mutex playing_mutex;
 std::mutex challenge_mutex;
@@ -911,12 +926,21 @@ bool HttpRequest(const std::string& method, const std::string& url, const std::s
             std::cerr << "HttpRequest() error: retryable error: " << curl_easy_strerror(res) << ": "
                       << errbuf << " HTTP: " << http_code << " -- attempt " << retry_count
                       << " of " << (max_retries + 1) << std::endl;
+            bool still_playing = true;
             if (http_code == 429) {
                 std::cerr << "waiting one full minute before retrying..." << std::endl;
-                std::this_thread::sleep_for(std::chrono::seconds(60));  // Rate limiting requires waiting 1 min
+                still_playing = sleep_while_playing(std::chrono::seconds(60));  // Rate limiting requires waiting 1 min
             }
             else if (retry_count <= max_retries) {
-                std::this_thread::sleep_for(std::chrono::seconds(retry_count));  // Linear delay (1s, 2s, 3s...)
+                still_playing = sleep_while_playing(std::chrono::seconds(retry_count));  // Linear delay (1s, 2s, 3s...)
+            }
+            //Shutting down: no more retries. The first attempt always runs, so the requests made
+            //during shutdown itself (cancelling an outstanding challenge) are still sent once.
+            if (!still_playing) {
+                std::cerr << "HttpRequest(): shutting down; not retrying " << url << std::endl;
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+                return false;
             }
         } else {
             // Non-retryable error (e.g., 4xx client errors)
@@ -1051,9 +1075,9 @@ void GetAndProcessBots(int nb) {
       if (!playing.load()) {
         break;
       }
-      std::this_thread::sleep_for(std::chrono::seconds(15)); //just to give time to kill the bot if needed
+      if (!sleep_while_playing(std::chrono::seconds(15))) break; //just to give time to kill the bot if needed
       if (!game_in_progress.load()) {
-          while (bots.empty()) {
+          while (bots.empty() && playing.load()) {
               std::string query = bot_url + "?nb=" + std::to_string(nb);
               std::string response;
               HttpRequest("GET", query, "", &response, "application/x-ndjson", false);
@@ -1086,9 +1110,10 @@ void GetAndProcessBots(int nb) {
                   std::cout << "GetAndProcessBots() debug: no bots have been found" << std::endl;
               }  
               if (bots.empty()) {
-                  std::this_thread::sleep_for(std::chrono::milliseconds(10000)); //sleep for 10s and try to create a list of bots again
+                  sleep_while_playing(std::chrono::milliseconds(10000)); //sleep for 10s and try to create a list of bots again
               }
           } //end of while (bots.empty)
+          if (!playing.load()) break;
           //A named opponent replaces the list entirely, so the retry loop below is unchanged --
           //it just has one candidate to try.
           if (!challenge_target.empty()) {
@@ -1143,12 +1168,13 @@ void GetAndProcessBots(int nb) {
               res = CreateChallenge(botname, challenge_rated, bot_clock, bot_increment, challengeId,
                                     "random", bot_variant);
               if (res) {
-                while (!challenge_accepted.load() && !challenge_declined.load()) {
+                //Also ends on shutdown; main() then cancels the challenge (cancelOutstandingChallenge).
+                while (playing.load() && !challenge_accepted.load() && !challenge_declined.load()) {
                   std::cout << "GetAndProcessBots() debug: challenge_accepted " << challenge_accepted.load() << ", challenge_declined " << challenge_declined.load() << std::endl;
                   std::unique_lock<std::mutex> lck(challenge_mutex);
                   using namespace std::chrono_literals;
                   int seconds = 5;
-                  bool wait_result = challenge_cv.wait_for(lck, seconds*1000ms, [] { return challenge_accepted.load() || challenge_declined.load(); });
+                  bool wait_result = challenge_cv.wait_for(lck, seconds*1000ms, [] { return challenge_accepted.load() || challenge_declined.load() || !playing.load(); });
                   lck.unlock();
                   if (wait_result) {// Wait until challenge is accepted for 5 s, challenge would expire in 20s
                     if (challenge_accepted.load() || challenge_declined.load()) break;
@@ -2259,14 +2285,33 @@ void ProcessEvent(const json& event) {
     }
 }
 
-void signal_handler(int sig) {
-    std::cout << "Received Ctrl-C (SIGINT). Shutting down gracefully..." << std::endl;
-    playing.store(false);
-    {
-      std::lock_guard<std::mutex> lk(playing_mutex);
-      game_in_progress.store(false);
+//ONLY ASYNC-SIGNAL-SAFE WORK HERE: two lock-free atomics and write(2). The handler used to print
+//through std::cout and take playing_mutex, either of which can deadlock if the signal lands while
+//the interrupted thread holds the same lock. Waking the waiting threads is done by the watcher
+//thread in main(). A second Ctrl-C exits at once, for when the graceful shutdown is stuck.
+//
+//What the second one still cleans up is limited to what is async-signal-safe: kill() and unlink().
+//It kills the engine child, which otherwise outlives the bot -- an engine whose input closes may
+//spin on EOF at a full core indefinitely, as two Stockfish children did (see quit() in
+//engine.cpp) -- and removes its two named pipes, which otherwise stay in /tmp. Both are read
+//from `creatica`'s fixed char arrays and int, so nothing is allocated. Not done: cancelling an open
+//challenge (lichess expires it in about 20 s) and resigning a game in progress, both HTTP requests.
+static std::atomic<int> sigint_count{0};
+void signal_handler(int) {
+    if (sigint_count.fetch_add(1) > 0) {
+        static const char now[] = "\nSecond Ctrl-C: killing the engine, removing its pipes, exiting now.\n";
+        const ssize_t r = write(STDERR_FILENO, now, sizeof now - 1);
+        (void)r;
+        if (creatica.enginePid > 0) kill((pid_t)creatica.enginePid, SIGKILL);
+        if (creatica.namedPipeTo[0])   unlink(creatica.namedPipeTo);
+        if (creatica.namedPipeFrom[0]) unlink(creatica.namedPipeFrom);
+        _exit(130);
     }
-    game_cv.notify_one();
+    static const char msg[] = "Received Ctrl-C (SIGINT). Shutting down gracefully..."
+                              " (Ctrl-C again exits at once)\n";
+    const ssize_t r = write(STDERR_FILENO, msg, sizeof msg - 1);
+    (void)r;
+    playing.store(false);
 }
 
 int main(int argc, char ** argv) {
@@ -2502,15 +2547,29 @@ int main(int argc, char ** argv) {
   }
 
   curl_global_init(CURL_GLOBAL_DEFAULT);
+  //THE SHUTDOWN WATCHER: does what the signal handler may not. Once `playing` goes false it releases
+  //the challenge thread from its two waits -- for the game to end, and for a challenge answer.
+  std::thread shutdown_watcher([] {
+    while (playing.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+      std::lock_guard<std::mutex> lk(playing_mutex);
+      game_in_progress.store(false);
+    }
+    game_cv.notify_all();
+    { std::lock_guard<std::mutex> lk(challenge_mutex); }
+    challenge_cv.notify_all();
+  });
   std::thread challenge;
   if (!no_challenge) challenge = std::thread(GetAndProcessBots, nb);
   std::string event_url = "https://lichess.org/api/stream/event";
   while (playing.load()) {  // Main loop: Keep streaming events
       StreamAndProcess(event_url, ProcessEvent);
+      if (!playing.load()) break;
       std::cerr << "main() debug: stream ended; reconnecting in 3s..." << std::endl;
-      std::this_thread::sleep_for(std::chrono::seconds(3));
+      sleep_while_playing(std::chrono::seconds(3));
   }
   if (challenge.joinable()) challenge.join();
+  shutdown_watcher.join();
   //Shutdown is the other place a challenge can outlive its purpose -- see
   //cancelOutstandingChallenge(). curl is still initialised here; the cleanup is below.
   cancelOutstandingChallenge("shutting down");
