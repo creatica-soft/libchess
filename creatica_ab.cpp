@@ -715,7 +715,7 @@ struct Worker {
     int pv_len[MAX_PLY];
     int16_t * cont_rows[MAX_PLY][CONT_LEVELS];   //each ply's continuation rows, by level
     CorrKeys ss_keys[MAX_PLY + 4];         //pawn, minor and non-pawn keys, per ply
-    uint64_t key_pre[MAX_PLY][8];          //the bitboards before the move made at each ply
+    bool ck_dpush = false, ck_exact = false;   //child_keys() -> finish_keys(): double push; prefetch was exact
     int history[2][MVIDX_N];               //move eval history per side
     int16_t cap_hist[12][64][7];               //[piece][to][captured type, 0 none]
     int16_t low_ply_hist[LOW_PLY_SIZE][MVIDX_N];
@@ -1461,28 +1461,6 @@ struct Worker {
     }
 
     //Records the move about to be made at `ply` for the child's history and continuation keys.
-    //The child's key for an ordinary move, from the board before it, so its table bucket can be
-    //fetched while the move and its NNUE update are still being made (upstream prefetches inside
-    //do_move()). Castling, en passant, double pushes and moves that may change castling rights
-    //are left to the prefetch after the move; a wrong guess would only fetch an unused line.
-    inline bool predict_child_key(const Mv& m, uint64_t& out) {
-        if (is_castle(m) || is_ep(m)) return false;
-        const int pc = board.piecesOnSquares[m.src];
-        const int pt = PC_TYPE((Piece)pc), c = (int)board.sideToMove;
-        if (pt == Pawn && (m.src ^ m.dst) == 16) return false;
-        if (board.castlingRights && (pt == King || pt == Rook || m.dst == 0 || m.dst == 7 || m.dst == 56 || m.dst == 63))
-            return false;
-        const auto key = [&](int col, int t, int sq) {
-            return t == Pawn ? z.pawns[col][sq - 8] : z.nonPawns[col][t - 2][sq];
-        };
-        uint64_t k = zh.hash ^ zh.prevEnPassant ^ z.blackMove;
-        k ^= key(c, pt, m.src) ^ z.emptySquares[m.src];
-        const int victim = PC_TYPE((Piece)board.piecesOnSquares[m.dst]);
-        k ^= board.piecesOnSquares[m.dst] == PieceNone ? z.emptySquares[m.dst] : key(1 - c, victim, m.dst);
-        k ^= key(c, is_promo_pc(m.promo) ? (int)m.promo : pt, m.dst);
-        out = k;
-        return true;
-    }
     inline void record_move(int ply, const Mv& m) {
         const int moved = PC_TYPE(board.piecesOnSquares[m.src]);
         const int onto  = is_promo_pc(m.promo) ? m.promo : moved;
@@ -1493,26 +1471,84 @@ struct Worker {
         ss_mv_promo[ply] = m.promo;
         prev_cap_sq[ply + 1] = cap_stage(m) ? (uint8_t)m.dst : (uint8_t)64;
         ss_cap_type[ply + 1] = (int8_t)cap_type(m);
-        for (int c = 0; c < 2; ++c) key_pre[ply][c] = board.side[c];
-        for (int t = 0; t < 6; ++t) key_pre[ply][2 + t] = board.pieceTypes[t];
     }
-    //The child's keys, from the parent's and the squares the move changed for each colour and
-    //piece type -- which covers captures, en passant, promotions and castling without cases.
-    inline void update_keys(int ply) {
+    //The child's keys, made once from the move and the board BEFORE it. The Zobrist part the pieces
+    //change is exactly updateHash()'s terms, with do_move()'s classification of the move (castling,
+    //then double push, then en passant capture, then capture); the correction keys use the same
+    //numbers, so they come from the same terms. Writes ss_keys[ply + 1], prefetches the child's
+    //table bucket, and returns the piece part of the hash; finish_keys() adds the rest after the move.
+    inline uint64_t child_keys(const Mv& m, int ply) {
         CorrKeys k = ss_keys[ply];
-        for (int c = 0; c < 2; ++c)
-            for (int t = 0; t < 6; ++t) {
-                uint64_t d = (key_pre[ply][c] & key_pre[ply][2 + t]) ^ (board.side[c] & board.pieceTypes[t]);
-                for (; d; d &= d - 1) {
-                    const int sq = lsBit(d);
-                    if (t == Pawn - 1) { k.pawn ^= z.pawns[c][sq - 8]; continue; }
-                    const uint64_t r = z.nonPawns[c][t - 1][sq];
-                    k.np[c] ^= r;
-                    if (t == Knight - 1 || t == Bishop - 1) k.minor ^= r;
-                }
+        uint64_t dz = 0;
+        const int c = (int)board.sideToMove, o = 1 - c;
+        const auto put = [&](int col, int t, int sq) {
+            if (t == Pawn) { const uint64_t x = z.pawns[col][sq - 8]; dz ^= x; k.pawn ^= x; }
+            else {
+                const uint64_t x = z.nonPawns[col][t - 2][sq]; dz ^= x; k.np[col] ^= x;
+                if (t == Knight || t == Bishop) k.minor ^= x;
             }
+        };
+        const int pt = PC_TYPE((Piece)board.piecesOnSquares[m.src]);
+        const int occ = board.piecesOnSquares[m.dst];
+        const bool enemy_on_dst = (board.side[o] >> m.dst) & 1ULL;
+        const bool promo = m.promo != PieceTypeNone;
+        int side = -1;   //castling: 0 kingside, 1 queenside
+        if (pt == King) {
+            if (board.isChess960 && ((board.castlingRooks >> m.dst) & 1ULL)) side = m.dst > m.src ? 0 : 1;
+            else if ((int)m.dst - (int)m.src == 2) side = 0;
+            else if ((int)m.src - (int)m.dst == 2) side = 1;
+        }
+        const int push = c == ColorWhite ? 16 : -16;
+        ck_dpush = false;
+        if (side >= 0) {
+            const int kd = castlingKingSquare[c][side], rd = castlingRookSquare[c][side];
+            const int rs = board.isChess960 ? (int)m.dst : (int)initialRookSquare[c][side];
+            put(c, King, m.src); dz ^= z.emptySquares[m.src] ^ z.emptySquares[kd]; put(c, King, kd);
+            put(c, Rook, rs);    dz ^= z.emptySquares[rs] ^ z.emptySquares[rd];    put(c, Rook, rd);
+        } else if (pt == Pawn && !enemy_on_dst && ((m.src ^ m.dst) & 7) != 0) {   //en passant capture
+            const int sq = c == ColorWhite ? m.dst - 8 : m.dst + 8;
+            put(c, Pawn, m.src); dz ^= z.emptySquares[m.src] ^ z.emptySquares[m.dst] ^ z.emptySquares[sq];
+            put(o, Pawn, sq); put(c, Pawn, m.dst);
+        } else {
+            put(c, promo ? (int)m.promo : pt, m.dst);
+            put(c, promo ? (int)Pawn : pt, m.src);
+            dz ^= z.emptySquares[m.src];
+            if (enemy_on_dst) put(o, PC_TYPE((Piece)occ), m.dst);
+            else {
+                dz ^= z.emptySquares[m.dst];
+                ck_dpush = !promo && pt == Pawn && (int)m.dst == (int)m.src + push;
+            }
+        }
         ss_keys[ply + 1] = k;
+        //The castling rights can change only when a king or rook moves or a rook square is entered.
+        ck_exact = !(board.castlingRights && (pt == King || pt == Rook || ((board.castlingRooks >> m.dst) & 1ULL)
+                                               || m.dst == 0 || m.dst == 7 || m.dst == 56 || m.dst == 63));
+        if (ck_exact)
+            tt_prefetch(zh.hash ^ zh.prevEnPassant ^ dz ^ z.blackMove ^ (ck_dpush ? z.enPassant[m.src & 7] : 0));
+        return dz;
     }
+    //After do_move: en passant, castling rights and side to move, as updateHash() adds them.
+    inline void finish_keys(uint64_t dz) {
+        zh.hash ^= zh.prevEnPassant ^ dz;
+        zh.prevEnPassant = 0;
+        if (ck_dpush) { zh.prevEnPassant = z.enPassant[board.enPassant]; zh.hash ^= zh.prevEnPassant; }
+        zh.hash ^= zh.prevCastlingRights;
+        zh.prevCastlingRights = z.castling[board.castlingRights];
+        zh.hash ^= zh.prevCastlingRights ^ z.blackMove;
+        if (!ck_exact) tt_prefetch(zh.hash);
+    }
+#ifdef KEYS_CHECK
+    void keys_verify(const ZobristHash& before, Move mm, int captured, int ply) {
+        ZobristHash ref = before;
+        updateHash(ref, board, mm, captured, z);
+        const CorrKeys rk = corr_keys(board), &k = ss_keys[ply + 1];
+        if (ref.hash != zh.hash || ref.prevEnPassant != zh.prevEnPassant || ref.prevCastlingRights != zh.prevCastlingRights
+            || rk.pawn != k.pawn || rk.minor != k.minor || rk.np[0] != k.np[0] || rk.np[1] != k.np[1]) {
+            fprintf(stderr, "KEYS_CHECK mismatch at ply %d move %d-%d promo %d type %d\n", ply, mm.src, mm.dst, mm.promoType, mm.type);
+            abort();
+        }
+    }
+#endif
 
     inline void update_pv(int ply, const Mv& m) {
         pv_line[ply][0] = m;
@@ -1686,10 +1722,12 @@ struct Worker {
             const ZobristHash saved = zh;
             if (ply < MAX_PLY) record_move(ply, m);
             ++nodes_sf;
-            { uint64_t ck; if (predict_child_key(m, ck)) tt_prefetch(ck); }
-            updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
-            tt_prefetch(zh.hash);
-            update_keys(ply);
+            const uint64_t dz = child_keys(m, ply);
+            [[maybe_unused]] const int captured = do_move_dp(board, mm, st, dp, dts);
+            finish_keys(dz);
+#ifdef KEYS_CHECK
+            keys_verify(saved, mm, captured, ply);
+#endif
             const int v = -qsearch(-beta, -alpha, ply + 1, pv);
             undo_move(board, mm, st); accumulator_stack_pop(ctx); zh = saved;
             if (out_of_time) return 0;
@@ -2086,10 +2124,12 @@ struct Worker {
                     auto [dp, dts] = accumulator_stack_push(ctx);
                     const ZobristHash saved = zh;
                     ++nodes_sf;
-                    { uint64_t ck; if (predict_child_key(m, ck)) tt_prefetch(ck); }
-                    updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
-                    tt_prefetch(zh.hash);
-                    update_keys(ply);
+                    const uint64_t dz = child_keys(m, ply);
+                    [[maybe_unused]] const int captured = do_move_dp(board, mm, st, dp, dts);
+                    finish_keys(dz);
+#ifdef KEYS_CHECK
+                    keys_verify(saved, mm, captured, ply);
+#endif
                     int v = -qsearch(-pcbeta, -pcbeta + 1, ply + 1, false);
                     if (v >= pcbeta && cdepth > 0)
                         v = -search(cdepth, -pcbeta, -pcbeta + 1, ply + 1, !cut_node, false);
@@ -2219,10 +2259,12 @@ struct Worker {
             const ZobristHash saved = zh;
             const long long root_nodes_before = nodes_sf;   //nodeCount, for the root's effort
             ++nodes_sf;
-            { uint64_t ck; if (predict_child_key(m, ck)) tt_prefetch(ck); }
-            updateHash(zh, board, mm, do_move_dp(board, mm, st, dp, dts), z);
-            tt_prefetch(zh.hash);
-            update_keys(ply);
+            const uint64_t dz = child_keys(m, ply);
+            [[maybe_unused]] const int captured = do_move_dp(board, mm, st, dp, dts);
+            finish_keys(dz);
+#ifdef KEYS_CHECK
+            keys_verify(saved, mm, captured, ply);
+#endif
             int cd = new_depth;
             if (ss_ttpv[ply])
                 r1024 -= 2719 + (pv_node ? 983 : 0)
