@@ -142,7 +142,10 @@ else()
         target_sources(${tgt} PRIVATE ${CHESS_SOURCES})
         stockfish_flags(${tgt})
     endfunction()
-    build_like_stockfish(creatica_ab)
+    # With clang, creatica_ab is the profile-guided build below; other compilers build it plain.
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        build_like_stockfish(creatica_ab)
+    endif()
     build_like_stockfish(creatica_abl)
     build_like_stockfish(creatica_fp)
     build_like_stockfish(creatica_mcts)
@@ -196,9 +199,10 @@ target_link_libraries(test_smp PRIVATE chess)
 target_link_libraries(tournament PRIVATE chess)
 target_link_libraries(lichess_bot PRIVATE chess curl)
 
-# creatica_ab_pgo: creatica_ab with clang's profile-guided optimisation, the way Stockfish's own
-# releases are built. Same search, node for node, about 4% faster. Not part of `make all`, because it
-# has to play a training run; ask for it with `make creatica_ab_pgo`. Plain creatica_ab is untouched.
+# creatica_ab is built with clang's profile-guided optimisation, the way Stockfish's own releases are
+# built: an instrumented copy (creatica_ab_gen) plays a training run, then creatica_ab is compiled
+# against the profile it recorded. Same search, node for node, as the plain build, and about 4% faster.
+# So building creatica_ab (or `make all`) includes the training run, about a minute.
 # Changing any source retrains: creatica_ab_gen rebuilds, so the profile does, so the stamp does, and
 # every object includes the stamp, which is what recompiles them against the new profile.
 if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -241,15 +245,12 @@ if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     stockfish_flags(creatica_ab_unprofiled)
     target_include_directories(creatica_ab_unprofiled PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
 
-    add_executable(creatica_ab_pgo EXCLUDE_FROM_ALL creatica_ab.cpp uci_frontend.cpp tbprobe.c
-        ${PGO_PROFILED} $<TARGET_OBJECTS:creatica_ab_unprofiled>)
-    add_dependencies(creatica_ab_pgo creatica_ab_profile)
-    stockfish_flags(creatica_ab_pgo)
-    target_compile_options(creatica_ab_pgo PRIVATE -fprofile-instr-use=${PGO_DATA} -include ${PGO_STAMP})
-    target_link_options(creatica_ab_pgo PRIVATE -fprofile-instr-use=${PGO_DATA})
+    target_sources(creatica_ab PRIVATE ${PGO_PROFILED} $<TARGET_OBJECTS:creatica_ab_unprofiled>)
+    add_dependencies(creatica_ab creatica_ab_profile)
+    stockfish_flags(creatica_ab)
+    target_compile_options(creatica_ab PRIVATE -fprofile-instr-use=${PGO_DATA} -include ${PGO_STAMP})
+    target_link_options(creatica_ab PRIVATE -fprofile-instr-use=${PGO_DATA})
 
     target_include_directories(creatica_ab_gen PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
-    target_include_directories(creatica_ab_pgo PRIVATE ${PROJECT_SOURCE_DIR}/nnue)
     target_link_libraries(creatica_ab_gen PRIVATE curl pthread)
-    target_link_libraries(creatica_ab_pgo PRIVATE curl pthread)
 endif()
