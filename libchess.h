@@ -952,6 +952,8 @@ CHESS_API std::string nnue_eval(Board& board, bool in_check);
 //Maintained incrementally by the accumulator stack, so it is already computed at a search node.
 CHESS_API int nnue_features(const Board& board, NNUEContext& ctx, unsigned char * out);
 CHESS_API int nnue_feature_dims();
+//nnue_features() plus the big net's PSQT part (before Stockfish's division by OutputScale, 16).
+CHESS_API int nnue_features_psqt(const Board& board, NNUEContext& ctx, unsigned char * out, int * psqt);
 //==================================================================================================
 //CHESS_API int get_see(const Board& board, const Move move, const PieceType capturedType); //move has been made
 //STATIC EXCHANGE EVALUATION, for a move that has NOT been made yet: what the exchange on the

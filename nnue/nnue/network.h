@@ -86,11 +86,13 @@ class Network {
     //AccumulatorStack/DirtyPiece, so reading it at a node costs nothing beyond what the
     //value head already pays. Intended as the input representation for a policy head:
     //a single position can then be scored without a batch. Returns the number of bytes
-    //written; `out` needs FeatureTransformer<FTDimensions>::BufferSize.
+    //written; `out` needs FeatureTransformer<FTDimensions>::BufferSize. If `psqt` is given, it
+    //receives the PSQT part as the transformer returns it (before the division by OutputScale).
     std::size_t transform_features(const Board&                            board,
                                    AccumulatorStack&                       accumulatorStack,
                                    AccumulatorCaches::Cache<FTDimensions>& cache,
-                                   TransformedFeatureType*                 out) const;
+                                   TransformedFeatureType*                 out,
+                                   std::int32_t*                           psqt = nullptr) const;
 
     void verify(std::string evalfilePath, const std::function<void(std::string_view)>&) const;
     /*NnueEvalTrace trace_evaluate(const Position&                         pos,
