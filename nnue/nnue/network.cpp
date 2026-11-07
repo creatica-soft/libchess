@@ -208,13 +208,15 @@ std::size_t Network<Arch, Transformer>::transform_features(
   const Board&                            board,
   AccumulatorStack&                       accumulatorStack,
   AccumulatorCaches::Cache<FTDimensions>& cache,
-  TransformedFeatureType*                 out) const {
+  TransformedFeatureType*                 out,
+  std::int32_t*                           psqt) const {
     constexpr uint64_t alignment = CacheLineSize;
     alignas(alignment) TransformedFeatureType transformedFeatures[
         FeatureTransformer<FTDimensions>::BufferSize];
     ASSERT_ALIGNED(transformedFeatures, alignment);
     const int bucket = (popcount(board.side[WHITE] | board.side[BLACK]) - 1) / 4;
-    (void)featureTransformer.transform(board, accumulatorStack, cache, transformedFeatures, bucket);
+    const auto p = featureTransformer.transform(board, accumulatorStack, cache, transformedFeatures, bucket);
+    if (psqt) *psqt = (std::int32_t)p;
     std::memcpy(out, transformedFeatures, FeatureTransformer<FTDimensions>::BufferSize);
     return FeatureTransformer<FTDimensions>::BufferSize;
 }

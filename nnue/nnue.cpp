@@ -46,6 +46,7 @@ CHESS_API void free_nnue_context(NNUEContext& ctx);
 CHESS_API double evaluate_nnue(const Board& board, NNUEContext& ctx, bool in_check);
 CHESS_API double evaluate_nnue_opt(const Board& board, NNUEContext& ctx, bool in_check, int optimism);
 CHESS_API int evaluate_nnue_value(const Board& board, NNUEContext& ctx, int optimism);
+CHESS_API int nnue_features_psqt(const Board& board, NNUEContext& ctx, unsigned char * out, int * psqt);
 
 static Stockfish::Eval::NNUE::Networks * networks = nullptr;
 
@@ -123,6 +124,17 @@ int nnue_features(const Board& board, NNUEContext& ctx, unsigned char* out) {
     if (!networks || !ctx.accumulator_stack || !ctx.caches) return 0;
     return (int)networks->big.transform_features(board, *ctx.accumulator_stack,
                                                  ctx.caches->big, out);
+}
+
+//The same vector plus the big net's PSQT part, as the feature transformer returns it (Stockfish
+//divides it by OutputScale, 16, before blending). For trainers that rebuild the evaluation.
+int nnue_features_psqt(const Board& board, NNUEContext& ctx, unsigned char* out, int* psqt) {
+    if (!networks || !ctx.accumulator_stack || !ctx.caches) return 0;
+    std::int32_t p = 0;
+    const int n = (int)networks->big.transform_features(board, *ctx.accumulator_stack,
+                                                        ctx.caches->big, out, &p);
+    if (psqt) *psqt = (int)p;
+    return n;
 }
 
 std::pair<Stockfish::DirtyPiece&, Stockfish::DirtyThreats&> accumulator_stack_push(NNUEContext& ctx) {

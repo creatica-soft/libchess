@@ -16,7 +16,7 @@ work to carry prominent notices stating that it was changed and giving a date.
 The fork was taken from Stockfish 18 (`nnue/misc.cpp` still reports
 `version = "18"`). It was first committed here on **2025-06-16** and has been
 modified continuously since; the most recent change as of this notice is
-**2026-09-07**. The individual commits are in this repository's git history.
+**2026-11-07**. The individual commits are in this repository's git history.
 
 The changes are substantial. In summary:
 
@@ -38,7 +38,9 @@ The changes are substantial. In summary:
   push/pop/reset calls and `nnue_eval`.
 
 - **A policy head was added** on top of the network, which upstream does not
-  have. Files ending in `.prepolicy` and `.withfeat` are retained snapshots from
+  have. To feed it and model trainers, `Network::transform_features` exports
+  the feature transformer's output and, optionally, its PSQT part. Files
+  ending in `.prepolicy` and `.withfeat` are retained snapshots from
   that work.
 
 ## Licence of this directory
