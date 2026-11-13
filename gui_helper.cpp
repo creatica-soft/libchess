@@ -418,23 +418,9 @@ static void cmd_move(const std::string& uci, const std::string& fen) {
 
     Move move = *chosen;
 
-    // move2san() reads move.type to decide whether to write 'x' or "O-O", and it needs
-    // the PRE-move board for disambiguation, so the type has to be classified here:
-    // do_move() sets it, but only after the SAN would have to be written.
-    if (board.piecesOnSquares[move.dst] != PieceNone) move.type = MoveTypeCapture;
-    else if (PC_TYPE(board.piecesOnSquares[move.src]) == Pawn &&
-             SQ_FILE(move.src) != SQ_FILE(move.dst)) {
-        // A diagonal pawn move to an empty square is en passant. move2san() only writes
-        // the "exd6" form for MoveTypeCapture, so it is labelled a capture here; do_move()
-        // reclassifies it to MoveTypeEnPassantCapture on its own.
-        move.type = MoveTypeCapture;
-    }
-    if (!board.isChess960 && PC_TYPE(board.piecesOnSquares[move.src]) == King) {
-        const int d = int(move.dst) - int(move.src);
-        if (d == 2) move.type = MoveTypeCastlingKingside;
-        else if (d == -2) move.type = MoveTypeCastlingQueenside;
-    }
-
+    // move2san() works out captures, en passant, castling and the check or mate suffix from
+    // the PRE-move board itself (since 2026-11-13), so it is called before the move is made
+    // and its output used as it is. This used to classify move.type here and append +/#.
     char sanBuf[32] = "";
     const char * sanp = move2san(board, move, sanBuf);
     std::string san = sanp ? sanp : to_uci(move);
@@ -445,9 +431,6 @@ static void cmd_move(const std::string& uci, const std::string& fen) {
     std::vector<Move> replies;
     generate(board, replies);
     const char * status = status_of(board, replies);
-    // move2san() stops before the check and mate markers; standard SAN carries them.
-    if (!strcmp(status, "mate")) san += "#";
-    else if (!strcmp(status, "check")) san += "+";
 
     char fenBuf[MAX_FEN_STRING_LEN] = "";
     board2fen(board, fenBuf);

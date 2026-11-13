@@ -420,65 +420,103 @@ int san2move(Board& board, const char * san_move, Move& move) {
 }
 
 //validates move and converts it to SAN move
+//
+//COMPLETE SAN FROM THE PRE-MOVE BOARD (2026-11-13). Captures, en passant, castling and the check or
+//mate suffix are all worked out here. Until then move2san() read move.type to decide on 'x' and
+//"O-O" -- but do_move() is what sets move.type, and the SAN is needed before the move is made, so
+//every caller had to classify the move first (tournament.cpp, gui_helper.cpp), and the ones that
+//did not wrote "Nf7" for Nxf7 and "Kc1" for O-O-O. En passant came out as "d6" for exd6 even when
+//classified, no move ever got its '+' or '#', and disambiguation added one character per rival
+//piece rather than SAN's minimal file / rank / both. A caller that still sets a castling type is
+//harmless: an explicit castling type is honoured, and no other type is read.
 char * move2san(Board& board, const Move& move, char * sanMove) {
   assert(sanMove);
-	if (move.type == MoveTypeCastlingQueenside) {
-		strcpy(sanMove, "O-O-O");
-		return sanMove;
-	} else if (move.type == MoveTypeCastlingKingside) {
-		strcpy(sanMove, "O-O");
-		return sanMove;
-	}
 	const Piece movingPiece = board.piecesOnSquares[move.src];
+	if (movingPiece == PieceNone) {
+		char fenString[MAX_FEN_STRING_LEN] = "";
+		printf("move2san() error: no piece on %s; FEN %s\n", square[move.src], board2fen(board, fenString));
+		return nullptr;
+	}
 	const PieceType mpType = PC_TYPE(movingPiece);
-	
+
+	//Castling: an explicit type, the king's two-square step in standard chess, or the king taking
+	//its own rook, which is how libchess encodes Chess960 castling (see normalise_castling()).
+	bool castling = move.type == MoveTypeCastlingKingside || move.type == MoveTypeCastlingQueenside;
+	bool kingside = move.type == MoveTypeCastlingKingside;
+	if (!castling && mpType == King) {
+		const Piece target = board.piecesOnSquares[move.dst];
+		const bool takesOwnRook = target != PieceNone && PC_TYPE(target) == Rook && PC_COLOR(target) == PC_COLOR(movingPiece);
+		const int d = int(move.dst) - int(move.src);
+		if (takesOwnRook || (!board.isChess960 && (d == 2 || d == -2))) {
+			castling = true;
+			kingside = move.dst > move.src;
+		}
+	}
+
 	auto [king_moves, pinned, pinning, checkers, kingSquare] = kingMoves(board);
   
 	if (bitCount(checkers) > 1 && mpType != King) {
 	  char fenString[MAX_FEN_STRING_LEN] = "";
 		printf("move2san() error: %s move from %s to %s is illegal; FEN %s\n", piece[movingPiece], square[move.src], square[move.dst], board2fen(board, fenString));
 		writeDebug(board);
-		//for (int i = 0; i < n; i++) printf("moveCandidate %s\n", square[moveCandidates[i]]);
 		return nullptr;	  
 	}
   auto [check_mask, ep_mask] = checkers? checkMask(board, kingSquare, checkers) : std::make_pair(0xffffffffffffffffULL, 0ULL);
 	
 	int i = 0;
-	if (mpType != Pawn)
-		sanMove[i++] = pieceLetter[mpType];
-	else if (move.type == MoveTypeCapture)
-		sanMove[i++] = SQ_FILE(move.src) + 'a';
+	if (castling) {
+		strcpy(sanMove, kingside ? "O-O" : "O-O-O");
+		i = (int)strlen(sanMove);
+	} else {
+		//A pawn moving diagonally captures; onto an empty square, en passant.
+		const bool capture = board.piecesOnSquares[move.dst] != PieceNone
+		                  || (mpType == Pawn && SQ_FILE(move.src) != SQ_FILE(move.dst));
+		if (mpType != Pawn)
+			sanMove[i++] = pieceLetter[mpType];
+		else if (capture)
+			sanMove[i++] = SQ_FILE(move.src) + 'a';
 
-	if (mpType != Pawn && mpType != King) {
-		//find move candidates
-		Square moveCandidates[10];
-		uint64_t cp = board.side[board.sideToMove] & board.pieceTypes[mpType - 1];
-		int idx = 0;
-		while (cp) {
-  		const Square s = lsBit(cp);
-  		uint64_t moves = piece_moves(board, mpType, s, kingSquare, pinned, pinning, check_mask, ep_mask);
-			if (moves & SQ_BIT(move.dst)) moveCandidates[idx++] = s;
-			cp &= cp - 1;
+		if (mpType != Pawn && mpType != King) {
+			//Disambiguation, as SAN defines it: among the other pieces of this type that can also
+			//reach dst, the file if none shares it, else the rank if none shares that, else both.
+			bool rival = false, rivalOnFile = false, rivalOnRank = false;
+			uint64_t cp = board.side[board.sideToMove] & board.pieceTypes[mpType - 1];
+			while (cp) {
+				const Square s = lsBit(cp);
+				cp &= cp - 1;
+				if (s == move.src) continue;
+				const uint64_t moves = piece_moves(board, mpType, s, kingSquare, pinned, pinning, check_mask, ep_mask);
+				if (!(moves & SQ_BIT(move.dst))) continue;
+				rival = true;
+				if (SQ_FILE(s) == SQ_FILE(move.src)) rivalOnFile = true;
+				if (SQ_RANK(s) == SQ_RANK(move.src)) rivalOnRank = true;
+			}
+			if (rival) {
+				if (!rivalOnFile) sanMove[i++] = SQ_FILE(move.src) + 'a';
+				else if (!rivalOnRank) sanMove[i++] = SQ_RANK(move.src) + '1';
+				else { sanMove[i++] = SQ_FILE(move.src) + 'a'; sanMove[i++] = SQ_RANK(move.src) + '1'; }
+			}
 		}
-		for (int j = 0; j < idx; j++) {
-			if (move.src == moveCandidates[j]) continue;
-			if (SQ_RANK(move.src) == SQ_RANK(moveCandidates[j]))
-				sanMove[i++] = SQ_FILE(move.src) + 'a';
-			else if (SQ_FILE(move.src) == SQ_FILE(moveCandidates[j]))
-				sanMove[i++] = SQ_RANK(move.src) + '1';
-			else sanMove[i++] = SQ_FILE(move.src) + 'a';
+		if (capture) sanMove[i++] = 'x';
+		sanMove[i++] = SQ_FILE(move.dst) + 'a';
+		sanMove[i++] = SQ_RANK(move.dst) + '1';
+
+		if (move.promoType != PieceTypeNone) {
+			sanMove[i++] = '=';
+			sanMove[i++] = promoLetter[move.promoType];
 		}
 	}
-	if (move.type == MoveTypeCapture) sanMove[i++] = 'x';
-	sanMove[i++] = SQ_FILE(move.dst) + 'a';
-	sanMove[i++] = SQ_RANK(move.dst) + '1';
 
-	if (move.promoType != PieceTypeNone) {
-		sanMove[i++] = '=';
-		sanMove[i++] = promoLetter[move.promoType];
-	}
+	//The suffix needs the move made, on a copy: '#' for mate, '+' for check. isCheckMateStaleMate()
+	//reports check == false on a mate (see the note on BoardState), so mate is tested first and
+	//check is read from the checkers directly.
+	Board after = board;
+	Move made = move;
+	StateInfo state = {};
+	do_move(after, made, state);
+	if (isCheckMateStaleMate(after).mate) sanMove[i++] = '#';
+	else if (getCheckers(after, ::kingSquare(after, after.sideToMove))) sanMove[i++] = '+';
 	sanMove[i] = '\0';
-	//Move has to be made in order to figure out if it checks, mates or leads to stale mate
 	return sanMove;
 }
 

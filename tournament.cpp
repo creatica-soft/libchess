@@ -194,19 +194,9 @@ double play_one_game(Engine& white, Engine& black, int game_id, const char* star
     }
     Move move = {}; //was uninitialised, so move.type below was stack garbage
     uci2move_idx(evaluations[0]->bestmove, move);
-    //move2san() reads move.type to decide whether to emit 'x', but ff_move() further
-    //down is what actually SETS that type - so every capture in every match PGN was
-    //written without its capture marker ("Nf7" for Nxf7, "d4" for exd4), which is not
-    //legal SAN and cannot be re-imported. move2san needs the PRE-move board for
-    //disambiguation, so it cannot simply be moved after ff_move; classify here instead.
-    if (board.piecesOnSquares[move.dst] != PieceNone) move.type = MoveTypeCapture;
-    //Castling likewise, or it is written as a plain king move ("Kc1" instead of O-O-O).
-    //Standard chess only: Chess960 encodes castling as king-takes-own-rook.
-    if (!board.isChess960 && PC_TYPE(board.piecesOnSquares[move.src]) == King) {
-      const int d = (int)move.dst - (int)move.src;
-      if (d == 2) move.type = MoveTypeCastlingKingside;
-      else if (d == -2) move.type = MoveTypeCastlingQueenside;
-    }
+    //move2san() needs the PRE-move board, and works out captures, castling and the check or
+    //mate suffix from it (since 2026-11-13). This used to classify move.type here first, which
+    //was the only way match PGNs got their 'x' and O-O; they had no '+' or '#' at all.
     char sanMove[12] = "";
     strcat(sanMoves, move2san(board, move, sanMove));
     strcat(sanMoves, " ");        
